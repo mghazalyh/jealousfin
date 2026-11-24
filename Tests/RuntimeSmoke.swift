@@ -34,6 +34,19 @@ import Foundation
         precondition((response["Items"] as? [[String:String]])?.first?["Id"]=="fixture")
         let stream=try await adapter.stream(path:"/live.m3u8",method:"DirectStream",itemID:"fixture")
         precondition(stream.1=="Transcode")
-        print("PASS: runtime bridge, interrupt recovery, and Jellyfin adapter hooks")
+        let baseline=try BundledPatchBaseline.load()
+        if let api=baseline.sources.jellyfinAPI{
+            _ = try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:api.id,source:api.source),engine:engine)
+        }
+        if let runtime=baseline.sources.runtime{
+            let defaults=try JSONCodec.encoder().encode(RuntimePolicy.baseline(Settings()))
+            guard let input=try JSONSerialization.jsonObject(with:defaults) as? [String:Any] else{fatalError("Invalid policy fixture")}
+            let source="(function(){\n"+runtime.source+"\nreturn JSON.stringify(typeof hooks !== 'undefined' && typeof hooks.configure === 'function' ? hooks.configure(api.state) : null);\n})()"
+            let (output,actions)=try await engine.evaluateAsync(source,snapshot:input)
+            precondition(actions.isEmpty)
+            let config=try JSONCodec.decoder().decode(RuntimePolicy?.self,from:Data(output.utf8))
+            _ = try (config ?? RuntimePolicy.baseline(Settings())).checked()
+        }
+        print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }

@@ -8,3 +8,5 @@ Config/Info.plist
 .DS_Store
 
 Vendor/QuickJS/
+
+Sources/PromotedBaseline.generated.swift

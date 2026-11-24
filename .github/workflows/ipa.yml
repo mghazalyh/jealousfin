@@ -20,10 +20,16 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           brew install xcodegen
           bash Scripts/fetch-runtime.sh
+      - name: Import reviewed patch baseline
+        env:
+          TORRIODB_RELEASE_TOKEN: ${{ secrets.TORRIODB_RELEASE_TOKEN }}
+        run: |
+          python3 Scripts/import-promoted.py
+          python3 Scripts/embed-promoted.py Promoted/baseline.json Sources/PromotedBaseline.generated.swift
       - name: Test channel policy
         run: |
           mkdir -p build
-          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Sources/JellyfinAdapterDomain.swift Tests/main.swift -o build/policy-tests
+          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Sources/JellyfinAdapterDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
       - name: Test interruptible runtime
@@ -32,7 +38,7 @@ jobs:
           for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
             clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
           done
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
       - name: Generate project and build
         run: |
@@ -47,6 +53,7 @@ jobs:
           mkdir -p build/Payload
           ditto "$APP" build/Payload/Jealousfin.app
           cp Vendor/QuickJS/LICENSE build/Payload/Jealousfin.app/QuickJS-LICENSE.txt
+          cp Promoted/baseline.json build/Payload/Jealousfin.app/PromotedBaseline.json
           cd build
           /usr/bin/zip -qry Jealousfin.ipa Payload
           unzip -t Jealousfin.ipa
@@ -63,4 +70,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v0.1.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin development build ${GITHUB_RUN_NUMBER}" --notes "Unsigned iOS 15+ arm64 IPA for TrollStore installation testing. Source: $GITHUB_SHA. Build and policy regression verified; physical playback, background endurance and global server enforcement not yet accepted." --prerelease
+          baseline="$(python3 -c 'import json;print(json.load(open("Promoted/baseline.json"))["revision"])')"
+          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin development build ${GITHUB_RUN_NUMBER}" --notes "Unsigned iOS 15+ arm64 IPA for TrollStore installation testing. Source: $GITHUB_SHA. Embedded promoted baseline: $baseline. Build and policy regression verified; physical playback, background endurance and global server enforcement not yet accepted." --prerelease

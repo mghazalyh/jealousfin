@@ -41,6 +41,10 @@ import Network
     let db=TorrioDB()
     let lan=LANServer()
     let scripts=ScriptEngine()
+    @Published private(set) var bundledBaselineRevision="native-baseline"
+    @Published private(set) var patchArchiveID:String?
+    @Published private(set) var patchArchiveFault:String?
+    private var promotionBusy=false
     @Published private(set) var jellyfinAPIRevision="native-baseline"
     @Published private(set) var jellyfinAPIFault:String?
     private var jellyfinAPIStore=JellyfinAdapterStore()
@@ -114,6 +118,12 @@ import Network
 
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
+        do {
+            let baseline=try BundledPatchBaseline.load()
+            try Self.installBundledBaseline(baseline,disk:disk)
+            bundledBaselineRevision=baseline.revision
+        }catch{patchArchiveFault="Bundled baseline installation failed: "+String(describing:type(of:error))}
+        patchArchiveID=disk.load(PatchArchive.self,"last-patch-archive.json")?.id
         jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
         decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()
@@ -169,6 +179,7 @@ import Network
             guard let self=self else{return}
             await self.bootJellyfinAPI()
             await self.bootRuntime()
+            self.capturePatchArchive(reason:"launch-reconciliation")
             if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect()}
             self.resumeCampaignIfNeeded()
         }
@@ -685,6 +696,8 @@ import Network
         lastSync=Date();syncStatus="Synchronizing"
         // Telemetry must not depend on health-ledger merge or command success.
         var telemetryError:String?
+        do {try await uploadPatchArchives()}
+        catch{log("WARN","patch-archive","UPLOAD_FAILED",["errorType":String(describing:type(of:error))])}
         do {try await uploadDecisions()}
         catch{log("WARN","decisions","UPLOAD_FAILED",["error":error.localizedDescription])}
         do {try await uploadEngineeringResults()}
@@ -736,6 +749,7 @@ import Network
     }
     func recalculateInsights(){
         var list:[Insight]=[]
+        if let fault=patchArchiveFault{list.append(Insight(id:"patch-archive",priority:"High",title:"Patch archival needs attention",explanation:fault,action:"Retry patch archival and inspect storage or synchronization."))}
         if let fault=jellyfinAPIFault{list.append(Insight(id:"jellyfin-api",priority:"High",title:"Jellyfin API adapter needs attention",explanation:fault,action:"Inspect API traces or restore the previous adapter."))}
         if let fault=patchFault {list.append(Insight(id:"patch",priority:"High",title:"Runtime module needs attention",explanation:fault,action:"Inspect module status and roll back or install a corrected module."))}
         if let result=campaign?.lastResult,result.status=="failed" {list.append(Insight(id:"device-test",priority:"High",title:"On-device test failed: "+result.kind,explanation:result.evidence["reason"] ?? "See the correlated engineering result.",action:"Inspect campaign evidence and revise the runtime policy."))}
@@ -754,9 +768,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -774,7 +788,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -831,6 +845,22 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "get_patch_archive":
+            guard let archive=disk.load(PatchArchive.self,"last-patch-archive.json") else{throw AppError.message("No archived source set")}
+            // Query metadata only. Complete executable sources are in private TorrioDB.
+            return try json(["id":archive.id,"runtime":archive.sources.runtime?.id ?? "native-baseline","jellyfinAPI":archive.sources.jellyfinAPI?.id ?? "native-baseline","ui":archive.sources.ui?.revision ?? "native-baseline","reason":archive.reason])
+        case "archive_active_patches":
+            guard apiReady,policyReady,!apiChanging,!patchBusy else{throw AppError.message("Patch engines busy")}
+            capturePatchArchive(reason:"requested")
+            guard patchArchiveFault==nil,let id=patchArchiveID else{throw AppError.message("Archive unavailable")}
+            return id
+        case "promote_patch_archive":
+            guard let id=args["id"],let expected=args["expectedRevision"],let evidence=args["evidence"] else{throw AppError.message("Archive ID, expected baseline revision and review evidence required")}
+            return try await promotePatchArchive(id:id,expected:expected,evidence:evidence)
+        case "get_release_baseline":
+            guard let file=try await db.read("engineering/releases/baseline.json") else{throw AppError.message("No release baseline")}
+            let baseline=try JSONCodec.decoder().decode(ReleaseBaseline.self,from:file.data).checked()
+            return try json(["revision":baseline.revision,"archiveID":baseline.archiveID ?? "","runtime":baseline.sources.runtime?.id ?? "native-baseline","jellyfinAPI":baseline.sources.jellyfinAPI?.id ?? "native-baseline","ui":baseline.sources.ui?.revision ?? "native-baseline"])
         case "get_jellyfin_api":
             return try json(["revision":jellyfinAPIRevision,"ready":String(apiReady),"fault":jellyfinAPIFault ?? "","previous":jellyfinAPIStore.previous?.id ?? "","operations":JellyfinAdapterRules.operations.joined(separator:",")])
         case "install_jellyfin_api":
@@ -947,7 +977,7 @@ import Network
         input["form"]=uiInputs
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1011,6 +1041,7 @@ extension AppModel {
             let p=try await engineering.install(id:id,source:source,settings:settings)
             applyRuntime(p)
             log("INFO","runtime","MODULE_ACTIVATED",["module":id])
+            capturePatchArchive(reason:"runtime-activated")
         }catch{
             patchFault=sanitized(error.localizedDescription)
             log("ERROR","runtime","MODULE_REJECTED",["module":id,"error":patchFault ?? ""])
@@ -1027,6 +1058,7 @@ extension AppModel {
         else {p=try await engineering.rollback(settings:settings)}
         applyRuntime(engineering.activeID=="native-baseline" ? nil:p)
         log("INFO","runtime","MODULE_ROLLBACK",["module":activePatchID])
+        capturePatchArchive(reason:reset ? "runtime-reset":"runtime-rollback")
     }
 
     private func saveCampaign(_ value:DeviceTestCheckpoint) throws {
@@ -1395,6 +1427,7 @@ extension AppModel {
         dynamicUIResults=[:]
         dynamicUISeen.removeAll()
         dynamicUI=store
+        capturePatchArchive(reason:"ui-changed")
         log("INFO","dynamic-ui","LAYOUT_CHANGED",["revision":store.active?.revision ?? "native-baseline","slots":String(store.active?.slots.count ?? 0),"pages":String(store.active?.pages.count ?? 0)])
         requestSync()
     }
@@ -1666,6 +1699,7 @@ extension AppModel {
             channels=catalogue;programs=epg ?? [];catalogueReady=true;lastRefresh=Date()
             disk.save(catalogue,"channels.json")
             status="Connected"
+            capturePatchArchive(reason:"jellyfin-api-activated")
             log("INFO","jellyfin-api","ACTIVATED",["revision":jellyfinAPIRevision,"channels":String(catalogue.count),"epgProbe":epg==nil ? "unavailable":"passed"])
             apiChanging=false
             if !engineeringOwnsPlayback && campaign?.canResume != true{
@@ -1690,6 +1724,7 @@ extension AppModel {
                 jellyfinAPIFault="Recovery adapter restored locally; live probe unavailable"
                 settings.resumeSurf=resumeLoop;settings.surfCategory=category
                 disk.save(settings,"settings.json")
+                capturePatchArchive(reason:"jellyfin-api-offline-rollback")
                 log("WARN","jellyfin-api","RECOVERED_OFFLINE",["revision":jellyfinAPIRevision])
                 recalculateInsights()
                 return
@@ -1720,5 +1755,114 @@ extension AppModel {
         result["status"]="passed"
         log("INFO","jellyfin-api","PROBE_COMPLETED",result)
         return result
+    }
+}
+
+
+// Release promotion records code, not device configuration. No credentials,
+// health records, command history, or editable UI values become build inputs.
+extension AppModel {
+    private static func installBundledBaseline(_ baseline:ReleaseBaseline,disk:Disk)throws{
+        let prior=disk.load(BaselineInstallState.self,"installed-baseline.json")
+        if prior?.revision==baseline.revision && prior?.sources==baseline.sources{return}
+        let runtime=disk.load(RuntimePatchStore.self,"runtime-patch.json")
+        let api=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json")
+        let ui=disk.load(DynamicUIStore.self,"dynamic-ui.json")
+        let oldRuntime=runtime?.active.map{PatchSource(id:$0.id,source:$0.source)}
+        let oldAPI=api?.active.map{PatchSource(id:$0.id,source:$0.source)}
+        let selectedRuntime=BaselineMerge.select(local:oldRuntime,previous:prior?.sources.runtime,incoming:baseline.sources.runtime,hadLocal:runtime != nil,hadPrevious:prior != nil)
+        let selectedAPI=BaselineMerge.select(local:oldAPI,previous:prior?.sources.jellyfinAPI,incoming:baseline.sources.jellyfinAPI,hadLocal:api != nil,hadPrevious:prior != nil)
+        let selectedUI=BaselineMerge.select(local:ui?.active,previous:prior?.sources.ui,incoming:baseline.sources.ui,hadLocal:ui != nil,hadPrevious:prior != nil)
+        // Keep interrupted activation journals untouched; their ordinary boot
+        // recovery handles them. An upgrade must never erase a rollback marker.
+        if runtime?.activationPending != true,selectedRuntime != oldRuntime || runtime==nil{
+            let next=RuntimePatchStore(active:selectedRuntime.map{RuntimePatch(id:$0.id,source:$0.source)},previous:runtime?.active,activationPending:false)
+            guard disk.save(next,"runtime-patch.json") else{throw AppError.message("Cannot install bundled runtime")}
+        }
+        if api?.pending != true,selectedAPI != oldAPI || api==nil{
+            let next=JellyfinAdapterStore(active:selectedAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source)},previous:api?.active,pending:false)
+            guard disk.save(next,"jellyfin-api.json") else{throw AppError.message("Cannot install bundled API")}
+        }
+        if selectedUI != ui?.active || ui==nil{
+            let next=DynamicUIStore(active:selectedUI,previous:ui?.active,values:selectedUI?.retainedValues(ui?.values ?? [:]) ?? [:])
+            guard disk.save(next,"dynamic-ui.json") else{throw AppError.message("Cannot install bundled UI")}
+        }
+        guard disk.save(BaselineInstallState(revision:baseline.revision,sources:baseline.sources),"installed-baseline.json") else{throw AppError.message("Cannot persist baseline migration")}
+    }
+    private func activePatchSources()->PatchSourceSet{
+        let runtime=engineering.store.active.flatMap{$0.id==activePatchID ? PatchSource(id:$0.id,source:$0.source):nil}
+        let api=jelly.adapter.map{PatchSource(id:$0.revision.id,source:$0.revision.source)}
+        return PatchSourceSet(runtime:runtime,jellyfinAPI:api,ui:dynamicUI.active)
+    }
+    private func capturePatchArchive(reason:String){
+        guard apiReady,policyReady || reason=="launch-reconciliation" else{return}
+        do{
+            let sources=try activePatchSources().checked()
+            // Never archive locally configured credentials accidentally embedded
+            // in a module. Log the condition without exporting the value.
+            let bytes=try JSONCodec.encoder().encode(sources)
+            let text=String(decoding:bytes,as:UTF8.self)
+            for secret in [settings.githubToken,jelly.token,settings.password] where secret.utf8.count>=8 {
+                if text.contains(secret){throw AppError.message("Patch source contains a configured credential")}
+            }
+            if let last=disk.load(PatchArchive.self,"last-patch-archive.json"),last.sources==sources{
+                patchArchiveID=last.id;patchArchiveFault=nil;return
+            }
+            let archive=PatchArchive(deviceID:deviceID,reason:reason,build:Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",sources:sources)
+            guard disk.save(archive,"patch-archive-"+archive.id+".json"),
+                disk.save(archive,"last-patch-archive.json") else{throw AppError.message("Cannot persist patch archive")}
+            patchArchiveID=archive.id;patchArchiveFault=nil
+            log("INFO","patch-archive","CAPTURED",["id":archive.id,"reason":reason])
+            requestSync()
+        }catch{
+            patchArchiveFault=sanitized(error.localizedDescription)
+            log("ERROR","patch-archive","CAPTURE_FAILED",["error":patchArchiveFault ?? ""])
+        }
+    }
+    private func uploadPatchArchives()async throws{
+        for url in disk.files(prefix:"patch-archive-").prefix(8){
+            let data=try Data(contentsOf:url)
+            let record=try JSONCodec.decoder().decode(PatchArchive.self,from:data)
+            guard record.deviceID==deviceID,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid patch archive")}
+            try dbArchiveCheck(record)
+            try await db.immutable("engineering/"+deviceID+"/patches/"+record.id+".json",data:data)
+            disk.remove(url)
+        }
+    }
+    private func dbArchiveCheck(_ record:PatchArchive)throws{
+        _ = try record.sources.checked()
+    }
+    private func promotePatchArchive(id:String,expected:String,evidence:String)async throws->String{
+        guard apiReady,policyReady,!apiChanging,!patchBusy,!promotionBusy,
+              DynamicUILayout.validID(id),DynamicUILayout.validID(expected),!evidence.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,evidence.count<=4000,
+              let archive=disk.load(PatchArchive.self,"last-patch-archive.json"),archive.id==id,
+              archive.sources==activePatchSources() else{throw AppError.message("Promotion requires the current archived source set and review evidence")}
+        promotionBusy=true;defer{promotionBusy=false}
+        let archivePath="engineering/"+deviceID+"/patches/"+id+".json"
+        if let saved=try await db.read(archivePath){
+            let decoded=try JSONCodec.decoder().decode(PatchArchive.self,from:saved.data)
+            guard decoded.id==id,decoded.sources==archive.sources,decoded.deviceID==deviceID else{throw AppError.message("Archive conflict")}
+        }else{
+            try await db.immutable(archivePath,data:JSONCodec.encoder().encode(archive))
+        }
+        let path="engineering/releases/baseline.json"
+        let old=try await db.read(path)
+        let current:ReleaseBaseline
+        if let old=old{current=try JSONCodec.decoder().decode(ReleaseBaseline.self,from:old.data).checked()}
+        else{current=ReleaseBaseline.empty}
+        if current.revision==id && current.sources==archive.sources{return id}
+        guard current.revision==expected,archive.sources==activePatchSources() else{throw AppError.message("Release baseline or active source changed during promotion")}
+        let baseline=try ReleaseBaseline(revision:id,archiveID:id,deviceID:deviceID,evidence:sanitized(evidence),sources:archive.sources).checked()
+        let data=try JSONCodec.encoder().encode(baseline)
+        let history="engineering/releases/history/"+id+".json"
+        if let existing=try await db.read(history){
+            let reviewed=try JSONCodec.decoder().decode(ReleaseBaseline.self,from:existing.data)
+            guard reviewed==baseline else{throw AppError.message("Review record conflicts with earlier promotion")}
+        }else{try await db.immutable(history,data:data)}
+        guard archive.sources==activePatchSources() else{throw AppError.message("Active source changed before publication")}
+        try await db.put(path,data:data,sha:old?.sha)
+        log("INFO","patch-archive","PROMOTED",["revision":id,"previous":expected])
+        requestSync()
+        return id
     }
 }
