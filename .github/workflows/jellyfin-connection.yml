@@ -31,8 +31,16 @@ jobs:
           base = os.environ["JELLYFIN_URL"].strip().rstrip("/")
           try:
               parsed = urllib.parse.urlsplit(base)
-              if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-                  raise ValueError()
+              if parsed.scheme not in ("http", "https"):
+                  fail("URL", "missing or unsupported scheme; expected https://")
+              if not parsed.hostname:
+                  fail("URL", "missing hostname")
+              if parsed.username or parsed.password:
+                  fail("URL", "embedded username or password is not permitted in the URL")
+              if parsed.query or parsed.fragment:
+                  fail("URL", "query string or fragment is present; expected server base URL")
+              if any(ch.isspace() for ch in base):
+                  fail("URL", "unexpected internal whitespace")
               port = parsed.port or (443 if parsed.scheme == "https" else 80)
           except ValueError:
               fail("URL", "invalid server URL")
