@@ -42,3 +42,33 @@ The server filtering adapter remains an offline integration component, not an in
 ## Automatic telemetry
 
 System telemetry begins immediately on launch, before Jellyfin login, and repeats every 15 seconds while executing. Startup, network changes, foreground/background lifecycle transitions and heartbeats produce durable structured events. System samples include launch ID, build, uptime, device/OS, thermal and battery state, physical memory capacity, available storage, network path, connection and queue status. Playback samples remain separate and are cleared when changing or stopping streams. TorrioDB upload is attempted immediately when configured, independent of successful health merging or remote command execution; pending records remain local on failure. The Telemetry page and get_telemetry expose system and playback measurements separately. No telemetry enable switch or manual start is required.
+
+
+## On-device engineering and reloadable modules (ABI 1)
+
+After launch, use the existing device command mailbox. Command arguments are string values.
+- start_device_tests: plan = JSON of {id, steps:[{kind, channelID?, seconds?, source?}], repeatCount, repeatForever}. Steps: system, catalogue, network, audio_route, reconnect, playback, pause_resume, endurance, surf_rotation, background, stop, script_probe.
+- pause_device_tests / resume_device_tests / stop_device_tests / get_device_tests.
+- install_runtime_module: id and source (JavaScript). reload_runtime_module, rollback_runtime_module, reset_runtime_module, get_runtime_module.
+- Results are durable under engineering/<deviceID>/results and checkpoint.json. Modules persist across launch; interrupted activation rolls back. Tests never alter channel health by their observations.
+
+Module example:
+```javascript
+var hooks = {
+  configure: function(p) {
+    p.startupTimeout = 45;
+    p.forwardBufferSeconds = 8;
+    p.recoveryMode = "advance_surf";
+    return p;
+  },
+  select: function(input) {
+    return input.candidates.length ? input.candidates[0].id : null;
+  },
+  tick: function(input) {
+    var state = input.state || {};
+    state.runs = String(Number(state.runs || 0) + 1);
+    return {state: state, actions: [], nextSeconds: 30, insights: []};
+  }
+};
+```
+The tick hook receives current application state, recent events, previous action receipts and persistent string state. It can emit application commands, custom insights and schedule its next evaluation. It has a bounded interface and cannot modify compiled iOS/native frameworks, the OS, or another application. It cannot approve bans or self-replace modules. Three consecutive tick errors disable the hook until reload or replacement. Native host updates still require a new IPA. Actual background transitions are measured, not manufactured. No indefinite execution while iOS suspends the process is promised.

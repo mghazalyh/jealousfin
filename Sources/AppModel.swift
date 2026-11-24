@@ -48,6 +48,10 @@ import Network
     private var policyOverride:RuntimePolicy?
     private var policyReady=false
     private var patchBusy=false
+    private var moduleTask:Task<Void,Never>?
+    private var moduleCheckpoint:ModuleCheckpoint?
+    private var moduleEventCursor:String?
+    private var moduleFailures=0
     private var campaignTask:Task<Void,Never>?
     private var campaignEpoch=UUID()
     private var backgroundTransitions=0
@@ -99,6 +103,7 @@ import Network
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
+        moduleCheckpoint=disk.load(ModuleCheckpoint.self,"module-checkpoint.json")
         ledger=disk.load(HealthLedger.self,"health.json") ?? HealthLedger()
         health=ledger.states()
         deviceID=disk.load(String.self,"device.json") ?? UUID().uuidString
@@ -444,7 +449,7 @@ import Network
         status=confirmed ? "Channel failed; validation recorded":"Playback failure needs diagnosis"
         playing=false;validated=false
         if surfing && !surfPaused && serverOK && failureRun<3 {nextRotation=Date().addingTimeInterval(2)}
-        else if surfing {emptyPoolRetry=Date().addingTimeInterval(30)}
+        else if surfing {emptyPoolRetry=Date().addingTimeInterval(Double(policy.failureRetrySeconds))}
         requestSync();recalculateInsights()
     }
     func presentationReady(_ value:Bool){
@@ -586,7 +591,13 @@ import Network
             playing=player.timeControlStatus == .playing
             if item.status == .failed || (lastAdvance.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)} ?? false) {
                 log("WARN","recovery","PLAYBACK_STALLED",["position":String(p)])
-                if let c=current {begin(c,keepSurf:surfing)}
+                if let c=current {
+                    switch effectivePolicy.recoveryMode {
+                    case "advance_surf":if surfing && !surfPaused{next()}else{begin(c,keepSurf:surfing)}
+                    case "pause":pause();status="Playback paused by recovery policy"
+                    default:begin(c,keepSurf:surfing)
+                    }
+                }
             } else if now.timeIntervalSince(lastReport)>15 {
                 lastReport=now
                 if let s=session,startedSession {
@@ -611,6 +622,7 @@ import Network
         }
         if policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
         resumeCampaignIfNeeded()
+        runModuleIfDue()
         if now.timeIntervalSince(lastHeartbeat)>30 {publishHeartbeat(now:now)}
         if now.timeIntervalSince(lastSync)>30 {requestSync()}
     }
@@ -705,6 +717,9 @@ import Network
         if settings.githubToken.isEmpty{list.append(Insight(id:"token",priority:"Attention",title:"TorrioDB is not configured",explanation:"Validation and telemetry are stored locally until repository access is configured.",action:"Enter a token in Settings."))}
         for c in channels where health[c.id]?.banned==true {list.append(Insight(id:"ban-"+c.id,priority:"High",title:c.name+" permanently excluded",explanation:"The final validation retry failed after progressive hiatus.",action:"Explicitly approve reinstatement only if desired."))}
         for c in channels where health[c.id]?.failures==7 && health[c.id]?.banned==false {list.append(Insight(id:"final-"+c.id,priority:"Attention",title:c.name+" at final hiatus",explanation:"The next confirmed failure after eligibility becomes permanent.",action:"Review its failure evidence."))}
+        if moduleCheckpoint?.moduleID==activePatchID {
+            list += (moduleCheckpoint?.insights ?? []).map{Insight(id:"module-"+$0.id,priority:$0.priority,title:$0.title,explanation:$0.explanation,action:$0.action)}
+        }
         insights=list
         disk.save(list,"insights.json")
     }
@@ -791,7 +806,9 @@ import Network
             try await installRuntime(id:id,source:source);return "Runtime module activated: "+activePatchID
         case "reload_runtime_module":
             guard policyReady,!patchBusy else{throw AppError.message("Runtime busy")}
-            await bootRuntime();return "Runtime reloaded: "+activePatchID
+            await bootRuntime()
+            if let fault=patchFault{throw AppError.message(fault)}
+            return "Runtime reloaded: "+activePatchID
         case "rollback_runtime_module":
             try await changeRuntime(reset:false);return "Runtime rolled back: "+activePatchID
         case "reset_runtime_module":
@@ -832,8 +849,15 @@ import Network
 // All test mutations are checkpointed. Test outcomes do not modify the production health ledger.
 extension AppModel {
     private func applyRuntime(_ policy:RuntimePolicy?) {
+        moduleTask?.cancel()
         policyOverride=policy
         activePatchID=engineering.activeID
+        moduleFailures=0
+        moduleEventCursor=nil
+        if moduleCheckpoint?.moduleID != activePatchID {
+            moduleCheckpoint=ModuleCheckpoint(moduleID:activePatchID)
+            if let cp=moduleCheckpoint{disk.save(cp,"module-checkpoint.json")}
+        }
         patchFault=engineering.fault
         player.automaticallyWaitsToMinimizeStalling=effectivePolicy.automaticallyWaits
         if let item=player.currentItem {
@@ -1004,6 +1028,25 @@ extension AppModel {
             var evidence=systemMetrics
             evidence["telemetryActive"]=String(telemetryActive)
             return Observation(status:telemetryActive && telemetryLastSample != nil ? "passed":"failed",evidence:evidence)
+        case "network":
+            sampleSystemTelemetry(force:true)
+            guard jelly.connected else{return Observation(status:"blocked",evidence:["reason":"Jellyfin not configured or connected"])}
+            let ok=await jelly.healthy()
+            return Observation(status:ok ? "passed":"failed",evidence:["networkState":networkState,"interfaces":networkInterfaces,"jellyfinReachable":String(ok),"requestMs":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
+        case "reconnect":
+            await connect()
+            return Observation(status:jelly.connected && catalogueReady ? "passed":"failed",evidence:["connected":String(jelly.connected),"catalogueReady":String(catalogueReady),"channelCount":String(channels.count)])
+        case "audio_route":
+            let audio=AVAudioSession.sharedInstance()
+            let route=audio.currentRoute.outputs.map{$0.portType.rawValue}.joined(separator:",")
+            return Observation(status:route.isEmpty ? "blocked":"passed",evidence:["outputRouteTypes":route,"sampleRate":String(audio.sampleRate),"ioBufferDuration":String(audio.ioBufferDuration),"outputLatency":String(audio.outputLatency),"outputChannels":String(audio.outputNumberOfChannels),"measurement":"Audio route only"])
+        case "script_probe":
+            guard let source=step.source else{return Observation(status:"failed",evidence:["reason":"Missing script probe"])}
+            do {
+                let (result,commands)=try await scripts.evaluateAsync(source,snapshot:stateSnapshot())
+                guard commands.isEmpty else{return Observation(status:"failed",evidence:["reason":"Script probe cannot enqueue mutations"])}
+                return Observation(status:result.trimmingCharacters(in:.whitespacesAndNewlines)=="true" ? "passed":"failed",evidence:["result":sanitized(result)])
+            }catch{return Observation(status:"failed",evidence:["reason":error.localizedDescription])}
         case "catalogue":
             guard jelly.connected else{return Observation(status:"blocked",evidence:["reason":"Jellyfin is not connected"])}
             do{
@@ -1094,6 +1137,8 @@ extension AppModel {
             await nap(0.5)
         }
         let finish=ProcessInfo.processInfo.systemUptime
+        maxTickGap=max(maxTickGap,finish-lastTick)
+        guard generation==streamGeneration,current?.id==channel.id else{return Observation(status:"failed",evidence:["reason":"Playback changed before final observation"],channelID:channel.id)}
         let progress=position-before
         evidence["observedSeconds"]=String(format:"%.2f",finish-observationStart)
         evidence["clockProgress"]=String(format:"%.2f",progress)
@@ -1124,6 +1169,54 @@ extension AppModel {
         if !ok{evidence["reason"]="Insufficient continuous video evidence or media clock progression"}
         return Observation(status:ok ? "passed":"failed",evidence:evidence,channelID:channel.id)
     }
+    private func runModuleIfDue(){
+        guard policyReady,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
+              var cp=moduleCheckpoint,cp.moduleID==activePatchID,cp.nextAt<=Date() else{return}
+        let module=activePatchID
+        let newEvents:[Event]
+        if let cursor=moduleEventCursor,let i=events.firstIndex(where:{$0.id==cursor}){newEvents=Array(events.dropFirst(i+1).suffix(40))}
+        else{newEvents=Array(events.suffix(40))}
+        let cursor=newEvents.last?.id
+        let eventData=(try? JSONCodec.encoder().encode(newEvents)) ?? Data("[]".utf8)
+        let values=(try? JSONSerialization.jsonObject(with:eventData)) as? [[String:Any]] ?? []
+        let snap=stateSnapshot()
+        moduleTask=Task{[weak self] in
+            guard let self=self else{return}
+            defer{self.moduleTask=nil}
+            do{
+                let decision=try await self.engineering.decision(snapshot:snap,state:cp.state,events:values,receipts:cp.lastReceipt)
+                guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
+                if let cursor=cursor{self.moduleEventCursor=cursor}
+                cp.nextAt=Date().addingTimeInterval(Double(decision?.nextSeconds ?? 30))
+                cp.state=decision?.state ?? cp.state
+                cp.insights=(decision?.insights ?? cp.insights).map{Insight(id:$0.id,priority:$0.priority,title:self.sanitized($0.title),explanation:self.sanitized($0.explanation),action:self.sanitized($0.action))}
+                cp.lastReceipt=[]
+                // The persistent hook may orchestrate app APIs; it cannot replace
+                // the host, approve permanent bans or change its own module.
+                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
+                for action in decision?.actions ?? [] {
+                    guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
+                    guard allowed.contains(action.action) else{cp.lastReceipt.append(action.action+": unsupported hook action");continue}
+                    if self.engineeringOwnsPlayback && !["get_status","get_telemetry","get_insights","get_device_tests","pause_device_tests","stop_device_tests","sync_now"].contains(action.action){cp.lastReceipt.append(action.action+": campaign owns playback");continue}
+                    let command=Command(id:UUID().uuidString,action:action.action,arguments:action.arguments,expiresAt:nil)
+                    let result=await self.execute(command)
+                    cp.lastReceipt.append(action.action+": "+result.status+" "+String(result.result.prefix(2048)))
+                }
+                guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
+                guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot save module state")}
+                self.moduleCheckpoint=cp;self.moduleFailures=0
+                self.recalculateInsights()
+            }catch{
+                guard self.activePatchID==module,!Task.isCancelled else{return}
+                self.moduleFailures+=1
+                cp.nextAt=Date().addingTimeInterval(30)
+                self.moduleCheckpoint=cp
+                self.disk.save(cp,"module-checkpoint.json")
+                self.log("WARN","runtime","MODULE_TICK_FAILED",["module":module,"error":error.localizedDescription,"count":String(self.moduleFailures)])
+                if self.moduleFailures>=3{self.patchFault="Module tick disabled after repeated errors; reload, replace or roll back";self.recalculateInsights()}
+            }
+        }
+    }
     private func uploadEngineeringResults() async throws {
         // Keep completed step evidence until the corresponding checkpoint is durable.
         for url in disk.files(prefix:"qa-result-").prefix(12) {
@@ -1132,6 +1225,12 @@ extension AppModel {
             let result=try JSONCodec.decoder().decode(DeviceTestResult.self,from:data)
             try await db.immutable("engineering/"+deviceID+"/results/"+result.id+".json",data:data)
             disk.remove(url)
+        }
+        if let module=moduleCheckpoint {
+            let path="engineering/"+deviceID+"/module-state.json"
+            let data=try JSONCodec.encoder().encode(module)
+            let existing=try await db.read(path)
+            if existing?.data != data{try await db.put(path,data:data,sha:existing?.sha)}
         }
         if let cp=campaign {
             let path="engineering/"+deviceID+"/checkpoint.json"

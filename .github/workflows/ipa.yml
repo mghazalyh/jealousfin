@@ -22,7 +22,7 @@ jobs:
       - name: Test channel policy
         run: |
           mkdir -p build
-          swiftc Sources/Domain.swift Tests/main.swift -o build/policy-tests
+          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
       - name: Generate project and build

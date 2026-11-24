@@ -42,6 +42,8 @@ import Foundation
         loading=true;defer{loading=false}
         let candidate=RuntimePatch(id:id,source:source)
         let old=store.active
+        let previous=store.previous
+        guard old?.id != id else{throw AppError.message("Use a new revision ID")}
         try persist(RuntimePatchStore(active:candidate,previous:old,activationPending:true))
         do{
             let p=try await policy(candidate,settings:settings)
@@ -49,7 +51,7 @@ import Foundation
             fault=nil
             return p
         }catch{
-            try persist(RuntimePatchStore(active:old,previous:nil,activationPending:false))
+            try persist(RuntimePatchStore(active:old,previous:previous,activationPending:false))
             fault="Candidate module rejected"
             throw error
         }
@@ -82,7 +84,8 @@ import Foundation
         let defaults=RuntimePolicy.baseline(settings)
         let encoded=try JSONCodec.encoder().encode(defaults)
         guard let input=try JSONSerialization.jsonObject(with:encoded) as? [String:Any] else{throw AppError.message("Cannot encode native policy")}
-        return try await evaluate(patch,hook:"configure",input:input,as:RuntimePolicy.self).checked()
+        let configured=try await evaluate(patch,hook:"configure",input:input,as:RuntimePolicy?.self)
+        return try (configured ?? defaults).checked()
     }
     func select(candidates:[Channel],currentID:String?) async throws -> String? {
         guard let patch=store.active,!loading else{return nil}
@@ -91,5 +94,11 @@ import Foundation
         guard let id=id else{return nil}
         guard candidates.contains(where:{$0.id==id}) else{throw AppError.message("Module selected an ineligible channel")}
         return id
+    }
+    func decision(snapshot:[String:Any],state:[String:String],events:[[String:Any]],receipts:[String]) async throws -> ModuleDecision? {
+        guard let patch=store.active,!loading else{return nil}
+        let input:[String:Any]=["snapshot":snapshot,"state":state,"events":events,"receipts":receipts]
+        let value=try await evaluate(patch,hook:"tick",input:input,as:ModuleDecision?.self)
+        return try value?.checked()
     }
 }

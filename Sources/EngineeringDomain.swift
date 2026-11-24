@@ -10,16 +10,19 @@ struct RuntimePolicy: Codable, Equatable {
     var minimumFrames: Int
     var forwardBufferSeconds: Int
     var automaticallyWaits: Bool
+    var recoveryMode: String
+    var failureRetrySeconds: Int
     static func baseline(_ settings: Settings) -> RuntimePolicy {
         RuntimePolicy(startupTimeout: settings.startupTimeout, retries: settings.retries,
             qualityMbps: settings.qualityMbps, stallSeconds: 30, rotationSeconds: settings.rotationMinutes * 60,
-            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true)
+            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true, recoveryMode:"reopen", failureRetrySeconds:30)
     }
     func checked() throws -> RuntimePolicy {
         guard (5...120).contains(startupTimeout), (1...5).contains(retries), (1...50).contains(qualityMbps),
             (5...300).contains(stallSeconds), (5...86400).contains(rotationSeconds),
             (3...60).contains(validationSeconds), (3...120).contains(minimumFrames),
-            (0...120).contains(forwardBufferSeconds), startupTimeout > validationSeconds
+            (0...120).contains(forwardBufferSeconds), startupTimeout > validationSeconds,
+            ["reopen","advance_surf","pause"].contains(recoveryMode),(5...600).contains(failureRetrySeconds)
         else { throw AppError.message("Runtime policy is outside supported native limits") }
         return self
     }
@@ -38,6 +41,7 @@ struct DeviceTestStep: Codable, Equatable {
     var kind: String
     var channelID: String?
     var seconds: Int?
+    var source: String?
 }
 struct DeviceTestPlan: Codable, Equatable {
     var id: String
@@ -49,8 +53,11 @@ struct DeviceTestPlan: Codable, Equatable {
               (1...200).contains(steps.count), (1...10000).contains(repeatCount)
         else { throw AppError.message("Invalid test plan ID, step count or repeats") }
         for s in steps {
-            guard ["system","catalogue","playback","pause_resume","endurance","surf_rotation","background","stop"].contains(s.kind),
+            guard ["system","catalogue","playback","pause_resume","endurance","surf_rotation","background","stop","network","audio_route","reconnect","script_probe"].contains(s.kind),
                   (1...3600).contains(s.seconds ?? 30) else {throw AppError.message("Invalid test step")}
+            if s.kind=="script_probe" {
+                guard let source=s.source,!source.isEmpty,source.utf8.count<=24000 else{throw AppError.message("Invalid script probe")}
+            }
         }
         return self
     }
@@ -89,4 +96,32 @@ struct DeviceTestCheckpoint: Codable {
         }
         updatedAt=Date()
     }
+}
+
+struct ModuleAction: Codable {
+    var action: String
+    var arguments: [String:String]?
+}
+struct ModuleDecision: Codable {
+    var state: [String:String]?
+    var actions: [ModuleAction]?
+    var nextSeconds: Int?
+    var insights: [Insight]?
+    func checked() throws -> ModuleDecision {
+        guard (state?.count ?? 0)<=128,
+            (state ?? [:]).allSatisfy({$0.key.utf8.count<=128 && $0.value.utf8.count<=4096}),
+            (actions?.count ?? 0)<=8,
+            (5...3600).contains(nextSeconds ?? 15),
+            (insights?.count ?? 0)<=20,
+            (insights ?? []).allSatisfy({["Emergency","High","Attention","Informational","Resolved"].contains($0.priority) && $0.id.count<=128 && $0.title.count<=512 && $0.explanation.count<=4096 && $0.action.count<=2048})
+        else {throw AppError.message("Module decision exceeds supported bounds")}
+        return self
+    }
+}
+struct ModuleCheckpoint: Codable {
+    var moduleID:String
+    var state:[String:String] = [:]
+    var nextAt=Date()
+    var insights:[Insight] = []
+    var lastReceipt:[String] = []
 }
