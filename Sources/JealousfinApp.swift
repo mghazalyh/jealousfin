@@ -232,6 +232,7 @@ struct EngineeringView:View{
                 VStack(alignment:.leading,spacing:16){
                     NavigationLink(destination:SettingsView()){Label("Settings",systemImage:"gear")}
                     NavigationLink(destination:RuntimeView()){Label("Remote & Runtime",systemImage:"terminal")}
+                    NavigationLink(destination:DeviceTestsView()){Label("Device tests & hot patches",systemImage:"checklist")}
                     NavigationLink(destination:TelemetryView()){Label("Telemetry",systemImage:"waveform.path")}
                     NavigationLink(destination:LogsView()){Label("Structured logs",systemImage:"doc.text")}
                     NavigationLink(destination:EPGView()){Label("Programme guide & DVR",systemImage:"calendar")}
@@ -339,5 +340,45 @@ struct EPGView:View{
             Button("Schedule"){if let p=selected{model.schedule(p)};selected=nil}
             Button("Cancel",role:.cancel){selected=nil}
         }
+    }
+}
+
+
+struct DeviceTestsView:View{
+    @EnvironmentObject var model:AppModel
+    @State private var issue=""
+    var body:some View{
+        Screen{
+            Text("On-device engineering").font(.title2.bold())
+            Panel{VStack(alignment:.leading,spacing:8){
+                Text("Active runtime module").font(.headline)
+                Text(model.activePatchID).font(.system(.caption,design:.monospaced)).foregroundColor(accent)
+                if let fault=model.patchFault{Text(fault).foregroundColor(.orange).font(.caption)}
+                Text("Runtime modules, diagnostics and campaign plans can be updated from TorrioDB.").font(.caption).foregroundColor(subdued)
+            }}
+            Panel{VStack(alignment:.leading,spacing:10){
+                Text("Device test campaign").font(.headline)
+                if let cp=model.campaign{
+                    Text(cp.plan.id+" · "+cp.state).font(.subheadline)
+                    Text("Cycle \(cp.cycle+1) · Step \(cp.stepIndex+1) / \(cp.plan.steps.count)").font(.caption)
+                    if let r=cp.lastResult{
+                        Text(r.kind+" · "+r.status).font(.subheadline.bold()).foregroundColor(r.status=="passed" ? .green:r.status=="failed" ? .red:.orange)
+                        ForEach(r.evidence.keys.sorted(),id:\.self){key in
+                            Text(key+": "+(r.evidence[key] ?? "")).font(.caption).foregroundColor(subdued)
+                        }
+                    }
+                    HStack{
+                        if cp.canResume{Button("Pause"){change("paused")}}
+                        if cp.state=="paused"{Button("Resume"){change("queued")}}
+                        if ["queued","running","paused"].contains(cp.state){Button("Stop",role:.destructive){change("stopped")}}
+                    }
+                }else{Text("No campaign submitted.").font(.caption).foregroundColor(subdued)}
+                if !issue.isEmpty{Text(issue).font(.caption).foregroundColor(.orange)}
+            }}
+        }.navigationTitle("Device testing").navigationBarTitleDisplayMode(.inline)
+    }
+    private func change(_ state:String){
+        do{try model.setCampaignState(state);issue=""}
+        catch{issue=error.localizedDescription}
     }
 }

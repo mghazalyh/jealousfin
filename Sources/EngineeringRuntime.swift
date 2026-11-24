@@ -38,7 +38,7 @@ import Foundation
     }
     func install(id:String,source:String,settings:Settings) async throws -> RuntimePolicy {
         guard !loading,id.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil,
-              !source.isEmpty,source.utf8.count<=24000 else{throw AppError.message("Invalid module or activation already running")}
+              !source.isEmpty,source.utf8.count<=192*1024 else{throw AppError.message("Invalid module or activation already running")}
         loading=true;defer{loading=false}
         let candidate=RuntimePatch(id:id,source:source)
         let old=store.active

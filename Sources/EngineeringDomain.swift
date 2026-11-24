@@ -124,4 +124,6 @@ struct ModuleCheckpoint: Codable {
     var nextAt=Date()
     var insights:[Insight] = []
     var lastReceipt:[String] = []
+    var eventCursor:String?
+    var pending:[Command]?
 }

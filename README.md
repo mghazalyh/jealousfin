@@ -76,3 +76,5 @@ The tick hook receives current application state, recent events, previous action
 ### Interpreter dependency
 
 The GitHub workflow fetches QuickJS-NG v0.10.1 at commit `3c9afc9943323ee9c7dbd123c0cd991448f4b6c2`, compiles it into the native host, and runs an interrupt-and-recovery smoke test before the IPA build. Each evaluation uses a fresh interpreter with a 32 MiB allocation limit, bounded stack, and a five-second interrupt deadline. No JIT, standard-library OS modules or arbitrary native symbol invocation is required. Module and command interfaces are unchanged. See https://github.com/quickjs-ng/quickjs and the included upstream license.
+
+Repository-hosted patches: commit `jealousfin/engineering/modules/<revision>.js` into private TorrioDB, then submit `install_runtime_module_from_db` with the `id` and exact Git blob `sha`. Modules can be up to 192 KiB. The module state includes a durable command journal so interrupted actions reuse the existing command receipt rather than being silently executed twice. The engineering screen displays active revision and campaign evidence and provides pause, resume and stop controls.

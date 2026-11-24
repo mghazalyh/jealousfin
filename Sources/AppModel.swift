@@ -726,7 +726,7 @@ import Network
     func stateSnapshot()->[String:Any]{
         ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -804,6 +804,15 @@ import Network
         case "install_runtime_module":
             guard let id=args["id"],let source=args["source"] else{throw AppError.message("Module ID and JavaScript source required")}
             try await installRuntime(id:id,source:source);return "Runtime module activated: "+activePatchID
+        case "install_runtime_module_from_db":
+            guard let id=args["id"],id.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil,
+                  let expected=args["sha"],expected.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil
+            else{throw AppError.message("Module revision ID and exact Git blob SHA required")}
+            guard let file=try await db.read("engineering/modules/"+id+".js"),file.sha==expected,
+                  file.data.count<=192*1024,let source=String(data:file.data,encoding:.utf8)
+            else{throw AppError.message("Module source not found or blob revision mismatch")}
+            try await installRuntime(id:id,source:source)
+            return "Repository module activated: "+activePatchID
         case "reload_runtime_module":
             guard policyReady,!patchBusy else{throw AppError.message("Runtime busy")}
             await bootRuntime()
@@ -835,7 +844,7 @@ import Network
         let start=ProcessInfo.processInfo.systemUptime
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:stateSnapshot())
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","reload_runtime_module","rollback_runtime_module","reset_runtime_module"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1171,10 +1180,10 @@ extension AppModel {
     }
     private func runModuleIfDue(){
         guard policyReady,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
-              var cp=moduleCheckpoint,cp.moduleID==activePatchID,cp.nextAt<=Date() else{return}
+              var cp=moduleCheckpoint,cp.moduleID==activePatchID,(cp.nextAt<=Date() || !(cp.pending ?? []).isEmpty) else{return}
         let module=activePatchID
         let newEvents:[Event]
-        if let cursor=moduleEventCursor,let i=events.firstIndex(where:{$0.id==cursor}){newEvents=Array(events.dropFirst(i+1).suffix(40))}
+        if let cursor=cp.eventCursor ?? moduleEventCursor,let i=events.firstIndex(where:{$0.id==cursor}){newEvents=Array(events.dropFirst(i+1).suffix(40))}
         else{newEvents=Array(events.suffix(40))}
         let cursor=newEvents.last?.id
         let eventData=(try? JSONCodec.encoder().encode(newEvents)) ?? Data("[]".utf8)
@@ -1184,23 +1193,41 @@ extension AppModel {
             guard let self=self else{return}
             defer{self.moduleTask=nil}
             do{
-                let decision=try await self.engineering.decision(snapshot:snap,state:cp.state,events:values,receipts:cp.lastReceipt)
-                guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
-                if let cursor=cursor{self.moduleEventCursor=cursor}
-                cp.nextAt=Date().addingTimeInterval(Double(decision?.nextSeconds ?? 30))
-                cp.state=decision?.state ?? cp.state
-                cp.insights=(decision?.insights ?? cp.insights).map{Insight(id:$0.id,priority:$0.priority,title:self.sanitized($0.title),explanation:self.sanitized($0.explanation),action:self.sanitized($0.action))}
-                cp.lastReceipt=[]
-                // The persistent hook may orchestrate app APIs; it cannot replace
-                // the host, approve permanent bans or change its own module.
-                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
-                for action in decision?.actions ?? [] {
+                if (cp.pending ?? []).isEmpty {
+                    let decision=try await self.engineering.decision(snapshot:snap,state:cp.state,events:values,receipts:cp.lastReceipt)
                     guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
-                    guard allowed.contains(action.action) else{cp.lastReceipt.append(action.action+": unsupported hook action");continue}
-                    if self.engineeringOwnsPlayback && !["get_status","get_telemetry","get_insights","get_device_tests","pause_device_tests","stop_device_tests","sync_now"].contains(action.action){cp.lastReceipt.append(action.action+": campaign owns playback");continue}
-                    let command=Command(id:UUID().uuidString,action:action.action,arguments:action.arguments,expiresAt:nil)
-                    let result=await self.execute(command)
-                    cp.lastReceipt.append(action.action+": "+result.status+" "+String(result.result.prefix(2048)))
+                    if let cursor=cursor{self.moduleEventCursor=cursor;cp.eventCursor=cursor}
+                    cp.nextAt=Date().addingTimeInterval(Double(decision?.nextSeconds ?? 30))
+                    cp.state=decision?.state ?? cp.state
+                    cp.insights=(decision?.insights ?? cp.insights).map{Insight(id:$0.id,priority:$0.priority,title:self.sanitized($0.title),explanation:self.sanitized($0.explanation),action:self.sanitized($0.action))}
+                    cp.lastReceipt=[]
+                    cp.pending=(decision?.actions ?? []).map{Command(id:UUID().uuidString,action:$0.action,arguments:$0.arguments,expiresAt:nil)}
+                    guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot journal module decision")}
+                    self.moduleCheckpoint=cp
+                }
+                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
+                // Journal the actual command IDs before execution. After a crash
+                // the ordinary command receipt prevents a duplicate mutation.
+                while let command=cp.pending?.first {
+                    guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
+                    if !allowed.contains(command.action) {
+                        cp.lastReceipt.append(command.action+": unsupported hook action")
+                    } else if self.engineeringOwnsPlayback && !["get_status","get_telemetry","get_insights","get_device_tests","pause_device_tests","stop_device_tests","sync_now"].contains(command.action) {
+                        cp.lastReceipt.append(command.action+": campaign owns playback")
+                    } else {
+                        let result=await self.execute(command)
+                        guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
+                        if result.status=="running"{
+                            cp.nextAt=Date().addingTimeInterval(5)
+                            self.moduleCheckpoint=cp
+                            self.disk.save(cp,"module-checkpoint.json")
+                            return
+                        }
+                        cp.lastReceipt.append(command.action+": "+result.status+" "+String(result.result.prefix(2048)))
+                    }
+                    cp.pending?.removeFirst()
+                    guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot checkpoint module action")}
+                    self.moduleCheckpoint=cp
                 }
                 guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
                 guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot save module state")}

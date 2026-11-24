@@ -18,7 +18,7 @@ private final class RuntimeWorker: @unchecked Sendable {
     private var waiting=0
 
     func run(_ source:String,snapshot:[String:Any]) async throws -> (String,[Command]){
-        guard source.utf8.count<=32768 else{throw AppError.message("Script exceeds size limit")}
+        guard source.utf8.count<=256*1024 else{throw AppError.message("Script exceeds size limit")}
         let data=try JSONSerialization.data(withJSONObject:snapshot,options:[.sortedKeys])
         guard data.count<=1048576 else{throw AppError.message("Snapshot exceeds interpreter limit")}
         let sourceData=try JSONSerialization.data(withJSONObject:source,options:[.fragmentsAllowed])
