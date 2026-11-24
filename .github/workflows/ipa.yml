@@ -56,6 +56,8 @@ jobs:
           path: |
             build/Jealousfin.ipa
             build/Jealousfin.ipa.sha256
+            build/Jealousfin-unsigned.ipa
+            build/Jealousfin-unsigned.ipa.sha256
           if-no-files-found: error
       - name: Publish release
         env:
@@ -64,4 +66,4 @@ jobs:
           set -euo pipefail
           tag="v0.1.13-build${JEALOUSFIN_BUILD_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           baseline="$(python3 -c 'import json;print(json.load(open("Promoted/baseline.json"))["revision"])')"
-          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build ${JEALOUSFIN_BUILD_NUMBER} (TrollStore candidate)" --notes "Ad hoc signed iOS 15+ arm64 IPA with bundle identifier com.example.jealousfin. For TrollStore testing, not Apple OTA distribution. No private login defaults or shared distribution provisioning profile. Source: $GITHUB_SHA. Embedded reviewed baseline: $baseline. Package signature and regressions verified by CI; physical installation and playback require separate acceptance." --prerelease
+          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 build/Jealousfin-unsigned.ipa build/Jealousfin-unsigned.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build ${JEALOUSFIN_BUILD_NUMBER} (TrollStore candidate)" --notes "Two iOS 15+ arm64 IPA candidates with bundle identifier com.example.jealousfin: Jealousfin.ipa is ad hoc signed; Jealousfin-unsigned.ipa uses the original unsigned RC1 packaging format. For TrollStore testing, not Apple OTA distribution. No private login defaults or shared distribution provisioning profile. Source: $GITHUB_SHA. Embedded reviewed baseline: $baseline. Package signature and regressions verified by CI; physical installation and playback require separate acceptance." --prerelease

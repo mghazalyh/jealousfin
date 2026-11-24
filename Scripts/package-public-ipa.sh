@@ -16,7 +16,9 @@ check_metadata() {
   [[ "$(lipo -archs "$app/Jealousfin")" == arm64 ]]
   [[ -z "$(find "$app" -type f \( -iname 'JealousfinDefaults.plist' -o -iname '*.mobileprovision' -o -iname '*.p12' -o -iname '*.pfx' -o -iname '*.key' \) -print -quit)" ]]
   test -x "$app/Jealousfin"
+  [[ "$(stat -f %Lp "$app/Jealousfin")" == 755 ]]
 }
+chmod 755 "$APP/Jealousfin"
 check_metadata "$APP"
 mkdir -p build
 rm -rf build/Payload
@@ -24,6 +26,34 @@ mkdir -p build/Payload
 ditto "$APP" "$STAGED"
 cp Vendor/QuickJS/LICENSE "$STAGED/QuickJS-LICENSE.txt"
 python3 -c 'import json; m=json.load(open("Promoted/baseline.json")); print(json.dumps({k:m[k] for k in ("schemaVersion","revision","sources")},sort_keys=True))' > "$STAGED/PromotedBaseline.json"
+# Preserve the unsigned packaging format used by the previously installed RC1.
+# This is input for a device-side installer, not a native OTA package.
+if codesign -dv "$STAGED/Jealousfin" >/dev/null 2>&1; then
+  codesign --remove-signature "$STAGED/Jealousfin"
+fi
+rm -rf "$STAGED/_CodeSignature"
+chmod 755 "$STAGED/Jealousfin"
+xattr -cr "$STAGED"
+verify_unsigned() {
+  local app="$1"
+  check_metadata "$app"
+  test ! -e "$app/_CodeSignature"
+  if codesign -dv "$app/Jealousfin" >/dev/null 2>&1; then
+    echo "Unsigned package unexpectedly has a signature" >&2
+    return 1
+  fi
+}
+verify_unsigned "$STAGED"
+rm -f build/Jealousfin-unsigned.ipa build/Jealousfin-unsigned.ipa.sha256
+(cd build && /usr/bin/zip -qry Jealousfin-unsigned.ipa Payload)
+unzip -tq build/Jealousfin-unsigned.ipa
+unsigned_check="$(mktemp -d)"
+trap 'rm -rf "$unsigned_check"' EXIT
+ditto -x -k build/Jealousfin-unsigned.ipa "$unsigned_check"
+verify_unsigned "$unsigned_check/Payload/Jealousfin.app"
+(cd build && shasum -a 256 Jealousfin-unsigned.ipa > Jealousfin-unsigned.ipa.sha256 && shasum -a 256 -c Jealousfin-unsigned.ipa.sha256)
+rm -rf "$unsigned_check"
+trap - EXIT
 # Sign only after every resource is staged. Do not copy shared profile entitlements.
 # This is an ad hoc signature for TrollStore, not an Apple distribution signature.
 xattr -cr "$STAGED"
