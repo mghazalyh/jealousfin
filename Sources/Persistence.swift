@@ -71,6 +71,7 @@ struct GitFile {
         let file=try await read(path)
         var merged=local
         if let file=file { merged.merge(try JSONCodec.decoder().decode(HealthLedger.self,from:file.data)) }
+        merged.events.sort { $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at }
         let bytes=try JSONCodec.encoder().encode(merged)
         if file?.data != bytes { try await put(path,data:bytes,sha:file?.sha) }
         return merged

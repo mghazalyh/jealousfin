@@ -61,6 +61,13 @@ import MediaPlayer
     private var intentionallyPaused=false
     private var lastTick=Date()
     private var healthDirty=false
+    private var pausedRotationSeconds:Int?
+    private var emptyPoolRetry:Date?
+    private var retryCurrentAfterResume=false
+    private var catalogueBusy=false
+    private var lastProgressReport:Task<Void,Never>?
+    private var lastPlayerError:String?
+    @Published private(set) var catalogueReady=false
     private var deviceObservers:[NSObjectProtocol]=[]
 
     init() {
@@ -161,6 +168,8 @@ import MediaPlayer
     var validatedCount:Int{health.values.filter{$0.successes>0 || $0.lifetimeFailures>0}.count}
     func connect() async {
         guard !loginBusy else{return};loginBusy=true;defer{loginBusy=false}
+        // A reconnect must not replace the credentials used to close an active stream.
+        if current != nil { stop() }
         lastLogin=Date();saveSettings();status="Connecting…"
         do {
             try await jelly.connect(settings)
@@ -173,8 +182,9 @@ import MediaPlayer
         recalculateInsights();requestSync()
     }
     func refresh() async throws {
+        guard !catalogueBusy else{return};catalogueBusy=true;defer{catalogueBusy=false}
         let items=try await jelly.channels()
-        channels=items;disk.save(items,"channels.json");lastRefresh=Date()
+        channels=items;catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
         log("INFO","catalogue","REFRESHED",["count":String(items.count),"favorites":String(items.filter(\.favorite).count)])
         do {programs=try await jelly.programs();log("INFO","epg","REFRESHED",["count":String(programs.count)])}
         catch {log("WARN","epg","UNAVAILABLE")}
@@ -199,11 +209,17 @@ import MediaPlayer
         attemptedIDs.removeAll();log("INFO","surf","START",["category":category,"minutes":String(settings.rotationMinutes)])
         next()
     }
-    func stopSurf(){surfing=false;surfPaused=false;nextRotation=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
+    func stopSurf(){surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
     func toggleSurfPause(){
         guard surfing else{return}
         surfPaused.toggle()
-        if surfPaused {nextRotation=nil} else if validated {nextRotation=Date().addingTimeInterval(Double(settings.rotationMinutes*60))}
+        if surfPaused {
+            pausedRotationSeconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())}
+            nextRotation=nil
+        } else if validated {
+            nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? settings.rotationMinutes*60)
+            pausedRotationSeconds=nil
+        } else { emptyPoolRetry=Date() }
         log("INFO","surf",surfPaused ? "PAUSED":"RESUMED")
     }
     private func pool()->[Channel]{
@@ -219,8 +235,10 @@ import MediaPlayer
         let candidates=pool()
         guard !candidates.isEmpty else {
             nextRotation=nil;remaining=0;status="No eligible channels for this filter"
+            emptyPoolRetry=Date().addingTimeInterval(60)
             log("WARN","surf","EMPTY_POOL",["category":settings.surfCategory]);return
         }
+        emptyPoolRetry=nil
         var remainingCandidates=candidates.filter{!attemptedIDs.contains($0.id)}
         if remainingCandidates.isEmpty {attemptedIDs.removeAll();remainingCandidates=candidates}
         let filtered=remainingCandidates.filter{$0.id != current?.id}
@@ -237,6 +255,7 @@ import MediaPlayer
     private func begin(_ channel:Channel,keepSurf:Bool){
         guard health[channel.id]?.eligible(at:Date()) ?? true else{status="Channel is excluded by validation policy";return}
         work?.cancel();generation=UUID();let g=generation
+        retryCurrentAfterResume=false;pausedRotationSeconds=nil;lastPlayerError=nil
         let old=session;let oldPosition=position
         session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil
         if let c=current,c.id != channel.id{previous.removeAll{$0.id==c.id};previous.insert(c,at:0);if previous.count>30{previous.removeLast()}}
@@ -248,7 +267,10 @@ import MediaPlayer
         log("INFO","player","OPEN",["channelID":channel.id,"name":channel.name])
         work=Task{[weak self] in
             guard let self=self else{return}
-            if let old=old {await self.jelly.close(old,position:oldPosition)}
+            if let old=old {
+                await self.lastProgressReport?.value
+                await self.jelly.close(old,position:oldPosition)
+            }
             guard self.generation==g,!Task.isCancelled else{return}
             await self.attempt(channel,generation:g)
         }
@@ -268,11 +290,17 @@ import MediaPlayer
                 item.add(output);videoOutput=output
                 player.replaceCurrentItem(with:item);player.play()
                 ready=false;lastPosition=position
-                let deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
+                var deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
                 var firstPosition:Double?
                 var decoded=false
                 while Date()<deadline && g==generation && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds:500_000_000)
+                    guard g==generation,!Task.isCancelled else{return}
+                    if intentionallyPaused {
+                        firstPosition=nil
+                        deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
+                        continue
+                    }
                     if item.status == .failed {errorReason="AVPlayer item failed";break}
                     let p=position
                     if output.hasNewPixelBuffer(forItemTime:player.currentTime()) {
@@ -281,7 +309,7 @@ import MediaPlayer
                     }
                     if item.status == .readyToPlay && player.timeControlStatus == .playing {
                         if firstPosition==nil {firstPosition=p}
-                        if let first=firstPosition,p-first>=3,(decoded || ready) {
+                        if let first=firstPosition,p-first>=3,decoded {
                             guard g==generation,!Task.isCancelled else{return}
                             validated=true;playing=true;lastSuccess=Date();lastAdvance=Date();lastPosition=p;failureRun=0
                             status="Playing \(channel.name)"
@@ -305,32 +333,50 @@ import MediaPlayer
             try? await Task.sleep(nanoseconds:1_000_000_000)
         }
         guard g==generation,!Task.isCancelled else{return}
+        if intentionallyPaused {retryCurrentAfterResume=true;return}
         let serverOK=await jelly.healthy()
         guard g==generation,!Task.isCancelled else{return}
         failureRun+=1
         // An infrastructure outage or unknown client-wide failure must not quarantine an entire catalogue.
         let recentSuccess=lastSuccess.map{Date().timeIntervalSince($0)<600} ?? false
-        let specific=errorReason.contains("HTTP 404") || errorReason.contains("HTTP 410")
-        let confirmed=serverOK && (specific || (recentSuccess && failureRun<=2))
+        let confirmed=PlaybackFailurePolicy.confirms(serverHealthy:serverOK,recentSuccess:recentSuccess,consecutiveFailures:failureRun,reason:errorReason,paused:intentionallyPaused)
+        lastPlayerError=errorReason
         if settings.validation && !channel.isSurf && confirmed {appendHealth(channel,"failure",errorReason)}
         log(confirmed ? "ERROR":"WARN","validator",confirmed ? "CHANNEL_FAILED":"FAILURE_UNCONFIRMED",["channelID":channel.id,"reason":errorReason,"serverHealthy":String(serverOK),"recentSuccess":String(recentSuccess)])
         status=confirmed ? "Channel failed; validation recorded":"Playback failure needs diagnosis"
         playing=false;validated=false
         if surfing && !surfPaused && serverOK && failureRun<3 {nextRotation=Date().addingTimeInterval(2)}
-        else if surfing {nextRotation=Date().addingTimeInterval(30)}
+        else if surfing {emptyPoolRetry=Date().addingTimeInterval(30)}
         requestSync();recalculateInsights()
     }
     func presentationReady(_ value:Bool){
         if value && !ready{log("INFO","renderer","READY_FOR_DISPLAY",["elapsedMs":String(Int(max(0,ProcessInfo.processInfo.systemUptime-startUptime)*1000))])}
         ready=value
     }
-    func pause(){intentionallyPaused=true;player.pause();playing=false;log("INFO","player","PAUSE")}
-    func resume(){intentionallyPaused=false;if session != nil {player.play();playing=true};log("INFO","player","RESUME")}
+    func pause(){
+        guard !intentionallyPaused else{return}
+        intentionallyPaused=true
+        if let deadline=nextRotation {pausedRotationSeconds=SurfClock.remaining(deadline:deadline,now:Date());nextRotation=nil}
+        player.pause();playing=false;log("INFO","player","PAUSE")
+    }
+    func resume(){
+        intentionallyPaused=false
+        lastAdvance=Date();lastPosition=position
+        if retryCurrentAfterResume,let c=current {begin(c,keepSurf:surfing)}
+        else if session != nil {
+            player.play()
+            if surfing && !surfPaused && validated {
+                nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? settings.rotationMinutes*60)
+            }
+        }
+        pausedRotationSeconds=nil
+        log("INFO","player","RESUME")
+    }
     func stop(){
         stopSurf();work?.cancel();generation=UUID();let old=session;let p=position
         session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil;current=nil;validated=false;playing=false;ready=false
         MPNowPlayingInfoCenter.default().nowPlayingInfo=nil
-        if let old=old{Task{await jelly.close(old,position:p)}}
+        if let old=old{Task{await lastProgressReport?.value;await jelly.close(old,position:p)}}
         status="Stopped";log("INFO","player","STOP")
     }
     func appendHealth(_ channel:Channel,_ action:String,_ reason:String){
@@ -348,9 +394,10 @@ import MediaPlayer
         let elapsed=now.timeIntervalSince(lastTick);lastTick=now
         if elapsed>5 {log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])}
         if let deadline=nextRotation,surfing,!surfPaused,!intentionallyPaused {
-            remaining=max(0,Int(ceil(deadline.timeIntervalSince(now))))
+            remaining=SurfClock.remaining(deadline:deadline,now:now)
             if remaining==0{nextRotation=nil;next()}
         }
+        if let retry=emptyPoolRetry,surfing,!surfPaused,!intentionallyPaused,retry<=now {emptyPoolRetry=nil;next()}
         if let item=player.currentItem,validated,!intentionallyPaused {
             let p=position
             if p>lastPosition+0.15 {lastAdvance=now;lastPosition=p}
@@ -360,7 +407,10 @@ import MediaPlayer
                 if let c=current {begin(c,keepSurf:surfing)}
             } else if now.timeIntervalSince(lastReport)>15 {
                 lastReport=now
-                if let s=session,startedSession {Task{await jelly.report(s,action:"Progress",position:p,paused:!playing)}}
+                if let s=session,startedSession {
+                    let previousReport=lastProgressReport
+                    lastProgressReport=Task{await previousReport?.value;await jelly.report(s,action:"Progress",position:p,paused:!playing)}
+                }
                 var values:[String:String]=["position":String(format:"%.2f",p),"rate":String(player.rate),"displayReady":String(ready),"thermal":String(ProcessInfo.processInfo.thermalState.rawValue),"battery":String(UIDevice.current.batteryLevel)]
                 let ranges=item.loadedTimeRanges.compactMap{$0.timeRangeValue.duration.seconds.isFinite ? $0.timeRangeValue.duration.seconds:nil}
                 values["bufferSeconds"]=String(format:"%.2f",ranges.reduce(0,+))
@@ -377,7 +427,7 @@ import MediaPlayer
         if jelly.connected && now.timeIntervalSince(lastRefresh)>180 {
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if !jelly.connected && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        if (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
         if now.timeIntervalSince(lastSync)>30 {requestSync()}
         if now.timeIntervalSince(lastHeartbeat)>30 {
             lastHeartbeat=now;log("INFO","app","HEARTBEAT",["status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
@@ -404,13 +454,16 @@ import MediaPlayer
             let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
             let old=try await db.read(prefix+"/heartbeat.json")
             try await db.put(prefix+"/heartbeat.json",data:snapshot,sha:old?.sha)
-            for file in try await db.directory(prefix+"/commands").prefix(20) {
+            let commandFiles=try await db.directory(prefix+"/commands")
+            let receiptFiles=Set(try await db.directory(prefix+"/receipts"))
+            for file in CommandQueue.pending(commandFiles,receipts:receiptFiles,limit:20) {
                 guard let remote=try await db.read(prefix+"/commands/"+file) else{continue}
                 let command=try JSONCodec.decoder().decode(Command.self,from:remote.data)
                 guard validID(command.id),file==command.id+".json" else{continue}
-                if (try await db.read(prefix+"/receipts/"+file)) != nil {continue}
                 let result=await execute(command)
-                try await db.immutable(prefix+"/receipts/"+file,data:JSONCodec.encoder().encode(result))
+                if result.status != "running" {
+                    try await db.immutable(prefix+"/receipts/"+file,data:JSONCodec.encoder().encode(result))
+                }
             }
             // Persist immutable batches before deleting their source records.
             for url in disk.files(prefix:"batch-").prefix(5) {
@@ -424,7 +477,7 @@ import MediaPlayer
                 let name="batch-\(UUID().uuidString).json"
                 guard disk.save(records,name) else{throw AppError.message("Local batch write failed")}
                 for url in urls{disk.remove(url)}
-                let data=try JSONCodec.encoder().encode(records)
+                let data=try Data(contentsOf:disk.root.appendingPathComponent(name))
                 try await db.immutable("telemetry/\(deviceID)/"+name,data:data)
                 disk.remove(disk.root.appendingPathComponent(name))
             }
@@ -452,14 +505,14 @@ import MediaPlayer
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"metrics":metrics,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
     static let actions=["get_status","list_channels","open_channel","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
-        if let previous=disk.load(Receipt.self,"receipt-\(c.id).json"){return previous}
         if pending.contains(c.id){return Receipt(id:c.id,action:c.action,status:"running",result:"Command already executing")}
+        if let previous=disk.load(Receipt.self,"receipt-\(c.id).json"){return previous}
         // A durable started receipt prevents replay after an interrupted mutation.
         let started=Receipt(id:c.id,action:c.action,status:"interrupted",result:"Execution started; outcome not yet recorded")
         guard disk.save(started,"receipt-\(c.id).json") else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Cannot persist command")}
@@ -470,7 +523,10 @@ import MediaPlayer
             if let expiry=c.expiresAt,expiry<Date(){throw AppError.message("Command expired")}
             result.result=sanitized(try await dispatch(c.action,args:c.arguments ?? [:]))
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
-        disk.save(result,"receipt-\(c.id).json");log(result.status=="succeeded" ? "INFO":"ERROR","commands","COMPLETED",["id":c.id,"action":c.action,"status":result.status])
+        if !disk.save(result,"receipt-\(c.id).json") {
+            result.status="interrupted";result.result="Operation finished but its receipt could not be persisted"
+        }
+        log(result.status=="succeeded" ? "INFO":"ERROR","commands","COMPLETED",["id":c.id,"action":c.action,"status":result.status])
         commandOutput=result.result
         return result
     }
@@ -483,7 +539,9 @@ import MediaPlayer
         case "list_channels":return try json(channels)
         case "open_channel":
             guard let id=args["id"],let c=channels.first(where:{$0.id==id}) else{throw AppError.message("Unknown channel")}
-            open(c);return "Playback requested"
+            guard health[id]?.eligible(at:Date()) ?? true else{throw AppError.message("Channel is excluded")}
+            guard jelly.connected else{throw AppError.message("Jellyfin is not connected")}
+            open(c);return "Playback requested, not yet validated"
         case "play","resume":resume()
         case "pause":pause()
         case "stop":stop()
@@ -508,7 +566,7 @@ import MediaPlayer
         case "get_telemetry":return try json(metrics)
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
-        case "reconnect":await connect()
+        case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
         case "script":
             guard let source=args["source"] else{throw AppError.message("Missing script source")}
             return try await runScript(source)

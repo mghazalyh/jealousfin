@@ -84,6 +84,7 @@ struct HealthLedger: Codable {
     mutating func merge(_ other: HealthLedger) {
         var ids = Set(events.map(\.id))
         for e in other.events where ids.insert(e.id).inserted { events.append(e) }
+        events.sort { $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at }
     }
 }
 struct Event: Codable, Identifiable {
@@ -159,4 +160,34 @@ enum JSONCodec {
 enum AppError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let s) = self { return s }; return nil }
+}
+
+enum PlaybackFailurePolicy {
+    // A healthy server is necessary but not sufficient. Never punish a channel
+    // for a canceled request, authentication failure, network loss or UI pause.
+    static func confirms(serverHealthy:Bool, recentSuccess:Bool, consecutiveFailures:Int,
+                         reason:String, cancelled:Bool=false, paused:Bool=false)->Bool {
+        guard serverHealthy, !cancelled, !paused else { return false }
+        let r=reason.lowercased()
+        let infrastructure=["http 401","http 403","http 429","http 5","network","not connected","offline","cancelled","canceled","certificate","connection refused","dns","authentication","no media source"]
+        if infrastructure.contains(where:{r.contains($0)}) { return false }
+        // A Jellyfin catalogue 404 can mean a stale item ID, not a dead source.
+        // Require corroborated recent playback for ambiguous player failures.
+        return recentSuccess && consecutiveFailures <= 2 && consecutiveFailures > 0 &&
+            (r.contains("startup timeout") || r.contains("player error") || r.contains("avplayer item failed"))
+    }
+}
+enum CommandQueue {
+    static func pending(_ commands:[String],receipts:Set<String>,limit:Int)->[String] {
+        Array(Set(commands).subtracting(receipts).sorted().prefix(max(0,limit)))
+    }
+}
+enum SurfClock {
+    static func remaining(deadline:Date?,now:Date)->Int {
+        guard let deadline=deadline else{return 0}
+        return max(0,Int(ceil(deadline.timeIntervalSince(now))))
+    }
+    static func resumed(now:Date,remaining:Int)->Date {
+        now.addingTimeInterval(Double(max(1,remaining)))
+    }
 }

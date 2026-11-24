@@ -45,3 +45,22 @@ let restored=try JSONCodec.decoder().decode(HealthLedger.self,from:encoded)
 check(restored.states()==ledger.states(),"persistence roundtrip")
 check(JSONCodec.date("2026-11-24T13:37:49.0000000Z") != nil,"Jellyfin fractional timestamp")
 print("PASS: \(checks) channel policy and persistence assertions")
+
+let done=Set((0..<100).map{String(format:"%03d.json",$0)})
+let queue=Array(done)+["100.json","101.json","100.json"]
+check(CommandQueue.pending(queue,receipts:done,limit:20)==["100.json","101.json"],"completed commands do not starve new ones")
+check(CommandQueue.pending(queue,receipts:done,limit:1)==["100.json"],"batch bounded")
+check(CommandQueue.pending(queue,receipts:done,limit:0).isEmpty,"zero command budget")
+check(SurfClock.remaining(deadline:start.addingTimeInterval(42.1),now:start)==43,"rotation countdown")
+check(SurfClock.remaining(deadline:start,now:start.addingTimeInterval(9))==0,"rotation clamps")
+check(SurfClock.resumed(now:start,remaining:42)==start.addingTimeInterval(42),"pause preserves rotation")
+check(PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout"),"corroborated timeout")
+for reason in ["HTTP 401","HTTP 403","HTTP 404","HTTP 429","HTTP 503","network offline","DNS failure","No media source returned","certificate error"] {
+    check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:reason),"infrastructure or ambiguous error: "+reason)
+}
+check(!PlaybackFailurePolicy.confirms(serverHealthy:false,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout"),"server outage")
+check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:false,consecutiveFailures:1,reason:"Startup timeout"),"no positive baseline")
+check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:3,reason:"Startup timeout"),"systemic failure guard")
+check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout",paused:true),"user pause")
+check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout",cancelled:true),"cancellation")
+print("PASS: \(checks) total assertions including scheduling, command fairness and failure classification")
