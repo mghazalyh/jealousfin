@@ -129,8 +129,9 @@ import Network
         }
         settings=storedSettings
         controlMode=storedSettings.controlMode
-        db=TorrioDB(address:storedSettings.repositoryAddress)
-        db.enabled=storedSettings.controlMode == .github
+        let database=TorrioDB(address:storedSettings.repositoryAddress)
+        database.enabled=storedSettings.controlMode == .github
+        db=database
         do {
             _ = try PatchVersionStore.recover(disk:disk)
         }catch{
