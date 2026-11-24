@@ -246,6 +246,7 @@ struct EngineeringView:View{
                     NavigationLink(destination:SettingsView()){Label("Settings",systemImage:"gear")}
                     NavigationLink(destination:RuntimeView()){Label("Remote & Runtime",systemImage:"terminal")}
                     NavigationLink(destination:DeviceTestsView()){Label("Device tests & hot patches",systemImage:"checklist")}
+                    NavigationLink(destination:PatchVersionHistoryView()){Label("Hot patch version history",systemImage:"clock.arrow.circlepath")}
                     NavigationLink(destination:TelemetryView()){Label("Telemetry",systemImage:"waveform.path")}
                     NavigationLink(destination:LogsView()){Label("Structured logs",systemImage:"doc.text")}
                     NavigationLink(destination:EPGView()){Label("Programme guide & DVR",systemImage:"calendar")}

@@ -80,6 +80,10 @@ import Foundation
         guard commands.isEmpty else{throw AppError.message("Policy hooks must return values, not execute commands")}
         return try JSONCodec.decoder().decode(type,from:Data(output.utf8))
     }
+    func preview(_ patch:RuntimePatch?,settings:Settings) async throws -> RuntimePolicy {
+        guard let patch=patch else{return try RuntimePolicy.baseline(settings).checked()}
+        return try await policy(patch,settings:settings)
+    }
     private func policy(_ patch:RuntimePatch,settings:Settings) async throws -> RuntimePolicy {
         let defaults=RuntimePolicy.baseline(settings)
         let encoded=try JSONCodec.encoder().encode(defaults)

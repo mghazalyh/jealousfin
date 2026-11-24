@@ -44,7 +44,10 @@ import Network
     @Published private(set) var bundledBaselineRevision="native-baseline"
     @Published private(set) var patchArchiveID:String?
     @Published private(set) var patchArchiveFault:String?
+    @Published private(set) var patchVersions:[PatchVersionSummary]=[]
+    @Published private(set) var versionBusy=false
     private var promotionBusy=false
+    private var versionRecoveryFailed=false
     @Published private(set) var jellyfinAPIRevision="native-baseline"
     @Published private(set) var jellyfinAPIFault:String?
     private var jellyfinAPIStore=JellyfinAdapterStore()
@@ -119,10 +122,22 @@ import Network
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
         do {
-            let baseline=try BundledPatchBaseline.load()
-            try BaselineInstaller.install(baseline,disk:disk)
-            bundledBaselineRevision=baseline.revision
-        }catch{patchArchiveFault="Bundled baseline installation failed: "+String(describing:type(of:error))}
+            _ = try PatchVersionStore.recover(disk:disk)
+        }catch{
+            versionRecoveryFailed=true
+            patchArchiveFault="Interrupted patch restoration could not be recovered"
+        }
+        if !versionRecoveryFailed{
+            do {
+                let baseline=try BundledPatchBaseline.load()
+                try BaselineInstaller.install(baseline,disk:disk)
+                bundledBaselineRevision=baseline.revision
+            }catch{patchArchiveFault="Bundled baseline installation failed: "+String(describing:type(of:error))}
+        }
+        if let last=disk.load(PatchArchive.self,"last-patch-archive.json"){
+            try? PatchVersionStore.retain(last,disk:disk)
+        }
+        patchVersions=PatchVersionStore.history(disk:disk)
         patchArchiveID=disk.load(PatchArchive.self,"last-patch-archive.json")?.id
         jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
@@ -177,6 +192,10 @@ import Network
         requestSync()
         Task { [weak self] in
             guard let self=self else{return}
+            if self.versionRecoveryFailed{
+                self.log("ERROR","patch-version","RECOVERY_BLOCKED")
+                return
+            }
             await self.bootJellyfinAPI()
             await self.bootRuntime()
             self.capturePatchArchive(reason:"launch-reconciliation")
@@ -608,7 +627,7 @@ import Network
         log("INFO","telemetry","SYSTEM_SAMPLE",fields)
     }
     private func publishHeartbeat(now:Date){
-        if apiReady,policyReady,!apiChanging,!patchBusy{capturePatchArchive(reason:"heartbeat-reconciliation")}
+        if apiReady,policyReady,!apiChanging,!patchBusy,!versionBusy{capturePatchArchive(reason:"heartbeat-reconciliation")}
         lastHeartbeat=now
         log("INFO","app","HEARTBEAT",["launchID":launchID,"status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
         recalculateInsights()
@@ -616,6 +635,11 @@ import Network
     private func tick() async {
         let now=Date()
         sampleSystemTelemetry()
+        if versionBusy || versionRecoveryFailed{
+            if now.timeIntervalSince(lastHeartbeat)>30{publishHeartbeat(now:now)}
+            if now.timeIntervalSince(lastSync)>30{requestSync()}
+            return
+        }
         processDecisions(now:now)
         let elapsed=now.timeIntervalSince(lastTick);lastTick=now
         if elapsed>5 {log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])}
@@ -769,9 +793,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -789,7 +813,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -801,6 +825,9 @@ import Network
     }
     private func json<T:Encodable>(_ value:T) throws -> String{String(decoding:try JSONCodec.encoder().encode(value),as:UTF8.self)}
     private func dispatch(_ action:String,args:[String:String]) async throws -> String{
+        if versionBusy && !["get_status","get_version","get_capabilities","get_logs","get_telemetry","get_insights","list_patch_versions","get_patch_archive","get_runtime_module","get_jellyfin_api","get_ui_layout"].contains(action){
+            throw AppError.message("Patch restoration in progress")
+        }
         switch action {
         case "get_status":return String(decoding:try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys]),as:UTF8.self)
         case "get_capabilities":return try json(Self.actions)
@@ -846,6 +873,33 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "list_patch_versions":
+            let offset=max(0,min(patchVersions.count,args["offset"].flatMap(Int.init) ?? 0))
+            let limit=max(1,min(100,args["limit"].flatMap(Int.init) ?? 50))
+            return try json(Array(patchVersions.dropFirst(offset).prefix(limit)))
+        case "compare_patch_versions":
+            guard let from=args["from"],let to=args["to"] else{throw AppError.message("Two archive IDs required")}
+            let old=try await fetchPatchVersion(from)
+            let new=try await fetchPatchVersion(to)
+            return try json(PatchVersionComparison(from:old,to:new))
+        case "checkpoint_patch_version":
+            guard let label=args["label"],!label.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,label.count<=120 else{throw AppError.message("Checkpoint label required")}
+            guard apiReady,policyReady,!versionBusy,!patchBusy,!apiChanging,!promotionBusy else{throw AppError.message("Patch engines busy")}
+            capturePatchArchive(reason:"checkpoint",force:true,label:sanitized(label),knownGood:args["knownGood"]=="true")
+            guard patchArchiveFault==nil,let id=patchArchiveID else{throw AppError.message("Checkpoint could not be saved")}
+            return id
+        case "restore_patch_version","restore_known_good":
+            let scope=PatchVersionScope(rawValue:args["scope"] ?? "all")
+            guard let scope=scope,let expected=args["expectedHead"] else{throw AppError.message("Restore scope and expected head required")}
+            let target:String
+            if action=="restore_known_good"{
+                guard let good=patchVersions.first(where:{$0.knownGood}) else{throw AppError.message("No verified checkpoint")}
+                target=good.id
+            }else{
+                guard let id=args["id"] else{throw AppError.message("Target archive ID required")}
+                target=id
+            }
+            return try await restorePatchVersion(target,scope:scope,expected:expected)
         case "get_patch_archive":
             guard let archive=disk.load(PatchArchive.self,"last-patch-archive.json") else{throw AppError.message("No archived source set")}
             // Query metadata only. Complete executable sources are in private TorrioDB.
@@ -946,7 +1000,8 @@ import Network
             try await installRuntime(id:id,source:source)
             return "Repository module activated: "+activePatchID
         case "reload_runtime_module":
-            guard policyReady,!patchBusy else{throw AppError.message("Runtime busy")}
+            guard policyReady,!patchBusy,!versionBusy,!promotionBusy,!apiChanging else{throw AppError.message("Runtime busy")}
+            try ensurePatchVersion(reason:"before-runtime-reload")
             await bootRuntime()
             capturePatchArchive(reason:"runtime-reloaded")
             if let fault=patchFault{throw AppError.message(fault)}
@@ -979,7 +1034,7 @@ import Network
         input["form"]=uiInputs
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive","checkpoint_patch_version","restore_patch_version","restore_known_good"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1020,7 +1075,7 @@ extension AppModel {
         }
     }
     private func bootRuntime() async {
-        guard !patchBusy else{return}
+        guard !patchBusy,!versionBusy else{return}
         patchBusy=true;policyReady=false
         defer{patchBusy=false;policyReady=true;resumeCampaignIfNeeded();requestSync()}
         do {
@@ -1035,7 +1090,8 @@ extension AppModel {
         }
     }
     private func installRuntime(id:String,source:String) async throws {
-        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        guard policyReady,!patchBusy,!versionBusy,!apiChanging,!promotionBusy else{throw AppError.message("Runtime not ready")}
+        try ensurePatchVersion(reason:"before-runtime-edit")
         patchBusy=true
         defer{patchBusy=false;resumeCampaignIfNeeded();requestSync()}
         try suspendCampaignForPatch()
@@ -1051,7 +1107,8 @@ extension AppModel {
         }
     }
     private func changeRuntime(reset:Bool) async throws {
-        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        guard policyReady,!patchBusy,!versionBusy,!apiChanging,!promotionBusy else{throw AppError.message("Runtime not ready")}
+        try ensurePatchVersion(reason:"before-runtime-rollback")
         patchBusy=true
         defer{patchBusy=false;resumeCampaignIfNeeded();requestSync()}
         try suspendCampaignForPatch()
@@ -1091,7 +1148,7 @@ extension AppModel {
         requestSync()
     }
     private func resumeCampaignIfNeeded(){
-        guard policyReady,!patchBusy,!apiChanging,campaignTask==nil,let cp=campaign,cp.canResume else{return}
+        guard policyReady,!versionBusy,!patchBusy,!apiChanging,campaignTask==nil,let cp=campaign,cp.canResume else{return}
         // Re-enter the current checkpoint after a process restart. Never infer that
         // an interrupted step succeeded.
         campaignEpoch=UUID();let epoch=campaignEpoch
@@ -1316,7 +1373,7 @@ extension AppModel {
         return Observation(status:ok ? "passed":"failed",evidence:evidence,channelID:channel.id)
     }
     private func runModuleIfDue(){
-        guard policyReady,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
+        guard policyReady,!versionBusy,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
               var cp=moduleCheckpoint,cp.moduleID==activePatchID,(cp.nextAt<=Date() || !(cp.pending ?? []).isEmpty) else{return}
         let module=activePatchID
         let newEvents:[Event]
@@ -1422,7 +1479,8 @@ extension AppModel {
         return DynamicUIBinding.truth(dynamicValue(key))
     }
     private func commitUILayout(_ store:DynamicUIStore)throws {
-        guard dynamicUIBusy.isEmpty else{throw AppError.message("A UI action is still executing")}
+        guard !versionBusy,!patchBusy,!apiChanging,!promotionBusy,apiReady,policyReady,dynamicUIBusy.isEmpty else{throw AppError.message("UI or patch engine busy")}
+        try ensurePatchVersion(reason:"before-ui-edit")
         if let layout=store.active{_ = try layout.checked()}
         guard disk.save(store,"dynamic-ui.json") else{throw AppError.message("Cannot persist UI layout")}
         dynamicPage=nil
@@ -1660,7 +1718,8 @@ extension AppModel {
         recalculateInsights()
     }
     private func activateJellyfinAPI(_ candidate:JellyfinAdapterRevision?,recovery:Bool=false)async throws{
-        guard apiReady,!apiChanging,!loginBusy,!catalogueBusy,favoriteInFlight.isEmpty,!patchBusy else{throw AppError.message("Jellyfin adapter busy; retry after current operation")}
+        guard apiReady,policyReady,!versionBusy,!promotionBusy,!apiChanging,!loginBusy,!catalogueBusy,favoriteInFlight.isEmpty,!patchBusy else{throw AppError.message("Jellyfin adapter busy; retry after current operation")}
+        try ensurePatchVersion(reason:"before-api-edit")
         guard candidate?.id != jellyfinAPIStore.active?.id || candidate==nil else{throw AppError.message("Use a new API revision ID")}
         apiChanging=true
         defer{apiChanging=false;resumeCampaignIfNeeded();requestSync()}
@@ -1769,8 +1828,8 @@ extension AppModel {
         let api=jelly.adapter.map{PatchSource(id:$0.revision.id,source:$0.revision.source)}
         return PatchSourceSet(runtime:runtime,jellyfinAPI:api,ui:dynamicUI.active)
     }
-    private func capturePatchArchive(reason:String){
-        guard apiReady,policyReady || reason=="launch-reconciliation" else{return}
+    private func capturePatchArchive(reason:String,force:Bool=false,label:String?=nil,knownGood:Bool?=nil,restoredFrom:String?=nil){
+        guard apiReady,policyReady || reason=="launch-reconciliation",!versionRecoveryFailed else{return}
         do{
             let sources=try activePatchSources().checked()
             // Never archive locally configured credentials accidentally embedded
@@ -1780,13 +1839,19 @@ extension AppModel {
             for secret in [settings.githubToken,jelly.token,settings.password] where secret.utf8.count>=8 {
                 if text.contains(secret){throw AppError.message("Patch source contains a configured credential")}
             }
-            if let last=disk.load(PatchArchive.self,"last-patch-archive.json"),last.sources==sources{
-                patchArchiveID=last.id;patchArchiveFault=nil;return
+            let last=disk.load(PatchArchive.self,"last-patch-archive.json")
+            if !force,let last=last,last.sources==sources{
+                try PatchVersionStore.retain(last,disk:disk)
+                patchArchiveID=last.id;patchArchiveFault=nil
+                if !patchVersions.contains(where:{$0.id==last.id}){patchVersions=PatchVersionStore.history(disk:disk)}
+                return
             }
-            let archive=PatchArchive(deviceID:deviceID,reason:reason,build:Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",sources:sources)
+            let archive=PatchArchive(deviceID:deviceID,reason:reason,build:Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",sources:sources,parentID:last?.id,restoredFrom:restoredFrom,label:label,knownGood:knownGood)
+            try PatchVersionStore.retain(archive,disk:disk)
             guard disk.save(archive,"patch-archive-"+archive.id+".json"),
                 disk.save(archive,"last-patch-archive.json") else{throw AppError.message("Cannot persist patch archive")}
             patchArchiveID=archive.id;patchArchiveFault=nil
+            patchVersions=PatchVersionStore.history(disk:disk)
             log("INFO","patch-archive","CAPTURED",["id":archive.id,"reason":reason])
             requestSync()
         }catch{
@@ -1800,15 +1865,122 @@ extension AppModel {
             let record=try JSONCodec.decoder().decode(PatchArchive.self,from:data)
             guard record.deviceID==deviceID,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid patch archive")}
             try dbArchiveCheck(record)
+            try PatchVersionStore.retain(record,disk:disk)
             try await db.immutable("engineering/"+deviceID+"/patches/"+record.id+".json",data:data)
             disk.remove(url)
         }
+    }
+    private func ensurePatchVersion(reason:String)throws{
+        guard apiReady,policyReady,!versionRecoveryFailed else{throw AppError.message("Patch engines unavailable")}
+        capturePatchArchive(reason:reason)
+        guard patchArchiveFault==nil,let head=patchArchiveID,
+              let version=PatchVersionStore.load(head,disk:disk),version.sources==activePatchSources() else{
+            throw AppError.message("Cannot preserve current version; edit refused")
+        }
+    }
+    private func fetchPatchVersion(_ id:String)async throws->PatchArchive{
+        guard DynamicUILayout.validID(id) else{throw AppError.message("Invalid archive ID")}
+        if let local=PatchVersionStore.load(id,disk:disk){
+            guard local.deviceID==deviceID else{throw AppError.message("Version belongs to another device")}
+            return local
+        }
+        guard let file=try await db.read("engineering/"+deviceID+"/patches/"+id+".json") else{throw AppError.message("Version not found locally or in TorrioDB")}
+        let record=try JSONCodec.decoder().decode(PatchArchive.self,from:file.data)
+        guard record.id==id,record.deviceID==deviceID else{throw AppError.message("Archive identity mismatch")}
+        try PatchVersionStore.retain(record,disk:disk)
+        patchVersions=PatchVersionStore.history(disk:disk)
+        return record
+    }
+    private func restorePatchVersion(_ id:String,scope:PatchVersionScope,expected:String)async throws->String{
+        guard apiReady,policyReady,!versionBusy,!patchBusy,!apiChanging,!promotionBusy,!loginBusy,!catalogueBusy,favoriteInFlight.isEmpty,dynamicUIBusy.isEmpty else{throw AppError.message("Patch engines busy")}
+        try ensurePatchVersion(reason:"before-version-restore")
+        guard patchArchiveID==expected else{throw AppError.message("Active version changed; refresh history")}
+        versionBusy=true;patchBusy=true;apiChanging=true
+        defer{
+            versionBusy=false;patchBusy=false;apiChanging=false
+            resumeCampaignIfNeeded();requestSync()
+        }
+        let old=activePatchSources()
+        let record=try await fetchPatchVersion(id)
+        let target=try scope.merge(current:old,target:record.sources).checked()
+        if target==old{return "Already at requested source set"}
+        let runtimeChanged=target.runtime != old.runtime
+        let apiChanged=target.jellyfinAPI != old.jellyfinAPI
+        let uiChanged=target.ui != old.ui
+        let nextRuntime=target.runtime.map{RuntimePatch(id:$0.id,source:$0.source)}
+        let nextAPI=target.jellyfinAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source)}
+        // Evaluate the candidate before touching the live engines.
+        let policy=runtimeChanged ? try await engineering.preview(nextRuntime,settings:settings):effectivePolicy
+        let adapter:JellyfinAPIAdapter?
+        if apiChanged{
+            if let nextAPI=nextAPI{adapter=try await JellyfinAPIAdapter.load(nextAPI,engine:scripts)}
+            else{adapter=nil}
+        }else{adapter=jelly.adapter}
+        guard patchArchiveID==expected,activePatchSources()==old,dynamicUIBusy.isEmpty else{throw AppError.message("Live source changed during restore")}
+        let resumeLoop=surfing || settings.resumeSurf
+        let category=settings.surfCategory
+        let priorChannel=current?.id
+        let wasConnected=jelly.connected
+        moduleTask?.cancel()
+        await moduleTask?.value
+        try suspendCampaignForPatch()
+        await campaignTask?.value
+        if apiChanged{
+            let oldWork=work
+            stop()
+            await oldWork?.value
+            await cleanupTask?.value
+            let deadline=ProcessInfo.processInfo.systemUptime+30
+            while jelly.inFlight>0 && ProcessInfo.processInfo.systemUptime<deadline{await nap(0.2)}
+            guard jelly.inFlight==0 else{throw AppError.message("Old API requests have not drained")}
+        }
+        let before=PatchRestoreSnapshot(runtime:engineering.store,api:jellyfinAPIStore,ui:dynamicUI)
+        let after=PatchRestoreSnapshot(
+            runtime:runtimeChanged ? RuntimePatchStore(active:nextRuntime,previous:before.runtime.active,activationPending:false):before.runtime,
+            api:apiChanged ? JellyfinAdapterStore(active:nextAPI,previous:before.api.active,pending:false):before.api,
+            ui:uiChanged ? DynamicUIStore(active:target.ui,previous:before.ui.active,values:target.ui?.retainedValues(before.ui.values) ?? [:]):before.ui)
+        do{
+            try PatchVersionStore.commit(before:before,after:after,targetID:id,scope:scope,disk:disk)
+        }catch{
+            if let journal=disk.load(PatchRestoreJournal.self,"patch-restore.json"),!journal.committed{
+                versionRecoveryFailed=true;policyReady=false;apiReady=false
+                stop()
+            }
+            throw error
+        }
+        if runtimeChanged{
+            engineering=EngineeringRuntime(disk:disk,engine:scripts)
+            moduleCheckpoint=nil
+            applyRuntime(nextRuntime==nil ? nil:policy)
+        }
+        if apiChanged{
+            jellyfinAPIStore=after.api;jelly.adapter=adapter
+            jellyfinAPIRevision=jelly.adapterID;jellyfinAPIFault=nil
+            jelly.token="";jelly.userID="";catalogueReady=false;status="Connection failed"
+            settings.resumeSurf=resumeLoop;settings.surfCategory=category
+            disk.save(settings,"settings.json")
+        }
+        if uiChanged{
+            dynamicPage=nil;dynamicUIResults=[:];dynamicUISeen.removeAll();dynamicUI=after.ui
+        }
+        capturePatchArchive(reason:"version-restored",force:true,restoredFrom:id)
+        let newHead=patchArchiveID ?? ""
+        log("INFO","patch-version","RESTORED",["target":id,"scope":scope.rawValue,"head":newHead])
+        recalculateInsights()
+        versionBusy=false;patchBusy=false;apiChanging=false
+        if apiChanged,wasConnected || settings.autoLogin{
+            await connect()
+            if !resumeLoop,campaign?.canResume != true,let channel=priorChannel,
+               current==nil,let c=channels.first(where:{$0.id==channel}){open(c)}
+        }
+        if let fault=patchArchiveFault{throw AppError.message("Sources restored; history recording failed: "+fault)}
+        return "Restored "+scope.rawValue+" from "+id+"; new head "+newHead
     }
     private func dbArchiveCheck(_ record:PatchArchive)throws{
         _ = try record.sources.checked()
     }
     private func promotePatchArchive(id:String,expected:String,evidence:String)async throws->String{
-        guard apiReady,policyReady,!apiChanging,!patchBusy,!promotionBusy,
+        guard apiReady,policyReady,!apiChanging,!patchBusy,!promotionBusy,!versionBusy,
               DynamicUILayout.validID(id),DynamicUILayout.validID(expected),!evidence.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,evidence.count<=4000,
               let archive=disk.load(PatchArchive.self,"last-patch-archive.json"),archive.id==id,
               archive.sources==activePatchSources() else{throw AppError.message("Promotion requires the current archived source set and review evidence")}

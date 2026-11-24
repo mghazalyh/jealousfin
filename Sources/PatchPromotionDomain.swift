@@ -31,6 +31,10 @@ struct PatchArchive:Codable,Equatable,Identifiable{
     var reason:String
     var build:String
     var sources:PatchSourceSet
+    var parentID:String?
+    var restoredFrom:String?
+    var label:String?
+    var knownGood:Bool?
 }
 struct ReleaseBaseline:Codable,Equatable{
     var schemaVersion=1

@@ -18,7 +18,7 @@ struct DecisionPrompt:Codable,Equatable,Identifiable {
     var expectedPatchID:String?
     var expectedJellyfinAPIRevision:String?
     var choices:[DecisionChoice]
-    static let repairCommands:Set<String>=DynamicUILayout.commands.subtracting(["script"]).union(["install_runtime_module_from_db","rollback_runtime_module","reload_runtime_module","install_ui_layout_from_db","rollback_ui_layout","reset_runtime_module","reset_ui_layout","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api"])
+    static let repairCommands:Set<String>=DynamicUILayout.commands.subtracting(["script"]).union(["install_runtime_module_from_db","rollback_runtime_module","reload_runtime_module","install_ui_layout_from_db","rollback_ui_layout","reset_runtime_module","reset_ui_layout","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","restore_patch_version","restore_known_good"])
     func checked(now:Date)throws->DecisionPrompt{
         guard schemaVersion==1,DynamicUILayout.validID(id),!title.isEmpty,title.count<=160,
               !message.isEmpty,message.count<=4000,["Emergency","High","Attention","Informational"].contains(priority),
