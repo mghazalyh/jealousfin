@@ -16,7 +16,7 @@ final class LANServer {
     var queryHandler:((String,@escaping(String,Data)->Void)->Void)?
     var state:((String)->Void)?
     init(port:NWEndpoint.Port=8765,advertise:Bool=true){listenPort=port;self.advertise=advertise}
-    var port:UInt16? {queue.sync{listener?.port?.rawValue}}
+    var port:UInt16? {queue.sync{guard let value=listener?.port?.rawValue,value != 0 else{return nil};return value}}
     func start() throws {
         try queue.sync {
             guard listener==nil else{return}
