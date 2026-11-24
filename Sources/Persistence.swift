@@ -1,0 +1,78 @@
+import Foundation
+
+@MainActor final class Disk {
+    let root: URL
+    private(set) var error: String?
+    init() {
+        root = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
+        do { try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true) } catch { self.error="Cannot create app storage" }
+    }
+    func load<T: Decodable>(_ type:T.Type,_ name:String) -> T? {
+        let url=root.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath:url.path) else { return nil }
+        do { return try JSONCodec.decoder().decode(type,from:Data(contentsOf:url)) }
+        catch { self.error="Cannot read \(name)"; return nil }
+    }
+    @discardableResult func save<T:Encodable>(_ object:T,_ name:String) -> Bool {
+        do { try JSONCodec.encoder().encode(object).write(to:root.appendingPathComponent(name),options:.atomic); return true }
+        catch { self.error="Cannot write \(name)"; return false }
+    }
+    func files(prefix:String) -> [URL] {
+        let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)) ?? []
+        return files.filter{$0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension=="json"}.sorted{$0.lastPathComponent<$1.lastPathComponent}
+    }
+    func remove(_ url:URL) { do { try FileManager.default.removeItem(at:url) } catch { self.error="Cannot remove uploaded batch" } }
+}
+struct GitFile {
+    var sha: String
+    var data: Data
+}
+@MainActor final class TorrioDB {
+    let base = "https://api.github.com/repos/mghazalyh/torriodb/contents/jealousfin/"
+    var token = ""
+    var configured:Bool { !token.isEmpty }
+    func call(_ path:String, method:String="GET", body:[String:Any]?=nil) async throws -> (Data,Int) {
+        guard configured, let u=URL(string:base+path) else { throw AppError.message("Configure TorrioDB token") }
+        var req=URLRequest(url:u); req.httpMethod=method; req.timeoutInterval=20
+        req.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")
+        req.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
+        req.setValue("2022-11-28",forHTTPHeaderField:"X-GitHub-Api-Version")
+        if let body=body { req.httpBody=try JSONSerialization.data(withJSONObject:body); req.setValue("application/json",forHTTPHeaderField:"Content-Type") }
+        let (d,r)=try await URLSession.shared.data(for:req)
+        guard let h=r as? HTTPURLResponse else { throw AppError.message("Invalid GitHub response") }
+        return (d,h.statusCode)
+    }
+    func read(_ path:String) async throws -> GitFile? {
+        let (d,status)=try await call(path)
+        if status==404 { return nil }
+        guard status==200, let j=try JSONSerialization.jsonObject(with:d) as? [String:Any], let sha=j["sha"] as? String, let c=j["content"] as? String, let bytes=Data(base64Encoded:c,options:.ignoreUnknownCharacters) else { throw AppError.message("TorrioDB read HTTP \(status)") }
+        return GitFile(sha:sha,data:bytes)
+    }
+    func put(_ path:String, data:Data, sha:String?=nil) async throws {
+        var b:[String:Any]=["message":"jealousfin: synchronize \(path)","content":data.base64EncodedString(),"branch":"main"]
+        if let sha=sha { b["sha"]=sha }
+        let (_,status)=try await call(path,method:"PUT",body:b)
+        guard status==200 || status==201 else { throw AppError.message("TorrioDB write HTTP \(status)") }
+    }
+    func immutable(_ path:String,data:Data) async throws {
+        if let existing=try await read(path) {
+            guard existing.data==data else { throw AppError.message("Immutable record collision") }; return
+        }
+        try await put(path,data:data)
+    }
+    func directory(_ path:String) async throws -> [String] {
+        let (d,status)=try await call(path)
+        if status==404 { return [] }
+        guard status==200, let a=try JSONSerialization.jsonObject(with:d) as? [[String:Any]] else { throw AppError.message("TorrioDB listing HTTP \(status)") }
+        return a.filter{$0["type"] as? String=="file"}.compactMap{$0["name"] as? String}.filter{$0.hasSuffix(".json") && $0.range(of:"^[A-Za-z0-9_.-]+$",options:.regularExpression) != nil}
+    }
+    func merge(_ local:HealthLedger) async throws -> HealthLedger {
+        let path="database/channel-health-v1.json"
+        let file=try await read(path)
+        var merged=local
+        if let file=file { merged.merge(try JSONCodec.decoder().decode(HealthLedger.self,from:file.data)) }
+        let bytes=try JSONCodec.encoder().encode(merged)
+        if file?.data != bytes { try await put(path,data:bytes,sha:file?.sha) }
+        return merged
+    }
+}

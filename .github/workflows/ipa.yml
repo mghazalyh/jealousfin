@@ -1,0 +1,56 @@
+name: Build and release Jealousfin IPA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: jealousfin-ipa
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install xcodegen
+      - name: Test channel policy
+        run: |
+          mkdir -p build
+          swiftc Sources/Domain.swift Tests/main.swift -o build/policy-tests
+          build/policy-tests
+          python3 -m unittest discover -s Tests -p 'test_*.py' -v
+      - name: Generate project and build
+        run: |
+          xcodegen generate
+          xcodebuild -project Jealousfin.xcodeproj -scheme Jealousfin -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" IPHONEOS_DEPLOYMENT_TARGET=15.0 CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" build
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=DerivedData/Build/Products/Release-iphoneos/Jealousfin.app
+          test -f "$APP/Jealousfin"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" | grep -x '15.0'
+          mkdir -p build/Payload
+          ditto "$APP" build/Payload/Jealousfin.app
+          cd build
+          /usr/bin/zip -qry Jealousfin.ipa Payload
+          unzip -t Jealousfin.ipa
+          shasum -a 256 Jealousfin.ipa > Jealousfin.ipa.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jealousfin-IPA
+          path: |
+            build/Jealousfin.ipa
+            build/Jealousfin.ipa.sha256
+          if-no-files-found: error
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v0.1.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin development build ${GITHUB_RUN_NUMBER}" --notes "Unsigned iOS 15+ arm64 IPA for TrollStore installation testing. Source: $GITHUB_SHA. Build and policy regression verified; physical playback, background endurance and global server enforcement not yet accepted." --prerelease

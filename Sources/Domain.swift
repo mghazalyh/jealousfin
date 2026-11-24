@@ -1,0 +1,162 @@
+import Foundation
+
+struct Program: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var start: Date?
+    var end: Date?
+    var channelID: String?
+    var title: String {
+        let p = name.components(separatedBy: " · ")
+        return p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
+    }
+    var progress: Double? {
+        guard let a = start, let b = end, b > a else { return nil }
+        return min(1, max(0, Date().timeIntervalSince(a) / b.timeIntervalSince(a)))
+    }
+}
+struct Channel: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var number: String?
+    var logo: Bool
+    var favorite: Bool
+    var program: Program?
+    var genres: [String]
+    var isSurf: Bool { name.hasPrefix("Surf:") }
+}
+struct ChannelHealth: Codable, Equatable {
+    var failures = 0
+    var lifetimeFailures = 0
+    var successes = 0
+    var lastFailure: Date?
+    var lastSuccess: Date?
+    var hiatusUntil: Date?
+    var banned = false
+    var reason: String?
+    var approvedAt: Date?
+    func eligible(at date: Date) -> Bool { !banned && (hiatusUntil.map { $0 <= date } ?? true) }
+    mutating func fail(at date: Date, reason: String) {
+        guard eligible(at: date) else { return }
+        failures += 1
+        lifetimeFailures += 1
+        lastFailure = date
+        self.reason = reason
+        if failures >= 8 { banned = true; hiatusUntil = nil }
+        else { hiatusUntil = date.addingTimeInterval(Double(failures * 3) * 86400) }
+    }
+    mutating func succeed(at date: Date) {
+        guard eligible(at: date) else { return }
+        failures = 0; successes += 1; lastSuccess = date; hiatusUntil = nil
+    }
+    mutating func approve(at date: Date) {
+        guard banned else { return }
+        banned = false; failures = 0; hiatusUntil = nil; approvedAt = date
+    }
+}
+struct HealthEvent: Codable, Identifiable, Equatable {
+    var id = UUID().uuidString
+    var at = Date()
+    var channelID: String
+    var channelName: String
+    var action: String
+    var reason: String
+}
+struct HealthLedger: Codable {
+    var schemaVersion = 1
+    var events: [HealthEvent] = []
+    func states() -> [String: ChannelHealth] {
+        var result: [String: ChannelHealth] = [:]
+        var seen = Set<String>()
+        for e in events.sorted(by: { $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at }) {
+            guard seen.insert(e.id).inserted else { continue }
+            var s = result[e.channelID] ?? ChannelHealth()
+            switch e.action {
+            case "failure": s.fail(at: e.at, reason: e.reason)
+            case "success": s.succeed(at: e.at)
+            case "approve": s.approve(at: e.at)
+            default: continue
+            }
+            result[e.channelID] = s
+        }
+        return result
+    }
+    mutating func merge(_ other: HealthLedger) {
+        var ids = Set(events.map(\.id))
+        for e in other.events where ids.insert(e.id).inserted { events.append(e) }
+    }
+}
+struct Event: Codable, Identifiable {
+    var schemaVersion = 1
+    var id = UUID().uuidString
+    var timestamp = Date()
+    var severity: String
+    var component: String
+    var code: String
+    var trace: String?
+    var fields: [String: String] = [:]
+}
+struct Insight: Identifiable, Codable, Equatable {
+    var id: String
+    var priority: String
+    var title: String
+    var explanation: String
+    var action: String
+}
+struct Command: Codable, Identifiable {
+    var schemaVersion = 1
+    var id: String
+    var action: String
+    var arguments: [String: String]?
+    var expiresAt: Date?
+}
+struct Receipt: Codable {
+    var schemaVersion = 1
+    var id: String
+    var action: String
+    var status: String
+    var result: String
+    var timestamp = Date()
+}
+struct Settings: Codable {
+    var server = ""
+    var username = ""
+    var password = ""
+    var githubToken = ""
+    var rotationMinutes = 5
+    var retries = 2
+    var startupTimeout = 25
+    var validation = true
+    var random = false
+    var unattended = true
+    var lanEnabled = true
+    var qualityMbps = 10
+    var autoLogin = true
+    var resumeSurf = false
+    var surfCategory = "All Channels"
+}
+enum JSONCodec {
+    static func encoder() -> JSONEncoder {
+        let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.sortedKeys]; return e
+    }
+    static func decoder() -> JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .custom { decoder in
+            let c = try decoder.singleValueContainer()
+            let s = try c.decode(String.self)
+            guard let v = date(s) else { throw DecodingError.dataCorruptedError(in: c, debugDescription: "Invalid timestamp") }
+            return v
+        }
+        return d
+    }
+    static func date(_ s: String?) -> Date? {
+        guard let s = s else { return nil }
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]; return f.date(from: s)
+    }
+}
+enum AppError: LocalizedError {
+    case message(String)
+    var errorDescription: String? { if case .message(let s) = self { return s }; return nil }
+}
