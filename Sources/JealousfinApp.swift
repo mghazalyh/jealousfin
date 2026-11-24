@@ -26,6 +26,7 @@ struct RootView:View {
             NavigationView{EngineeringView()}.navigationViewStyle(.stack).tabItem{Label("More",systemImage:"ellipsis.circle")}.tag(4)
         }
         .accentColor(accent)
+        .sheet(item:$model.dynamicPage){page in DynamicUIPageView(page:page).environmentObject(model)}
     }
 }
 struct Panel<Content:View>:View {
@@ -55,6 +56,7 @@ struct GuideView:View{
     }
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"guide.top")
             HStack{
                 VStack(alignment:.leading,spacing:4){Text("LIVE TV").font(.caption.bold()).foregroundColor(accent);Text("Jealousfin").font(.largeTitle.bold())}
                 Spacer()
@@ -80,6 +82,7 @@ struct GuideView:View{
                 Panel{VStack(alignment:.leading,spacing:8){Text(model.channels.isEmpty ? "Connect to Jellyfin":"No matching channels").font(.headline);Text(model.channels.isEmpty ? "Enter your server and account in Settings to load the actual Live TV catalogue.":"Try another filter.").foregroundColor(subdued).font(.subheadline);if model.channels.isEmpty{NavigationLink("Open Settings",destination:SettingsView())}}}
             }
             ForEach(visible){c in ChannelRow(channel:c)}
+            DynamicUISlotView(location:"guide.bottom")
         }.navigationBarHidden(true)
     }
 }
@@ -113,6 +116,7 @@ struct PlaybackView:View{
     @State private var category="All Channels"
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"player.top")
             HStack{Text("Now playing").font(.largeTitle.bold());Spacer();if model.playing{Label("LIVE",systemImage:"circle.fill").font(.caption.bold()).foregroundColor(.red)}}
             PlayerSurface(player:model.player,onReady:model.presentationReady).aspectRatio(16/9,contentMode:.fit).background(.black).cornerRadius(14)
             Panel{
@@ -128,6 +132,7 @@ struct PlaybackView:View{
                     }.buttonStyle(.bordered)
                 }
             }
+            DynamicUISlotView(location:"player.controls")
             SectionLabel(title:"Surf controls")
             Panel{
                 VStack(alignment:.leading,spacing:12){
@@ -144,6 +149,7 @@ struct PlaybackView:View{
             }
             SectionLabel(title:"Recently played")
             ForEach(model.previous){c in ChannelRow(channel:c)}
+            DynamicUISlotView(location:"player.bottom")
         }.navigationBarHidden(true)
     }
 }
@@ -153,6 +159,7 @@ struct HealthView:View{
     @State private var approval:Channel?
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"health.top")
             Text("Channel Health").font(.largeTitle.bold())
             Text("Validation through real playback").foregroundColor(subdued)
             HStack{
@@ -184,6 +191,7 @@ struct HealthView:View{
                     }
                 }
             }
+            DynamicUISlotView(location:"health.bottom")
         }.navigationBarHidden(true)
         .confirmationDialog("Explicitly reinstate \(approval?.name ?? "channel")?",isPresented:Binding(get:{approval != nil},set:{if !$0{approval=nil}}),titleVisibility:.visible){
             Button("Approve reinstatement"){if let c=approval{model.approve(c)};approval=nil}
@@ -198,6 +206,7 @@ struct InsightsView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"insights.top")
             Text("Insights").font(.largeTitle.bold())
             Text("What needs your attention").foregroundColor(subdued)
             if model.insights.isEmpty{Panel{Label("No active issues detected",systemImage:"checkmark.circle").foregroundColor(.green);Text("This reflects current observations, not a complete system health certification.").font(.caption).foregroundColor(subdued)}}
@@ -211,6 +220,7 @@ struct InsightsView:View{
                     }
                 }
             }
+            DynamicUISlotView(location:"insights.bottom")
         }.navigationBarHidden(true)
     }
 }
@@ -218,6 +228,7 @@ struct EngineeringView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"more.top")
             Text("Engineering").font(.largeTitle.bold())
             Panel{
                 VStack(alignment:.leading,spacing:12){
@@ -238,6 +249,19 @@ struct EngineeringView:View{
                     NavigationLink(destination:EPGView()){Label("Programme guide & DVR",systemImage:"calendar")}
                 }.font(.headline)
             }
+            if let pages=model.dynamicUI.active?.pages,!pages.isEmpty{
+                SectionLabel(title:"Custom pages")
+                Panel{VStack(alignment:.leading,spacing:12){
+                    ForEach(pages){page in Button{model.openDynamicPageFromView(page.id)}label:{
+                        HStack{Label(page.title,systemImage:page.symbol ?? "square.grid.2x2");Spacer();Image(systemName:"chevron.right").font(.caption)}
+                    }.buttonStyle(.plain)}
+                }}
+            }
+            Button("Restore native interface"){
+                Task{_ = await model.execute(Command(id:UUID().uuidString,action:"reset_ui_layout",arguments:nil,expiresAt:nil))}
+            }.font(.caption).foregroundColor(.secondary)
+            .disabled(model.dynamicUI.active==nil)
+            DynamicUISlotView(location:"more.bottom")
         }.navigationBarHidden(true)
     }
 }
@@ -245,6 +269,7 @@ struct SettingsView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"settings.top")
             SectionLabel(title:"Jellyfin")
             Panel{VStack(alignment:.leading,spacing:12){
                 TextField("Server URL",text:$model.settings.server).keyboardType(.URL).autocapitalization(.none).disableAutocorrection(true)
@@ -268,6 +293,7 @@ struct SettingsView:View{
             }}
             Button("Save settings"){model.saveSettings();model.requestSync()}.buttonStyle(.borderedProminent)
             Text("Background execution depends on iOS and the installed device.").font(.caption).foregroundColor(subdued)
+            DynamicUISlotView(location:"settings.bottom")
         }.navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -277,12 +303,14 @@ struct RuntimeView:View{
     @State private var busy=false
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"runtime.top")
             Panel{VStack(alignment:.leading,spacing:10){Text("JavaScript runtime").font(.headline);Text("Scripts can inspect state and invoke registered application commands without reinstalling.").font(.caption).foregroundColor(subdued)
                 TextEditor(text:$source).font(.system(.caption,design:.monospaced)).frame(minHeight:180)
                 Button(busy ? "Running…":"Run script"){busy=true;Task{do{model.scriptOutput=try await model.runScript(source)}catch{model.scriptOutput=error.localizedDescription};busy=false}}.buttonStyle(.borderedProminent).disabled(busy)
                 Text(model.scriptOutput).font(.system(.caption,design:.monospaced)).textSelection(.enabled)
             }}
             Panel{VStack(alignment:.leading,spacing:8){Text("Registered commands").font(.headline);ForEach(AppModel.actions,id:\.self){Text($0).font(.system(.caption,design:.monospaced))}}}
+            DynamicUISlotView(location:"runtime.bottom")
         }.navigationTitle("Remote & Runtime").navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -290,6 +318,7 @@ struct TelemetryView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"telemetry.top")
             Panel{VStack(alignment:.leading,spacing:8){
                 Label(model.telemetryActive ? "Collecting automatically":"Starting collector",systemImage:"waveform.path.ecg").foregroundColor(model.telemetryActive ? .green:subdued)
                 Text(model.syncStatus).font(.caption).foregroundColor(subdued)
@@ -301,6 +330,7 @@ struct TelemetryView:View{
             if model.metrics.isEmpty{Panel{Text("No active playback sample; system telemetry remains active.").foregroundColor(subdued)}}
             ForEach(model.metrics.keys.sorted(),id:\.self){key in Panel{HStack{Text(key).font(.caption);Spacer();Text(model.metrics[key] ?? "").monospacedDigit().foregroundColor(accent)}}}
             Text("AVPlayer-reported measurements; actual physical A/V synchronization is not measured by these values.").font(.caption).foregroundColor(subdued)
+            DynamicUISlotView(location:"telemetry.bottom")
         }.navigationTitle("Telemetry").navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -308,6 +338,7 @@ struct LogsView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"logs.top")
             ForEach(Array(model.events.reversed())){e in
                 Panel{VStack(alignment:.leading,spacing:5){
                     HStack{Text(e.severity).font(.caption.bold()).foregroundColor(e.severity=="ERROR" ? .red:accent);Spacer();Text(e.timestamp.formatted(date:.omitted,time:.standard)).font(.caption2).foregroundColor(subdued)}
@@ -316,6 +347,7 @@ struct LogsView:View{
                     if let trace=e.trace{Text(trace).font(.caption2).foregroundColor(subdued)}
                 }}
             }
+            DynamicUISlotView(location:"logs.bottom")
         }.navigationTitle("Logs").navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -324,6 +356,7 @@ struct EPGView:View{
     @State private var selected:Program?
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"epg.top")
             SectionLabel(title:"Programme guide")
             ForEach(model.programs){p in Panel{VStack(alignment:.leading,spacing:6){
                 Text(p.title).font(.headline)
@@ -335,6 +368,7 @@ struct EPGView:View{
             SectionLabel(title:"Recordings")
             Button("Refresh recordings"){model.loadRecordings()}
             ForEach(Array(model.recordings.enumerated()),id:\.offset){item in Panel{Text(item.element)}}
+            DynamicUISlotView(location:"epg.bottom")
         }.navigationTitle("Guide & DVR").navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Schedule recording?",isPresented:Binding(get:{selected != nil},set:{if !$0{selected=nil}})){
             Button("Schedule"){if let p=selected{model.schedule(p)};selected=nil}
@@ -349,6 +383,7 @@ struct DeviceTestsView:View{
     @State private var issue=""
     var body:some View{
         Screen{
+            DynamicUISlotView(location:"tests.top")
             Text("On-device engineering").font(.title2.bold())
             Panel{VStack(alignment:.leading,spacing:8){
                 Text("Active runtime module").font(.headline)
@@ -375,6 +410,7 @@ struct DeviceTestsView:View{
                 }else{Text("No campaign submitted.").font(.caption).foregroundColor(subdued)}
                 if !issue.isEmpty{Text(issue).font(.caption).foregroundColor(.orange)}
             }}
+            DynamicUISlotView(location:"tests.bottom")
         }.navigationTitle("Device testing").navigationBarTitleDisplayMode(.inline)
     }
     private func change(_ state:String){

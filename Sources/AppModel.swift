@@ -41,6 +41,11 @@ import Network
     let db=TorrioDB()
     let lan=LANServer()
     let scripts=ScriptEngine()
+    @Published private(set) var dynamicUI=DynamicUIStore()
+    @Published var dynamicPage:DynamicUIPage?
+    @Published private(set) var dynamicUIResults:[String:String]=[:]
+    @Published private(set) var dynamicUIBusy=Set<String>()
+    private var dynamicUISeen=Set<String>()
     private lazy var engineering=EngineeringRuntime(disk:disk,engine:scripts)
     @Published private(set) var campaign:DeviceTestCheckpoint?
     @Published private(set) var activePatchID="native-baseline"
@@ -103,6 +108,17 @@ import Network
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
+        if var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
+            if let layout=stored.active,(try? layout.checked())==nil {
+                stored.active=nil;stored.values=[:]
+            }
+            if let previous=stored.previous,(try? previous.checked())==nil {stored.previous=nil}
+            if let layout=stored.active {
+                let defaults=layout.formDefaults()
+                stored.values=defaults.merging(stored.values.filter{defaults[$0.key] != nil && $0.value.utf8.count<=4096}){_,saved in saved}
+            }else{stored.values=[:]}
+            dynamicUI=stored
+        }
         moduleCheckpoint=disk.load(ModuleCheckpoint.self,"module-checkpoint.json")
         ledger=disk.load(HealthLedger.self,"health.json") ?? HealthLedger()
         health=ledger.states()
@@ -134,6 +150,7 @@ import Network
         telemetryActive=true
         log("INFO","app","START",["version":Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown","os":UIDevice.current.systemVersion,"launchID":launchID])
         sampleSystemTelemetry(force:true)
+        log("INFO","dynamic-ui","LAYOUT_RESTORED",["revision":dynamicUI.active?.revision ?? "native-baseline"])
         startNetworkTelemetry()
         configureAudio()
         observeLifecycle()
@@ -724,9 +741,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -744,7 +761,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -801,6 +818,41 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "install_ui_layout":
+            guard let source=args["layout"],source.utf8.count<=192*1024 else{throw AppError.message("Provide layout JSON up to 192 KiB")}
+            let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data(source.utf8))
+            try installUILayout(layout);return "UI layout activated: "+layout.revision
+        case "install_ui_layout_from_db":
+            guard let id=args["id"],DynamicUILayout.validID(id),let expected=args["sha"],
+                  expected.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil
+            else{throw AppError.message("Layout revision and exact Git blob SHA required")}
+            guard let file=try await db.read("engineering/ui/"+id+".json"),file.sha==expected,file.data.count<=192*1024
+            else{throw AppError.message("Layout source missing or revision mismatch")}
+            let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:file.data)
+            guard layout.revision==id else{throw AppError.message("Layout ID mismatch")}
+            try installUILayout(layout);return "Repository UI layout activated: "+id
+        case "get_ui_layout":return try json(dynamicUI.active)
+        case "rollback_ui_layout":
+            guard let previous=dynamicUI.previous else{throw AppError.message("No prior UI layout")}
+            try commitUILayout(DynamicUIStore(active:previous,previous:dynamicUI.active,values:previous.formDefaults()))
+            return "UI layout rolled back: "+previous.revision
+        case "reset_ui_layout":
+            try commitUILayout(DynamicUIStore(active:nil,previous:dynamicUI.active))
+            return "Native UI restored"
+        case "ui_set_value":
+            guard let key=args["key"],let value=args["value"] else{throw AppError.message("Field key and value required")}
+            try setDynamicUIValue(key,value:value)
+        case "ui_trigger":
+            guard let id=args["id"] else{throw AppError.message("UI node ID required")}
+            let receipt=try await triggerDynamicUI(id,origin:"remote")
+            guard receipt.status=="succeeded" else{throw AppError.message(receipt.result)}
+            return receipt.result
+        case "ui_open_page":
+            guard let id=args["id"] else{throw AppError.message("Page ID required")}
+            try openDynamicPage(id)
+        case "ui_close_page":dynamicPage=nil
+        case "ui_get_capabilities":
+            return String(decoding:try JSONSerialization.data(withJSONObject:["abi":1,"locations":DynamicUILayout.locations,"kinds":DynamicUILayout.kinds,"commands":DynamicUILayout.commands.sorted()],options:[.sortedKeys]),as:UTF8.self)
         case "install_runtime_module":
             guard let id=args["id"],let source=args["source"] else{throw AppError.message("Module ID and JavaScript source required")}
             try await installRuntime(id:id,source:source);return "Runtime module activated: "+activePatchID
@@ -840,11 +892,13 @@ import Network
         }
         return "OK"
     }
-    func runScript(_ source:String) async throws -> String {
+    func runScript(_ source:String,uiInputs:[String:String]=[:]) async throws -> String {
         let start=ProcessInfo.processInfo.systemUptime
-        let (output,commands)=try await scripts.evaluateAsync(source,snapshot:stateSnapshot())
+        var input=stateSnapshot()
+        input["form"]=uiInputs
+        let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1264,6 +1318,101 @@ extension AppModel {
             let data=try JSONCodec.encoder().encode(cp)
             let existing=try await db.read(path)
             if existing?.data != data {try await db.put(path,data:data,sha:existing?.sha)}
+        }
+    }
+}
+
+
+// Remote declarative UI. Native screens and their recovery controls remain available.
+extension AppModel {
+    func dynamicValue(_ key:String?) -> String? {
+        guard let key=key else{return nil}
+        return DynamicUIBinding.resolve(key,values:dynamicUI.values,state:stateSnapshot())
+    }
+    func dynamicVisible(_ node:DynamicUINode)->Bool{
+        guard let key=node.visibleWhen else{return true}
+        return DynamicUIBinding.truth(dynamicValue(key))
+    }
+    func dynamicEnabled(_ node:DynamicUINode)->Bool{
+        guard let key=node.enabledWhen else{return true}
+        return DynamicUIBinding.truth(dynamicValue(key))
+    }
+    private func commitUILayout(_ store:DynamicUIStore)throws {
+        guard dynamicUIBusy.isEmpty else{throw AppError.message("A UI action is still executing")}
+        if let layout=store.active{_ = try layout.checked()}
+        guard disk.save(store,"dynamic-ui.json") else{throw AppError.message("Cannot persist UI layout")}
+        dynamicPage=nil
+        dynamicUIResults=[:]
+        dynamicUISeen.removeAll()
+        dynamicUI=store
+        log("INFO","dynamic-ui","LAYOUT_CHANGED",["revision":store.active?.revision ?? "native-baseline","slots":String(store.active?.slots.count ?? 0),"pages":String(store.active?.pages.count ?? 0)])
+        requestSync()
+    }
+    private func installUILayout(_ layout:DynamicUILayout)throws {
+        let layout=try layout.checked()
+        guard layout.revision != dynamicUI.active?.revision else{throw AppError.message("Use a new UI revision")}
+        let defaults=layout.formDefaults()
+        try commitUILayout(DynamicUIStore(active:layout,previous:dynamicUI.active,values:defaults))
+    }
+    func setDynamicUIValue(_ key:String,value:String)throws{
+        guard let layout=dynamicUI.active else{throw AppError.message("No active UI layout")}
+        let field=key.hasPrefix("form.") ? String(key.dropFirst(5)):key
+        guard layout.formDefaults()[field] != nil,value.utf8.count<=4096 else{throw AppError.message("Unknown form field or oversized value")}
+        guard dynamicUI.values[field] != value else{return}
+        var copy=dynamicUI;copy.values[field]=value
+        guard disk.save(copy,"dynamic-ui.json") else{throw AppError.message("Cannot persist form value")}
+        dynamicUI=copy
+    }
+    func setDynamicUIValueFromView(_ key:String,value:String){
+        do{try setDynamicUIValue(key,value:value)}
+        catch{log("WARN","dynamic-ui","FIELD_WRITE_FAILED",["field":key,"error":error.localizedDescription])}
+    }
+    func openDynamicPage(_ id:String)throws{
+        guard let page=dynamicUI.active?.pages.first(where:{$0.id==id}) else{throw AppError.message("Unknown dynamic page")}
+        dynamicPage=page
+        log("INFO","dynamic-ui","PAGE_OPENED",["page":id,"revision":dynamicUI.active?.revision ?? ""])
+    }
+    func openDynamicPageFromView(_ id:String){
+        do{try openDynamicPage(id)}
+        catch{log("WARN","dynamic-ui","PAGE_OPEN_FAILED",["page":id])}
+    }
+    func observeDynamicSlot(_ slot:String){
+        let identity=(dynamicUI.active?.revision ?? "")+":"+slot
+        guard dynamicUISeen.insert(identity).inserted else{return}
+        log("INFO","dynamic-ui","SLOT_RENDERED",["slot":slot,"revision":dynamicUI.active?.revision ?? ""])
+    }
+    func triggerDynamicUI(_ id:String,origin:String)async throws->Receipt{
+        guard let layout=dynamicUI.active,let node=layout.node(id),let action=node.action,
+              dynamicVisible(node),dynamicEnabled(node) else{throw AppError.message("UI action unavailable")}
+        guard dynamicUIBusy.insert(id).inserted else{throw AppError.message("UI action already running")}
+        defer{dynamicUIBusy.remove(id)}
+        let inputs=dynamicUI.values
+        let args=try DynamicUIBinding.arguments(action.arguments ?? [:],values:inputs,state:stateSnapshot())
+        log("INFO","dynamic-ui","ACTION_STARTED",["node":id,"origin":origin,"revision":layout.revision,"command":action.command])
+        let result:Receipt
+        if action.command=="script" {
+            do {
+                guard let source=args["source"] else{throw AppError.message("Missing script source")}
+                let output=try await runScript(source,uiInputs:inputs)
+                result=Receipt(id:UUID().uuidString,action:"script",status:"succeeded",result:output)
+            }catch{
+                result=Receipt(id:UUID().uuidString,action:"script",status:"failed",result:sanitized(error.localizedDescription))
+            }
+        }else{
+            result=await execute(Command(id:UUID().uuidString,action:action.command,arguments:args,expiresAt:nil))
+        }
+        dynamicUIResults[id]=sanitized(result.result,limit:8192)
+        log(result.status=="succeeded" ? "INFO":"WARN","dynamic-ui","ACTION_FINISHED",["node":id,"origin":origin,"revision":layout.revision,"status":result.status,"receipt":result.id])
+        requestSync()
+        return result
+    }
+    func triggerDynamicUIFromView(_ id:String){
+        Task{
+            do{_ = try await triggerDynamicUI(id,origin:"touch")}
+            catch{
+                dynamicUIResults[id]=sanitized(error.localizedDescription)
+                log("WARN","dynamic-ui","ACTION_FAILED",["node":id,"error":error.localizedDescription])
+            }
         }
     }
 }
