@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "revision": "engineering-controls-v1",
+  "slots": [
+    {
+      "location": "player.controls",
+      "nodes": [
+        {
+          "id": "qa-controls",
+          "kind": "card",
+          "title": "Quick diagnostics",
+          "children": [
+            {
+              "id": "qa-btn",
+              "kind": "button",
+              "title": "Capture diagnostics",
+              "symbol": "waveform.path.ecg",
+              "style": "prominent",
+              "action": {
+                "command": "get_telemetry"
+              }
+            },
+            {
+              "id": "qa-surf",
+              "kind": "button",
+              "title": "Pause Surf",
+              "action": {
+                "command": "pause_surf"
+              },
+              "enabledWhen": "state.surfing"
+            },
+            {
+              "id": "qa-link",
+              "kind": "link",
+              "title": "Engineering dashboard",
+              "targetPage": "qa-dashboard"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "location": "guide.top",
+      "nodes": [
+        {
+          "id": "guide-health",
+          "kind": "metric",
+          "title": "Eligible channels",
+          "valueKey": "state.eligible"
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "qa-dashboard",
+      "title": "Engineering dashboard",
+      "symbol": "chart.bar.xaxis",
+      "nodes": [
+        {
+          "id": "qa-runtime",
+          "kind": "metric",
+          "title": "Active runtime module",
+          "valueKey": "state.runtimePatch"
+        },
+        {
+          "id": "qa-input",
+          "kind": "picker",
+          "title": "Rotation duration",
+          "valueKey": "form.minutes",
+          "defaultValue": "5",
+          "options": [
+            {
+              "value": "1",
+              "title": "1 minute"
+            },
+            {
+              "value": "5",
+              "title": "5 minutes"
+            },
+            {
+              "value": "10",
+              "title": "10 minutes"
+            }
+          ]
+        },
+        {
+          "id": "qa-apply",
+          "kind": "button",
+          "title": "Apply rotation interval",
+          "action": {
+            "command": "set_rotation_minutes",
+            "arguments": {
+              "minutes": "$form.minutes"
+            }
+          }
+        },
+        {
+          "id": "qa-sync",
+          "kind": "button",
+          "title": "Synchronize TorrioDB",
+          "action": {
+            "command": "sync_now"
+          }
+        },
+        {
+          "id": "qa-web",
+          "kind": "web",
+          "height": 150,
+          "html": "<div style='padding:12px;border-radius:12px;background:#19172b'><b>Live channel availability</b><svg viewBox='0 0 300 42' width='100%' height='55' role='img' aria-label='Eligible channel ratio'><rect x='0' y='6' width='300' height='18' rx='9' fill='#3a344c'/><rect id='bar' x='0' y='6' width='0' height='18' rx='9' fill='#a373ff'/></svg><span id='count'>Waiting for state</span></div><script>window.addEventListener('jealousfin-state',function(e){const s=e.detail;const total=Number(s.channels)||0;const eligible=Number(s.eligible)||0;document.getElementById('bar').setAttribute('width',Math.max(0,Math.min(300,total?300*eligible/total:0)));document.getElementById('count').textContent=eligible+' eligible / '+total+' channels';});</script>"
+        }
+      ]
+    }
+  ]
+}

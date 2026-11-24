@@ -124,3 +124,35 @@ check((try? moduleDecision.checked()) != nil,"dynamic decision valid")
 var badDecision=moduleDecision;badDecision.nextSeconds=0
 check((try? badDecision.checked())==nil,"reject tight loop")
 print("PASS: \(checks) total assertions including campaign and runtime policy")
+
+
+let layoutData=try Data(contentsOf:URL(fileURLWithPath:"Examples/dynamic-ui.json"))
+let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:layoutData)
+check((try? layout.checked()) != nil,"sample runtime UI layout valid")
+check(layout.node("qa-btn")?.action?.command=="get_telemetry","nested command discovery")
+check(layout.node("qa-web")?.kind=="web","custom component discovery")
+check(layout.formDefaults()["minutes"]=="5","form default")
+check(layout.retainedValues(["minutes":"10","removed":"old"])==["minutes":"10"],"valid existing field retained across revision")
+check(layout.retainedValues(["minutes":"99"])==["minutes":"5"],"invalid old option restored to default")
+let bindingValues=["minutes":"10"]
+let bindingState:[String:Any]=["surfing":true,"systemMetrics":["networkState":"satisfied"],"eligible":12]
+let bound=try DynamicUIBinding.arguments(["minutes":"$form.minutes","network":"$state.systemMetrics.networkState","literal":"unchanged"],values:bindingValues,state:bindingState)
+check(bound==["minutes":"10","network":"satisfied","literal":"unchanged"],"UI action parameter binding")
+check(DynamicUIBinding.truth(DynamicUIBinding.resolve("state.surfing",values:[:],state:bindingState)),"boolean visibility")
+check(DynamicUIBinding.resolve("state.eligible",values:[:],state:bindingState)=="12","live numeric binding")
+check((try? DynamicUIBinding.arguments(["minutes":"$form.missing"],values:[:],state:[:]))==nil,"missing binding rejected")
+var badLayout=layout;badLayout.schemaVersion=2
+check((try? badLayout.checked())==nil,"unknown UI schema rejected")
+badLayout=layout;badLayout.slots.append(layout.slots[0])
+check((try? badLayout.checked())==nil,"duplicate slot rejected")
+badLayout=layout;badLayout.pages[0].nodes.append(badLayout.pages[0].nodes[0])
+check((try? badLayout.checked())==nil,"duplicate node ID rejected")
+badLayout=layout;badLayout.slots[0].nodes[0].children?[0].action?.command="approve_reinstatement"
+check((try? badLayout.checked())==nil,"UI cannot bypass explicit reinstatement")
+badLayout=layout;badLayout.pages[0].nodes[4].height=1e9
+check((try? badLayout.checked())==nil,"invalid web size rejected")
+let store=DynamicUIStore(active:layout,previous:nil,values:["minutes":"10"])
+let storedBytes=try JSONCodec.encoder().encode(store)
+let decodedStore=try JSONCodec.decoder().decode(DynamicUIStore.self,from:storedBytes)
+check(decodedStore.active==layout && decodedStore.values["minutes"]=="10","UI persists across restart")
+print("PASS: \(checks) total assertions including dynamic UI layouts and bindings")

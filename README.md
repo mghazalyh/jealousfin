@@ -78,3 +78,23 @@ The tick hook receives current application state, recent events, previous action
 The GitHub workflow fetches QuickJS-NG v0.10.1 at commit `3c9afc9943323ee9c7dbd123c0cd991448f4b6c2`, compiles it into the native host, and runs an interrupt-and-recovery smoke test before the IPA build. Each evaluation uses a fresh interpreter with a 32 MiB allocation limit, bounded stack, and a five-second interrupt deadline. No JIT, standard-library OS modules or arbitrary native symbol invocation is required. Module and command interfaces are unchanged. See https://github.com/quickjs-ng/quickjs and the included upstream license.
 
 Repository-hosted patches: commit `jealousfin/engineering/modules/<revision>.js` into private TorrioDB, then submit `install_runtime_module_from_db` with the `id` and exact Git blob `sha`. Modules can be up to 192 KiB. The module state includes a durable command journal so interrupted actions reuse the existing command receipt rather than being silently executed twice. The engineering screen displays active revision and campaign evidence and provides pause, resume and stop controls.
+
+
+## Runtime-driven UI (ABI 1)
+
+Jealousfin supports durable UI layout revisions independently of runtime policy modules. A layout can add native SwiftUI controls to extension slots on every built-in screen and create custom pages reachable through More or a runtime link. Existing core navigation, guide, playback and settings remain available. Use Examples/dynamic-ui.json as a working example.
+
+Native primitives: text, metric, button, input, toggle, picker, slider, progress, card, vstack, hstack, divider, link, spacer. The web primitive accepts a local HTML/CSS/JS/SVG fragment and a fixed height in points for bespoke visualizations. Its WebKit view receives a sanitized application state snapshot via the jealousfin-state event and can invoke registered application commands through window.jealousfin.command(name, stringArguments, requestID), receiving jealousfin-receipt events. It does not load remote navigation or expose native symbols. Use native forms for persistent input fields; the HTML component maintains its own ephemeral DOM state.
+
+Remote operations through the normal command mailbox:
+- ui_get_capabilities: enumerate slots, components and supported commands.
+- install_ui_layout: layout = JSON manifest string, for smaller changes.
+- install_ui_layout_from_db: id + sha of jealousfin/engineering/ui/<id>.json in TorrioDB. Maximum manifest size 192 KiB.
+- get_ui_layout, rollback_ui_layout, reset_ui_layout.
+- ui_set_value: key and value, for an existing form field.
+- ui_open_page: id; ui_close_page.
+- ui_trigger: id of a native command-backed button. This invokes its action, not a simulated touch; genuine touches have origin=touch in logs.
+
+Bindings: valueKey, visibleWhen and enabledWhen reference state.<path> or form.<field>. Arguments beginning with $state. or $form. are resolved when invoked. A script action may use api.state.form for current native UI inputs. Native inputs persist across launches and compatible revisions. Layouts are validated before activation; a rejected revision does not replace the previous one. More > Restore native interface removes all runtime extensions. Runtime UI fields are for ordinary non-secret application data, not credentials.
+
+UI revision and page IDs appear in the device heartbeat; rendered slots, command origin, activation and action results are logged. No new IPA is required for changes supported by this UI ABI. New native controls or changes to the compiled base screens still require a host build.
