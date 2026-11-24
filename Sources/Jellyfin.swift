@@ -18,7 +18,8 @@ struct StreamSession {
     private var adapterSpec:JellyfinAdapterSpec{adapter?.spec ?? JellyfinAdapterSpec()}
     let deviceID: String
     var log: ((String, String, [String: String]) -> Void)?
-    init(deviceID: String) { self.deviceID = deviceID }
+    private let transport:URLSession
+    init(deviceID: String,transport:URLSession = .shared) { self.deviceID = deviceID;self.transport=transport }
     var connected: Bool { !token.isEmpty && !userID.isEmpty }
     private var auth: String {
         "MediaBrowser Client=\"Jealousfin\", Device=\"iOS\", DeviceId=\"\(deviceID)\", Version=\"0.1\"" + (token.isEmpty ? "" : ", Token=\"\(token)\"")
@@ -48,8 +49,8 @@ struct StreamSession {
             r.setValue("application/json",forHTTPHeaderField:"Accept")
             r.setValue(requestID,forHTTPHeaderField:"X-Jealousfin-Request-ID")
             if let payload=plan.body{r.httpBody=try JSONSerialization.data(withJSONObject:payload);r.setValue("application/json",forHTTPHeaderField:"Content-Type")}
-            let (data, response) = try await URLSession.shared.data(for: r)
-            guard let http = response as? HTTPURLResponse else { throw AppError.message("Invalid HTTP response") }
+            let (data, httpResponse) = try await transport.data(for: r)
+            guard let http = httpResponse as? HTTPURLResponse else { throw AppError.message("Invalid HTTP response") }
             log?(http.statusCode < 400 ? "INFO" : "ERROR","HTTP_RESULT",["operation":operation,"endpoint":plan.path,"method":plan.method,"adapter":revision,"requestID":requestID,"status":String(http.statusCode),"bytes":String(data.count),"ms":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
             guard (200..<300).contains(http.statusCode) else { throw AppError.message("Jellyfin HTTP \(http.statusCode)") }
             phase="response_decode"

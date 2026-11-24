@@ -39,7 +39,7 @@ jobs:
           for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
             clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
           done
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
       - name: Generate project and build
         run: |

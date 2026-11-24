@@ -1,0 +1,113 @@
+import Foundation
+
+// Runs the actual native transport against an isolated URLProtocol fixture.
+// No production Jellyfin, credentials or private device data are involved.
+final class JellyfinFixture:URLProtocol {
+    override class func canInit(with request:URLRequest)->Bool{true}
+    override class func canonicalRequest(for request:URLRequest)->URLRequest{request}
+    override func startLoading(){
+        guard let url=request.url else{return}
+        var status=200
+        var object:[String:Any]=[:]
+        switch url.path {
+        case "/fixture/auth":
+            if request.httpMethod=="POST" && request.value(forHTTPHeaderField:"X-Emby-Authorization") != nil {
+                object=["Session":["Token":"fixture-token","UserID":"fixture-user"]]
+            }else{status=401}
+        case "/fixture/catalogue":
+            if request.value(forHTTPHeaderField:"X-Emby-Authorization")?.contains("fixture-token")==true &&
+                URLComponents(url:url,resolvingAgainstBaseURL:false)?.queryItems?.contains(where:{$0.name=="Limit" && $0.value=="200"})==true{
+                object=["Channels":[["Key":"channel-a","Title":"Fixture channel"]]]
+            }else{status=403}
+        case "/System/Info/Public":object=["ServerName":"Fixture"]
+        case "/Items/channel-a/PlaybackInfo":
+            object=["PlaySessionId":"fixture-play","MediaSources":[["Id":"fixture-source","LiveStreamId":"fixture-live","TranscodingUrl":"/original.m3u8?api_key=old"]]]
+        case "/Sessions/Playing","/Sessions/Playing/Progress","/Sessions/Playing/Stopped","/LiveStreams/Close":status=204
+        default:status=404
+        }
+        let data=(try? JSONSerialization.data(withJSONObject:object)) ?? Data()
+        let response=HTTPURLResponse(url:url,statusCode:status,httpVersion:"HTTP/1.1",headerFields:["Content-Type":"application/json"])!
+        client?.urlProtocol(self,didReceive:response,cacheStoragePolicy:.notAllowed)
+        if status != 204{client?.urlProtocol(self,didLoad:data)}
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading(){}
+}
+
+@MainActor enum HotPatchIntegration{
+    static func require(_ value:Bool,_ message:String)throws{
+        guard value else{throw AppError.message("Integration failed: "+message)}
+        print("PASS: hot patch "+message)
+    }
+    static func run(engine:ScriptEngine) async throws{
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent("jealousfin-tests-"+UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:root)}
+        let disk=Disk(root:root)
+        let settings=Settings()
+        let first="var hooks={configure:function(p){p.retries=3;return p;},select:function(p){return p.candidates[0].id;},tick:function(p){return {state:{count:String(Number(p.state.count||0)+1)},actions:[{action:'get_status'}],nextSeconds:10};}};"
+        let second="var hooks={configure:function(p){p.retries=4;return p;}};"
+        let runtime=EngineeringRuntime(disk:disk,engine:engine)
+        let p1=try await runtime.install(id:"one",source:first,settings:settings)
+        try require(p1.retries==3 && runtime.activeID=="one","actual runtime installation")
+        let channel=Channel(id:"channel-a",name:"Fixture",number:nil,logo:false,favorite:false,program:nil,genres:[])
+        let selected=try await runtime.select(candidates:[channel],currentID:nil)
+        try require(selected=="channel-a","channel selection hook")
+        let decision=try await runtime.decision(snapshot:[:],state:["count":"2"],events:[],receipts:[])
+        try require(decision?.state?["count"]=="3" && decision?.actions?.first?.action=="get_status","event decision hook")
+        let p2=try await runtime.install(id:"two",source:second,settings:settings)
+        try require(p2.retries==4 && runtime.store.previous?.id=="one","live module replacement")
+        var rejected=false
+        do{_ = try await runtime.install(id:"bad",source:"var hooks={configure:function(p){p.retries=999;return p;}};",settings:settings)}
+        catch{rejected=true}
+        try require(rejected && runtime.activeID=="two" && runtime.store.previous?.id=="one","rejected patch preserves rollback target")
+        let reloaded=EngineeringRuntime(disk:Disk(root:root),engine:engine)
+        let boot=try await reloaded.boot(settings:settings)
+        try require(boot.retries==4 && reloaded.activeID=="two","reload from durable storage")
+        let rolled=try await reloaded.rollback(settings:settings)
+        try require(rolled.retries==3 && reloaded.activeID=="one","actual runtime rollback")
+        let interrupted=RuntimePatchStore(active:RuntimePatch(id:"interrupted",source:second),previous:RuntimePatch(id:"one",source:first),activationPending:true)
+        try require(disk.save(interrupted,"runtime-patch.json"),"write interruption fixture")
+        let recovered=EngineeringRuntime(disk:Disk(root:root),engine:engine)
+        let recovery=try await recovered.boot(settings:settings)
+        try require(recovery.retries==3 && recovered.activeID=="one","interrupted activation recovers previous module")
+        let reset=try recovered.reset(settings:settings)
+        try require(reset.retries==settings.retries && recovered.activeID=="native-baseline","reset actual module")
+
+        let source="""
+        var hooks={
+            configure:function(p){p.authorizationHeader="both";p.tokenPath="Session.Token";p.userIDPath="Session.UserID";return p;},
+            request:function(p){if(p.operation==="authenticate"){p.path="fixture/auth";}if(p.operation==="channels"){p.path="fixture/catalogue";p.query.Limit="200";}return p;},
+            response:function(p){if(p.operation==="channels"){return {Items:p.response.Channels.map(function(c){return {Id:c.Key,Name:c.Title};})};}return p.response;},
+            stream:function(p){p.path="/patched.m3u8";p.method="Transcode";return p;}
+        };
+        """
+        let adapter=try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:"api-test",source:source),engine:engine)
+        let config=URLSessionConfiguration.ephemeral
+        config.protocolClasses=[JellyfinFixture.self]
+        let client=Jellyfin(deviceID:"fixture",transport:URLSession(configuration:config))
+        client.adapter=adapter
+        var fixtureSettings=Settings();fixtureSettings.server="http://fixture.invalid:8096";fixtureSettings.username="fixture";fixtureSettings.password="test-only"
+        try await client.connect(fixtureSettings)
+        try require(client.connected && client.userID=="fixture-user","patched authentication through HTTP transport")
+        let catalogue=try await client.channels()
+        try require(catalogue.count==1 && catalogue[0].id=="channel-a","patched request and response through HTTP transport")
+        let stream=try await client.stream(catalogue[0],mbps:5)
+        try require(stream.url.path=="/patched.m3u8" && stream.method=="Transcode" && URLComponents(url:stream.url,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name=="api_key"})?.value=="fixture-token","patched playback URL and native credential injection")
+        await client.close(stream,position:0)
+        try require(client.inFlight==0,"session cleanup drains transport")
+        let healthy=await client.healthy()
+        try require(healthy,"patched server health probe")
+        let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data(contentsOf:URL(fileURLWithPath:"Examples/dynamic-ui.json"))).checked()
+        let baseline=ReleaseBaseline(revision:"release-one",sources:PatchSourceSet(runtime:PatchSource(id:"one",source:first),jellyfinAPI:PatchSource(id:"api-test",source:source),ui:layout))
+        let installDisk=Disk(root:root.appendingPathComponent("fresh"))
+        try BaselineInstaller.install(baseline,disk:installDisk)
+        try require(installDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="one" && installDisk.load(JellyfinAdapterStore.self,"jellyfin-api.json")?.active?.id=="api-test" && installDisk.load(DynamicUIStore.self,"dynamic-ui.json")?.active?.revision==layout.revision,"real clean-install baseline migration")
+        let newer=ReleaseBaseline(revision:"release-two",sources:PatchSourceSet(runtime:PatchSource(id:"two",source:second),ui:layout))
+        try BaselineInstaller.install(newer,disk:installDisk)
+        try require(installDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="two" && installDisk.load(JellyfinAdapterStore.self,"jellyfin-api.json")?.active==nil,"real upgrade applies new module and removes retired API")
+        let override=RuntimePatchStore(active:RuntimePatch(id:"local",source:first))
+        try require(installDisk.save(override,"runtime-patch.json"),"write local override fixture")
+        try BaselineInstaller.install(ReleaseBaseline(revision:"release-three",sources:PatchSourceSet()),disk:installDisk)
+        try require(installDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="local","real upgrade preserves independent local override")
+    }
+}

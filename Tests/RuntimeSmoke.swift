@@ -47,6 +47,7 @@ import Foundation
             let config=try JSONCodec.decoder().decode(RuntimePolicy?.self,from:Data(output.utf8))
             _ = try (config ?? RuntimePolicy.baseline(Settings())).checked()
         }
+        try await HotPatchIntegration.run(engine:engine)
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }

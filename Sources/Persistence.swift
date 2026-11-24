@@ -3,8 +3,8 @@ import Foundation
 @MainActor final class Disk {
     let root: URL
     private(set) var error: String?
-    init() {
-        root = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
+    init(root override:URL? = nil) {
+        root = override ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
         do { try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true) } catch { self.error="Cannot create app storage" }
     }
     func load<T: Decodable>(_ type:T.Type,_ name:String) -> T? {
