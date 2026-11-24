@@ -36,6 +36,7 @@ import Foundation
         let input:[String:Any]=["operation":operation,"path":path,"method":method,"query":query,"body":login ? NSNull() as Any : (body.map{$0 as Any} ?? NSNull())]
         let output=try await Self.evaluate(revision,engine:engine,hook:"request",input:input) ?? input
         var result=try JellyfinAdapterRules.request(output,authenticate:login)
+        if ["health","channels","programs","recordings"].contains(operation),result.method != "GET"{throw AppError.message("Read-only API operation must remain GET")}
         if login {
             var payload=result.body ?? [:]
             payload[spec.usernameKey]=body?["Username"] as? String ?? ""

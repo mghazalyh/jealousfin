@@ -273,6 +273,14 @@ struct SettingsView:View{
         Screen{
             DynamicUISlotView(location:"settings.top")
             SectionLabel(title:"Jellyfin")
+            Panel{VStack(alignment:.leading,spacing:8){
+                Text("API adapter").font(.headline)
+                Text(model.jellyfinAPIRevision).font(.caption.monospaced()).textSelection(.enabled)
+                if let fault=model.jellyfinAPIFault{Text(fault).font(.caption).foregroundColor(.orange)}
+                Button("Restore native Jellyfin API"){
+                    Task{_ = await model.execute(Command(id:UUID().uuidString,action:"reset_jellyfin_api",arguments:nil,expiresAt:nil))}
+                }.buttonStyle(.bordered)
+            }}
             Panel{VStack(alignment:.leading,spacing:12){
                 TextField("Server URL",text:$model.settings.server).keyboardType(.URL).autocapitalization(.none).disableAutocorrection(true)
                 Divider()

@@ -200,3 +200,27 @@ check(decisionJournalFixture.pendingUpload.isEmpty,"latest decision uploaded")
 let decisionRestoredFixture=try JSONCodec.decoder().decode(DecisionJournal.self,from:JSONCodec.encoder().encode(decisionJournalFixture))
 check(decisionRestoredFixture.records.first?.receipt?.id==decisionRecordFixture.commandID,"decision and receipt persist across restart")
 print("PASS: \(checks) total assertions including interactive decisions")
+
+
+let apiDefaults=JellyfinAdapterSpec()
+check((try? apiDefaults.checked()) != nil,"native API adapter defaults valid")
+var apiBad=apiDefaults;apiBad.logoPath="../{id}"
+check((try? apiBad.checked())==nil,"invalid image route")
+check(JellyfinAdapterRules.operation("Items/fixture/PlaybackInfo")=="playback_info","playback operation classification")
+check(JellyfinAdapterRules.operation("Sessions/Playing/Progress")=="session_progress","session operation classification")
+check(JellyfinAdapterRules.string(at:"User.Id",in:["User":["Id":"fixture"]])=="fixture","nested auth response field")
+check(!JellyfinAdapterRules.validPath("https://example.invalid"),"absolute patched request disallowed")
+check(!JellyfinAdapterRules.validPath("Items/../secret"),"parent path disallowed")
+check(!JellyfinAdapterRules.validPath("Items/%2e%2e"),"encoded traversal disallowed")
+let apiOrigin=URL(string:"http://example.invalid:8096")!
+check(JellyfinAdapterRules.sameOrigin(URL(string:"http://example.invalid:8096/live.m3u8")!,apiOrigin),"same origin stream")
+check(!JellyfinAdapterRules.sameOrigin(URL(string:"http://example.invalid:8103/live.m3u8")!,apiOrigin),"different port not same origin")
+check(!JellyfinAdapterRules.sameOrigin(URL(string:"http://elsewhere.invalid:8096/live.m3u8")!,apiOrigin),"different host not same origin")
+let apiPlan:[String:Any]=["path":"LiveTv/Channels","method":"GET","query":["Limit":"50"],"body":NSNull()]
+let apiParsed=try JellyfinAdapterRules.request(apiPlan,authenticate:false)
+check(apiParsed.path=="LiveTv/Channels" && apiParsed.query["Limit"]=="50","patched request plan")
+check((try? JellyfinAdapterRules.request(apiPlan,authenticate:true))==nil,"authentication must remain POST")
+var apiDecision=decisionFixture;apiDecision.expectedJellyfinAPIRevision="rev-a"
+check(!apiDecision.contextMatches(channelID:"channel-a",patchID:"baseline",apiRevision:"rev-b"),"API repair context must match")
+check(apiDecision.contextMatches(channelID:"channel-a",patchID:"baseline",apiRevision:"rev-a"),"API repair context matches")
+print("PASS: \(checks) total assertions including Jellyfin adapter rules")

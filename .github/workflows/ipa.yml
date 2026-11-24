@@ -23,7 +23,7 @@ jobs:
       - name: Test channel policy
         run: |
           mkdir -p build
-          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Tests/main.swift -o build/policy-tests
+          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Sources/JellyfinAdapterDomain.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
       - name: Test interruptible runtime
@@ -32,7 +32,7 @@ jobs:
           for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
             clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
           done
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
       - name: Generate project and build
         run: |

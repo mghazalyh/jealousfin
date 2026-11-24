@@ -16,6 +16,24 @@ import Foundation
         do{_ = try await engine.evaluateAsync("throw new Error('fixture')",snapshot:[:])}
         catch{exception=true}
         precondition(exception)
-        print("PASS: runtime bridge, infinite-loop interrupt, subsequent evaluation and error recovery")
+        let adapterSource="""
+        var hooks = {
+          configure: function(p) { p.timeoutSeconds=35; p.authorizationHeader="both"; return p; },
+          request: function(p) { if(p.operation==="channels"){p.query.Limit="200";} return p; },
+          response: function(p) { if(p.operation==="channels"){return {Items:p.response.Channels};} return p.response; },
+          stream: function(p) {p.method="Transcode";return p;}
+        };
+        """
+        let adapter=try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:"fixture-api",source:adapterSource),engine:engine)
+        precondition(adapter.spec.timeoutSeconds==35)
+        let request=try await adapter.request(operation:"channels",path:"LiveTv/Channels",method:"GET",query:[:],body:nil)
+        precondition(request.query["Limit"]=="200")
+        let login=try await adapter.request(operation:"authenticate",path:"Users/AuthenticateByName",method:"POST",query:[:],body:["Username":"fixture-user","Pw":"fixture-password"])
+        precondition(login.body?["Pw"] as? String=="fixture-password")
+        let response=try await adapter.response(operation:"channels",response:["Channels":[["Id":"fixture"]]])
+        precondition((response["Items"] as? [[String:String]])?.first?["Id"]=="fixture")
+        let stream=try await adapter.stream(path:"/live.m3u8",method:"DirectStream",itemID:"fixture")
+        precondition(stream.1=="Transcode")
+        print("PASS: runtime bridge, interrupt recovery, and Jellyfin adapter hooks")
     }
 }

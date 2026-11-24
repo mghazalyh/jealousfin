@@ -845,10 +845,10 @@ import Network
             return "Jellyfin API revision active: "+jellyfinAPIRevision
         case "rollback_jellyfin_api":
             guard jellyfinAPIStore.active != nil else{throw AppError.message("Already using native API")}
-            try await activateJellyfinAPI(jellyfinAPIStore.previous)
+            try await activateJellyfinAPI(jellyfinAPIStore.previous,recovery:true)
             return "Jellyfin API rolled back: "+jellyfinAPIRevision
         case "reset_jellyfin_api":
-            try await activateJellyfinAPI(nil)
+            try await activateJellyfinAPI(nil,recovery:true)
             return "Native Jellyfin API restored"
         case "probe_jellyfin_api":
             return try json(try await probeJellyfinAPI(args["operation"] ?? "health"))
@@ -1057,7 +1057,7 @@ extension AppModel {
         requestSync()
     }
     private func resumeCampaignIfNeeded(){
-        guard policyReady,!patchBusy,campaignTask==nil,let cp=campaign,cp.canResume else{return}
+        guard policyReady,!patchBusy,!apiChanging,campaignTask==nil,let cp=campaign,cp.canResume else{return}
         // Re-enter the current checkpoint after a process restart. Never infer that
         // an interrupted step succeeded.
         campaignEpoch=UUID();let epoch=campaignEpoch
@@ -1624,7 +1624,7 @@ extension AppModel {
         log(jellyfinAPIFault==nil ? "INFO":"WARN","jellyfin-api","RESTORED",["revision":jellyfinAPIRevision,"fault":jellyfinAPIFault ?? ""])
         recalculateInsights()
     }
-    private func activateJellyfinAPI(_ candidate:JellyfinAdapterRevision?)async throws{
+    private func activateJellyfinAPI(_ candidate:JellyfinAdapterRevision?,recovery:Bool=false)async throws{
         guard apiReady,!apiChanging,!loginBusy,!catalogueBusy,favoriteInFlight.isEmpty,!patchBusy else{throw AppError.message("Jellyfin adapter busy; retry after current operation")}
         guard candidate?.id != jellyfinAPIStore.active?.id || candidate==nil else{throw AppError.message("Use a new API revision ID")}
         apiChanging=true
@@ -1633,20 +1633,25 @@ extension AppModel {
         let resumeLoop=surfing || settings.resumeSurf
         let category=settings.surfCategory
         let channelID=current?.id
+        let savedSettings=settings
+        var validatedCandidate:JellyfinAPIAdapter?
+        var locallyValidated=false
         do {
             // A candidate must pass interpreter fixtures and real read-only
             // catalogue/health probes before replacing the active adapter.
             let loaded:JellyfinAPIAdapter?
             if let candidate=candidate{loaded=try await JellyfinAPIAdapter.load(candidate,engine:scripts)}
             else{loaded=nil}
+            validatedCandidate=loaded;locallyValidated=true
             let staged=Jellyfin(deviceID:deviceID)
             staged.adapter=loaded
             staged.log={ [weak self] severity,code,fields in self?.log(severity,"jellyfin-api-stage",code,fields)}
-            try await staged.connect(settings)
+            try await staged.connect(savedSettings)
             guard await staged.healthy() else{throw AppError.message("Candidate health probe failed")}
             let catalogue=try await staged.channels()
             guard !catalogue.isEmpty else{throw AppError.message("Candidate returned an empty live catalogue")}
             let epg=try? await staged.programs()
+            guard settings.server==savedSettings.server,settings.username==savedSettings.username,settings.password==savedSettings.password else{throw AppError.message("Connection settings changed during activation")}
             try suspendCampaignForPatch()
             let oldWork=work
             stop()
@@ -1669,6 +1674,26 @@ extension AppModel {
             }
             recalculateInsights()
         }catch{
+            if recovery && locallyValidated{
+                try suspendCampaignForPatch()
+                let oldWork=work
+                stop()
+                await oldWork?.value
+                await cleanupTask?.value
+                let deadline=ProcessInfo.processInfo.systemUptime+30
+                while jelly.inFlight>0 && ProcessInfo.processInfo.systemUptime<deadline{await nap(0.2)}
+                guard jelly.inFlight==0 else{throw AppError.message("Cannot restore adapter while old operations are in flight")}
+                try persistJellyfinAPI(JellyfinAdapterStore(active:candidate,previous:previous.active,pending:false))
+                jelly.adapter=validatedCandidate;jelly.token="";jelly.userID=""
+                jellyfinAPIRevision=jelly.adapterID
+                catalogueReady=false;status="Connection failed"
+                jellyfinAPIFault="Recovery adapter restored locally; live probe unavailable"
+                settings.resumeSurf=resumeLoop;settings.surfCategory=category
+                disk.save(settings,"settings.json")
+                log("WARN","jellyfin-api","RECOVERED_OFFLINE",["revision":jellyfinAPIRevision])
+                recalculateInsights()
+                return
+            }
             jellyfinAPIFault="Candidate API revision rejected; previous adapter retained"
             log("ERROR","jellyfin-api","ACTIVATION_REJECTED",["candidate":candidate?.id ?? "native-baseline","errorType":String(describing:type(of:error))])
             apiChanging=false
