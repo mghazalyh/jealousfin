@@ -123,11 +123,11 @@ struct PlaybackView:View{
                 if model.fullscreenPresented {
                     Color.black.aspectRatio(16/9,contentMode:.fit)
                 }else{
-                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:false,gravity:model.dynamicUI.active?.presentation?.videoGravity ?? "fit")
+                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:false,gravity:model.presentationConfiguration.videoGravity ?? "fit")
                         .aspectRatio(16/9,contentMode:.fit)
                 }
                 Button{
-                    model.fullscreenControlsVisible=model.dynamicUI.active?.presentation?.fullscreenInitiallyVisible ?? true
+                    model.fullscreenControlsVisible=model.presentationConfiguration.fullscreenInitiallyVisible ?? true
                     model.fullscreenPresented=true
                 }label:{
                     Image(systemName:"arrow.up.left.and.arrow.down.right")

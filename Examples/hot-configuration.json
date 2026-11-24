@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "revision": "conservative-configuration-example",
+  "operations": {
+    "systemSampleSeconds": 15,
+    "playbackSampleSeconds": 15,
+    "heartbeatSeconds": 30,
+    "syncSeconds": 30,
+    "catalogueRefreshSeconds": 180,
+    "reconnectSeconds": 60,
+    "eventRetentionCount": 5000,
+    "eventRetentionMiB": 32,
+    "resourceWarningMiB": 512,
+    "suspendAutomationOnPressure": true
+  },
+  "interpreter": {
+    "timeoutMs": 5000,
+    "memoryMiB": 32,
+    "maxCommands": 100
+  },
+  "presentation": {
+    "videoGravity": "fit",
+    "fullscreenOpacity": 0.82,
+    "fullscreenMaxHeight": 0.48,
+    "fullscreenInitiallyVisible": true
+  },
+  "playbackRules": [
+    {
+      "channelID": "40abc828a6be4477ef90560e66f4b69e",
+      "attempt": 2,
+      "policy": {
+        "segmentContainer": "mp4",
+        "forceEncode": true,
+        "segmentSeconds": 3,
+        "minimumSegments": 2,
+        "videoBitrate": 2000000,
+        "audioBitrate": 128000,
+        "maxWidth": 854,
+        "maxHeight": 480,
+        "diagnosticSeconds": 8
+      }
+    }
+  ]
+}

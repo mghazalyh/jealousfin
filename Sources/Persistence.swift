@@ -21,6 +21,33 @@ import Foundation
         let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)) ?? []
         return files.filter{$0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension=="json"}.sorted{$0.lastPathComponent<$1.lastPathComponent}
     }
+    // Only diagnostic events are pruned. Receipts, health, patches and queued
+    // batches are deliberately excluded. Order by creation time, not UUID.
+    func trimDiagnosticEvents(maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int){
+        let candidates=files(prefix:"event-").compactMap{url->(URL,Int,Date)? in
+            guard let v=try? url.resourceValues(forKeys:[.fileSizeKey,.creationDateKey]),let bytes=v.fileSize else{return nil}
+            return (url,bytes,v.creationDate ?? .distantPast)
+        }.sorted{$0.2<$1.2}
+        var count=candidates.count,total=candidates.reduce(0){$0+$1.1},removed=0,bytes=0
+        for entry in candidates {
+            guard count>maxCount || total>maxBytes else{break}
+            do{try FileManager.default.removeItem(at:entry.0);count-=1;total-=entry.1;removed+=1;bytes+=entry.1}
+            catch{self.error="Diagnostic retention cleanup failed"}
+        }
+        return(removed,bytes)
+    }
+    func saveConfiguration(_ candidate:HotConfigurationStore)throws{
+        _ = try candidate.checked()
+        if let config=candidate.active {
+            let file="hot-config-version-"+config.revision+".json"
+            if FileManager.default.fileExists(atPath:root.appendingPathComponent(file).path){
+                guard load(HotConfiguration.self,file)==config else{throw AppError.message("Immutable configuration revision collision")}
+            }else{
+                guard save(config,file) else{throw AppError.message("Cannot archive configuration")}
+            }
+        }
+        guard save(candidate,"hot-config.json") else{throw AppError.message("Cannot activate configuration")}
+    }
     func remove(_ url:URL) { do { try FileManager.default.removeItem(at:url) } catch { self.error="Cannot remove uploaded batch" } }
 }
 struct GitFile {

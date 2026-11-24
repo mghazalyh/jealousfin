@@ -17,7 +17,9 @@ private final class RuntimeWorker: @unchecked Sendable {
     private let lock=NSLock()
     private var waiting=0
 
-    func run(_ source:String,snapshot:[String:Any]) async throws -> (String,[Command]){
+    func run(_ source:String,snapshot:[String:Any],budget:InterpreterBudget) async throws -> (String,[Command]){
+        let budget=try budget.checked()
+        let maxCommands=budget.maxCommands ?? 100
         guard source.utf8.count<=256*1024 else{throw AppError.message("Script exceeds size limit")}
         let data=try JSONSerialization.data(withJSONObject:snapshot,options:[.sortedKeys])
         guard data.count<=1048576 else{throw AppError.message("Snapshot exceeds interpreter limit")}
@@ -32,7 +34,7 @@ private final class RuntimeWorker: @unchecked Sendable {
             globalThis.api = {
                 state: snapshot,
                 command: function(name,args) {
-                    if (commands.length >= 100) throw new Error("Command limit");
+                    if (commands.length >= \(maxCommands)) throw new Error("Command limit");
                     const values = args || {};
                     if (Object.keys(values).some(k => typeof values[k] !== "string")) {
                         throw new Error("Command argument values must be strings");
@@ -58,7 +60,7 @@ private final class RuntimeWorker: @unchecked Sendable {
                 defer{self.lock.lock();self.waiting-=1;self.lock.unlock()}
                 do {
                     var status:Int32=1
-                    guard let ptr=wrapper.withCString({jf_runtime_eval($0,5000,&status)}) else{throw AppError.message("Interpreter allocation failed")}
+                    guard let ptr=wrapper.withCString({jf_runtime_eval_budget($0,Int32(budget.timeoutMs ?? 5000),Int32(budget.memoryMiB ?? 32),&status)}) else{throw AppError.message("Interpreter allocation failed")}
                     defer{jf_runtime_free(ptr)}
                     let raw=String(cString:ptr)
                     guard status==0 else{throw AppError.message(String(raw.prefix(4096)))}
@@ -72,6 +74,14 @@ private final class RuntimeWorker: @unchecked Sendable {
 }
 extension ScriptEngine {
     func evaluateAsync(_ source:String,snapshot:[String:Any]) async throws -> (String,[Command]){
-        try await RuntimeWorker.shared.run(source,snapshot:snapshot)
+        let start=ProcessInfo.processInfo.systemUptime
+        do{
+            let result=try await RuntimeWorker.shared.run(source,snapshot:snapshot,budget:budget)
+            recordEvaluation(start:start,failed:false)
+            return result
+        }catch{
+            recordEvaluation(start:start,failed:true)
+            throw error
+        }
     }
 }

@@ -63,6 +63,34 @@ import Foundation
         let restored=try await runtime.playbackAttempt(channel:fixtureChannel,attempt:2,previousFailure:"timeout",defaults:PlaybackAttemptPolicy())
         precondition(restored.segmentContainer=="mp4")
         print("PASS: ABI 2 per-attempt transport hook, bounded values and rollback")
+        let budgetEngine=ScriptEngine()
+        budgetEngine.budget=InterpreterBudget(timeoutMs:150,memoryMiB:16,maxCommands:2)
+        let budgetStart=ProcessInfo.processInfo.systemUptime
+        var shortTimeout=false
+        do{_ = try await budgetEngine.evaluateAsync("while(true){}",snapshot:[:])}catch{shortTimeout=error.localizedDescription.lowercased().contains("deadline")}
+        precondition(shortTimeout && ProcessInfo.processInfo.systemUptime-budgetStart<2)
+        var cappedCommands=false
+        do{_ = try await budgetEngine.evaluateAsync("for(let i=0;i<3;i++)api.command('get_status',{});",snapshot:[:])}catch{cappedCommands=true}
+        precondition(cappedCommands && budgetEngine.failures==2)
+        let (recovered,_)=try await budgetEngine.evaluateAsync("40+2",snapshot:[:])
+        precondition(recovered=="42" && budgetEngine.evaluations==3)
+        var footprint:UInt64=0,cpu:UInt64=0
+        let flags=jf_process_resources(&footprint,&cpu)
+        precondition(flags & 1 != 0 && flags & 2 != 0 && footprint>0 && cpu>0)
+        let hotConfigFixture=try HotConfiguration.decode(Data(contentsOf:URL(fileURLWithPath:"Examples/hot-configuration.json")))
+        let configDisk=Disk(root:fixtureRoot.appendingPathComponent("config"))
+        let stored=try HotConfigurationStore().activating(hotConfigFixture,expected:"native-baseline")
+        try configDisk.saveConfiguration(stored)
+        precondition(configDisk.load(HotConfigurationStore.self,"hot-config.json")==stored)
+        var collision=hotConfigFixture;collision.operations?.systemSampleSeconds=30
+        var collisionRejected=false
+        do{try configDisk.saveConfiguration(HotConfigurationStore(active:collision,previous:nil))}catch{collisionRejected=true}
+        precondition(collisionRejected && configDisk.load(HotConfigurationStore.self,"hot-config.json")==stored)
+        for index in 0..<5{precondition(configDisk.save(["event":index],"event-\(index).json"))}
+        precondition(configDisk.save(["receipt":1],"receipt-fixture.json"))
+        let trimmed=configDisk.trimDiagnosticEvents(maxCount:2,maxBytes:1024*1024)
+        precondition(trimmed.removed==3 && configDisk.files(prefix:"event-").count==2 && configDisk.files(prefix:"receipt-").count==1)
+        print("PASS: configured interpreter deadline, command cap, recovery, process counters, immutable configuration and isolated log retention")
         try await HotPatchIntegration.run(engine:engine)
         let lanFixture=LANServer(port:.any,advertise:false)
         lanFixture.handler={body,complete in complete("200 OK",body)}

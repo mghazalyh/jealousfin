@@ -69,6 +69,19 @@ import Network
     @Published private(set) var activePatchID="native-baseline"
     @Published private(set) var patchFault:String?
     private var policyOverride:RuntimePolicy?
+    @Published private(set) var hotConfiguration=HotConfigurationStore()
+    @Published private(set) var configurationFault:String?
+    @Published private(set) var automationSuspended=false
+    private var lastResourceCPU:UInt64?
+    private var lastResourceTime:TimeInterval?
+    private var lastRetention=Date.distantPast
+    private var diagnosticEventsPruned=0
+    private var diagnosticBytesPruned=0
+    private var configurationBusy=false
+    private var operational:OperationalConfiguration{hotConfiguration.active?.operations ?? OperationalConfiguration()}
+    var presentationConfiguration:DynamicPresentation{
+        dynamicUI.active?.presentation ?? hotConfiguration.active?.presentation ?? DynamicPresentation()
+    }
     private var policyReady=false
     private var patchBusy=false
     private var moduleTask:Task<Void,Never>?
@@ -81,7 +94,7 @@ import Network
     private var selectionTask:Task<Void,Never>?
     private var selectionID=UUID()
     private var engineeringOwnsPlayback:Bool {campaign?.state=="running"}
-    private var effectivePolicy:RuntimePolicy {policyOverride ?? RuntimePolicy.baseline(settings)}
+    private var effectivePolicy:RuntimePolicy {policyOverride ?? hotConfiguration.active?.runtime ?? RuntimePolicy.baseline(settings)}
     let jelly:Jellyfin
     let deviceID:String
     private var ledger:HealthLedger
@@ -121,6 +134,8 @@ import Network
     private var cleanupTask:Task<Void,Never>?
     private var lastPlayerError:String?
     private var manualHLSProbeBusy=false
+    private var activeAttemptPolicy:PlaybackAttemptPolicy?
+    private var currentAttemptIndex=1
     @Published private(set) var catalogueReady=false
     private var deviceObservers:[NSObjectProtocol]=[]
 
@@ -206,6 +221,12 @@ import Network
     func start() {
         guard !started else {return}; started=true
         telemetryActive=true
+        do{
+            let stored=try readHotConfiguration()
+            try applyHotConfiguration(stored)
+        }catch{
+            configurationFault="Saved configuration invalid; native defaults retained"
+        }
         log("INFO","app","START",["version":Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown","os":UIDevice.current.systemVersion,"launchID":launchID])
         sampleSystemTelemetry(force:true)
         log("INFO","dynamic-ui","LAYOUT_RESTORED",["revision":dynamicUI.active?.revision ?? "native-baseline"])
@@ -327,6 +348,9 @@ import Network
                     guard let self=self else {return}
                     self.log("INFO","lifecycle",name.rawValue)
                     if name==UIApplication.didEnterBackgroundNotification{self.backgroundTransitions+=1}
+                    if name==UIApplication.didReceiveMemoryWarningNotification && self.operational.suspendAutomationOnPressure != false {
+                        self.suspendAutomation(reason:"iOS memory warning")
+                    }
                     if name==UIApplication.willEnterForegroundNotification || name==UIApplication.didEnterBackgroundNotification {
                         self.sampleSystemTelemetry(force:true)
                         self.publishHeartbeat(now:Date())
@@ -340,6 +364,60 @@ import Network
         center.playCommand.addTarget{[weak self] _ in Task{@MainActor in self?.resume()};return .success}
         center.pauseCommand.addTarget{[weak self] _ in Task{@MainActor in self?.pause()};return .success}
         center.nextTrackCommand.addTarget{[weak self] _ in Task{@MainActor in self?.next()};return .success}
+    }
+    private func readHotConfiguration()throws->HotConfigurationStore{
+        let url=disk.root.appendingPathComponent("hot-config.json")
+        guard FileManager.default.fileExists(atPath:url.path) else{return HotConfigurationStore()}
+        guard let stored=disk.load(HotConfigurationStore.self,"hot-config.json") else{throw AppError.message("Saved configuration cannot be decoded")}
+        return try stored.checked()
+    }
+    private func applyHotConfiguration(_ stored:HotConfigurationStore)throws{
+        _ = try stored.checked()
+        let oldInterval=operational.systemSampleSeconds ?? 15
+        hotConfiguration=stored
+        scripts.budget=stored.active?.interpreter ?? InterpreterBudget()
+        if oldInterval != (operational.systemSampleSeconds ?? 15){
+            telemetryCadence=TelemetryCadence(interval:Double(operational.systemSampleSeconds ?? 15))
+        }
+        configurationFault=nil
+        applyPlayerConfiguration()
+        if surfing,!usingSharedSurf,!surfPaused,!intentionallyPaused,validated {
+            nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
+        }
+        log("INFO","configuration","RELOADED",["revision":stored.revision])
+        sampleSystemTelemetry(force:true)
+    }
+    private func installHotConfiguration(_ candidate:HotConfiguration?,expected:String)throws{
+        guard !configurationBusy,!patchBusy,!apiChanging,!versionBusy,!promotionBusy,!versionRecoveryFailed else{throw AppError.message("Configuration or patch engine busy")}
+        let next=try hotConfiguration.activating(candidate,expected:expected)
+        try disk.saveConfiguration(next)
+        try applyHotConfiguration(next)
+    }
+    private func applyPlayerConfiguration(){
+        let policy=effectivePolicy
+        let candidate:PlaybackAttemptPolicy
+        if let c=current,!c.isSurf {
+            candidate=hotConfiguration.active?.attemptPolicy(channelID:c.id,attempt:currentAttemptIndex,defaults:policy.playback ?? PlaybackAttemptPolicy()) ?? policy.playback ?? PlaybackAttemptPolicy()
+        }else{candidate=PlaybackAttemptPolicy()}
+        // A runtime attempt hook owns the active item's settings while it is running.
+        if activePatchID != "native-baseline",let live=activeAttemptPolicy {
+            configurePlayerItem(player.currentItem,policy:policy,candidate:live)
+        }else{
+            configurePlayerItem(player.currentItem,policy:policy,candidate:candidate)
+        }
+    }
+    private func configurePlayerItem(_ item:AVPlayerItem?,policy:RuntimePolicy,candidate:PlaybackAttemptPolicy){
+        player.automaticallyWaitsToMinimizeStalling=candidate.automaticallyWaits ?? policy.automaticallyWaits
+        guard let item=item else{return}
+        item.preferredForwardBufferDuration=Double(candidate.forwardBufferSeconds ?? policy.forwardBufferSeconds)
+        item.preferredPeakBitRate=Double(candidate.peakMbps>0 ? candidate.peakMbps : policy.qualityMbps)*1_000_000
+        item.preferredMaximumResolution=CGSize(width:CGFloat(candidate.preferredMaximumWidth ?? 0),height:CGFloat(candidate.preferredMaximumHeight ?? 0))
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused=candidate.networkWhilePaused ?? false
+    }
+    private func suspendAutomation(reason:String){
+        guard !automationSuspended else{return}
+        automationSuspended=true;moduleTask?.cancel()
+        log("WARN","runtime","AUTOMATION_SUSPENDED",["reason":reason])
     }
     func sanitized(_ value:String,limit:Int=8192)->String {
         var s=value
@@ -543,6 +621,7 @@ import Network
         player.automaticallyWaitsToMinimizeStalling=policy.automaticallyWaits
         for attemptIndex in 1...max(1,policy.retries) {
             guard g==generation,!Task.isCancelled else{return}
+            currentAttemptIndex=attemptIndex
             let previousFailure=attemptIndex>1 ? errorReason : ""
             errorReason="Startup timeout"
             log("INFO","validator","ATTEMPT",["channelID":channel.id,"attempt":String(attemptIndex)])
@@ -553,7 +632,8 @@ import Network
                 if channel.isSurf {candidate=PlaybackAttemptPolicy()}
                 else {
                     do{
-                        let proposed=try await engineering.playbackAttempt(channel:channel,attempt:attemptIndex,previousFailure:sanitized(previousFailure),defaults:policy.playback ?? PlaybackAttemptPolicy())
+                        let defaults=hotConfiguration.active?.attemptPolicy(channelID:channel.id,attempt:attemptIndex,defaults:policy.playback ?? PlaybackAttemptPolicy()) ?? policy.playback ?? PlaybackAttemptPolicy()
+                        let proposed=try await engineering.playbackAttempt(channel:channel,attempt:attemptIndex,previousFailure:sanitized(previousFailure),defaults:defaults)
                         guard (proposed.startupSeconds ?? policy.startupTimeout)>policy.validationSeconds else{throw AppError.message("Startup must exceed validation window")}
                         candidate=proposed
                     }catch{
@@ -577,10 +657,9 @@ import Network
                     }
                 }else{diagnosticTask=nil}
                 defer{diagnosticTask?.cancel()}
-                player.automaticallyWaitsToMinimizeStalling=candidate.automaticallyWaits ?? policy.automaticallyWaits
                 let item=AVPlayerItem(url:s.url)
-                item.preferredForwardBufferDuration=Double(candidate.forwardBufferSeconds ?? policy.forwardBufferSeconds)
-                item.preferredPeakBitRate=Double(candidate.peakMbps>0 ? candidate.peakMbps : policy.qualityMbps)*1_000_000
+                activeAttemptPolicy=candidate
+                configurePlayerItem(item,policy:policy,candidate:candidate)
                 log("INFO","player","PLAYBACK_ATTEMPT_POLICY",["format":candidate.segmentContainer,"forceEncode":String(candidate.forceEncode),"startupSeconds":String(startup),"attempt":String(attemptIndex),"runtime":activePatchID,"adapter":jellyfinAPIRevision])
                 let output=AVPlayerItemVideoOutput(pixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA])
                 item.add(output);videoOutput=output
@@ -696,7 +775,7 @@ import Network
     }
     private func clearPlayback(){
         work?.cancel();generation=UUID();let old=session;let p=position
-        session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil;current=nil;validated=false;playing=false;ready=false
+        session=nil;activeAttemptPolicy=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil;current=nil;validated=false;playing=false;ready=false
         metrics=[:]
         nextRotation=nil;remaining=0;retryCurrentAfterResume=false;lastAdvance=nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo=nil
@@ -770,6 +849,27 @@ import Network
             "queuedEvents":String(disk.files(prefix:"event-").count),
             "queuedBatches":String(disk.files(prefix:"batch-").count)
         ]
+        var footprint:UInt64=0,cpu:UInt64=0
+        let resourceFlags=jf_process_resources(&footprint,&cpu)
+        if resourceFlags & 1 != 0 {
+            fields["processFootprintBytes"]=String(footprint)
+            if footprint>UInt64(operational.resourceWarningMiB ?? 512)*1024*1024 && operational.suspendAutomationOnPressure != false {
+                suspendAutomation(reason:"Configured application memory threshold")
+            }
+        }
+        if resourceFlags & 2 != 0 {
+            fields["processCPUMicroseconds"]=String(cpu)
+            if let old=lastResourceCPU,let when=lastResourceTime,cpu>=old,now>when {
+                fields["processCPUPercentOneCore"]=String(format:"%.2f",Double(cpu-old)/1_000_000/(now-when)*100)
+            }
+            lastResourceCPU=cpu;lastResourceTime=now
+        }
+        fields["interpreterEvaluations"]=String(scripts.evaluations)
+        fields["interpreterFailures"]=String(scripts.failures)
+        fields["interpreterLastEvaluationMs"]=String(scripts.lastEvaluationMs)
+        fields["automationSuspended"]=String(automationSuspended)
+        fields["diagnosticEventsPruned"]=String(diagnosticEventsPruned)
+        fields["diagnosticBytesPruned"]=String(diagnosticBytesPruned)
         if device.batteryLevel>=0 {fields["batteryPercent"]=String(format:"%.0f",device.batteryLevel*100)}
         if let attributes=try? FileManager.default.attributesOfFileSystem(forPath:disk.root.path),
            let free=attributes[.systemFreeSize] as? NSNumber {
@@ -789,9 +889,15 @@ import Network
         let now=Date()
         if (lanStatus.hasPrefix("failed") || lanStatus=="Failed to listen") && Int(now.timeIntervalSince1970)%15==0{configureLAN()}
         sampleSystemTelemetry()
+        if now.timeIntervalSince(lastRetention)>60 {
+            lastRetention=now
+            let trimmed=disk.trimDiagnosticEvents(maxCount:operational.eventRetentionCount ?? 5000,maxBytes:(operational.eventRetentionMiB ?? 32)*1024*1024)
+            diagnosticEventsPruned+=trimmed.removed;diagnosticBytesPruned+=trimmed.bytes
+            if trimmed.removed>0{log("WARN","storage","DIAGNOSTICS_PRUNED",["count":String(trimmed.removed),"bytes":String(trimmed.bytes)])}
+        }
         if versionBusy || versionRecoveryFailed{
-            if now.timeIntervalSince(lastHeartbeat)>30{publishHeartbeat(now:now)}
-            if now.timeIntervalSince(lastSync)>30{requestSync()}
+            if now.timeIntervalSince(lastHeartbeat)>Double(operational.heartbeatSeconds ?? 30){publishHeartbeat(now:now)}
+            if now.timeIntervalSince(lastSync)>Double(operational.syncSeconds ?? 30){requestSync()}
             return
         }
         processDecisions(now:now)
@@ -815,7 +921,7 @@ import Network
                     default:begin(c,keepSurf:surfing)
                     }
                 }
-            } else if now.timeIntervalSince(lastReport)>15 {
+            } else if now.timeIntervalSince(lastReport)>Double(operational.playbackSampleSeconds ?? 15) {
                 lastReport=now
                 if let s=session,startedSession {
                     let previousReport=lastProgressReport
@@ -834,14 +940,14 @@ import Network
                 metrics=values;log("INFO","telemetry","PLAYBACK_SAMPLE",values)
             }
         }
-        if jelly.connected && now.timeIntervalSince(lastRefresh)>180 {
+        if jelly.connected && now.timeIntervalSince(lastRefresh)>Double(operational.catalogueRefreshSeconds ?? 180) {
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if apiReady && !apiChanging && policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        if apiReady && !apiChanging && policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect()}}
         resumeCampaignIfNeeded()
         runModuleIfDue()
-        if now.timeIntervalSince(lastHeartbeat)>30 {publishHeartbeat(now:now)}
-        if now.timeIntervalSince(lastSync)>30 {requestSync()}
+        if now.timeIntervalSince(lastHeartbeat)>Double(operational.heartbeatSeconds ?? 30) {publishHeartbeat(now:now)}
+        if now.timeIntervalSince(lastSync)>Double(operational.syncSeconds ?? 30) {requestSync()}
     }
     func requestSync(){
         guard controlMode == .github else{syncStatus="LAN control active; GitHub paused";return}
@@ -972,11 +1078,14 @@ import Network
     }
     func stateSnapshot()->[String:Any]{
         var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        snapshot["configurationRevision"]=hotConfiguration.revision
+        snapshot["configurationFault"]=configurationFault ?? ""
+        snapshot["automationSuspended"]=automationSuspended
         snapshot["preferences"]=PatchablePreferences.snapshot(settings)
         snapshot["playerAudio"]=["volume":String(player.volume),"muted":String(player.isMuted)]
         return snapshot
     }
-    static let actions=["get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","list_hot_configurations","restore_hot_configuration","resume_automation","get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command,origin:String="internal") async -> Receipt {
         if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
@@ -1004,7 +1113,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_preferences","set_preferences","get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
+            let structured:Set<String>=["get_media_tracks","get_hot_configuration","list_hot_configurations","get_preferences","set_preferences","get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -1020,6 +1129,101 @@ import Network
             throw AppError.message("Patch restoration in progress")
         }
         switch action {
+        case "get_media_tracks":
+            guard let item=player.currentItem,item.status == .readyToPlay else{throw AppError.message("No ready player item")}
+            var tracks:[String:[[String:String]]]=[:]
+            for (name,characteristic) in [("audio",AVMediaCharacteristic.audible),("subtitle",AVMediaCharacteristic.legible)]{
+                if let group=item.asset.mediaSelectionGroup(forMediaCharacteristic:characteristic){
+                    let selected=item.currentMediaSelection.selectedMediaOption(in:group)
+                    tracks[name]=group.options.enumerated().map{index,option in
+                        ["index":String(index),"name":sanitized(option.displayName),"language":option.extendedLanguageTag ?? "","selected":String(option==selected)]
+                    }
+                }
+            }
+            return try json(tracks)
+        case "select_media_track":
+            guard let item=player.currentItem,item.status == .readyToPlay,
+                  let kind=args["kind"],["audio","subtitle"].contains(kind),let raw=args["index"],
+                  let group=item.asset.mediaSelectionGroup(forMediaCharacteristic:kind=="audio" ? .audible : .legible) else{throw AppError.message("Media selection group unavailable")}
+            if raw=="auto"{item.selectMediaOptionAutomatically(in:group)}
+            else if raw=="off",kind=="subtitle",group.allowsEmptySelection{item.select(nil,in:group)}
+            else{
+                guard let index=Int(raw),group.options.indices.contains(index) else{throw AppError.message("Track selection outside available options")}
+                item.select(group.options[index],in:group)
+            }
+            return "Media selection requested"
+        case "seek_live","seek_relative":
+            guard let item=player.currentItem,item.status == .readyToPlay,
+                  let range=item.seekableTimeRanges.last?.timeRangeValue,
+                  range.start.seconds.isFinite,range.end.seconds.isFinite,range.duration.seconds>0
+            else{throw AppError.message("No seekable playback range")}
+            let target:Double
+            if action=="seek_live"{
+                let raw=args["offsetSeconds"] ?? "2"
+                guard let offset=Double(raw),offset.isFinite,(0...60).contains(offset) else{throw AppError.message("Live offset must be 0 to 60 seconds")}
+                target=max(range.start.seconds,range.end.seconds-offset)
+            }else{
+                guard let delta=args["seconds"].flatMap(Double.init),delta.isFinite,(-3600...3600).contains(delta) else{throw AppError.message("Relative seek outside supported bounds")}
+                target=min(range.end.seconds,max(range.start.seconds,position+delta))
+            }
+            let expected=generation
+            let success=await withCheckedContinuation{(c:CheckedContinuation<Bool,Never>) in
+                player.seek(to:CMTime(seconds:target,preferredTimescale:600),toleranceBefore:CMTime(seconds:0.5,preferredTimescale:600),toleranceAfter:CMTime(seconds:0.5,preferredTimescale:600)){finished in c.resume(returning:finished)}
+            }
+            guard generation==expected,success else{throw AppError.message("Seek interrupted")}
+            lastPosition=position;lastAdvance=Date()
+            return "Seek completed"
+        case "reload_current_stream":
+            guard let c=current,jelly.connected,catalogueReady,!apiChanging,!loginBusy,!patchBusy,!versionBusy else{throw AppError.message("No current stream or engine busy")}
+            let keep=surfing
+            let paused=intentionallyPaused
+            begin(c,keepSurf:keep)
+            if paused{pause()}
+            return "Stream reload requested; decoded playback not yet verified"
+        case "get_hot_configuration":
+            return try json(hotConfiguration)
+        case "install_hot_configuration":
+            guard let source=args["configuration"],let expected=args["expectedRevision"] else{throw AppError.message("Configuration JSON and expectedRevision required")}
+            try installHotConfiguration(HotConfiguration.decode(Data(source.utf8)),expected:expected)
+            return "Configuration activated: "+hotConfiguration.revision+"; transport changes apply on next open"
+        case "install_hot_configuration_from_db":
+            guard let id=args["id"],DynamicUILayout.validID(id),let sha=args["sha"],sha.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil,
+                  let expected=args["expectedRevision"],!configurationBusy else{throw AppError.message("Configuration ID, blob SHA and expectedRevision required")}
+            configurationBusy=true
+            defer{configurationBusy=false}
+            guard let file=try await db.read("engineering/configurations/"+id+".json"),file.sha==sha else{throw AppError.message("Configuration source or exact blob SHA unavailable")}
+            let candidate=try HotConfiguration.decode(file.data)
+            guard candidate.revision==id else{throw AppError.message("Configuration revision mismatch")}
+            configurationBusy=false
+            try installHotConfiguration(candidate,expected:expected)
+            return "Repository configuration activated: "+id
+        case "reload_hot_configuration":
+            guard !configurationBusy,!patchBusy,!apiChanging,!versionBusy,!promotionBusy,let expected=args["expectedRevision"],expected==hotConfiguration.revision else{throw AppError.message("Configuration busy or stale revision")}
+            let stored=try readHotConfiguration()
+            // Reload only the persisted active revision, not unvalidated edits.
+            guard stored==hotConfiguration else{throw AppError.message("Persisted configuration differs; use install or restore")}
+            try applyHotConfiguration(stored)
+            return "Configuration reloaded: "+hotConfiguration.revision
+        case "rollback_hot_configuration","reset_hot_configuration","restore_hot_configuration":
+            guard let expected=args["expectedRevision"],expected==hotConfiguration.revision else{throw AppError.message("Current expectedRevision required")}
+            let target:HotConfiguration?
+            if action=="reset_hot_configuration"{target=nil}
+            else if action=="rollback_hot_configuration"{target=hotConfiguration.previous}
+            else {
+                guard let id=args["id"],DynamicUILayout.validID(id),let stored=disk.load(HotConfiguration.self,"hot-config-version-"+id+".json"),stored.revision==id else{throw AppError.message("Unknown configuration revision")}
+                target=stored
+            }
+            if target==hotConfiguration.active,configurationFault==nil{return "Configuration already active"}
+            try installHotConfiguration(target,expected:expected)
+            return "Configuration restored: "+hotConfiguration.revision
+        case "list_hot_configurations":
+            let limit=max(1,min(100,args["limit"].flatMap(Int.init) ?? 50))
+            let offset=max(0,args["offset"].flatMap(Int.init) ?? 0)
+            return try json(disk.files(prefix:"hot-config-version-").dropFirst(offset).prefix(limit).map{$0.deletingPathExtension().lastPathComponent.replacingOccurrences(of:"hot-config-version-",with:"")})
+        case "resume_automation":
+            guard automationSuspended else{return "Automation already enabled"}
+            automationSuspended=false;moduleFailures=0
+            return "Automation resumed; resource guard remains active"
         case "get_preferences":
             return try json(PatchablePreferences.snapshot(settings))
         case "set_preferences":
@@ -1062,7 +1266,7 @@ import Network
             return "Catalogue refreshed"
         case "set_fullscreen":
             guard let raw=args["visible"],["true","false"].contains(raw) else{throw AppError.message("Expected visible=true or false")}
-            if raw=="true"{tab=1;fullscreenControlsVisible=dynamicUI.active?.presentation?.fullscreenInitiallyVisible ?? true}
+            if raw=="true"{tab=1;fullscreenControlsVisible=presentationConfiguration.fullscreenInitiallyVisible ?? true}
             fullscreenPresented=raw=="true"
             return "Fullscreen presentation requested"
         case "set_fullscreen_controls":
@@ -1072,12 +1276,15 @@ import Network
         case "get_native_capabilities":
             var contract:[String:Any]=[:]
             contract["runtimeABI"]=2
+            contract["configurationABI"]=1
+            contract["configurationSections"]=["runtime","playbackRules","operations","interpreter","presentation"]
+            contract["configurationActivation"]="CAS revision; local/DB; live properties now; transport on next open"
             contract["adapterABI"]=1
             contract["uiABI"]=1
             contract["actions"]=Self.actions
             contract["runtimeHooks"]=["configure","playbackAttempt","select","tick"]
             contract["adapterHooks"]=["configure","request","response","stream"]
-            contract["playbackPolicyFields"]=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect"]
+            contract["playbackPolicyFields"]=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect","preferredMaximumWidth","preferredMaximumHeight","networkWhilePaused"]
             contract["uiLocations"]=DynamicUILayout.locations
             contract["uiReplacementLocations"]=DynamicUILayout.replacementLocations.filter{$0 != "more.body"}
             contract["uiPrimitives"]=DynamicUILayout.kinds
@@ -1104,6 +1311,13 @@ import Network
             snapshot["runtime"]=activePatchID
             snapshot["adapter"]=jellyfinAPIRevision
             snapshot["channelID"]=current?.id ?? ""
+            snapshot["configurationRevision"]=hotConfiguration.revision
+            snapshot["volume"]=String(player.volume)
+            snapshot["muted"]=String(player.isMuted)
+            if let range=item?.seekableTimeRanges.last?.timeRangeValue,range.start.seconds.isFinite,range.end.seconds.isFinite{
+                snapshot["seekableStart"]=String(range.start.seconds)
+                snapshot["seekableEnd"]=String(range.end.seconds)
+            }
             return try json(snapshot)
         case "probe_active_hls":
             guard !manualHLSProbeBusy,let active=session,!active.isSharedSurf else{throw AppError.message("No ordinary active HLS session or probe already running")}
@@ -1134,9 +1348,10 @@ import Network
             next()
             if reconnecting{return "Shared Surf reconnect requested; underlying channel selection is server-owned"}
         case "previous_channel":
+            guard !usingSharedSurf,session?.isSharedSurf != true else{throw AppError.message("Previous underlying channel is server-owned")}
             guard let c=previous.first else{throw AppError.message("No previous channel")}
             open(c)
-            if usingSharedSurf{return "Previous shared Surf category requested; underlying channel selection is server-owned"}
+            if c.isSurf{return "Previous Surf category requested; underlying channel selection is not verified"}
         case "start_surf":
             let category=args["category"] ?? "All Channels"
             guard ["All Channels","Favorites","Sports","Movies & Series"].contains(category),jelly.connected,catalogueReady,!loginBusy else{throw AppError.message("Invalid category or Jellyfin unavailable")}
@@ -1328,7 +1543,7 @@ import Network
         input["form"]=uiInputs
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive","checkpoint_patch_version","restore_patch_version","restore_known_good"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","restore_hot_configuration","resume_automation","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive","checkpoint_patch_version","restore_patch_version","restore_known_good"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1352,11 +1567,9 @@ extension AppModel {
             if let cp=moduleCheckpoint{disk.save(cp,"module-checkpoint.json")}
         }
         patchFault=engineering.fault
-        player.automaticallyWaitsToMinimizeStalling=effectivePolicy.automaticallyWaits
-        if let item=player.currentItem {
-            item.preferredForwardBufferDuration=Double(effectivePolicy.forwardBufferSeconds)
-            item.preferredPeakBitRate=Double(effectivePolicy.qualityMbps)*1_000_000
-        }
+        // A new runtime's live global controls supersede the old attempt policy.
+        activeAttemptPolicy=nil
+        applyPlayerConfiguration()
         if surfing && !surfPaused && !intentionallyPaused && validated && !usingSharedSurf {
             nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
         }
@@ -1588,9 +1801,12 @@ extension AppModel {
         else {channel=eligibleChannels.first(where:{$0.id==current?.id}) ?? eligibleChannels.first}
         guard let channel=channel else{return Observation(status:"blocked",evidence:["reason":"Requested channel is not eligible"],channelID:step.channelID)}
         let reuse=CampaignPlaybackPolicy.reuse(kind:step.kind,requestedID:channel.id,currentID:current?.id,validated:validated,hasItem:player.currentItem?.status == .readyToPlay,hasSession:session != nil,playing:player.timeControlStatus == .playing,paused:intentionallyPaused,hasError:lastPlayerError != nil)
-        if !reuse {open(channel)}
+        if !reuse {
+            if step.kind=="shared_surf_continuity"{openServerSurf(channel)}
+            else{open(channel)}
+        }
         else {log("INFO","engineering","CONTINUITY_REUSED",["kind":step.kind,"channelID":channel.id])}
-        let startupBudget=max(15,min(720,effectivePolicy.retries*((activePatchID=="native-baseline" ? effectivePolicy.startupTimeout : 120)+45)))
+        let startupBudget=max(15,min(720,effectivePolicy.retries*((activePatchID=="native-baseline" && hotConfiguration.active?.playbackRules==nil && effectivePolicy.playback==nil ? effectivePolicy.startupTimeout : 120)+45)))
         guard await awaitPlayback(epoch:epoch,id:channel.id,seconds:startupBudget) else {
             return Observation(status:"failed",evidence:["reason":lastPlayerError ?? "No confirmed playback before deadline","startupBudgetSeconds":String(startupBudget)],channelID:channel.id)
         }
@@ -1684,7 +1900,7 @@ extension AppModel {
         return Observation(status:ok ? "passed":"failed",evidence:evidence,channelID:channel.id)
     }
     private func runModuleIfDue(){
-        guard policyReady,!versionBusy,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
+        guard !automationSuspended,policyReady,!versionBusy,!patchBusy,activePatchID != "native-baseline",moduleTask==nil,moduleFailures<3,
               var cp=moduleCheckpoint,cp.moduleID==activePatchID,(cp.nextAt<=Date() || !(cp.pending ?? []).isEmpty) else{return}
         let module=activePatchID
         let newEvents:[Event]

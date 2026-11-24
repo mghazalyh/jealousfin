@@ -3,7 +3,17 @@ import Network
 
 // Scripts execute application APIs, not an operating-system shell.
 // JavaScriptCore is interpreted on the target device; native changes still require an IPA.
-@MainActor final class ScriptEngine {}
+@MainActor final class ScriptEngine {
+    var budget=InterpreterBudget()
+    private(set) var evaluations=0
+    private(set) var failures=0
+    private(set) var lastEvaluationMs=0
+    func recordEvaluation(start:TimeInterval,failed:Bool){
+        evaluations+=1
+        if failed{failures+=1}
+        lastEvaluationMs=Int((ProcessInfo.processInfo.systemUptime-start)*1000)
+    }
+}
 
 // Transport failures are HTTP errors; decoded application commands retain
 // their durable receipt and application-level success/failure semantics.

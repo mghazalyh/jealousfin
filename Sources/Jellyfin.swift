@@ -162,13 +162,20 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             return StreamSession(url:url,itemID:channel.id,mediaSourceID:channel.id,playSessionID:UUID().uuidString,liveStreamID:nil,method:"SharedSurfHLS")
         }
         let bitrate = max(1, min(50, mbps)) * 1_000_000
+        var transcode:[String:Any]=["Container":playback.segmentContainer=="server" ? "ts" : playback.segmentContainer,"Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":playback.minimumSegments>0 ? playback.minimumSegments : 2]
+        if playback.segmentSeconds>0{transcode["SegmentLength"]=playback.segmentSeconds}
         let profile: [String: Any] = [
             "Name":"Jealousfin AVPlayer","MaxStreamingBitrate":bitrate,
             "DirectPlayProfiles":[["Container":"mp4,m4v,mov","Type":"Video","VideoCodec":"h264,hevc","AudioCodec":"aac,mp3,ac3,eac3"]],
-            "TranscodingProfiles":[["Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":2]],
+            "TranscodingProfiles":[transcode],
             "CodecProfiles":[], "SubtitleProfiles":[["Format":"vtt","Method":"Hls"]]
         ]
-        let info = try await request("Items/\(channel.id)/PlaybackInfo", method:"POST", query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"], body:["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":false,"EnableDirectStream":playback.preferDirect,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile])
+        var negotiation:[String:Any]=["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":false,"EnableDirectStream":playback.preferDirect,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile]
+        if playback.forceEncode {
+            negotiation["AllowVideoStreamCopy"]=false
+            negotiation["AllowAudioStreamCopy"]=false
+        }
+        let info = try await request("Items/\(channel.id)/PlaybackInfo",method:"POST",query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"],body:negotiation)
         guard let source = (info["MediaSources"] as? [[String:Any]])?.first else { throw AppError.message("No media source returned") }
         let sid = source["Id"] as? String ?? channel.id
         let playID = info["PlaySessionId"] as? String ?? UUID().uuidString

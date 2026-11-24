@@ -5,7 +5,7 @@ import AVKit
 // changes. Native buttons remain available if a dynamic UI revision is rejected.
 struct FullscreenSurfPlayer:View {
     @EnvironmentObject var model:AppModel
-    private var presentation:DynamicPresentation{model.dynamicUI.active?.presentation ?? DynamicPresentation()}
+    private var presentation:DynamicPresentation{model.presentationConfiguration}
     var body:some View {
         GeometryReader{geometry in
             ZStack {

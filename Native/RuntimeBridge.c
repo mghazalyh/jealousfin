@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
+#include <mach/mach.h>
 
 typedef struct { double deadline; int timed_out; } JFDeadline;
 static double jf_now(void) {
@@ -29,14 +31,14 @@ static char *jf_copy(const char *value, size_t len) {
 }
 static char *jf_message(const char *value) { return jf_copy(value, strlen(value)); }
 
-char *jf_runtime_eval(const char *source, int32_t timeout_ms, int32_t *status) {
+char *jf_runtime_eval_budget(const char *source, int32_t timeout_ms, int32_t memory_mib, int32_t *status) {
     if (!status) return NULL;
     *status = 1;
-    if (!source || timeout_ms < 1 || timeout_ms > 10000 || strlen(source) > 4194304)
+    if (!source || timeout_ms < 1 || timeout_ms > 10000 || memory_mib < 8 || memory_mib > 64 || strlen(source) > 4194304)
         return jf_message("Invalid interpreter input");
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) return jf_message("Cannot allocate interpreter");
-    JS_SetMemoryLimit(rt, 32 * 1024 * 1024);
+    JS_SetMemoryLimit(rt, (size_t)memory_mib * 1024 * 1024);
     JS_SetMaxStackSize(rt, 128 * 1024);
     JFDeadline deadline = { jf_now() + (double)timeout_ms / 1000.0, 0 };
     JS_SetInterruptHandler(rt, jf_interrupt, &deadline);
@@ -82,5 +84,25 @@ char *jf_runtime_eval(const char *source, int32_t timeout_ms, int32_t *status) {
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return result;
+}
+char *jf_runtime_eval(const char *source, int32_t timeout_ms, int32_t *status) {
+    return jf_runtime_eval_budget(source, timeout_ms, 32, status);
+}
+int32_t jf_process_resources(uint64_t *footprint_bytes, uint64_t *cpu_microseconds) {
+    if (!footprint_bytes || !cpu_microseconds) return 0;
+    *footprint_bytes = 0; *cpu_microseconds = 0;
+    int32_t flags = 0;
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
+        *footprint_bytes = vm.phys_footprint; flags |= 1;
+    }
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        *cpu_microseconds = (uint64_t)usage.ru_utime.tv_sec * 1000000 + usage.ru_utime.tv_usec +
+                            (uint64_t)usage.ru_stime.tv_sec * 1000000 + usage.ru_stime.tv_usec;
+        flags |= 2;
+    }
+    return flags;
 }
 void jf_runtime_free(char *value) { free(value); }
