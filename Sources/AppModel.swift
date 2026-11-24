@@ -65,6 +65,7 @@ import MediaPlayer
     private var emptyPoolRetry:Date?
     private var retryCurrentAfterResume=false
     private var catalogueBusy=false
+    private var favoriteInFlight=Set<String>()
     private var lastProgressReport:Task<Void,Never>?
     private var cleanupTask:Task<Void,Never>?
     private var lastPlayerError:String?
@@ -204,6 +205,9 @@ import MediaPlayer
     }
     func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
     func favorite(_ channel:Channel) async throws {
+        guard jelly.connected,!loginBusy else{throw AppError.message("Jellyfin unavailable")}
+        guard favoriteInFlight.insert(channel.id).inserted else{throw AppError.message("Favorite update already in progress")}
+        defer{favoriteInFlight.remove(channel.id)}
         let value = !(channels.first(where:{$0.id==channel.id})?.favorite ?? channel.favorite)
         try await jelly.favorite(channel.id,value:value)
         if let i=channels.firstIndex(where:{$0.id==channel.id}){channels[i].favorite=value}
@@ -300,6 +304,7 @@ import MediaPlayer
         var errorReason="Startup timeout"
         for attemptIndex in 1...max(1,settings.retries) {
             guard g==generation,!Task.isCancelled else{return}
+            errorReason="Startup timeout"
             log("INFO","validator","ATTEMPT",["channelID":channel.id,"attempt":String(attemptIndex)])
             do {
                 let s=try await jelly.stream(channel,mbps:settings.qualityMbps)
@@ -313,12 +318,13 @@ import MediaPlayer
                 ready=false;lastPosition=position
                 var deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
                 var firstPosition:Double?
-                var decoded=false
+                var evidence=VideoEvidence()
                 while Date()<deadline && g==generation && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds:500_000_000)
                     guard g==generation,!Task.isCancelled else{return}
                     if intentionallyPaused {
                         firstPosition=nil
+                        evidence=VideoEvidence()
                         deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
                         continue
                     }
@@ -326,15 +332,17 @@ import MediaPlayer
                     let p=position
                     if output.hasNewPixelBuffer(forItemTime:player.currentTime()) {
                         var display=CMTime.invalid
-                        if output.copyPixelBuffer(forItemTime:player.currentTime(),itemTimeForDisplay:&display) != nil {decoded=true}
+                        if output.copyPixelBuffer(forItemTime:player.currentTime(),itemTimeForDisplay:&display) != nil {
+                            evidence.observe(frameTime:display.seconds,monotonic:ProcessInfo.processInfo.systemUptime)
+                        }
                     }
                     if item.status == .readyToPlay && player.timeControlStatus == .playing {
                         if firstPosition==nil {firstPosition=p}
-                        if let first=firstPosition,p-first>=3,decoded {
+                        if let first=firstPosition,evidence.qualifies(progress:p-first,monotonic:ProcessInfo.processInfo.systemUptime) {
                             guard g==generation,!Task.isCancelled else{return}
                             validated=true;playing=true;lastSuccess=Date();lastAdvance=Date();lastPosition=p;failureRun=0
                             status="Playing \(channel.name)"
-                            log("INFO","validator","PLAYBACK_CONFIRMED",["channelID":channel.id,"decodedSample":String(decoded),"displayReady":String(ready),"progressSeconds":String(format:"%.2f",p-first),"startupMs":String(Int((ProcessInfo.processInfo.systemUptime-startUptime)*1000))])
+                            log("INFO","validator","PLAYBACK_CONFIRMED",["channelID":channel.id,"decodedSamples":String(evidence.frameCount),"displayReady":String(ready),"progressSeconds":String(format:"%.2f",p-first),"startupMs":String(Int((ProcessInfo.processInfo.systemUptime-startUptime)*1000))])
                             if settings.validation && !channel.isSurf {appendHealth(channel,"success","Playback progressed with video evidence")}
                             if surfing && !surfPaused {nextRotation=Date().addingTimeInterval(Double(settings.rotationMinutes*60))}
                             MPNowPlayingInfoCenter.default().nowPlayingInfo=[MPMediaItemPropertyTitle:channel.name,MPMediaItemPropertyArtist:channel.program?.title ?? "Live TV",MPNowPlayingInfoPropertyIsLiveStream:true,MPNowPlayingInfoPropertyPlaybackRate:1.0]
@@ -346,9 +354,15 @@ import MediaPlayer
                     } else if !intentionallyPaused {firstPosition=nil}
                 }
                 if g != generation || Task.isCancelled {return}
-                if let error=item.error {errorReason="Player error \((error as NSError).code)"}
+                if let event=item.errorLog()?.events.last,(400...599).contains(event.errorStatusCode) {
+                    errorReason="Stream HTTP \(event.errorStatusCode)"
+                } else if let error=item.error {
+                    let ns=error as NSError
+                    errorReason=ns.domain==NSURLErrorDomain ? "Network player error \(ns.code)" : "Player error \(ns.code)"
+                }
                 session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil
-                await jelly.close(s,position:0)
+                queueClose(s,position:0)
+                await cleanupTask?.value
             } catch {errorReason=error.localizedDescription}
             guard g==generation,!Task.isCancelled else{return}
             log("WARN","validator","ATTEMPT_FAILED",["channelID":channel.id,"reason":errorReason,"attempt":String(attemptIndex)])

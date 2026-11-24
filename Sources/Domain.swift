@@ -179,7 +179,7 @@ enum PlaybackFailurePolicy {
         // A Jellyfin catalogue 404 can mean a stale item ID, not a dead source.
         // Require corroborated recent playback for ambiguous player failures.
         return recentSuccess && consecutiveFailures <= 2 && consecutiveFailures > 0 &&
-            (r.contains("startup timeout") || r.contains("player error") || r.contains("avplayer item failed"))
+            (r.contains("startup timeout") || r.contains("player error") || r.contains("avplayer item failed") || r.contains("stream http 404") || r.contains("stream http 410"))
     }
 }
 enum CommandQueue {
@@ -194,5 +194,20 @@ enum SurfClock {
     }
     static func resumed(now:Date,remaining:Int)->Date {
         now.addingTimeInterval(Double(max(1,remaining)))
+    }
+}
+
+struct VideoEvidence {
+    private(set) var frameCount=0
+    private(set) var lastFrameTime:Double?
+    private(set) var lastFrameObservedAt:Double?
+    mutating func observe(frameTime:Double,monotonic:Double){
+        guard frameTime.isFinite,monotonic.isFinite else{return}
+        if let last=lastFrameTime,abs(last-frameTime)<0.000001{return}
+        frameCount+=1;lastFrameTime=frameTime;lastFrameObservedAt=monotonic
+    }
+    func qualifies(progress:Double,monotonic:Double)->Bool{
+        guard let seen=lastFrameObservedAt,monotonic>=seen else{return false}
+        return progress.isFinite && progress>=3 && frameCount>=3 && monotonic-seen<=2
     }
 }

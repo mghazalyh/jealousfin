@@ -60,7 +60,12 @@ struct StreamSession {
         return items.compactMap { x in
             guard let id = x["Id"] as? String, let n = x["Name"] as? String else { return nil }
             let p = (x["CurrentProgram"] as? [String: Any]).flatMap(Self.program)
-            return Channel(id: id, name: n, number: x["ChannelNumber"] as? String, logo: !(x["ImageTags"] as? [String: Any] ?? [:]).isEmpty || x["PrimaryImageTag"] != nil, favorite: (x["UserData"] as? [String: Any])?["IsFavorite"] as? Bool ?? false, program: p, genres: (x["Genres"] as? [String] ?? []) + (x["Tags"] as? [String] ?? []) + ((x["GenreItems"] as? [[String:Any]] ?? []).compactMap{$0["Name"] as? String}))
+            let genres=x["Genres"] as? [String] ?? []
+            let tags=x["Tags"] as? [String] ?? []
+            let genreItems=(x["GenreItems"] as? [[String:Any]] ?? []).compactMap{$0["Name"] as? String}
+            let hasLogo = !(x["ImageTags"] as? [String:Any] ?? [:]).isEmpty || x["PrimaryImageTag"] != nil
+            let favorite=(x["UserData"] as? [String:Any])?["IsFavorite"] as? Bool ?? false
+            return Channel(id:id,name:n,number:x["ChannelNumber"] as? String,logo:hasLogo,favorite:favorite,program:p,genres:genres+tags+genreItems)
         }
     }
     func programs() async throws -> [Program] {
