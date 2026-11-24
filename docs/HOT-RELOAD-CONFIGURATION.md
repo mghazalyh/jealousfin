@@ -122,3 +122,42 @@ References:
 - https://developer.apple.com/documentation/xcode/reducing-your-app-s-memory-use
 - https://developer.apple.com/documentation/avkit/adopting-picture-in-picture-in-a-custom-player
 - https://bellard.org/quickjs/quickjs.html
+
+## Staged files and timed experiments
+stage_hot_configuration accepts configuration JSON and expectedRevision.
+stage_hot_configuration_from_db accepts an exact id/blob SHA and expectedRevision.
+These write a staged file without touching the active player. To apply, call
+reload_hot_configuration with expectedRevision and stagedRevision. Alternatively
+begin_configuration_trial accepts the same staged/base revisions and seconds
+(30–3600). The prior configuration is durably journaled before activation.
+finish_configuration_trial accepts trial id, expectedRevision and outcome
+accept/rollback; accept also requires approval=explicit. It is explicit operator
+confirmation, not an automatic hardware certification. A pending trial rolls
+back on expiry or on the next app launch, including an interrupted activation.
+An active campaign is paused on rollback; test results record all four source
+revisions, and revision changes during a step block that result. A transport
+change still requires opening/reloading the stream. Rollback does not prove
+video has resumed until a new playback test confirms it.
+
+The presentation options nativePlaybackControls, pictureInPictureAllowed and
+automaticPictureInPicture can restore the AVKit system control path without
+another build. The custom fullscreen controls remain the default. Native PiP
+availability and system fullscreen behavior must be verified on target iOS;
+the configuration does not promise unsupported PiP behavior.
+Read-only telemetry queries no longer create persistent telemetry events.
+
+Native item events (stall, error log, end, access log) are recorded with
+numeric metrics, revision and stream generation, without URLs. Configure
+playerEventDiagnostics and playerEventSampleSeconds in operations to control
+access-log sampling; direct player snapshots expose the generation for
+continuity assertions. WebKit component termination has one retry and then a
+native-visible suspended component message; no repeated automatic recovery
+loop. An explicit configuration reset quarantines an unreadable trial journal.
+
+operations.surfTransport defaults to auto (working shared gateway when
+available). Set device explicitly to test real device-owned rotation, then
+start Surf again; this is experimental on channels whose ordinary playback
+has not yet passed. Explicit server Surf remains available. Direct shared
+playback reports server ownership even when local Surf mode is stopped;
+Next reconnects the current shared category rather than pretending to
+advance its underlying source. Ordinary Next does not implicitly start Surf.

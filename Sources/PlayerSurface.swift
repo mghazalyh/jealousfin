@@ -7,6 +7,8 @@ struct PlayerSurface: UIViewControllerRepresentable {
     var onReady: (Bool)->Void
     var showsControls:Bool = true
     var gravity:String = "fit"
+    var allowsPiP:Bool = true
+    var automaticPiP:Bool = false
     private var videoGravity:AVLayerVideoGravity {
         switch gravity{case "fill":return .resizeAspectFill;case "stretch":return .resize;default:return .resizeAspect}
     }
@@ -21,7 +23,8 @@ struct PlayerSurface: UIViewControllerRepresentable {
         c.player=player
         c.showsPlaybackControls=showsControls
         c.videoGravity=videoGravity
-        c.allowsPictureInPicturePlayback=true
+        c.allowsPictureInPicturePlayback=allowsPiP
+        c.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
         context.coordinator.observation=c.observe(\.isReadyForDisplay,options:[.initial,.new]){ [weak coordinator=context.coordinator] vc,_ in
             let ready=vc.isReadyForDisplay
             DispatchQueue.main.async { coordinator?.callback(ready) }
@@ -33,6 +36,8 @@ struct PlayerSurface: UIViewControllerRepresentable {
         if uiViewController.player !== player {uiViewController.player=player}
         uiViewController.showsPlaybackControls=showsControls
         uiViewController.videoGravity=videoGravity
+        uiViewController.allowsPictureInPicturePlayback=allowsPiP
+        uiViewController.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
     }
     static func dismantleUIViewController(_ uiViewController:AVPlayerViewController,coordinator:Coordinator){
         coordinator.observation?.invalidate()

@@ -27,6 +27,10 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     private let transport:URLSession
     init(deviceID: String,transport:URLSession = .shared) { self.deviceID = deviceID;self.transport=transport }
     var connected: Bool { !token.isEmpty && !userID.isEmpty }
+    func adoptConnection(from staged:Jellyfin){
+        base=staged.base;token=staged.token;userID=staged.userID
+        sharedSurfAvailable=staged.sharedSurfAvailable
+    }
     private var auth: String {
         "MediaBrowser Client=\"Jealousfin\", Device=\"iOS\", DeviceId=\"\(deviceID)\", Version=\"0.1\"" + (token.isEmpty ? "" : ", Token=\"\(token)\"")
     }

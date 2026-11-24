@@ -241,10 +241,10 @@ struct HotConfiguration:Codable,Equatable {
             if let p=rule["policy"] as? [String:Any]{try keys(p,playbackKeys)}
         }
         if let op=root["operations"] as? [String:Any]{
-            try keys(op,["systemSampleSeconds","playbackSampleSeconds","heartbeatSeconds","syncSeconds","catalogueRefreshSeconds","reconnectSeconds","eventRetentionCount","eventRetentionMiB","resourceWarningMiB","suspendAutomationOnPressure"])
+            try keys(op,["systemSampleSeconds","playbackSampleSeconds","heartbeatSeconds","syncSeconds","catalogueRefreshSeconds","reconnectSeconds","eventRetentionCount","eventRetentionMiB","resourceWarningMiB","suspendAutomationOnPressure","playerEventDiagnostics","playerEventSampleSeconds","surfTransport"])
         }
         if let budget=root["interpreter"] as? [String:Any]{try keys(budget,["timeoutMs","memoryMiB","maxCommands"])}
-        if let ui=root["presentation"] as? [String:Any]{try keys(ui,["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible"])}
+        if let ui=root["presentation"] as? [String:Any]{try keys(ui,["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture"])}
         var normalized=root
         if let runtime=root["runtime"] as? [String:Any]{
             let defaults=try JSONCodec.encoder().encode(RuntimePolicy.baseline(Settings()))
@@ -279,6 +279,9 @@ struct OperationalConfiguration:Codable,Equatable{
     var eventRetentionMiB:Int?=nil
     var resourceWarningMiB:Int?=nil
     var suspendAutomationOnPressure:Bool?=nil
+    var playerEventDiagnostics:Bool?=nil
+    var playerEventSampleSeconds:Int?=nil
+    var surfTransport:String?=nil
     func checked()throws->Self{
         guard (5...300).contains(systemSampleSeconds ?? 15),
               (5...120).contains(playbackSampleSeconds ?? 15),
@@ -288,7 +291,9 @@ struct OperationalConfiguration:Codable,Equatable{
               (15...600).contains(reconnectSeconds ?? 60),
               (500...20000).contains(eventRetentionCount ?? 5000),
               (4...128).contains(eventRetentionMiB ?? 32),
-              (64...2048).contains(resourceWarningMiB ?? 512)
+              (64...2048).contains(resourceWarningMiB ?? 512),
+              (1...60).contains(playerEventSampleSeconds ?? 5),
+              ["auto","device"].contains(surfTransport ?? "auto")
         else{throw AppError.message("Operational configuration outside supported bounds")}
         return self
     }
@@ -319,4 +324,31 @@ struct HotConfigurationStore:Codable,Equatable{
         }
         return HotConfigurationStore(active:candidate,previous:active)
     }
+}
+
+// A staged file is not active until its exact revision and base are requested.
+struct StagedHotConfiguration:Codable,Equatable{
+    var expectedRevision:String
+    var candidate:HotConfiguration
+    func checked(against current:HotConfigurationStore)throws->Self{
+        _ = try current.activating(candidate,expected:expectedRevision)
+        return self
+    }
+}
+struct HotConfigurationTrial:Codable,Equatable{
+    var id=UUID().uuidString
+    var before:HotConfigurationStore
+    var candidateRevision:String
+    var startedAt:Date=Date()
+    var expiresAt:Date
+    var pending=true
+    var outcome:String?=nil
+    func checked()throws->Self{
+        _ = try before.checked()
+        guard candidateRevision != before.revision,DynamicUILayout.validID(candidateRevision),
+              DynamicUILayout.validID(id),expiresAt.timeIntervalSince(startedAt)>0,
+              expiresAt.timeIntervalSince(startedAt)<=3601 else{throw AppError.message("Invalid configuration trial journal")}
+        return self
+    }
+    func expired(at now:Date)->Bool{pending && now>=expiresAt}
 }

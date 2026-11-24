@@ -10,7 +10,7 @@ struct FullscreenSurfPlayer:View {
         GeometryReader{geometry in
             ZStack {
                 Color.black.ignoresSafeArea()
-                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:false,gravity:presentation.videoGravity ?? "fit")
+                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:presentation.nativePlaybackControls ?? false,gravity:presentation.videoGravity ?? "fit",allowsPiP:presentation.pictureInPictureAllowed ?? true,automaticPiP:presentation.automaticPictureInPicture ?? false)
                     .ignoresSafeArea()
                     .accessibilityLabel("Fullscreen video")
                 if model.fullscreenControlsVisible {
@@ -78,7 +78,7 @@ struct FullscreenSurfPlayer:View {
                     control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill","playPause"){
                         if model.playing{model.pause()}else{model.resume()}
                     }
-                    if model.surfing{
+                    if model.surfing || model.currentSharedTransport{
                         control(model.usingSharedSurf ? "Reconnect":"Next",model.usingSharedSurf ? "arrow.clockwise":"forward.end.fill","next"){model.next()}
                     }
                     control("Stop","stop.fill","stop"){model.stop()}

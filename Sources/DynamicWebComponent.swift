@@ -39,11 +39,16 @@ struct DynamicWebComponent:UIViewRepresentable{
         private var loaded:String?
         private var ready=false
         private var lastPublish=Date.distantPast
+        private var recoveryAttempts=0
         init(model:AppModel,nodeID:String,revision:String){
             self.model=model;self.nodeID=nodeID;self.revision=revision
         }
         func load(_ fragment:String,in view:WKWebView){
             guard loaded != fragment else{return}
+            recoveryAttempts=0
+            render(fragment,in:view)
+        }
+        private func render(_ fragment:String,in view:WKWebView){
             loaded=fragment;ready=false
             let document="""
             <!doctype html><html><head>
@@ -67,6 +72,18 @@ struct DynamicWebComponent:UIViewRepresentable{
             guard let data=try? JSONSerialization.data(withJSONObject:model.stateSnapshot(),options:[.sortedKeys]),
                 let json=String(data:data,encoding:.utf8) else{return}
             view.evaluateJavaScript("window.jealousfinState=\(json);window.dispatchEvent(new CustomEvent('jealousfin-state',{detail:window.jealousfinState}));",completionHandler:nil)
+        }
+        func webViewWebContentProcessDidTerminate(_ webView:WKWebView){
+            ready=false
+            recoveryAttempts+=1
+            model?.log("WARN","dynamic-ui","WEB_PROCESS_TERMINATED",["node":nodeID,"revision":revision,"attempt":String(recoveryAttempts)])
+            guard recoveryAttempts<=1,let fragment=loaded else{
+                if recoveryAttempts==2{
+                    webView.loadHTMLString("<html><body style='background:#111;color:white;font:16px sans-serif'>Custom component suspended. Reload its UI revision to recover.</body></html>",baseURL:nil)
+                }
+                return
+            }
+            render(fragment,in:webView)
         }
         func webView(_ webView:WKWebView,didFinish navigation:WKNavigation!){
             ready=true;publish(in:webView,force:true)

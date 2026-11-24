@@ -47,6 +47,9 @@ struct DynamicPresentation: Codable, Equatable {
     var fullscreenOpacity:Double? = nil
     var fullscreenMaxHeight:Double? = nil
     var fullscreenInitiallyVisible:Bool? = nil
+    var nativePlaybackControls:Bool? = nil
+    var pictureInPictureAllowed:Bool? = nil
+    var automaticPictureInPicture:Bool? = nil
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
               (0.15...1).contains(fullscreenOpacity ?? 0.82),

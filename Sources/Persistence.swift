@@ -36,6 +36,24 @@ import Foundation
         }
         return(removed,bytes)
     }
+    func quarantineUnreadableConfigurationTrial()throws{
+        let path=root.appendingPathComponent("hot-config-trial.json")
+        guard FileManager.default.fileExists(atPath:path.path) else{return}
+        if let trial=load(HotConfigurationTrial.self,"hot-config-trial.json"),(try? trial.checked()) != nil{return}
+        let quarantine=root.appendingPathComponent("hot-config-recovery-"+UUID().uuidString+".json")
+        try FileManager.default.moveItem(at:path,to:quarantine)
+    }
+    func recoverConfigurationTrial()throws->HotConfigurationTrial?{
+        let path=root.appendingPathComponent("hot-config-trial.json")
+        guard FileManager.default.fileExists(atPath:path.path) else{return nil}
+        guard var trial=load(HotConfigurationTrial.self,"hot-config-trial.json") else{throw AppError.message("Cannot decode configuration trial journal")}
+        _ = try trial.checked()
+        guard trial.pending else{return trial}
+        try saveConfiguration(trial.before)
+        trial.pending=false;trial.outcome="recovered-on-launch"
+        guard save(trial,"hot-config-trial.json") else{throw AppError.message("Cannot finalize configuration recovery")}
+        return trial
+    }
     func saveConfiguration(_ candidate:HotConfigurationStore)throws{
         _ = try candidate.checked()
         if let config=candidate.active {
