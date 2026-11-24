@@ -201,3 +201,35 @@ jobs:
                   except Exception:errs+=1;print("Logout failed",flush=True)
           sys.exit(1 if errs else 0)
           PY
+  publish_rc2:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'RC2 release gate') }}
+    needs: [native, direct]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: v0.1.12-rc.2
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Jealousfin-IPA
+          path: verified
+      - name: Verify and publish exact accepted IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd verified
+          sha256sum -c Jealousfin.ipa.sha256
+          unzip -tq Jealousfin.ipa
+          unzip -Z1 Jealousfin.ipa | grep -Fx 'Payload/Jealousfin.app/Jealousfin'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite"
+            exit 1
+          fi
+          printf 'Physical-device testing prerelease. Includes bounded TorrioDB conflict recovery, independent command processing, continuous playback acceptance, and native frame sampling. Published only after all native, hot patch and public HLS acceptance jobs pass. Physical-device retest is still required.\n\nTested commit: %s\nAcceptance: https://github.com/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GH_REPO" "$GITHUB_RUN_ID" > notes.md
+          gh release create "$TAG" Jealousfin.ipa Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin v0.1.12 RC2" --notes-file notes.md --prerelease --latest=false
+          gh release view "$TAG" --json tagName,url,isPrerelease,assets
