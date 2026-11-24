@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "playback-repair-example",
+  "title": "Playback recovery",
+  "message": "Repeated stalls have been observed. Reconnect to Jellyfin and reload the catalogue?",
+  "priority": "High",
+  "evidence": {
+    "Stalls": "Illustrative: 3"
+  },
+  "expiresAt": "2030-01-01T00:00:00Z",
+  "choices": [
+    {
+      "id": "fix",
+      "title": "OK, fix it",
+      "detail": "Reconnect to Jellyfin using the existing settings.",
+      "action": {
+        "command": "reconnect"
+      }
+    },
+    {
+      "id": "cancel",
+      "title": "No, cancel",
+      "detail": "Leave playback unchanged."
+    }
+  ]
+}

@@ -23,7 +23,7 @@ jobs:
       - name: Test channel policy
         run: |
           mkdir -p build
-          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Tests/main.swift -o build/policy-tests
+          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
       - name: Test interruptible runtime

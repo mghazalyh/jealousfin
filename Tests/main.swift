@@ -156,3 +156,47 @@ let storedBytes=try JSONCodec.encoder().encode(store)
 let decodedStore=try JSONCodec.decoder().decode(DynamicUIStore.self,from:storedBytes)
 check(decodedStore.active==layout && decodedStore.values["minutes"]=="10","UI persists across restart")
 print("PASS: \(checks) total assertions including dynamic UI layouts and bindings")
+
+
+let decisionNow=Date(timeIntervalSince1970:1700000000)
+let decisionFixture=DecisionPrompt(schemaVersion:1,id:"diagnostic-repair",title:"Playback recovery",message:"Apply revised playback settings?",priority:"High",evidence:["Stalls":"3"],expiresAt:decisionNow.addingTimeInterval(600),expectedChannelID:"channel-a",expectedPatchID:"baseline",choices:[DecisionChoice(id:"fix",title:"Fix it",detail:"Reconnect to Jellyfin",action:DynamicUIAction(command:"reconnect",arguments:nil)),DecisionChoice(id:"cancel",title:"Cancel",detail:nil,action:nil)])
+var decisionJournalFixture=DecisionJournal()
+try decisionJournalFixture.insert(decisionFixture,at:decisionNow)
+try decisionJournalFixture.insert(decisionFixture,at:decisionNow)
+check(decisionJournalFixture.records.count==1,"duplicate decision id is idempotent")
+check(decisionJournalFixture.next(at:decisionNow)?.id==decisionFixture.id,"decision queued")
+var decisionConflictFixture=decisionFixture;decisionConflictFixture.title="Changed decision"
+var conflictRejected=false
+do{try decisionJournalFixture.insert(decisionConflictFixture,at:decisionNow)}catch{conflictRejected=true}
+check(conflictRejected,"decisionConflictFixture decisionFixture cannot overwrite prior approval")
+var decisionRecordFixture=decisionJournalFixture.records[0]
+var hiddenApprovalRejected=false
+do{try decisionRecordFixture.choose("fix",at:decisionNow)}catch{hiddenApprovalRejected=true}
+check(hiddenApprovalRejected,"unpresented decision cannot be approved")
+decisionRecordFixture.present(at:decisionNow)
+try decisionRecordFixture.choose("cancel",at:decisionNow)
+check(decisionRecordFixture.status=="declined" && decisionRecordFixture.chosenAction==nil && decisionRecordFixture.terminal,"cancel has no action")
+decisionRecordFixture=decisionJournalFixture.records[0];decisionRecordFixture.present(at:decisionNow)
+try decisionRecordFixture.choose("fix",at:decisionNow)
+check(decisionRecordFixture.status=="approved" && decisionRecordFixture.chosenAction?.command=="reconnect","explicit approval binds fixed repair")
+check(!decisionFixture.contextMatches(channelID:"channel-b",patchID:"baseline"),"stale channel detected")
+check(!decisionFixture.contextMatches(channelID:"channel-a",patchID:"new"),"stale module detected")
+check(decisionFixture.contextMatches(channelID:"channel-a",patchID:"baseline"),"matching context")
+var decisionReceiptFixture=Receipt(id:"other",action:"reconnect",status:"succeeded",result:"OK")
+decisionRecordFixture.finish(decisionReceiptFixture,at:decisionNow)
+check(decisionRecordFixture.status=="approved","unrelated receipt cannot complete decision")
+decisionReceiptFixture.id=decisionRecordFixture.commandID
+decisionRecordFixture.finish(decisionReceiptFixture,at:decisionNow)
+check(decisionRecordFixture.status=="succeeded" && decisionRecordFixture.terminal,"stable receipt completes approved decision")
+var decisionExpiredFixture=decisionJournalFixture.records[0];decisionExpiredFixture.expire(at:decisionNow.addingTimeInterval(601))
+check(decisionExpiredFixture.status=="decisionExpiredFixture" && decisionExpiredFixture.chosenAction==nil,"expiry never applies a repair")
+var decisionUnsafeFixture=decisionFixture;decisionUnsafeFixture.choices[0].action=DynamicUIAction(command:"approve_reinstatement",arguments:[:])
+check((try? decisionUnsafeFixture.checked(now:decisionNow))==nil,"decision cannot bypass reinstatement approval")
+decisionJournalFixture.records[0]=decisionRecordFixture
+decisionJournalFixture.markUploaded(id:decisionRecordFixture.id,revision:1)
+check(decisionJournalFixture.pendingUpload.count==1,"older acknowledgement retains newer decision state")
+decisionJournalFixture.markUploaded(id:decisionRecordFixture.id,revision:decisionRecordFixture.revision)
+check(decisionJournalFixture.pendingUpload.isEmpty,"latest decision uploaded")
+let decisionRestoredFixture=try JSONCodec.decoder().decode(DecisionJournal.self,from:JSONCodec.encoder().encode(decisionJournalFixture))
+check(decisionRestoredFixture.records.first?.receipt?.id==decisionRecordFixture.commandID,"decision and receipt persist across restart")
+print("PASS: \(checks) total assertions including interactive decisions")

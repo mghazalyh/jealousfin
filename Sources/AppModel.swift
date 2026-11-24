@@ -1548,7 +1548,7 @@ extension AppModel {
         }
     }
     private func uploadDecisions() async throws{
-        // Each revision is an immutable transition record. Local updates during
+        // Each uploaded revision is an immutable snapshot. Local updates during
         // network awaits are not overwritten by an older upload acknowledgement.
         for record in decisions.pendingUpload.prefix(12){
             let path="engineering/"+deviceID+"/decisions/"+record.id+"/revision-"+String(record.revision)+".json"
