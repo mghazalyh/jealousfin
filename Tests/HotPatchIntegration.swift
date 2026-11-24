@@ -98,22 +98,22 @@ final class TorrioConflictFixture:URLProtocol {
         try require(TorrioConflictFixture.count("PUT snapshot.json")==2 && TorrioConflictFixture.count("GET snapshot.json")==2,"TorrioDB heartbeat conflict re-reads and retries")
         try await conflictDB.immutable("immutable.json",data:receipt)
         try require(TorrioConflictFixture.count("PUT immutable.json")==1,"TorrioDB identical concurrent receipt is idempotent")
-        var rejected=false
-        do{try await conflictDB.immutable("collision.json",data:receipt)}catch{rejected=true}
-        try require(rejected && TorrioConflictFixture.count("PUT collision.json")==1,"TorrioDB immutable collision never overwrites")
-        rejected=false
-        do{try await conflictDB.put("cas.json",data:receipt,sha:"old")}catch{rejected=true}
-        try require(rejected && TorrioConflictFixture.count("PUT cas.json")==1,"TorrioDB compare-and-swap preserves concurrent baseline")
+        var conflictRejected=false
+        do{try await conflictDB.immutable("collision.json",data:receipt)}catch{conflictRejected=true}
+        try require(conflictRejected && TorrioConflictFixture.count("PUT collision.json")==1,"TorrioDB immutable collision never overwrites")
+        conflictRejected=false
+        do{try await conflictDB.put("cas.json",data:receipt,sha:"old")}catch{conflictRejected=true}
+        try require(conflictRejected && TorrioConflictFixture.count("PUT cas.json")==1,"TorrioDB compare-and-swap preserves concurrent baseline")
         var local=HealthLedger()
         local.events=[HealthEvent(id:"local",channelID:"a",channelName:"A",action:"success",reason:"fixture")]
         let merged=try await conflictDB.merge(local)
         try require(Set(merged.events.map(\.id))==Set(["local","remote-one","remote-two"]) && TorrioConflictFixture.count("PUT channel-health-v1.json")==2,"TorrioDB ledger conflict merges fresh remote events")
-        rejected=false
-        do{try await conflictDB.put("auth.json",data:receipt)}catch{rejected=true}
-        try require(rejected && TorrioConflictFixture.count("PUT auth.json")==1,"TorrioDB unauthorized write is not retried")
-        rejected=false
-        do{try await conflictDB.replaceDeviceSnapshot("exhausted.json",data:receipt)}catch{rejected=true}
-        try require(rejected && TorrioConflictFixture.count("PUT exhausted.json")==4,"TorrioDB conflict retry is bounded")
+        conflictRejected=false
+        do{try await conflictDB.put("auth.json",data:receipt)}catch{conflictRejected=true}
+        try require(conflictRejected && TorrioConflictFixture.count("PUT auth.json")==1,"TorrioDB unauthorized write is not retried")
+        conflictRejected=false
+        do{try await conflictDB.replaceDeviceSnapshot("exhausted.json",data:receipt)}catch{conflictRejected=true}
+        try require(conflictRejected && TorrioConflictFixture.count("PUT exhausted.json")==4,"TorrioDB conflict retry is bounded")
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("jealousfin-tests-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}
         let disk=Disk(root:root)
