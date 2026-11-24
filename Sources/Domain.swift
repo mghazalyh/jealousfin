@@ -166,11 +166,38 @@ struct Receipt: Codable {
     var result: String
     var timestamp = Date()
 }
+// Only canonical GitHub repository addresses are accepted. Derive the API
+// origin from validated owner/name components, never from an arbitrary URL.
+enum GitHubRepositoryAddress {
+    static let defaultURL="https://github.com/mghazalyh/jealousdb"
+    static func canonical(_ input:String)->String? {
+        let raw=input.trimmingCharacters(in:.whitespacesAndNewlines)
+        guard let c=URLComponents(string:raw),c.scheme?.lowercased()=="https",
+              c.host?.lowercased()=="github.com",c.port==nil,c.user==nil,c.password==nil,
+              c.query==nil,c.fragment==nil,c.percentEncodedPath==c.path else{return nil}
+        let path=c.path.hasSuffix("/") ? String(c.path.dropLast()) : c.path
+        guard path.range(of:"^/[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$",options:.regularExpression) != nil else{return nil}
+        let parts=path.split(separator:"/")
+        guard parts.count==2,parts[1] != ".",parts[1] != "..",!parts[1].hasSuffix(".git") else{return nil}
+        return "https://github.com"+path.lowercased()
+    }
+    static func apiRoot(_ input:String)->String? {
+        guard let address=canonical(input),let path=URLComponents(string:address)?.path else{return nil}
+        return "https://api.github.com/repos"+path+"/"
+    }
+}
 struct Settings: Codable {
     var server = ""
     var username = ""
     var password = ""
     var githubToken = ""
+    // Optional on disk so decoding older settings preserves credentials,
+    // player preferences and all other fields during an upgrade.
+    var githubRepositoryURL:String?
+    var repositoryAddress:String {
+        get {githubRepositoryURL ?? GitHubRepositoryAddress.defaultURL}
+        set {githubRepositoryURL=newValue}
+    }
     var rotationMinutes = 5
     var retries = 2
     var startupTimeout = 25

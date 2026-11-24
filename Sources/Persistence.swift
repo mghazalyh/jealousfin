@@ -31,25 +31,39 @@ private struct TorrioWriteFailure:LocalizedError {
     let status:Int
     var errorDescription:String?{"JealousDB write HTTP \(status)"}
 }
+private final class DatabaseNoRedirect:NSObject,URLSessionTaskDelegate {
+    func urlSession(_ session:URLSession,task:URLSessionTask,willPerformHTTPRedirection response:HTTPURLResponse,newRequest request:URLRequest,completionHandler:@escaping (URLRequest?)->Void){completionHandler(nil)}
+}
 @MainActor final class TorrioDB {
     private let transport:URLSession
-    init(transport:URLSession = .shared){self.transport=transport}
+    let repositoryAddress:String?
+    private let repository:String?
+    init(address:String,transport:URLSession = .shared){
+        self.transport=transport
+        self.repositoryAddress=GitHubRepositoryAddress.canonical(address)
+        self.repository=GitHubRepositoryAddress.apiRoot(address)
+    }
     private let writeAttempts=4
     private func conflictBackoff(_ attempt:Int) async throws {
         try await Task.sleep(nanoseconds:UInt64(250_000_000 * (1 << attempt)))
     }
-    let repository = "https://api.github.com/repos/mghazalyh/jealousdb/"
-    var base:String {repository+"contents/jealousfin/"}
+    var base:String? {repository.map{$0+"contents/jealousfin/"}}
     var token = ""
-    var configured:Bool { !token.isEmpty }
+    var configured:Bool { repository != nil && !token.isEmpty }
     func call(_ path:String, method:String="GET", body:[String:Any]?=nil,gitTree:Bool=false) async throws -> (Data,Int) {
-        guard configured, let u=URL(string:(gitTree ? repository+"git/trees/" : base)+path) else { throw AppError.message("Configure JealousDB token") }
+        guard let repository=repository,let base=base else{throw AppError.message("Invalid GitHub repository address")}
+        guard !token.isEmpty else{throw AppError.message("Configure GitHub repository token")}
+        guard var components=URLComponents(string:(gitTree ? repository+"git/trees/" : base)+path),
+              components.scheme=="https",components.host=="api.github.com",components.fragment==nil,
+              components.query==nil else{throw AppError.message("Invalid database request path")}
+        if method=="GET" && !gitTree{components.queryItems=[URLQueryItem(name:"ref",value:"main")]}
+        guard let u=components.url else{throw AppError.message("Invalid database request URL")}
         var req=URLRequest(url:u); req.httpMethod=method; req.timeoutInterval=20
         req.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")
         req.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
         req.setValue("2022-11-28",forHTTPHeaderField:"X-GitHub-Api-Version")
         if let body=body { req.httpBody=try JSONSerialization.data(withJSONObject:body); req.setValue("application/json",forHTTPHeaderField:"Content-Type") }
-        let (d,r)=try await transport.data(for:req)
+        let (d,r)=try await transport.data(for:req,delegate:DatabaseNoRedirect())
         guard let h=r as? HTTPURLResponse else { throw AppError.message("Invalid GitHub response") }
         return (d,h.statusCode)
     }

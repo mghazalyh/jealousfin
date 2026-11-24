@@ -39,7 +39,7 @@ import Network
     @Published var commandOutput=""
     let player=AVPlayer()
     let disk=Disk()
-    let db=TorrioDB()
+    let db:TorrioDB
     let lan=LANServer()
     let scripts=ScriptEngine()
     @Published private(set) var bundledBaselineRevision="native-baseline"
@@ -121,7 +121,13 @@ import Network
     private var deviceObservers:[NSObjectProtocol]=[]
 
     init() {
-        settings=disk.load(Settings.self,"settings.json") ?? Settings()
+        var storedSettings=disk.load(Settings.self,"settings.json") ?? Settings()
+        if storedSettings.githubRepositoryURL==nil {
+            storedSettings.repositoryAddress=GitHubRepositoryAddress.defaultURL
+            disk.save(storedSettings,"settings.json")
+        }
+        settings=storedSettings
+        db=TorrioDB(address:storedSettings.repositoryAddress)
         do {
             _ = try PatchVersionStore.recover(disk:disk)
         }catch{
@@ -211,13 +217,27 @@ import Network
             }
         }
     }
+    var repositorySwitchPending:Bool {
+        GitHubRepositoryAddress.canonical(settings.repositoryAddress) != db.repositoryAddress
+    }
+    var repositoryAddressValid:Bool {
+        GitHubRepositoryAddress.canonical(settings.repositoryAddress) != nil
+    }
     func saveSettings() {
         settings.rotationMinutes=max(1,min(1440,settings.rotationMinutes))
         settings.retries=max(1,min(5,settings.retries))
         settings.startupTimeout=max(5,min(120,settings.startupTimeout))
         settings.qualityMbps=max(1,min(50,settings.qualityMbps))
-        disk.save(settings,"settings.json")
-        db.token=settings.githubToken
+        guard let address=GitHubRepositoryAddress.canonical(settings.repositoryAddress) else {
+            syncStatus="Invalid repository address; enter https://github.com/owner/repo"
+            return
+        }
+        settings.repositoryAddress=address
+        guard disk.save(settings,"settings.json") else {
+            syncStatus="Cannot save settings"
+            return
+        }
+        if repositorySwitchPending {syncStatus="Repository saved. Relaunch Jealousfin to switch."}
         configureLAN()
         log("INFO","settings","SAVED")
     }
@@ -704,8 +724,13 @@ import Network
     }
     func requestSync(){
         guard syncTask==nil else{return}
+        guard repositoryAddressValid else{syncStatus="Invalid GitHub repository address";return}
+        // Pin the repository for the life of the process. A user may save a
+        // different target, but no multi-request Git transaction can cross
+        // repositories while it is in flight.
+        guard !repositorySwitchPending else{syncStatus="Save settings and relaunch to switch repository";return}
         db.token=settings.githubToken
-        guard db.configured else{syncStatus="Configure JealousDB token";return}
+        guard db.configured else{syncStatus="Configure GitHub repository token";return}
         syncTask=Task{[weak self] in
             guard let self=self else{return}
             await self.synchronize()

@@ -278,3 +278,24 @@ for value in ["http://10.1.2.3:8096","http://172.16.1.2:8096","http://172.31.1.2
     check(SharedSurf.gatewayOrigin(for:URL(string:value)!)?.port==8097,"supported private LAN range")
 }
 print("PASS: \(checks) total assertions including LAN shared gateway isolation")
+
+var repositorySettings=Settings()
+check(repositorySettings.repositoryAddress=="https://github.com/mghazalyh/jealousdb","new settings prefill JealousDB")
+repositorySettings.githubToken="fixture-token"
+repositorySettings.server="http://fixture.invalid:8096"
+repositorySettings.username="fixture-user"
+repositorySettings.password="fixture-password"
+repositorySettings.rotationMinutes=17
+repositorySettings.repositoryAddress="https://github.com/fixture-owner/custom-repo"
+let encodedRepositorySettings=try JSONCodec.encoder().encode(repositorySettings)
+let decodedRepositorySettings=try JSONCodec.decoder().decode(Settings.self,from:encodedRepositorySettings)
+check(decodedRepositorySettings.repositoryAddress==repositorySettings.repositoryAddress && decodedRepositorySettings.githubToken=="fixture-token","edited repository and token survive settings round trip")
+var legacyRepositorySettings=try JSONSerialization.jsonObject(with:encodedRepositorySettings) as! [String:Any]
+legacyRepositorySettings.removeValue(forKey:"githubRepositoryURL")
+let migratedRepositorySettings=try JSONCodec.decoder().decode(Settings.self,from:JSONSerialization.data(withJSONObject:legacyRepositorySettings))
+check(migratedRepositorySettings.repositoryAddress=="https://github.com/mghazalyh/jealousdb" && migratedRepositorySettings.server==repositorySettings.server && migratedRepositorySettings.username==repositorySettings.username && migratedRepositorySettings.password==repositorySettings.password && migratedRepositorySettings.githubToken==repositorySettings.githubToken && migratedRepositorySettings.rotationMinutes==17,"legacy settings migrate without losing credentials or preferences")
+check(GitHubRepositoryAddress.apiRoot(" HTTPS://GitHub.com/Fixture-Owner/Custom-Repo/ ")=="https://api.github.com/repos/fixture-owner/custom-repo/","canonical repository URL derives fixed GitHub API host")
+for invalidRepositoryAddress in ["","http://github.com/owner/repo","https://github.com.evil.invalid/owner/repo","https://github.com@evil.invalid/owner/repo","https://user@github.com/owner/repo","https://github.com:443/owner/repo","https://github.com/owner/repo?x=1","https://github.com/owner/repo#fragment","https://github.com/owner/repo/extra","https://github.com/owner/%2e%2e","https://github.com/owner/..","https://github.com/owner/repo.git"] {
+    check(GitHubRepositoryAddress.apiRoot(invalidRepositoryAddress)==nil,"reject invalid repository URL")
+}
+print("PASS: \(checks) total assertions including editable repository settings and legacy migration")

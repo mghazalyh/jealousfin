@@ -142,3 +142,7 @@ Restoration prevalidates interpreter code and UI, saves the current versions, an
 ## Dedicated database migration
 
 This branch targets `mghazalyh/jealousdb` on `main` with the existing `jealousfin/` directory layout. A token restricted to the new repository requires a client built from this branch; the old installed application still targets TorrioDB. The initial snapshot is not continuous replication. Do not switch tokens or issue new remote commands against the new repository until the client has been switched and verified. Preserve existing local device IDs and refresh the snapshot before actual cutover if the old client continues to write.
+
+### Editable database address
+
+The native Settings screen prefills `https://github.com/mghazalyh/jealousdb` for fresh or older installations. The URL is editable and persisted alongside the existing token. Only HTTPS github.com owner/repository addresses are accepted; the client derives api.github.com and refuses redirects. The active repository is pinned until app relaunch to avoid changing destinations during multi-request writes or remote commands. Save settings, then fully close and reopen the app to apply a new repository address. Pending local records and device identity are retained. The CI baseline importer is separately configured for the reviewed release database, not controlled by device settings.

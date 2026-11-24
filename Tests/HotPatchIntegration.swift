@@ -57,6 +57,11 @@ final class TorrioConflictFixture:URLProtocol {
         func blob(_ sha:String,_ data:Data){object=["sha":sha,"content":data.base64EncodedString()]}
         if method=="GET" {
             switch path {
+            case "route-probe.json":
+                if url.scheme=="https",url.host=="api.github.com",url.path=="/repos/fixture-owner/fixture-repo/contents/jealousfin/route-probe.json",
+                   URLComponents(url:url,resolvingAgainstBaseURL:false)?.queryItems==[URLQueryItem(name:"ref",value:"main")],
+                   request.value(forHTTPHeaderField:"Authorization")=="Bearer fixture" {blob("alternate-route",Data("ok".utf8))}
+                else{status=403}
             case "snapshot.json":blob(n==1 ? "old" : "new",Data("old snapshot".utf8))
             case "cas.json":blob("changed",Data("concurrent value".utf8))
             case "immutable.json":
@@ -92,8 +97,17 @@ final class TorrioConflictFixture:URLProtocol {
     static func run(engine:ScriptEngine) async throws{
         TorrioConflictFixture.reset()
         let dbConfig=URLSessionConfiguration.ephemeral;dbConfig.protocolClasses=[TorrioConflictFixture.self]
-        let conflictDB=TorrioDB(transport:URLSession(configuration:dbConfig));conflictDB.token="fixture"
-        try require(conflictDB.base=="https://api.github.com/repos/mghazalyh/jealousdb/contents/jealousfin/","dedicated private JealousDB route")
+        let conflictDB=TorrioDB(address:Settings().repositoryAddress,transport:URLSession(configuration:dbConfig));conflictDB.token="fixture"
+        try require(conflictDB.base=="https://api.github.com/repos/mghazalyh/jealousdb/contents/jealousfin/","prefilled JealousDB route")
+        let alternateDB=TorrioDB(address:"https://github.com/fixture-owner/fixture-repo",transport:URLSession(configuration:dbConfig))
+        alternateDB.token="fixture"
+        let routeProbe=try await alternateDB.read("route-probe.json")
+        try require(routeProbe?.sha=="alternate-route","native authenticated request uses edited repository")
+        let invalidDB=TorrioDB(address:"https://example.invalid/fixture-owner/fixture-repo",transport:URLSession(configuration:dbConfig))
+        invalidDB.token="fixture"
+        var invalidRejected=false
+        do{_ = try await invalidDB.read("invalid-route.json")}catch{invalidRejected=true}
+        try require(invalidRejected && TorrioConflictFixture.count("GET invalid-route.json")==0,"invalid repository never sends a token")
         let receipt=Data("receipt".utf8)
         try await conflictDB.replaceDeviceSnapshot("snapshot.json",data:Data("new snapshot".utf8))
         try require(TorrioConflictFixture.count("PUT snapshot.json")==2 && TorrioConflictFixture.count("GET snapshot.json")==2,"TorrioDB heartbeat conflict re-reads and retries")

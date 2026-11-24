@@ -292,8 +292,23 @@ struct SettingsView:View{
                 Button("Connect & refresh"){Task{await model.connect()}}.buttonStyle(.borderedProminent)
                 Text(model.status).font(.caption).foregroundColor(subdued)
             }}
-            SectionLabel(title:"JealousDB")
-            Panel{VStack(alignment:.leading,spacing:10){SecureField("GitHub repository access token",text:$model.settings.githubToken);Text("Private repository: jealousdb/jealousfin").font(.caption).foregroundColor(subdued);Text(model.syncStatus).font(.caption)}}
+            SectionLabel(title:"GitHub database")
+            Panel{VStack(alignment:.leading,spacing:10){
+                Text("Repository URL").font(.caption).foregroundColor(subdued)
+                TextField("https://github.com/owner/repo",text:$model.settings.repositoryAddress)
+                    .keyboardType(.URL).autocapitalization(.none).disableAutocorrection(true)
+                if !model.repositoryAddressValid {
+                    Text("Enter a valid HTTPS GitHub repository URL.").font(.caption).foregroundColor(.red)
+                }
+                Divider()
+                SecureField("GitHub repository access token",text:$model.settings.githubToken)
+                Text("Active: "+(model.db.repositoryAddress ?? "Not configured")).font(.caption).foregroundColor(subdued)
+                Text("Branch: main · Data folder: jealousfin/").font(.caption).foregroundColor(subdued)
+                if model.repositorySwitchPending && model.repositoryAddressValid {
+                    Text("Save settings, then close and reopen Jealousfin to switch repositories safely.").font(.caption).foregroundColor(subdued)
+                }
+                Text(model.syncStatus).font(.caption)
+            }}
             SectionLabel(title:"Playback and operation")
             Panel{VStack(alignment:.leading,spacing:12){
                 Stepper("Quality: \(model.settings.qualityMbps) Mbps",value:$model.settings.qualityMbps,in:1...50)
