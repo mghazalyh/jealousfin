@@ -25,6 +25,8 @@ import Network
     @Published var playing=false
     @Published var remaining=0
     @Published var ready=false
+    @Published var fullscreenPresented=false
+    @Published var fullscreenControlsVisible=true
     @Published var metrics:[String:String]=[:]
     @Published private(set) var systemMetrics:[String:String]=[:]
     @Published private(set) var telemetryActive=false
@@ -969,9 +971,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command,origin:String="internal") async -> Receipt {
         if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
@@ -1015,12 +1017,36 @@ import Network
             throw AppError.message("Patch restoration in progress")
         }
         switch action {
+        case "set_fullscreen":
+            guard let raw=args["visible"],["true","false"].contains(raw) else{throw AppError.message("Expected visible=true or false")}
+            if raw=="true"{tab=1;fullscreenControlsVisible=true}
+            fullscreenPresented=raw=="true"
+            return "Fullscreen presentation requested"
+        case "set_fullscreen_controls":
+            guard let raw=args["visible"],["true","false"].contains(raw) else{throw AppError.message("Expected visible=true or false")}
+            fullscreenControlsVisible=raw=="true"
+            return "Fullscreen controls updated"
         case "get_native_capabilities":
-            return try json(["runtimeABI":"2","adapterABI":"1","playbackAttemptHook":"true","playbackPolicyFields":"segmentContainer,forceEncode,segmentSeconds,minimumSegments,maxWidth,maxHeight,videoBitrate,audioBitrate,peakMbps,forwardBufferSeconds,automaticallyWaits,startupSeconds,diagnosticSeconds,preferDirect","hlsProbe":"active-session,same-origin,no-redirect","sharedSurf":"unchanged,server-owned","nativeLifecycle":"native-only"])
+            return try json(["runtimeABI":"2","adapterABI":"1","playbackAttemptHook":"true","playbackPolicyFields":"segmentContainer,forceEncode,segmentSeconds,minimumSegments,maxWidth,maxHeight,videoBitrate,audioBitrate,peakMbps,forwardBufferSeconds,automaticallyWaits,startupSeconds,diagnosticSeconds,preferDirect","hlsProbe":"active-session,same-origin,no-redirect","sharedSurf":"unchanged,server-owned","nativeLifecycle":"native-only","fullscreenUI":"player.fullscreen.top,player.fullscreen.controls,player.fullscreen.bottom"])
         case "get_player_snapshot":
             let item=player.currentItem
             let access=item?.accessLog()?.events.last
-            return try json(["position":String(position),"rate":String(player.rate),"itemStatus":String(item?.status.rawValue ?? -1),"timeControl":String(player.timeControlStatus.rawValue),"waiting":player.reasonForWaitingToPlay?.rawValue ?? "none","bytes":String(access?.numberOfBytesTransferred ?? 0),"stalls":String(access?.numberOfStalls ?? 0),"droppedFrames":String(access?.numberOfDroppedVideoFrames ?? 0),"displayReady":String(ready),"validated":String(validated),"transport":session?.method ?? "none","runtime":activePatchID,"adapter":jellyfinAPIRevision,"channelID":current?.id ?? ""])
+            var snapshot:[String:String]=[:]
+            snapshot["position"]=String(position)
+            snapshot["rate"]=String(player.rate)
+            snapshot["itemStatus"]=String(item?.status.rawValue ?? -1)
+            snapshot["timeControl"]=String(player.timeControlStatus.rawValue)
+            snapshot["waiting"]=player.reasonForWaitingToPlay?.rawValue ?? "none"
+            snapshot["bytes"]=String(access?.numberOfBytesTransferred ?? 0)
+            snapshot["stalls"]=String(access?.numberOfStalls ?? 0)
+            snapshot["droppedFrames"]=String(access?.numberOfDroppedVideoFrames ?? 0)
+            snapshot["displayReady"]=String(ready)
+            snapshot["validated"]=String(validated)
+            snapshot["transport"]=session?.method ?? "none"
+            snapshot["runtime"]=activePatchID
+            snapshot["adapter"]=jellyfinAPIRevision
+            snapshot["channelID"]=current?.id ?? ""
+            return try json(snapshot)
         case "probe_active_hls":
             guard !manualHLSProbeBusy,let active=session,!active.isSharedSurf else{throw AppError.message("No ordinary active HLS session or probe already running")}
             manualHLSProbeBusy=true;defer{manualHLSProbeBusy=false}

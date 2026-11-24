@@ -119,7 +119,24 @@ struct PlaybackView:View{
         Screen{
             DynamicUISlotView(location:"player.top")
             HStack{Text("Now playing").font(.largeTitle.bold());Spacer();if model.playing{Label("LIVE",systemImage:"circle.fill").font(.caption.bold()).foregroundColor(.red)}}
-            PlayerSurface(player:model.player,onReady:model.presentationReady).aspectRatio(16/9,contentMode:.fit).background(.black).cornerRadius(14)
+            ZStack(alignment:.bottomTrailing){
+                if model.fullscreenPresented {
+                    Color.black.aspectRatio(16/9,contentMode:.fit)
+                }else{
+                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:false)
+                        .aspectRatio(16/9,contentMode:.fit)
+                }
+                Button{
+                    model.fullscreenControlsVisible=true
+                    model.fullscreenPresented=true
+                }label:{
+                    Image(systemName:"arrow.up.left.and.arrow.down.right")
+                        .font(.title3.weight(.semibold)).frame(width:48,height:48)
+                        .background(Color.black.opacity(0.7)).clipShape(Circle())
+                }.buttonStyle(.plain).padding(10)
+                    .accessibilityLabel("Enter fullscreen with Surf controls")
+                    .accessibilityIdentifier("player.fullscreen.enter")
+            }.background(.black).cornerRadius(14)
             Panel{
                 VStack(alignment:.leading,spacing:8){
                     Text(model.current?.name ?? "Choose a channel").font(.title2.bold())
@@ -152,6 +169,9 @@ struct PlaybackView:View{
             ForEach(model.previous){c in ChannelRow(channel:c)}
             DynamicUISlotView(location:"player.bottom")
         }.navigationBarHidden(true)
+        .fullScreenCover(isPresented:$model.fullscreenPresented){
+            FullscreenSurfPlayer().environmentObject(model)
+        }
     }
 }
 struct HealthView:View{

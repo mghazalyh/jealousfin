@@ -370,3 +370,8 @@ check((try? playbackAttempt.checked())==nil,"reject excessive playback dimension
 check((try? PrivateConnectionDefaults(schemaVersion:1,server:"http://fixture.invalid",username:"fixture",password:"fixture").checked()) != nil,"private connection defaults schema")
 check((try? PrivateConnectionDefaults(schemaVersion:1,server:"http://user:secret@fixture.invalid",username:"fixture",password:"fixture").checked()) == nil,"reject embedded URL credentials")
 print("PASS: \(checks) assertions including ABI 2 playback and provisioning rules")
+
+let fullscreenLayout = DynamicUILayout(schemaVersion:1,revision:"fullscreen-fixture",slots:[DynamicUISlot(location:"player.fullscreen.controls",nodes:[])],pages:[])
+check((try? fullscreenLayout.checked()) != nil,"fullscreen hot patch slot supported")
+check(DynamicUILayout.commands.contains("set_fullscreen_controls"),"fullscreen overlay remotely controllable")
+print("PASS: \(checks) assertions including fullscreen hot patch support")

@@ -33,3 +33,11 @@ into validated, reversible QuickJS policy. The previous working IPA is preserved
   regression. Keep the accepted build 1015 latest until physical approval.
 - Native limitations: arbitrary Swift/OS changes, entitlements, native UI
   primitives and installation still require a new IPA.
+
+Fullscreen uses the existing AVPlayer with an interactive application-owned
+overlay. Category, transport controls, rotation state and start/stop are
+available in fullscreen. New dynamic slots: player.fullscreen.top,
+player.fullscreen.controls and player.fullscreen.bottom. Commands
+set_fullscreen and set_fullscreen_controls accept visible=true/false.
+The app's own fullscreen entry replaces the inline system transport controls.
+Physical transition and accessibility acceptance remains required.
