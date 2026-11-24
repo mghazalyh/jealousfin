@@ -1,0 +1,64 @@
+name: Publish verified Surf IPA prerelease
+on:
+  push:
+    branches: [release/verified-surf-20261125]
+    paths: ['.github/workflows/publish-verified-surf.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: jealousfin-publish-verified-surf
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TEST_RUN: '45457110623'
+      TEST_SHA: 'dafb7556e011145db912b17a1fc07e8fedc5c08e'
+      ARTIFACT_ID: '14951731505'
+      TAG: v0.1.12-rc.1
+    steps:
+      - name: Verify accepted revision and artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$TEST_RUN" > run.json
+          jq -e --arg sha "$TEST_SHA" '.status == "completed" and .conclusion == "success" and .head_sha == $sha and .head_branch == "diagnostics/comprehensive-acceptance-20261125" and .path == ".github/workflows/comprehensive-acceptance.yml"' run.json
+          gh api "repos/$GH_REPO/actions/runs/$TEST_RUN/artifacts" > artifacts.json
+          jq -e --argjson id "$ARTIFACT_ID" '.artifacts | any(.id == $id and .name == "Jealousfin-IPA" and .expired == false)' artifacts.json
+          gh api "repos/$GH_REPO/actions/runs/$TEST_RUN/jobs" > jobs.json
+          jq -e '(.jobs | length == 2) and (.jobs | all(.conclusion == "success"))' jobs.json
+          gh run download "$TEST_RUN" --name Jealousfin-IPA --dir verified
+          cd verified
+          test -s Jealousfin.ipa
+          test -s Jealousfin.ipa.sha256
+          expected=$(awk 'NR==1 {print $1}' Jealousfin.ipa.sha256)
+          [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]]
+          actual=$(sha256sum Jealousfin.ipa | awk '{print $1}')
+          [[ "${expected,,}" == "$actual" ]]
+          printf '%s  Jealousfin.ipa\n' "$actual" > Jealousfin.ipa.sha256
+          unzip -tq Jealousfin.ipa
+          unzip -Z1 Jealousfin.ipa | grep -Fx 'Payload/Jealousfin.app/Jealousfin'
+          echo "Accepted artifact integrity verified: $actual"
+      - name: Publish exact accepted IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          Physical-device acceptance prerelease. The attached unsigned ARM64 IPA is the exact artifact from successful comprehensive acceptance run #45457110623, not a rebuild.
+
+          Includes the repaired authenticated shared Surf HLS gateway, native API adapter/runtime and hot patch version restoration. GitHub-hosted acceptance passed all six native Surf scenarios, an ordinary-channel playback scenario, 167 Swift assertions, 34 hot patch integration checks, six Python tests, and the independent three-category HLS decoder tests.
+
+          Limitations: AVPlayer acceptance ran on hosted macOS using production Swift sources; the installed iOS app, physical iPhone playback, background endurance, and device command execution have not yet been accepted. Two ordinary-channel attempts failed before one succeeded. Shared Surf rotation is server-managed.
+
+          iOS 15+; unsigned device IPA for compatible TrollStore installations.
+
+          Tested revision: dafb7556e011145db912b17a1fc07e8fedc5c08e
+          Acceptance: https://github.com/mghazalyh/jealousfin/actions/runs/45457110623
+          EOF
+          gh release create "$TAG" verified/Jealousfin.ipa verified/Jealousfin.ipa.sha256 --target "$TEST_SHA" --title "Jealousfin v0.1.12 RC1 — Verified Surf repair" --notes-file notes.md --prerelease --latest=false
+          gh release view "$TAG" --json tagName,url,isPrerelease,assets,targetCommitish
