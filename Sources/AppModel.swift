@@ -41,6 +41,18 @@ import Network
     let db=TorrioDB()
     let lan=LANServer()
     let scripts=ScriptEngine()
+    private lazy var engineering=EngineeringRuntime(disk:disk,engine:scripts)
+    @Published private(set) var campaign:DeviceTestCheckpoint?
+    @Published private(set) var activePatchID="native-baseline"
+    @Published private(set) var patchFault:String?
+    private var policyOverride:RuntimePolicy?
+    private var policyReady=false
+    private var patchBusy=false
+    private var campaignTask:Task<Void,Never>?
+    private var selectionTask:Task<Void,Never>?
+    private var selectionID=UUID()
+    private var engineeringOwnsPlayback:Bool {campaign?.state=="running"}
+    private var effectivePolicy:RuntimePolicy {policyOverride ?? RuntimePolicy.baseline(settings)}
     let jelly:Jellyfin
     let deviceID:String
     private var ledger:HealthLedger
@@ -84,6 +96,7 @@ import Network
 
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
+        campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
         ledger=disk.load(HealthLedger.self,"health.json") ?? HealthLedger()
         health=ledger.states()
         deviceID=disk.load(String.self,"device.json") ?? UUID().uuidString
@@ -120,7 +133,12 @@ import Network
         configureLAN()
         publishHeartbeat(now:Date())
         requestSync()
-        if settings.autoLogin && !settings.server.isEmpty { Task { await connect() } }
+        Task { [weak self] in
+            guard let self=self else{return}
+            await self.bootRuntime()
+            if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect()}
+            self.resumeCampaignIfNeeded()
+        }
         supervisor=Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds:1_000_000_000)
@@ -208,8 +226,8 @@ import Network
             log("INFO","jellyfin","CONNECTED",["channels":String(channels.count)])
             failureRun=0
             loginBusy=false
-            if resumeLoop && current==nil {startSurf(category:category)}
-            else if let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
+            if !engineeringOwnsPlayback && resumeLoop && current==nil {startSurf(category:category)}
+            else if !engineeringOwnsPlayback,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
         } catch {status="Connection failed";log("ERROR","jellyfin","CONNECT_FAILED",["error":error.localizedDescription])}
         recalculateInsights();requestSync()
     }
@@ -245,7 +263,7 @@ import Network
         attemptedIDs.removeAll();log("INFO","surf","START",["category":category,"minutes":String(settings.rotationMinutes)])
         next()
     }
-    func stopSurf(){surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
+    func stopSurf(){selectionTask?.cancel();selectionID=UUID();surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
     func toggleSurfPause(){
         guard surfing else{return}
         surfPaused.toggle()
@@ -253,7 +271,7 @@ import Network
             pausedRotationSeconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())}
             nextRotation=nil
         } else if validated {
-            nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? settings.rotationMinutes*60)
+            nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? effectivePolicy.rotationSeconds)
             pausedRotationSeconds=nil
         } else { emptyPoolRetry=Date() }
         log("INFO","surf",surfPaused ? "PAUSED":"RESUMED")
@@ -268,7 +286,8 @@ import Network
         }
     }
     func next(){
-        guard !loginBusy,jelly.connected,catalogueReady else{return}
+        guard !loginBusy,jelly.connected,catalogueReady,policyReady else{return}
+        selectionTask?.cancel();selectionID=UUID();let ticket=selectionID
         let candidates=pool()
         guard !candidates.isEmpty else {
             clearPlayback();nextRotation=nil;remaining=0;status="No eligible channels for this filter"
@@ -280,8 +299,22 @@ import Network
         if remainingCandidates.isEmpty {attemptedIDs.removeAll();remainingCandidates=candidates}
         let filtered=remainingCandidates.filter{$0.id != current?.id}
         if !filtered.isEmpty {remainingCandidates=filtered}
-        guard let channel=settings.random ? remainingCandidates.randomElement() : remainingCandidates.first else{return}
-        attemptedIDs.insert(channel.id);begin(channel,keepSurf:true)
+        guard let fallback=settings.random ? remainingCandidates.randomElement() : remainingCandidates.first else{return}
+        if activePatchID=="native-baseline" {
+            attemptedIDs.insert(fallback.id);begin(fallback,keepSurf:true);return
+        }
+        let choices=remainingCandidates
+        let previousID=current?.id
+        selectionTask=Task{[weak self] in
+            guard let self=self else{return}
+            var selected=fallback
+            do {
+                if let id=try await self.engineering.select(candidates:choices,currentID:previousID),
+                   let chosen=choices.first(where:{$0.id==id}){selected=chosen}
+            }catch{self.log("WARN","runtime","SELECT_FALLBACK",["error":error.localizedDescription])}
+            guard !Task.isCancelled,self.selectionID==ticket,self.health[selected.id]?.eligible(at:Date()) ?? true else{return}
+            self.attemptedIDs.insert(selected.id);self.begin(selected,keepSurf:true)
+        }
     }
     func open(_ c:Channel){
         guard !loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
@@ -296,7 +329,7 @@ import Network
         stopSurf();begin(c,keepSurf:false)
     }
     private func begin(_ channel:Channel,keepSurf:Bool){
-        guard !loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
+        guard !loginBusy,jelly.connected,catalogueReady,policyReady else{log("WARN","player","NOT_CONNECTED");return}
         guard health[channel.id]?.eligible(at:Date()) ?? true else{status="Channel is excluded by validation policy";return}
         work?.cancel();generation=UUID();let g=generation
         retryCurrentAfterResume=false;pausedRotationSeconds=nil;lastPlayerError=nil
@@ -322,21 +355,25 @@ import Network
     private var position:Double {let n=player.currentTime().seconds;return n.isFinite ? max(0,n):0}
     private func attempt(_ channel:Channel,generation g:UUID) async {
         var errorReason="Startup timeout"
-        for attemptIndex in 1...max(1,settings.retries) {
+        let policy=effectivePolicy
+        player.automaticallyWaitsToMinimizeStalling=policy.automaticallyWaits
+        for attemptIndex in 1...max(1,policy.retries) {
             guard g==generation,!Task.isCancelled else{return}
             errorReason="Startup timeout"
             log("INFO","validator","ATTEMPT",["channelID":channel.id,"attempt":String(attemptIndex)])
             do {
-                let s=try await jelly.stream(channel,mbps:settings.qualityMbps)
+                let s=try await jelly.stream(channel,mbps:policy.qualityMbps)
                 guard g==generation,!Task.isCancelled else{await jelly.close(s,position:0);return}
                 session=s;startedSession=false
                 let item=AVPlayerItem(url:s.url)
+                item.preferredForwardBufferDuration=Double(policy.forwardBufferSeconds)
+                item.preferredPeakBitRate=Double(policy.qualityMbps)*1_000_000
                 let output=AVPlayerItemVideoOutput(pixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA])
                 item.add(output);videoOutput=output
                 player.replaceCurrentItem(with:item)
                 if !intentionallyPaused {player.play()}
                 ready=false;lastPosition=position
-                var deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
+                var deadline=Date().addingTimeInterval(Double(policy.startupTimeout))
                 var firstPosition:Double?
                 var evidence=VideoEvidence()
                 while Date()<deadline && g==generation && !Task.isCancelled {
@@ -345,7 +382,7 @@ import Network
                     if intentionallyPaused {
                         firstPosition=nil
                         evidence=VideoEvidence()
-                        deadline=Date().addingTimeInterval(Double(settings.startupTimeout))
+                        deadline=Date().addingTimeInterval(Double(policy.startupTimeout))
                         continue
                     }
                     if item.status == .failed {errorReason="AVPlayer item failed";break}
@@ -358,13 +395,14 @@ import Network
                     }
                     if item.status == .readyToPlay && player.timeControlStatus == .playing {
                         if firstPosition==nil {firstPosition=p}
-                        if let first=firstPosition,evidence.qualifies(progress:p-first,monotonic:ProcessInfo.processInfo.systemUptime) {
+                        if let first=firstPosition,evidence.qualifies(progress:p-first,monotonic:ProcessInfo.processInfo.systemUptime),
+                           p-first>=Double(policy.validationSeconds),evidence.frameCount>=policy.minimumFrames {
                             guard g==generation,!Task.isCancelled else{return}
                             validated=true;playing=true;lastSuccess=Date();lastAdvance=Date();lastPosition=p;failureRun=0
                             status="Playing \(channel.name)"
                             log("INFO","validator","PLAYBACK_CONFIRMED",["channelID":channel.id,"decodedSamples":String(evidence.frameCount),"displayReady":String(ready),"progressSeconds":String(format:"%.2f",p-first),"startupMs":String(Int((ProcessInfo.processInfo.systemUptime-startUptime)*1000))])
-                            if settings.validation && !channel.isSurf {appendHealth(channel,"success","Playback progressed with video evidence")}
-                            if surfing && !surfPaused {nextRotation=Date().addingTimeInterval(Double(settings.rotationMinutes*60))}
+                            if settings.validation && !engineeringOwnsPlayback && !channel.isSurf {appendHealth(channel,"success","Playback progressed with video evidence")}
+                            if surfing && !surfPaused {nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))}
                             MPNowPlayingInfoCenter.default().nowPlayingInfo=[MPMediaItemPropertyTitle:channel.name,MPMediaItemPropertyArtist:channel.program?.title ?? "Live TV",MPNowPlayingInfoPropertyIsLiveStream:true,MPNowPlayingInfoPropertyPlaybackRate:1.0]
                             let report=lastProgressReport
                             lastProgressReport=Task{await report?.value;await jelly.report(s,action:"",position:p,paused:false)}
@@ -398,7 +436,7 @@ import Network
         let foreground=UIApplication.shared.applicationState == .active
         let confirmed=PlaybackFailurePolicy.confirms(serverHealthy:serverOK,recentSuccess:recentSuccess,consecutiveFailures:failureRun,reason:errorReason,paused:intentionallyPaused || !foreground)
         lastPlayerError=errorReason
-        if settings.validation && !channel.isSurf && confirmed {appendHealth(channel,"failure",errorReason)}
+        if settings.validation && !engineeringOwnsPlayback && !channel.isSurf && confirmed {appendHealth(channel,"failure",errorReason)}
         log(confirmed ? "ERROR":"WARN","validator",confirmed ? "CHANNEL_FAILED":"FAILURE_UNCONFIRMED",["channelID":channel.id,"reason":errorReason,"serverHealthy":String(serverOK),"recentSuccess":String(recentSuccess)])
         status=confirmed ? "Channel failed; validation recorded":"Playback failure needs diagnosis"
         playing=false;validated=false
@@ -423,7 +461,7 @@ import Network
         else if session != nil {
             player.play()
             if surfing && !surfPaused && validated {
-                nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? settings.rotationMinutes*60)
+                nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? effectivePolicy.rotationSeconds)
             }
         }
         pausedRotationSeconds=nil
@@ -543,7 +581,7 @@ import Network
             let p=position
             if p>lastPosition+0.15 {lastAdvance=now;lastPosition=p}
             playing=player.timeControlStatus == .playing
-            if item.status == .failed || (lastAdvance.map{now.timeIntervalSince($0)>30} ?? false) {
+            if item.status == .failed || (lastAdvance.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)} ?? false) {
                 log("WARN","recovery","PLAYBACK_STALLED",["position":String(p)])
                 if let c=current {begin(c,keepSurf:surfing)}
             } else if now.timeIntervalSince(lastReport)>15 {
@@ -568,7 +606,8 @@ import Network
         if jelly.connected && now.timeIntervalSince(lastRefresh)>180 {
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        if policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        resumeCampaignIfNeeded()
         if now.timeIntervalSince(lastHeartbeat)>30 {publishHeartbeat(now:now)}
         if now.timeIntervalSince(lastSync)>30 {requestSync()}
     }
@@ -604,11 +643,15 @@ import Network
         lastSync=Date();syncStatus="Synchronizing"
         // Telemetry must not depend on health-ledger merge or command success.
         var telemetryError:String?
+        do {try await uploadEngineeringResults()}
+        catch {log("WARN","engineering","RESULT_UPLOAD_FAILED",["error":error.localizedDescription])}
         do {try await uploadTelemetry()}
         catch {telemetryError=sanitized(error.localizedDescription);log("WARN","torriodb","TELEMETRY_UPLOAD_FAILED",["error":error.localizedDescription])}
         do {
-            let merged=try await db.merge(ledger)
-            ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
+            do {
+                let merged=try await db.merge(ledger)
+                ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
+            }catch{log("WARN","health","MERGE_FAILED",["error":error.localizedDescription])}
             let prefix="control/devices/\(deviceID)"
             // Publish a small heartbeat before consuming pending commands.
             let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
@@ -649,6 +692,8 @@ import Network
     }
     func recalculateInsights(){
         var list:[Insight]=[]
+        if let fault=patchFault {list.append(Insight(id:"patch",priority:"High",title:"Runtime module needs attention",explanation:fault,action:"Inspect module status and roll back or install a corrected module."))}
+        if let result=campaign?.lastResult,result.status=="failed" {list.append(Insight(id:"device-test",priority:"High",title:"On-device test failed: "+result.kind,explanation:result.evidence["reason"] ?? "See the correlated engineering result.",action:"Inspect campaign evidence and revise the runtime policy."))}
         if status=="Connection failed"{list.append(Insight(id:"connection",priority:"Emergency",title:"Jellyfin connection failed",explanation:"The application cannot authenticate or reach the server. Channel penalties are suspended for infrastructure failures.",action:"Check server availability and connection settings."))}
         if disk.error != nil {list.append(Insight(id:"disk",priority:"Emergency",title:"Local persistence needs attention",explanation:disk.error ?? "",action:"Check available device storage."))}
         if failureRun>=3 {list.append(Insight(id:"failure-run",priority:"High",title:"Multiple consecutive playback failures",explanation:"The validator cannot establish channel-specific failure. Automatic exclusions are restrained.",action:"Inspect server and player traces."))}
@@ -661,9 +706,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -681,7 +726,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -738,6 +783,27 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "install_runtime_module":
+            guard let id=args["id"],let source=args["source"] else{throw AppError.message("Module ID and JavaScript source required")}
+            try await installRuntime(id:id,source:source);return "Runtime module activated: "+activePatchID
+        case "reload_runtime_module":
+            guard policyReady,!patchBusy else{throw AppError.message("Runtime busy")}
+            await bootRuntime();return "Runtime reloaded: "+activePatchID
+        case "rollback_runtime_module":
+            try await changeRuntime(reset:false);return "Runtime rolled back: "+activePatchID
+        case "reset_runtime_module":
+            try await changeRuntime(reset:true);return "Native baseline restored"
+        case "get_runtime_module":
+            let data=try JSONCodec.encoder().encode(effectivePolicy)
+            let p=try JSONSerialization.jsonObject(with:data)
+            return String(decoding:try JSONSerialization.data(withJSONObject:["abi":1,"id":activePatchID,"ready":policyReady,"fault":patchFault ?? "","policy":p],options:[.sortedKeys]),as:UTF8.self)
+        case "start_device_tests":
+            guard let plan=args["plan"] else{throw AppError.message("Provide a JSON test plan")}
+            try startCampaign(try JSONCodec.decoder().decode(DeviceTestPlan.self,from:Data(plan.utf8)));return "Campaign persisted and queued"
+        case "pause_device_tests":try setCampaignState("paused")
+        case "resume_device_tests":try setCampaignState("queued");resumeCampaignIfNeeded()
+        case "stop_device_tests":try setCampaignState("stopped")
+        case "get_device_tests":return try json(campaign)
         case "script":
             guard let source=args["source"] else{throw AppError.message("Missing script source")}
             return try await runScript(source)
@@ -749,7 +815,7 @@ import Network
         let start=ProcessInfo.processInfo.systemUptime
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:stateSnapshot())
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","reload_runtime_module","rollback_runtime_module","reset_runtime_module"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
