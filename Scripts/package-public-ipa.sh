@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${JEALOUSFIN_BUILD_NUMBER:?Expected numeric build number}"
+[[ "$JEALOUSFIN_BUILD_NUMBER" =~ ^[0-9]+$ ]]
+APP="DerivedData/Build/Products/Release-iphoneos/Jealousfin.app"
+STAGED="build/Payload/Jealousfin.app"
+BUNDLE="com.example.jealousfin"
+test -f "$APP/Jealousfin"
+test -f "$APP/Info.plist"
+check_metadata() {
+  local app="$1"
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" == "$BUNDLE" ]]
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")" == "0.1.13" ]]
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")" == "$JEALOUSFIN_BUILD_NUMBER" ]]
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")" == "15.0" ]]
+  [[ "$(lipo -archs "$app/Jealousfin")" == arm64 ]]
+  [[ -z "$(find "$app" -type f \( -iname 'JealousfinDefaults.plist' -o -iname '*.mobileprovision' -o -iname '*.p12' -o -iname '*.pfx' -o -iname '*.key' \) -print -quit)" ]]
+  test -x "$app/Jealousfin"
+}
+check_metadata "$APP"
+mkdir -p build
+rm -rf build/Payload
+mkdir -p build/Payload
+ditto "$APP" "$STAGED"
+cp Vendor/QuickJS/LICENSE "$STAGED/QuickJS-LICENSE.txt"
+python3 -c 'import json; m=json.load(open("Promoted/baseline.json")); print(json.dumps({k:m[k] for k in ("schemaVersion","revision","sources")},sort_keys=True))' > "$STAGED/PromotedBaseline.json"
+# Sign only after every resource is staged. Do not copy shared profile entitlements.
+# This is an ad hoc signature for TrollStore, not an Apple distribution signature.
+xattr -cr "$STAGED"
+codesign --force --sign - --identifier "$BUNDLE" "$STAGED"
+verify_signature() {
+  local app="$1"
+  local details
+  check_metadata "$app"
+  codesign --verify --strict --verbose=2 "$app"
+  details="$(codesign -dv --verbose=4 "$app" 2>&1)"
+  grep -Fx "Identifier=$BUNDLE" <<< "$details"
+  grep -Fx 'Signature=adhoc' <<< "$details"
+  local entitlements
+  entitlements="$(codesign -d --entitlements :- "$app" 2>/dev/null)"
+  if [[ -n "$entitlements" ]]; then
+    printf '%s' "$entitlements" | python3 -c 'import plistlib,sys; e=plistlib.loads(sys.stdin.buffer.read()); assert not e, "Unexpected public IPA entitlements"'
+  fi
+}
+verify_signature "$STAGED"
+rm -f build/Jealousfin.ipa build/Jealousfin.ipa.sha256
+(cd build && /usr/bin/zip -qry Jealousfin.ipa Payload)
+unzip -tq build/Jealousfin.ipa
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+ditto -x -k build/Jealousfin.ipa "$scratch"
+verify_signature "$scratch/Payload/Jealousfin.app"
+(cd build && shasum -a 256 Jealousfin.ipa > Jealousfin.ipa.sha256 && shasum -a 256 -c Jealousfin.ipa.sha256)
+echo "Public package verified: $BUNDLE, build $JEALOUSFIN_BUILD_NUMBER, ARM64, iOS 15.0."

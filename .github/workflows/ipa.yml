@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Import reviewed patch baseline (required)
         env:
-          JEALOUSDB_RELEASE_TOKEN: ${{ secrets.JEALOUSDB_RELEASE_TOKEN }}
+          JEALOUSDB_RELEASE_TOKEN: ${{ secrets.JEALOUSDB_RELEASE_TOKEN || secrets.TORRIODB_RELEASE_TOKEN }}
         run: |
           python3 Scripts/import-promoted.py
       - name: Generate reviewed baseline source
@@ -43,22 +43,13 @@ jobs:
           build/runtime-tests
       - name: Generate project and build
         run: |
-          xcodegen generate
-          xcodebuild -project Jealousfin.xcodeproj -scheme Jealousfin -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" IPHONEOS_DEPLOYMENT_TARGET=15.0 CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" build
-      - name: Package IPA
-        run: |
           set -euo pipefail
-          APP=DerivedData/Build/Products/Release-iphoneos/Jealousfin.app
-          test -f "$APP/Jealousfin"
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" | grep -x '15.0'
-          mkdir -p build/Payload
-          ditto "$APP" build/Payload/Jealousfin.app
-          cp Vendor/QuickJS/LICENSE build/Payload/Jealousfin.app/QuickJS-LICENSE.txt
-          python3 -c 'import json; m=json.load(open("Promoted/baseline.json")); print(json.dumps({k:m[k] for k in ("schemaVersion","revision","sources")},sort_keys=True))' > build/Payload/Jealousfin.app/PromotedBaseline.json
-          cd build
-          /usr/bin/zip -qry Jealousfin.ipa Payload
-          unzip -t Jealousfin.ipa
-          shasum -a 256 Jealousfin.ipa > Jealousfin.ipa.sha256
+          build_number=$((1000 + GITHUB_RUN_NUMBER))
+          echo "JEALOUSFIN_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          xcodegen generate
+          xcodebuild -project Jealousfin.xcodeproj -scheme Jealousfin -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" IPHONEOS_DEPLOYMENT_TARGET=15.0 PRODUCT_BUNDLE_IDENTIFIER=com.example.jealousfin CURRENT_PROJECT_VERSION="$build_number" build
+      - name: Package and verify public TrollStore IPA
+        run: bash Scripts/package-public-ipa.sh
       - uses: actions/upload-artifact@v4
         with:
           name: Jealousfin-IPA
@@ -70,6 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v0.1.${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          set -euo pipefail
+          tag="v0.1.13-build${JEALOUSFIN_BUILD_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           baseline="$(python3 -c 'import json;print(json.load(open("Promoted/baseline.json"))["revision"])')"
-          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin development build ${GITHUB_RUN_NUMBER}" --notes "Unsigned iOS 15+ arm64 IPA for TrollStore installation testing. Source: $GITHUB_SHA. Embedded promoted baseline: $baseline. Build and policy regression verified; physical playback, background endurance and global server enforcement not yet accepted." --prerelease
+          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build ${JEALOUSFIN_BUILD_NUMBER} (TrollStore candidate)" --notes "Ad hoc signed iOS 15+ arm64 IPA with bundle identifier com.example.jealousfin. For TrollStore testing, not Apple OTA distribution. No private login defaults or shared distribution provisioning profile. Source: $GITHUB_SHA. Embedded reviewed baseline: $baseline. Package signature and regressions verified by CI; physical installation and playback require separate acceptance." --prerelease
