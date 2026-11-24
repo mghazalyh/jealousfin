@@ -29,6 +29,7 @@ targets:
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UIBackgroundModes: [audio]
         NSLocalNetworkUsageDescription: Connect to Jellyfin and receive local playback commands.
+        NSBonjourServices: [_jealousfin._tcp]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
     settings:

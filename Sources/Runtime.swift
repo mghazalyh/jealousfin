@@ -5,50 +5,92 @@ import Network
 // JavaScriptCore is interpreted on the target device; native changes still require an IPA.
 @MainActor final class ScriptEngine {}
 
-// Small HTTP/1.1 command transport. No shell or file-system endpoint.
+// Direct local application control; no GitHub dependency.
 final class LANServer {
     private var listener:NWListener?
     private let queue=DispatchQueue(label:"jealousfin.lan")
+    private let listenPort:NWEndpoint.Port
+    private let advertise:Bool
+    private var connections:[ObjectIdentifier:NWConnection]=[:]
     var handler:((Data,@escaping(Data)->Void)->Void)?
+    var queryHandler:((String,@escaping(String,Data)->Void)->Void)?
     var state:((String)->Void)?
+    init(port:NWEndpoint.Port=8765,advertise:Bool=true){listenPort=port;self.advertise=advertise}
+    var port:UInt16? {queue.sync{listener?.port?.rawValue}}
     func start() throws {
-        guard listener==nil else { return }
-        let l=try NWListener(using:.tcp,on:8765)
-        l.stateUpdateHandler={ [weak self] status in self?.state?(String(describing:status)) }
-        l.newConnectionHandler={ [weak self] c in
-            c.start(queue:self?.queue ?? .global())
-            self?.receive(c,buffer:Data())
-        }
-        listener=l; l.start(queue:queue)
-    }
-    func stop(){ listener?.cancel(); listener=nil }
-    private func respond(_ c:NWConnection,_ status:String,_ data:Data) {
-        let head="HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
-        var packet=Data(head.utf8); packet.append(data)
-        c.send(content:packet,completion:.contentProcessed{_ in c.cancel()})
-    }
-    private func receive(_ c:NWConnection,buffer:Data) {
-        c.receive(minimumIncompleteLength:1,maximumLength:65536){[weak self] data,_,done,error in
-            guard let self=self else { c.cancel(); return }
-            var b=buffer; if let data=data { b.append(data) }
-            guard b.count<=131072,error==nil else { c.cancel(); return }
-            if let end=b.range(of:Data("\r\n\r\n".utf8)),let header=String(data:b[..<end.lowerBound],encoding:.utf8) {
-                let lines=header.components(separatedBy:"\r\n")
-                let first=lines.first ?? ""
-                if first.hasPrefix("GET /health ") { self.respond(c,"200 OK",Data("{\"service\":\"Jealousfin\",\"status\":\"reachable\"}".utf8)); return }
-                guard first.hasPrefix("POST /command ") else { self.respond(c,"404 Not Found",Data("{}".utf8)); return }
-                let len=lines.compactMap { line -> Int? in
-                    guard line.lowercased().hasPrefix("content-length:") else { return nil }
-                    return Int(line.dropFirst(15).trimmingCharacters(in:.whitespaces))
-                }.first ?? -1
-                guard len>=0,len<=65536 else { self.respond(c,"400 Bad Request",Data("{}".utf8)); return }
-                if b.count-end.upperBound>=len {
-                    let body=Data(b[end.upperBound..<(end.upperBound+len)])
-                    guard let handler=self.handler else { self.respond(c,"503 Unavailable",Data("{}".utf8)); return }
-                    handler(body){ output in self.respond(c,"200 OK",output) }; return
+        try queue.sync {
+            guard listener==nil else{return}
+            let parameters=NWParameters.tcp
+            parameters.prohibitedInterfaceTypes=[.cellular]
+            let l=try NWListener(using:parameters,on:listenPort)
+            if advertise {l.service=NWListener.Service(name:nil,type:"_jealousfin._tcp")}
+            l.stateUpdateHandler={ [weak self,weak l] status in
+                guard let self=self,let l=l,self.listener===l else{return}
+                self.state?(String(describing:status))
+                if case .failed = status {self.listener=nil;l.cancel()}
+            }
+            l.newConnectionHandler={ [weak self] c in
+                guard let self=self,self.connections.count<16 else{c.cancel();return}
+                let id=ObjectIdentifier(c)
+                self.connections[id]=c
+                c.stateUpdateHandler={ [weak self,weak c] status in
+                    switch status {
+                    case .failed,.cancelled:
+                        if let c=c{self?.finish(c)}
+                    default:break
+                    }
+                }
+                c.start(queue:self.queue)
+                self.receive(c,buffer:Data())
+                self.queue.asyncAfter(deadline:.now()+180){[weak self,weak c] in
+                    if let c=c{self?.finish(c)}
                 }
             }
-            if done { c.cancel() } else { self.receive(c,buffer:b) }
+            listener=l;l.start(queue:queue)
+        }
+    }
+    func stop(){
+        queue.sync{
+            listener?.cancel();listener=nil
+            for c in connections.values{c.cancel()}
+            connections.removeAll()
+        }
+    }
+    private func finish(_ c:NWConnection){
+        if connections.removeValue(forKey:ObjectIdentifier(c)) != nil{c.cancel()}
+    }
+    private func respond(_ c:NWConnection,_ status:String,_ data:Data){
+        queue.async{[weak self] in
+            guard let self=self,self.connections[ObjectIdentifier(c)] != nil else{return}
+            let head="HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
+            var packet=Data(head.utf8);packet.append(data)
+            c.send(content:packet,completion:.contentProcessed{[weak self] _ in self?.queue.async{self?.finish(c)}})
+        }
+    }
+    private func errorBody(_ message:String)->Data{
+        (try? JSONSerialization.data(withJSONObject:["status":"failed","result":message])) ?? Data("{}".utf8)
+    }
+    private func receive(_ c:NWConnection,buffer:Data){
+        c.receive(minimumIncompleteLength:1,maximumLength:65536){[weak self] data,_,done,error in
+            guard let self=self,self.connections[ObjectIdentifier(c)] != nil else{c.cancel();return}
+            guard error==nil else{self.finish(c);return}
+            var b=buffer;if let data=data{b.append(data)}
+            switch LANHTTP.parse(b){
+            case .incomplete:
+                if done{self.finish(c)}else{self.receive(c,buffer:b)}
+            case .invalid(let status):self.respond(c,status,self.errorBody(status))
+            case .request(let method,let path,let body):
+                if method=="POST" && path=="/command"{
+                    guard let handler=self.handler else{self.respond(c,"503 Service Unavailable",self.errorBody("Command dispatcher unavailable"));return}
+                    handler(body){[weak self] output in self?.respond(c,"200 OK",output)}
+                }else if method=="GET"{
+                    if path=="/health" && self.queryHandler==nil{
+                        self.respond(c,"200 OK",Data("{\"service\":\"Jealousfin\",\"status\":\"reachable\"}".utf8));return
+                    }
+                    guard let handler=self.queryHandler else{self.respond(c,"404 Not Found",self.errorBody("Unknown route"));return}
+                    handler(path){[weak self] status,output in self?.respond(c,status,output)}
+                }else{self.respond(c,"404 Not Found",self.errorBody("Unknown route"))}
+            }
         }
     }
 }

@@ -48,6 +48,29 @@ import Foundation
             _ = try (config ?? RuntimePolicy.baseline(Settings())).checked()
         }
         try await HotPatchIntegration.run(engine:engine)
+        let lanFixture=LANServer(port:.any,advertise:false)
+        lanFixture.handler={body,complete in complete(body)}
+        try lanFixture.start()
+        defer{lanFixture.stop()}
+        for _ in 0..<100 {
+            if lanFixture.port != nil{break}
+            try await Task.sleep(nanoseconds:20_000_000)
+        }
+        guard let port=lanFixture.port,let url=URL(string:"http://127.0.0.1:\(port)/command") else{throw AppError.message("LAN listener did not start")}
+        let config=URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest=15
+        let localTransport=URLSession(configuration:config)
+        for size in [64*1024,192*1024,1024*1024,LANHTTP.maxBody] {
+            var request=URLRequest(url:url);request.httpMethod="POST"
+            request.httpBody=Data(repeating:65,count:size)
+            let (reply,response)=try await localTransport.data(for:request)
+            precondition((response as? HTTPURLResponse)?.statusCode==200 && reply==request.httpBody)
+            print("PASS: actual LAN HTTP listener round trip \(size) bytes")
+        }
+        var over=URLRequest(url:url);over.httpMethod="POST";over.httpBody=Data(repeating:65,count:LANHTTP.maxBody+1)
+        let (_,response)=try await localTransport.data(for:over)
+        precondition((response as? HTTPURLResponse)?.statusCode==413)
+        print("PASS: actual LAN listener rejects over-limit request")
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }

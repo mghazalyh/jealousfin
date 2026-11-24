@@ -205,6 +205,11 @@ struct Settings: Codable {
     var random = false
     var unattended = true
     var lanEnabled = true
+    var remoteControlMode:RemoteControlMode?
+    var controlMode:RemoteControlMode {
+        get {remoteControlMode ?? .lan}
+        set {remoteControlMode=newValue}
+    }
     var qualityMbps = 10
     var autoLogin = true
     var resumeSurf = false
@@ -308,5 +313,49 @@ struct TelemetryCadence {
         if !force, let previous = lastSample, monotonic >= previous, monotonic - previous < interval { return false }
         lastSample = monotonic
         return true
+    }
+}
+
+enum RemoteControlMode:String,Codable,CaseIterable {
+    case lan, github
+}
+enum LANHTTP {
+    static let maxHeader=16*1024
+    static let maxBody=4*1024*1024
+    enum Parsed {
+        case incomplete
+        case invalid(String)
+        case request(method:String,path:String,body:Data)
+    }
+    static func parse(_ buffer:Data)->Parsed {
+        guard buffer.count<=maxHeader+maxBody else{return .invalid("413 Payload Too Large")}
+        guard let end=buffer.range(of:Data("\r\n\r\n".utf8)) else {
+            return buffer.count>maxHeader ? .invalid("431 Request Header Fields Too Large") : .incomplete
+        }
+        guard end.upperBound<=maxHeader,let header=String(data:buffer[..<end.lowerBound],encoding:.utf8) else{return .invalid("400 Bad Request")}
+        let lines=header.components(separatedBy:"\r\n")
+        let first=(lines.first ?? "").split(separator:" ",omittingEmptySubsequences:false)
+        guard first.count==3,["HTTP/1.0","HTTP/1.1"].contains(String(first[2])),
+              first[1].hasPrefix("/"),!first[1].contains("?"),!first[1].contains("#") else{return .invalid("400 Bad Request")}
+        var lengths:[Int]=[]
+        for line in lines.dropFirst(){
+            guard let colon=line.firstIndex(of:":") else{return .invalid("400 Bad Request")}
+            let key=line[..<colon].lowercased()
+            let value=line[line.index(after:colon)...].trimmingCharacters(in:.whitespaces)
+            if key=="transfer-encoding"{return .invalid("400 Bad Request")}
+            if key=="content-length"{
+                guard !value.isEmpty,value.allSatisfy({$0.isASCII && $0.isNumber}),let length=Int(value),length>=0 else{return .invalid("400 Bad Request")}
+                lengths.append(length)
+            }
+        }
+        guard lengths.count<=1 else{return .invalid("400 Bad Request")}
+        let method=String(first[0]),path=String(first[1])
+        guard method=="GET" || method=="POST" else{return .invalid("405 Method Not Allowed")}
+        if method=="POST" && lengths.isEmpty{return .invalid("411 Length Required")}
+        let size=lengths.first ?? 0
+        guard size<=maxBody else{return .invalid("413 Payload Too Large")}
+        if method=="GET" && size != 0{return .invalid("400 Bad Request")}
+        guard buffer.count-end.upperBound>=size else{return .incomplete}
+        return .request(method:method,path:path,body:Data(buffer[end.upperBound..<(end.upperBound+size)]))
     }
 }

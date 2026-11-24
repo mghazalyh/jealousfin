@@ -299,3 +299,25 @@ for invalidRepositoryAddress in ["","http://github.com/owner/repo","https://gith
     check(GitHubRepositoryAddress.apiRoot(invalidRepositoryAddress)==nil,"reject invalid repository URL")
 }
 print("PASS: \(checks) total assertions including editable repository settings and legacy migration")
+
+check(Settings().controlMode == .lan,"LAN is default remote control mode")
+var legacyControlSettings=Settings()
+legacyControlSettings.remoteControlMode=nil
+let legacyControlData=try JSONCodec.encoder().encode(legacyControlSettings)
+check(try JSONCodec.decoder().decode(Settings.self,from:legacyControlData).controlMode == .lan,"legacy settings default to LAN")
+legacyControlSettings.controlMode = .github
+let githubControlData=try JSONCodec.encoder().encode(legacyControlSettings)
+check(try JSONCodec.decoder().decode(Settings.self,from:githubControlData).controlMode == .github,"explicit GitHub control mode persists")
+func lanRequest(_ size:Int,body:Data=Data())->Data{
+    var data=Data("POST /command HTTP/1.1\r\nContent-Length: \(size)\r\n\r\n".utf8)
+    data.append(body);return data
+}
+func lanAccepted(_ data:Data,_ expected:Int)->Bool{
+    if case .request(let method,let path,let body)=LANHTTP.parse(data){return method=="POST" && path=="/command" && body.count==expected}
+    return false
+}
+check(lanAccepted(lanRequest(192*1024,body:Data(repeating:65,count:192*1024)),192*1024),"LAN accepts full size hot patch")
+check(lanAccepted(lanRequest(LANHTTP.maxBody,body:Data(repeating:65,count:LANHTTP.maxBody)),LANHTTP.maxBody),"LAN accepts four MiB request")
+if case .incomplete=LANHTTP.parse(lanRequest(200000,body:Data(repeating:65,count:65536))){check(true,"LAN waits for fragmented body")}else{check(false,"LAN waits for fragmented body")}
+if case .invalid(let status)=LANHTTP.parse(lanRequest(LANHTTP.maxBody+1)){check(status.hasPrefix("413"),"LAN returns 413 for oversized request")}else{check(false,"LAN returns 413 for oversized request")}
+print("PASS: \(checks) total assertions including LAN control selection and request limits")
