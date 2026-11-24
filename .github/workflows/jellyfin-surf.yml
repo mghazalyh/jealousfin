@@ -10,6 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Ensure FFmpeg decoder is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -n 1
       - name: Probe one Surf channel and close session
         env:
           JELLYFIN_TEST_URL: ${{ secrets.JELLYFIN_TEST_URL }}
