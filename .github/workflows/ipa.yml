@@ -33,8 +33,13 @@ jobs:
         run: python3 Scripts/embed-promoted.py Promoted/baseline.json Sources/PromotedBaseline.generated.swift
       - name: Verify toolchain
         run: |
+          # Build 1015 was physically accepted on an iPad. Preserve its exact SDK.
+          test -d /Applications/Xcode_16.4.app/Contents/Developer || { echo "::error::Accepted Xcode 16.4 toolchain unavailable on this runner"; exit 1; }
+          export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = "18.5"
+          test "$(xcodebuild -version | head -1)" = "Xcode 16.4"
           command -v xcodegen >/dev/null || brew install xcodegen
           bash Scripts/fetch-runtime.sh
       - name: Test channel policy
@@ -159,9 +164,9 @@ jobs:
           build_number=$((1000 + GITHUB_RUN_NUMBER))
           tag="v0.1.13-build${build_number}-${GITHUB_RUN_ATTEMPT}"
           baseline="$(cat packages/baseline-revision.txt)"
-          notes="Ad hoc signed and unsigned iOS 15+ ARM64 Jealousfin candidates. Source: $GITHUB_SHA. Reviewed baseline: $baseline. CI archive and signature checks passed; physical TrollStore installation unverified."
+          notes="Ad hoc signed and unsigned iOS 15+ ARM64 Jealousfin packages using the build 1015 accepted packaging baseline. Source: $GITHUB_SHA. Reviewed baseline: $baseline. CI archive and signature checks passed. Build 1015 was physically accepted on iPad; this new build has not independently undergone physical installation testing."
           files=(packages/Jealousfin.ipa packages/Jealousfin.ipa.sha256 packages/Jealousfin-unsigned.ipa packages/Jealousfin-unsigned.ipa.sha256)
-          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build $build_number (TrollStore candidate)" --notes "$notes" --prerelease
+          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build $build_number" --notes "$notes" --latest
           for f in "${files[@]}"; do
             name="$(basename "$f")"
             expected="$(stat -c%s "$f")"
