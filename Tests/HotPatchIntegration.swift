@@ -58,7 +58,7 @@ final class TorrioConflictFixture:URLProtocol {
         if method=="GET" {
             switch path {
             case "snapshot.json":blob(n==1 ? "old" : "new",Data("old snapshot".utf8))
-            case "cas.json":blob(n==1 ? "old" : "changed",Data("concurrent value".utf8))
+            case "cas.json":blob("changed",Data("concurrent value".utf8))
             case "immutable.json":
                 if n==1{status=404}else{blob("existing",Data("receipt".utf8))}
             case "collision.json":
