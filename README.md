@@ -1,6 +1,6 @@
 # Jealousfin
 
-Independent native SwiftUI Live TV client targeting iOS 15.0 and newer. This initial development build uses AVPlayer, real Jellyfin catalogue and EPG, server-negotiated playback, Favorites, session reporting, local Surf rotation, progressive health exclusions, Insights, persistent structured events, LAN commands, JavaScriptCore scripting, and GitHub-backed synchronization.
+Independent native SwiftUI Live TV client targeting iOS 15.0 and newer. This initial development build uses AVPlayer, real Jellyfin catalogue and EPG, server-negotiated playback, Favorites, session reporting, local Surf rotation, progressive health exclusions, Insights, persistent structured events, LAN commands, QuickJS-NG scripting, and GitHub-backed synchronization.
 
 ## Install and configure
 Use the IPA from GitHub Releases with TrollStore on a compatible device. No signing certificates are used by CI; installation and actual iOS 15/16 acceptance have not yet been tested. In Settings supply the Jellyfin origin, username and password and a GitHub token with access to the private TorrioDB repository. Credentials remain in local application configuration; no credentials are embedded in the public source or release. The UI uses real server metadata and does not embed simulated channel health data.
@@ -20,7 +20,7 @@ console.log(api.state.status);
 api.command("set_rotation_minutes", {minutes:"5"});
 api.command("start_surf", {category:"All Channels"});
 ```
-A five-second script deadline returns an error; a nonterminating interpreter remains isolated and unavailable until it exits or the app restarts. This is not unrestricted native hot patching. Native defects still need an IPA update.
+A five-second interpreter deadline interrupts runaway JavaScript and the next invocation starts a fresh runtime. This is not unrestricted native hot patching. Native defects still need an IPA update.
 
 ## Server-wide enforcement
 The client filters its own catalogue. `Server/filter_m3u.py` is an offline reference adapter for a filtered tuner catalogue using a verified mapping between Jellyfin item IDs and stable M3U tvg-ids. It never edits the production source. **Global exclusion in other Jellyfin clients is not active** until an independently verified server integration also filters the Surf companion source selection and handles existing sessions/catalogue refresh. No server changes are performed by this release.
@@ -72,3 +72,7 @@ var hooks = {
 };
 ```
 The tick hook receives current application state, recent events, previous action receipts and persistent string state. It can emit application commands, custom insights and schedule its next evaluation. It has a bounded interface and cannot modify compiled iOS/native frameworks, the OS, or another application. It cannot approve bans or self-replace modules. Three consecutive tick errors disable the hook until reload or replacement. Native host updates still require a new IPA. Actual background transitions are measured, not manufactured. No indefinite execution while iOS suspends the process is promised.
+
+### Interpreter dependency
+
+The GitHub workflow fetches QuickJS-NG v0.10.1 at commit `3c9afc9943323ee9c7dbd123c0cd991448f4b6c2`, compiles it into the native host, and runs an interrupt-and-recovery smoke test before the IPA build. Each evaluation uses a fresh interpreter with a 32 MiB allocation limit, bounded stack, and a five-second interrupt deadline. No JIT, standard-library OS modules or arbitrary native symbol invocation is required. Module and command interfaces are unchanged. See https://github.com/quickjs-ng/quickjs and the included upstream license.

@@ -19,12 +19,21 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           brew install xcodegen
+          bash Scripts/fetch-runtime.sh
       - name: Test channel policy
         run: |
           mkdir -p build
           swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
+      - name: Test interruptible runtime
+        run: |
+          mkdir -p build/quickjs
+          for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
+            clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
+          done
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          build/runtime-tests
       - name: Generate project and build
         run: |
           xcodegen generate
@@ -37,6 +46,7 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" | grep -x '15.0'
           mkdir -p build/Payload
           ditto "$APP" build/Payload/Jealousfin.app
+          cp Vendor/QuickJS/LICENSE build/Payload/Jealousfin.app/QuickJS-LICENSE.txt
           cd build
           /usr/bin/zip -qry Jealousfin.ipa Payload
           unzip -t Jealousfin.ipa

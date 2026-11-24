@@ -1,33 +1,9 @@
 import Foundation
-import JavaScriptCore
 import Network
 
 // Scripts execute application APIs, not an operating-system shell.
 // JavaScriptCore is interpreted on the target device; native changes still require an IPA.
-@MainActor final class ScriptEngine {
-    func evaluate(_ script:String,snapshot:[String:Any]) throws -> (String,[Command]) {
-        guard script.utf8.count<=32768, let context=JSContext() else { throw AppError.message("Script unavailable or too large") }
-        var commands:[Command]=[]
-        var logs:[String]=[]
-        let emit: @convention(block) (String,String) -> Void = { name,json in
-            guard commands.count<100, let d=json.data(using:.utf8), let args=(try? JSONSerialization.jsonObject(with:d)) as? [String:String] else { return }
-            commands.append(Command(id:UUID().uuidString,action:name,arguments:args,expiresAt:nil))
-        }
-        let log: @convention(block) (String) -> Void = { value in if logs.count<100 { logs.append(String(value.prefix(2048))) } }
-        context.setObject(emit,forKeyedSubscript:"nativeCommand" as NSString)
-        context.setObject(log,forKeyedSubscript:"nativeLog" as NSString)
-        context.setObject(snapshot,forKeyedSubscript:"snapshot" as NSString)
-        context.evaluateScript("""
-        var api = { state: snapshot, command: function(name,args) { nativeCommand(name,JSON.stringify(args||{})); },
-        log: function(value) { nativeLog(String(value)); } };
-        var console = { log: api.log };
-        """)
-        // No synchronous scripts from untrusted sources; the local owner controls the script.
-        let result=context.evaluateScript(script)
-        if let exception=context.exception { throw AppError.message("JavaScript exception: "+String((exception.toString() ?? "unknown").prefix(500))) }
-        return ((logs+[result?.toString() ?? "undefined"]).joined(separator:"\n"),commands)
-    }
-}
+@MainActor final class ScriptEngine {}
 
 // Small HTTP/1.1 command transport. No shell or file-system endpoint.
 final class LANServer {

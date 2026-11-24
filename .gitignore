@@ -6,3 +6,5 @@ build/
 *.xcarchive
 Config/Info.plist
 .DS_Store
+
+Vendor/QuickJS/

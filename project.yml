@@ -12,7 +12,11 @@ targets:
   Jealousfin:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+      - path: Sources
+      - path: Native
+      - path: Vendor/QuickJS
+        excludes: [LICENSE, REVISION]
     info:
       path: Config/Info.plist
       properties:
@@ -33,6 +37,10 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGNING_ALLOWED: NO
         ENABLE_BITCODE: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Native/RuntimeBridge.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/QuickJS"
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) _GNU_SOURCE"
+        CLANG_C_LANGUAGE_STANDARD: gnu11
 schemes:
   Jealousfin:
     build:

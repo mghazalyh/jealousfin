@@ -1,47 +1,71 @@
 import Foundation
-import JavaScriptCore
 
-// Run scripts off the UI thread. A timed-out interpreter is isolated until it exits.
-private final class ScriptCompletion: @unchecked Sendable {
-    private let lock=NSLock()
-    private var continuation:CheckedContinuation<(String,[Command]),Error>?
-    init(_ c:CheckedContinuation<(String,[Command]),Error>){continuation=c}
-    func finish(_ result:Result<(String,[Command]),Error>){
-        lock.lock();let c=continuation;continuation=nil;lock.unlock()
-        c?.resume(with:result)
+private struct InterpreterEnvelope: Decodable {
+    struct Action: Decodable {
+        var action: String
+        var arguments: [String:String]
     }
+    var result: String
+    var logs: [String]
+    var commands: [Action]
 }
+
+// Every evaluation gets a fresh, interruptible interpreter. No JIT or OS modules.
 private final class RuntimeWorker: @unchecked Sendable {
     static let shared=RuntimeWorker()
+    private let queue=DispatchQueue(label:"jealousfin.interpreter",qos:.utility)
     private let lock=NSLock()
-    private var busy=false
+    private var waiting=0
+
     func run(_ source:String,snapshot:[String:Any]) async throws -> (String,[Command]){
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            guard !busy else{lock.unlock();continuation.resume(throwing:AppError.message("Script interpreter busy"));return}
-            busy=true;lock.unlock()
-            let completion=ScriptCompletion(continuation)
-            DispatchQueue.global(qos:.utility).asyncAfter(deadline:.now()+5){
-                completion.finish(.failure(AppError.message("Script exceeded five-second execution deadline")))
-            }
-            DispatchQueue.global(qos:.utility).async {
-                defer{self.lock.lock();self.busy=false;self.lock.unlock()}
-                do {
-                    guard source.utf8.count<=32768,let context=JSContext() else{throw AppError.message("Invalid script")}
-                    var commands:[Command]=[];var logs:[String]=[]
-                    let emit:@convention(block)(String,String)->Void={name,json in
-                        guard commands.count<100,let d=json.data(using:.utf8),let a=(try? JSONSerialization.jsonObject(with:d)) as? [String:String] else{return}
-                        commands.append(Command(id:UUID().uuidString,action:name,arguments:a,expiresAt:nil))
+        guard source.utf8.count<=32768 else{throw AppError.message("Script exceeds size limit")}
+        let data=try JSONSerialization.data(withJSONObject:snapshot,options:[.sortedKeys])
+        guard data.count<=1048576 else{throw AppError.message("Snapshot exceeds interpreter limit")}
+        let sourceData=try JSONSerialization.data(withJSONObject:source,options:[.fragmentsAllowed])
+        let input=String(decoding:data,as:UTF8.self)
+        let script=String(decoding:sourceData,as:UTF8.self)
+        let wrapper="""
+        (function(){
+            const snapshot = \(input);
+            const logs = [], commands = [];
+            globalThis.snapshot = snapshot;
+            globalThis.api = {
+                state: snapshot,
+                command: function(name,args) {
+                    if (commands.length >= 100) throw new Error("Command limit");
+                    const values = args || {};
+                    if (Object.keys(values).some(k => typeof values[k] !== "string")) {
+                        throw new Error("Command argument values must be strings");
                     }
-                    let log:@convention(block)(String)->Void={v in if logs.count<100{logs.append(String(v.prefix(2048)))}}
-                    context.setObject(emit,forKeyedSubscript:"nativeCommand" as NSString)
-                    context.setObject(log,forKeyedSubscript:"nativeLog" as NSString)
-                    context.setObject(snapshot,forKeyedSubscript:"snapshot" as NSString)
-                    context.evaluateScript("var api={state:snapshot,command:function(n,a){nativeCommand(n,JSON.stringify(a||{}));},log:function(v){nativeLog(String(v));}};var console={log:api.log};")
-                    let result=context.evaluateScript(source)
-                    if let e=context.exception{throw AppError.message("JavaScript exception: "+String((e.toString() ?? "unknown").prefix(500)))}
-                    completion.finish(.success(((logs+[result?.toString() ?? "undefined"]).joined(separator:"\n"),commands)))
-                }catch{completion.finish(.failure(error))}
+                    commands.push({action:String(name), arguments:values});
+                },
+                log: function(value) {
+                    if (logs.length < 100) logs.push(String(value).slice(0,2048));
+                }
+            };
+            globalThis.console = {log:api.log};
+            const value = (0,eval)(\(script));
+            return JSON.stringify({result:String(value), logs:logs, commands:commands});
+        })()
+        """
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            guard waiting<4 else {
+                lock.unlock();continuation.resume(throwing:AppError.message("Interpreter queue full"));return
+            }
+            waiting+=1;lock.unlock()
+            queue.async {
+                defer{self.lock.lock();self.waiting-=1;self.lock.unlock()}
+                do {
+                    var status:Int32=1
+                    guard let ptr=wrapper.withCString({jf_runtime_eval($0,5000,&status)}) else{throw AppError.message("Interpreter allocation failed")}
+                    defer{jf_runtime_free(ptr)}
+                    let raw=String(cString:ptr)
+                    guard status==0 else{throw AppError.message(String(raw.prefix(4096)))}
+                    let envelope=try JSONDecoder().decode(InterpreterEnvelope.self,from:Data(raw.utf8))
+                    let commands=envelope.commands.map{Command(id:UUID().uuidString,action:$0.action,arguments:$0.arguments,expiresAt:nil)}
+                    continuation.resume(returning:((envelope.logs+[envelope.result]).joined(separator:"\n"),commands))
+                }catch{continuation.resume(throwing:error)}
             }
         }
     }
