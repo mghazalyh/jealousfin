@@ -7,7 +7,7 @@ permissions:
   contents: read
 concurrency:
   group: jealousfin-comprehensive-acceptance
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   native:
     runs-on: macos-15
@@ -26,6 +26,7 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           brew install xcodegen
+          if ! command -v ffmpeg >/dev/null; then brew install ffmpeg; fi
           bash Scripts/fetch-runtime.sh
       - name: Test channel policy
         run: |
@@ -49,7 +50,8 @@ jobs:
           JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
         run: |
           swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/LiveAcceptance.swift build/quickjs/*.o -framework AVFoundation -framework CoreVideo -o build/live-acceptance
-          build/live-acceptance
+          ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=440:sample_rate=44100 -t 15 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart -y build/control.mp4
+          JEALOUSFIN_AVPLAYER_CONTROL="$PWD/build/control.mp4" build/live-acceptance
       - name: Generate project and build
         id: build_app
         if: ${{ !cancelled() }}

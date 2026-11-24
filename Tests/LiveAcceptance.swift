@@ -14,6 +14,7 @@ import QuartzCore
         item.add(output)
         let player=AVPlayer(playerItem:item)
         player.automaticallyWaitsToMinimizeStalling=true
+        player.isMuted=true
         defer { player.pause();player.replaceCurrentItem(with:nil) }
         player.play()
         let deadline=Date().addingTimeInterval(50)
@@ -56,6 +57,12 @@ import QuartzCore
         settings.username=env["JELLYFIN_TEST_USERNAME"] ?? ""
         settings.password=env["JELLYFIN_TEST_PASSWORD"] ?? ""
         let client=Jellyfin(deviceID:"ci-"+UUID().uuidString,transport:URLSession(configuration:.ephemeral))
+        if let control=env["JEALOUSFIN_AVPLAYER_CONTROL"],FileManager.default.fileExists(atPath:control) {
+            let session=StreamSession(url:URL(fileURLWithPath:control),itemID:"control",mediaSourceID:"control",playSessionID:"control",liveStreamID:nil,method:"LocalControl")
+            let ok=await observe(session)
+            if !ok {failures+=1}
+            print((ok ? "PASS ":"FAIL ")+"hosted AVPlayer local H264 control")
+        }else{failures+=1;print("FAIL hosted AVPlayer control fixture missing")}
         do {
             try require(URL(string:settings.server)?.scheme=="https" && URL(string:settings.server)?.host=="desktop-hb9oshs.tail1fc8b.ts.net" && !settings.username.isEmpty && !settings.password.isEmpty,"missing/invalid configuration")
             stage="native authentication"
@@ -124,8 +131,6 @@ import QuartzCore
             }
             if !ordinaryOK {failures+=1}
             print((ordinaryOK ? "PASS ":"FAIL ")+stage)
-        } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
-            }
         } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
         if client.connected {
             do {_ = try await client.request("Sessions/Logout",method:"POST");print("PASS logout")}
