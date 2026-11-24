@@ -66,10 +66,27 @@ import Foundation
             let (reply,response)=try await localTransport.data(for:request)
             precondition((response as? HTTPURLResponse)?.statusCode==200 && reply==request.httpBody)
             print("PASS: actual LAN HTTP listener round trip \(size) bytes")
+            fflush(stdout)
         }
-        var over=URLRequest(url:url);over.httpMethod="POST";over.httpBody=Data(repeating:65,count:LANHTTP.maxBody+1)
-        let (_,overLimitResponse)=try await localTransport.data(for:over)
-        precondition((overLimitResponse as? HTTPURLResponse)?.statusCode==413)
+        // Send only the declared oversized header. The server must reject
+        // without waiting for a multi-megabyte upload or draining its body.
+        let oversizeProbe=Process()
+        oversizeProbe.executableURL=URL(fileURLWithPath:"/usr/bin/python3")
+        oversizeProbe.arguments=["-c","""
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10) as s:
+    s.settimeout(10)
+    s.sendall(("POST /command HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Length: "+sys.argv[2]+"\\r\\n\\r\\n").encode())
+    data=b""
+    while b"\\r\\n" not in data:
+        part=s.recv(4096)
+        if not part: break
+        data+=part
+    assert data.startswith(b"HTTP/1.1 413 "), repr(data[:200])
+""",String(port),String(LANHTTP.maxBody+1)]
+        try oversizeProbe.run()
+        oversizeProbe.waitUntilExit()
+        guard oversizeProbe.terminationStatus==0 else{throw AppError.message("Oversized HTTP header was not rejected")}
         print("PASS: actual LAN listener rejects over-limit request")
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
