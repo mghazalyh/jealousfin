@@ -234,6 +234,14 @@ enum SurfClock {
     }
 }
 
+// Continuity tests must preserve a healthy validated stream; the cold-start
+// playback step always allocates a fresh session.
+enum CampaignPlaybackPolicy {
+    static func reuse(kind:String,requestedID:String,currentID:String?,validated:Bool,hasItem:Bool,hasSession:Bool,playing:Bool,paused:Bool,hasError:Bool)->Bool {
+        ["pause_resume","endurance","background"].contains(kind) &&
+        requestedID==currentID && validated && hasItem && hasSession && playing && !paused && !hasError
+    }
+}
 struct VideoEvidence {
     private(set) var frameCount=0
     private(set) var lastFrameTime:Double?

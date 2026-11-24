@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import QuartzCore
 import UIKit
 import MediaPlayer
 import Network
@@ -420,6 +421,10 @@ import Network
             await self.attempt(channel,generation:g)
         }
     }
+    private func videoSampleTime(_ output:AVPlayerItemVideoOutput)->CMTime {
+        let time=output.itemTime(forHostTime:CACurrentMediaTime())
+        return time.isValid && time.seconds.isFinite ? time : player.currentTime()
+    }
     private var position:Double {let n=player.currentTime().seconds;return n.isFinite ? max(0,n):0}
     private func attempt(_ channel:Channel,generation g:UUID) async {
         var errorReason="Startup timeout"
@@ -456,9 +461,10 @@ import Network
                     }
                     if item.status == .failed {errorReason="AVPlayer item failed";break}
                     let p=position
-                    if output.hasNewPixelBuffer(forItemTime:player.currentTime()) {
+                    let sampleTime=videoSampleTime(output)
+                    if output.hasNewPixelBuffer(forItemTime:sampleTime) {
                         var display=CMTime.invalid
-                        if output.copyPixelBuffer(forItemTime:player.currentTime(),itemTimeForDisplay:&display) != nil {
+                        if output.copyPixelBuffer(forItemTime:sampleTime,itemTimeForDisplay:&display) != nil {
                             evidence.observe(frameTime:display.seconds,monotonic:ProcessInfo.processInfo.systemUptime)
                         }
                     }
@@ -481,6 +487,8 @@ import Network
                     } else if !intentionallyPaused {firstPosition=nil}
                 }
                 if g != generation || Task.isCancelled {return}
+                let access=item.accessLog()?.events.last
+                log("WARN","validator","STARTUP_DIAGNOSTICS",["channelID":channel.id,"itemStatus":String(item.status.rawValue),"timeControl":String(player.timeControlStatus.rawValue),"waiting":player.reasonForWaitingToPlay?.rawValue ?? "none","clock":String(position),"bytes":String(access?.numberOfBytesTransferred ?? 0),"errorCodes":item.errorLog()?.events.map{String($0.errorStatusCode)}.joined(separator:",") ?? ""])
                 if let event=item.errorLog()?.events.last,(400...599).contains(event.errorStatusCode) {
                     errorReason="Stream HTTP \(event.errorStatusCode)"
                 } else if let error=item.error {
@@ -1292,14 +1300,16 @@ extension AppModel {
         if let id=step.channelID{channel=eligibleChannels.first(where:{$0.id==id})}
         else {channel=eligibleChannels.first(where:{$0.id==current?.id}) ?? eligibleChannels.first}
         guard let channel=channel else{return Observation(status:"blocked",evidence:["reason":"Requested channel is not eligible"],channelID:step.channelID)}
-        open(channel)
+        let reuse=CampaignPlaybackPolicy.reuse(kind:step.kind,requestedID:channel.id,currentID:current?.id,validated:validated,hasItem:player.currentItem?.status == .readyToPlay,hasSession:session != nil,playing:player.timeControlStatus == .playing,paused:intentionallyPaused,hasError:lastPlayerError != nil)
+        if !reuse {open(channel)}
+        else {log("INFO","engineering","CONTINUITY_REUSED",["kind":step.kind,"channelID":channel.id])}
         let startupBudget=max(15,min(720,effectivePolicy.retries*(effectivePolicy.startupTimeout+45)))
         guard await awaitPlayback(epoch:epoch,id:channel.id,seconds:startupBudget) else {
             return Observation(status:"failed",evidence:["reason":lastPlayerError ?? "No confirmed playback before deadline","startupBudgetSeconds":String(startupBudget)],channelID:channel.id)
         }
         let startupMs=Int((ProcessInfo.processInfo.systemUptime-start)*1000)
         let streamGeneration=generation
-        var evidence:[String:String]=["startupMs":String(startupMs),"channel":channel.name,"displayReady":String(ready)]
+        var evidence:[String:String]=["startupMs":String(startupMs),"channel":channel.name,"displayReady":String(ready),"reusedValidatedStream":String(reuse)]
         if step.kind=="pause_resume" {
             pause();await nap(0.75)
             let p=position
@@ -1338,9 +1348,10 @@ extension AppModel {
                 if priorWasBackground{backgroundProgress+=max(0,position-prior)}
             }
             prior=position;priorWasBackground=background
-            if let output=videoOutput,output.hasNewPixelBuffer(forItemTime:player.currentTime()){
+            if let output=videoOutput{
+                let sampleTime=videoSampleTime(output)
                 var display=CMTime.invalid
-                if output.copyPixelBuffer(forItemTime:player.currentTime(),itemTimeForDisplay:&display) != nil {
+                if output.hasNewPixelBuffer(forItemTime:sampleTime),output.copyPixelBuffer(forItemTime:sampleTime,itemTimeForDisplay:&display) != nil {
                     let oldCount=frames.frameCount
                     frames.observe(frameTime:display.seconds,monotonic:now)
                     if frames.frameCount>oldCount{maxGap=max(maxGap,now-lastFrame);lastFrame=now}

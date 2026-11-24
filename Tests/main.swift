@@ -251,3 +251,19 @@ for bad in ["https://elsewhere.invalid/api/surf/sports/hls/index.m3u8?ticket=fix
     check((try? SharedSurf.ticketURL(bad,origin:sharedOrigin,mode:"sports"))==nil,"reject unsafe ticket route")
 }
 print("PASS: \(checks) total assertions including shared Surf routing and ticket isolation")
+
+func continuity(_ kind:String,_ current:String?="same",_ validated:Bool=true,_ item:Bool=true,_ session:Bool=true,_ playing:Bool=true,_ paused:Bool=false,_ error:Bool=false)->Bool {
+    CampaignPlaybackPolicy.reuse(kind:kind,requestedID:"same",currentID:current,validated:validated,hasItem:item,hasSession:session,playing:playing,paused:paused,hasError:error)
+}
+check(continuity("endurance"),"endurance preserves validated live session")
+check(continuity("pause_resume"),"pause test preserves validated live session")
+check(continuity("background"),"background test preserves validated live session")
+check(!continuity("playback"),"cold-start playback always opens fresh")
+check(!continuity("endurance","other"),"different requested channel opens fresh")
+check(!continuity("endurance","same",false),"unvalidated stream cannot satisfy continuity")
+check(!continuity("endurance","same",true,false),"missing player item cannot satisfy continuity")
+check(!continuity("endurance","same",true,true,false),"missing session cannot satisfy continuity")
+check(!continuity("endurance","same",true,true,true,false),"stalled stream cannot satisfy continuity")
+check(!continuity("endurance","same",true,true,true,true,true),"paused stream cannot satisfy continuity")
+check(!continuity("endurance","same",true,true,true,true,false,true),"failed stream cannot satisfy continuity")
+print("PASS: \(checks) total assertions including continuity and cold-start separation")
