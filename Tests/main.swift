@@ -267,3 +267,14 @@ check(!continuity("endurance","same",true,true,true,false),"stalled stream canno
 check(!continuity("endurance","same",true,true,true,true,true),"paused stream cannot satisfy continuity")
 check(!continuity("endurance","same",true,true,true,true,false,true),"failed stream cannot satisfy continuity")
 print("PASS: \(checks) total assertions including continuity and cold-start separation")
+
+let lanGateway=URL(string:"http://192.168.31.243:8096")!
+check(SharedSurf.gatewayOrigin(for:lanGateway)?.absoluteString=="http://192.168.31.243:8097","LAN shared HLS uses same private host catalog port")
+check(SharedSurf.gatewayOrigin(for:URL(string:"https://fixture.invalid")!)?.absoluteString=="https://fixture.invalid","HTTPS gateway stays same origin")
+for value in ["http://203.0.113.4:8096","http://example.org:8096","http://192.168.31.243:8098","http://192.168.31.243:8096/proxy","http://user@192.168.31.243:8096","http://192.168.31.243:8096?x=1","http://172.32.1.2:8096"] {
+    check(SharedSurf.gatewayOrigin(for:URL(string:value)!)==nil,"reject unsupported gateway origin")
+}
+for value in ["http://10.1.2.3:8096","http://172.16.1.2:8096","http://172.31.1.2:8096"] {
+    check(SharedSurf.gatewayOrigin(for:URL(string:value)!)?.port==8097,"supported private LAN range")
+}
+print("PASS: \(checks) total assertions including LAN shared gateway isolation")

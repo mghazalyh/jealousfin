@@ -26,6 +26,21 @@ struct Channel: Codable, Identifiable, Equatable {
     var isSurf: Bool { name.hasPrefix("Surf:") }
 }
 enum SharedSurf {
+    // The LAN gateway is a separate authenticated service on the same configured
+    // server. Only the explicitly supported private IPv4 Jellyfin port pairing
+    // can use it; no arbitrary cross-host or public HTTP token forwarding.
+    static func gatewayOrigin(for server:URL)->URL? {
+        guard var c=URLComponents(url:server,resolvingAgainstBaseURL:false),
+              c.user==nil,c.password==nil,c.query==nil,c.fragment==nil,
+              c.path.isEmpty || c.path=="/",let host=c.host else{return nil}
+        if c.scheme?.lowercased()=="https" {c.path="";return c.url}
+        guard c.scheme?.lowercased()=="http",c.port==8096 else{return nil}
+        let octets=host.split(separator:".").compactMap{UInt8($0)}
+        guard octets.count==4,host==octets.map{String($0)}.joined(separator:"."),
+              octets[0]==10 || (octets[0]==172 && (16...31).contains(octets[1])) || (octets[0]==192 && octets[1]==168)
+        else{return nil}
+        c.port=8097;c.path="";return c.url
+    }
     static func mode(for category:String)->String? {
         let value=category.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
         switch value {
