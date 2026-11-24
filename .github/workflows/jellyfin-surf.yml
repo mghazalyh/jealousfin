@@ -17,7 +17,7 @@ jobs:
           JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
         run: |
           python3 - <<'PY'
-          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,uuid,time,sys
+          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,uuid,time,sys,subprocess
           base=os.environ["JELLYFIN_TEST_URL"].strip().rstrip("/")
           p=U.urlsplit(base)
           if p.scheme!="https" or not p.hostname or p.username or p.password or p.query or p.fragment: sys.exit("Invalid HTTPS base URL")
@@ -30,12 +30,13 @@ jobs:
           token=None
           auth='MediaBrowser Client="Jealousfin Surf Diagnostics", Device="GitHub Actions", DeviceId="'+uuid.uuid4().hex+'", Version="1"'
           stage="startup"
-          def call(path,method="GET",body=None,limit=4000000,media=False):
+          def call(path,method="GET",body=None,limit=4000000,media=False,raw=False):
               global stage
               url=U.urljoin(base+"/",path)
               if origin(url)!=origin(base): raise ValueError("cross-origin URL blocked")
               h={"Authorization":auth+(', Token="'+token+'"' if token else ""), "Accept":"*/*" if media else "application/json"}
               if token: h["X-Emby-Token"]=token
+              if raw: h={"Accept":"*/*"}
               if body is not None: h["Content-Type"]="application/json"
               req=R.Request(url,data=json.dumps(body).encode() if body is not None else None,headers=h,method=method)
               t=time.monotonic()
@@ -52,6 +53,17 @@ jobs:
               q=[(k,v) for k,v in U.parse_qsl(parts.query,keep_blank_values=True) if k.lower() not in ("api_key","token","access_token")]
               q.append(("api_key",token))
               return U.urlunsplit(parts._replace(query=U.urlencode(q)))
+          def child(ref,parent,limit):
+              dest=U.urljoin(parent,ref)
+              if origin(dest)!=origin(base): raise ValueError("cross-origin media reference")
+              try:
+                  result=call(dest,limit=limit,media=True,raw=True)
+                  print("Client-style reference: PASS (no added credentials)",flush=True)
+                  return dest,result
+              except E.HTTPError as e:
+                  print("Client-style reference: HTTP",e.code,"; trying token injection",flush=True)
+                  dest=mediaurl(ref,parent)
+                  return dest,call(dest,limit=limit,media=True)
           live=None; play=None; sid=None; channel=None; ok=False
           try:
               stage="Public identity"
@@ -103,7 +115,7 @@ jobs:
                       print("Direct stream returned bytes; HLS and decoding not established",flush=True)
                   ok=True
               else:
-                  data,ctype=call(url,limit=1000000,media=True)
+                  data,ctype=call(url,limit=1000000,media=True,raw=True)
                   for depth in range(3):
                       stage="HLS manifest"
                       if not data.startswith(b"#EXTM3U"): raise ValueError("response is not HLS")
@@ -111,12 +123,21 @@ jobs:
                       refs=[x.strip() for x in lines if x.strip() and not x.startswith("#")]
                       if not refs: raise ValueError("manifest has no media references")
                       if any(x.startswith("#EXT-X-STREAM-INF") for x in lines):
-                          url=mediaurl(refs[0],url)
-                          data,ctype=call(url,limit=1000000,media=True)
+                          url,(data,ctype)=child(refs[0],url,1000000)
                           continue
                       stage="HLS segment"
                       print("Media playlist entries:",len(refs),flush=True)
-                      seg,ctype=call(mediaurl(refs[0],url),limit=4000000,media=True)
+                      segments=[]
+                      for ref in refs[:2]:
+                          _,(seg,ctype)=child(ref,url,4000000)
+                          if not seg: raise ValueError("empty segment")
+                          segments.append(seg)
+                      stage="FFmpeg video decode"
+                      proc=subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-nostdin","-progress","pipe:1","-i","pipe:0","-map","0:v:0","-an","-f","null","-"],input=b"".join(segments),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
+                      frames=[int(line.split("=")[1].strip()) for line in proc.stdout.decode("utf-8","replace").splitlines() if line.startswith("frame=") and line.split("=")[1].strip().isdigit()]
+                      count=max(frames,default=0)
+                      print("FFmpeg return code:",proc.returncode,"decoded video frames:",count,flush=True)
+                      if proc.returncode!=0 or count<3: raise ValueError("video decode failed")
                       if not seg: raise ValueError("empty segment")
                       print("Segment MPEG-TS sync byte:",seg[:1]==b"\x47",flush=True)
                       ok=True
@@ -144,6 +165,6 @@ jobs:
                       stage="Logout"
                       call("Sessions/Logout","POST")
                   except Exception as e: print("Logout failed:",type(e).__name__,flush=True); ok=False
-          print("Bounded Surf transport result:", "PASS (not decoded playback)" if ok else "FAIL",flush=True)
+          print("Bounded Surf transport result:", "PASS (bounded media decode if HLS; not physical playback)" if ok else "FAIL",flush=True)
           sys.exit(0 if ok else 1)
           PY
