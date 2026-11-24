@@ -138,7 +138,12 @@ struct Settings: Codable {
 }
 enum JSONCodec {
     static func encoder() -> JSONEncoder {
-        let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.sortedKeys]; return e
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .custom { date,encoder in
+            let f=ISO8601DateFormatter();f.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+            var c=encoder.singleValueContainer();try c.encode(f.string(from:date))
+        }
+        e.outputFormatting = [.sortedKeys]; return e
     }
     static func decoder() -> JSONDecoder {
         let d = JSONDecoder()

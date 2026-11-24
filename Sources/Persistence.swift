@@ -28,11 +28,12 @@ struct GitFile {
     var data: Data
 }
 @MainActor final class TorrioDB {
-    let base = "https://api.github.com/repos/mghazalyh/torriodb/contents/jealousfin/"
+    let repository = "https://api.github.com/repos/mghazalyh/torriodb/"
+    var base:String {repository+"contents/jealousfin/"}
     var token = ""
     var configured:Bool { !token.isEmpty }
-    func call(_ path:String, method:String="GET", body:[String:Any]?=nil) async throws -> (Data,Int) {
-        guard configured, let u=URL(string:base+path) else { throw AppError.message("Configure TorrioDB token") }
+    func call(_ path:String, method:String="GET", body:[String:Any]?=nil,gitTree:Bool=false) async throws -> (Data,Int) {
+        guard configured, let u=URL(string:(gitTree ? repository+"git/trees/" : base)+path) else { throw AppError.message("Configure TorrioDB token") }
         var req=URLRequest(url:u); req.httpMethod=method; req.timeoutInterval=20
         req.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")
         req.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
@@ -64,7 +65,22 @@ struct GitFile {
         let (d,status)=try await call(path)
         if status==404 { return [] }
         guard status==200, let a=try JSONSerialization.jsonObject(with:d) as? [[String:Any]] else { throw AppError.message("TorrioDB listing HTTP \(status)") }
-        return a.filter{$0["type"] as? String=="file"}.compactMap{$0["name"] as? String}.filter{$0.hasSuffix(".json") && $0.range(of:"^[A-Za-z0-9_.-]+$",options:.regularExpression) != nil}
+        var names=a.filter{$0["type"] as? String=="file"}.compactMap{$0["name"] as? String}
+        // Contents API caps directory listings at 1000 entries. Resolve its tree
+        // instead of silently losing later commands/receipts after long operation.
+        if a.count>=1000 {
+            let parent=(path as NSString).deletingLastPathComponent
+            let name=(path as NSString).lastPathComponent
+            let (pd,ps)=try await call(parent)
+            guard ps==200,let children=try JSONSerialization.jsonObject(with:pd) as? [[String:Any]],
+                  let sha=children.first(where:{$0["name"] as? String==name && $0["type"] as? String=="dir"})?["sha"] as? String,
+                  sha.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil else{throw AppError.message("Cannot resolve complete command directory")}
+            let (td,ts)=try await call(sha,gitTree:true)
+            guard ts==200,let tree=try JSONSerialization.jsonObject(with:td) as? [String:Any],tree["truncated"] as? Bool==false,
+                  let entries=tree["tree"] as? [[String:Any]] else{throw AppError.message("Incomplete Git tree")}
+            names=entries.filter{$0["type"] as? String=="blob"}.compactMap{$0["path"] as? String}
+        }
+        return names.filter{$0.hasSuffix(".json") && $0.range(of:"^[A-Za-z0-9_.-]+$",options:.regularExpression) != nil}
     }
     func merge(_ local:HealthLedger) async throws -> HealthLedger {
         let path="database/channel-health-v1.json"

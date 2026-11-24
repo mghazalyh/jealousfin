@@ -55,12 +55,12 @@ struct StreamSession {
         return Program(id: id, name: name, start: JSONCodec.date(x["StartDate"] as? String), end: JSONCodec.date(x["EndDate"] as? String), channelID: x["ChannelId"] as? String)
     }
     func channels() async throws -> [Channel] {
-        let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true"])
+        let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true","Fields":"Genres,Tags"])
         guard let items = a["Items"] as? [[String: Any]] else { throw AppError.message("Channel catalogue missing") }
         return items.compactMap { x in
             guard let id = x["Id"] as? String, let n = x["Name"] as? String else { return nil }
             let p = (x["CurrentProgram"] as? [String: Any]).flatMap(Self.program)
-            return Channel(id: id, name: n, number: x["ChannelNumber"] as? String, logo: !(x["ImageTags"] as? [String: Any] ?? [:]).isEmpty || x["PrimaryImageTag"] != nil, favorite: (x["UserData"] as? [String: Any])?["IsFavorite"] as? Bool ?? false, program: p, genres: x["Genres"] as? [String] ?? [])
+            return Channel(id: id, name: n, number: x["ChannelNumber"] as? String, logo: !(x["ImageTags"] as? [String: Any] ?? [:]).isEmpty || x["PrimaryImageTag"] != nil, favorite: (x["UserData"] as? [String: Any])?["IsFavorite"] as? Bool ?? false, program: p, genres: (x["Genres"] as? [String] ?? []) + (x["Tags"] as? [String] ?? []) + ((x["GenreItems"] as? [[String:Any]] ?? []).compactMap{$0["Name"] as? String}))
         }
     }
     func programs() async throws -> [Program] {

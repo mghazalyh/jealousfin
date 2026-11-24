@@ -100,6 +100,9 @@ struct ChannelRow:View{
                         }.frame(maxWidth:.infinity,alignment:.leading)
                     }
                 }.buttonStyle(.plain)
+                if channel.isSurf {
+                    Button{model.openServerSurf(channel)}label:{Image(systemName:"antenna.radiowaves.left.and.right").foregroundColor(subdued).padding(6)}.buttonStyle(.plain).accessibilityLabel("Play server-managed Surf")
+                }
                 Button{model.favoriteFromUI(channel)}label:{Image(systemName:channel.favorite ? "heart.fill":"heart").foregroundColor(channel.favorite ? accent:subdued).padding(6)}.buttonStyle(.plain)
             }
         }
