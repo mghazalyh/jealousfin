@@ -168,7 +168,7 @@ check(decisionJournalFixture.next(at:decisionNow)?.id==decisionFixture.id,"decis
 var decisionConflictFixture=decisionFixture;decisionConflictFixture.title="Changed decision"
 var conflictRejected=false
 do{try decisionJournalFixture.insert(decisionConflictFixture,at:decisionNow)}catch{conflictRejected=true}
-check(conflictRejected,"decisionConflictFixture decisionFixture cannot overwrite prior approval")
+check(conflictRejected,"conflicting prompt cannot overwrite prior approval")
 var decisionRecordFixture=decisionJournalFixture.records[0]
 var hiddenApprovalRejected=false
 do{try decisionRecordFixture.choose("fix",at:decisionNow)}catch{hiddenApprovalRejected=true}
@@ -189,7 +189,7 @@ decisionReceiptFixture.id=decisionRecordFixture.commandID
 decisionRecordFixture.finish(decisionReceiptFixture,at:decisionNow)
 check(decisionRecordFixture.status=="succeeded" && decisionRecordFixture.terminal,"stable receipt completes approved decision")
 var decisionExpiredFixture=decisionJournalFixture.records[0];decisionExpiredFixture.expire(at:decisionNow.addingTimeInterval(601))
-check(decisionExpiredFixture.status=="decisionExpiredFixture" && decisionExpiredFixture.chosenAction==nil,"expiry never applies a repair")
+check(decisionExpiredFixture.status=="expired" && decisionExpiredFixture.chosenAction==nil,"expiry never applies a repair")
 var decisionUnsafeFixture=decisionFixture;decisionUnsafeFixture.choices[0].action=DynamicUIAction(command:"approve_reinstatement",arguments:[:])
 check((try? decisionUnsafeFixture.checked(now:decisionNow))==nil,"decision cannot bypass reinstatement approval")
 decisionJournalFixture.records[0]=decisionRecordFixture
