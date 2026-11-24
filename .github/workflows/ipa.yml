@@ -3,17 +3,27 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Initial macOS runner pool
+        type: choice
+        default: macos-15-intel
+        options: [macos-15-intel, macos-26-intel, macos-15]
 permissions:
-  contents: write
+  contents: read
+  actions: read
 concurrency:
   group: jealousfin-ipa
   cancel-in-progress: false
 jobs:
-  release:
-    runs-on: macos-15
+  primary:
+    name: Jealousfin primary macOS
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 35
-    steps:
+    steps: &native_steps
       - uses: actions/checkout@v4
+      - name: Verify source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Import reviewed patch baseline (required)
         env:
           JEALOUSDB_RELEASE_TOKEN: ${{ secrets.JEALOUSDB_RELEASE_TOKEN || secrets.TORRIODB_RELEASE_TOKEN }}
@@ -25,7 +35,7 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
-          brew install xcodegen
+          command -v xcodegen >/dev/null || brew install xcodegen
           bash Scripts/fetch-runtime.sh
       - name: Test channel policy
         run: |
@@ -50,6 +60,8 @@ jobs:
           xcodebuild -project Jealousfin.xcodeproj -scheme Jealousfin -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" IPHONEOS_DEPLOYMENT_TARGET=15.0 PRODUCT_BUNDLE_IDENTIFIER=com.example.jealousfin CURRENT_PROJECT_VERSION="$build_number" build
       - name: Package and verify public TrollStore IPA (PlayTorrio reference signing)
         run: bash Scripts/package-public-ipa.sh
+      - name: Record reviewed baseline revision
+        run: python3 -c 'import json;print(json.load(open("Promoted/baseline.json"))["revision"])' > build/baseline-revision.txt
       - uses: actions/upload-artifact@v4
         with:
           name: Jealousfin-IPA
@@ -58,12 +70,101 @@ jobs:
             build/Jealousfin.ipa.sha256
             build/Jealousfin-unsigned.ipa
             build/Jealousfin-unsigned.ipa.sha256
+            build/baseline-revision.txt
           if-no-files-found: error
+  primary-guard:
+    needs: primary
+    if: ${{ always() && !cancelled() && needs.primary.result == 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      eligible: ${{ steps.guard.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that no runner or build was started
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_JOB_NAME: Jealousfin primary macOS
+        run: python3 Scripts/runner-fallback-guard.py
+  rescue-intel:
+    name: Jealousfin backup Intel
+    needs: [primary, primary-guard]
+    if: ${{ always() && !cancelled() && needs.primary-guard.outputs.eligible == 'true' }}
+    runs-on: ${{ inputs.runner == 'macos-26-intel' && 'macos-15-intel' || 'macos-26-intel' }}
+    timeout-minutes: 35
+    steps: *native_steps
+  intel-guard:
+    needs: rescue-intel
+    if: ${{ always() && !cancelled() && needs.rescue-intel.result == 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      eligible: ${{ steps.guard.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that backup never started
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_JOB_NAME: Jealousfin backup Intel
+        run: python3 Scripts/runner-fallback-guard.py
+  rescue-arm:
+    name: Jealousfin backup Apple Silicon
+    needs: [rescue-intel, intel-guard]
+    if: ${{ always() && !cancelled() && needs.intel-guard.outputs.eligible == 'true' && inputs.runner != 'macos-15' }}
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps: *native_steps
+  publish:
+    name: Publish verified IPA once
+    needs: [primary, rescue-intel, rescue-arm]
+    if: ${{ always() && !cancelled() && (needs.primary.result == 'success' || needs.rescue-intel.result == 'success' || needs.rescue-arm.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Jealousfin-IPA
+          path: packages
+      - name: Verify archive checksums and metadata
+        run: |
+          set -euo pipefail
+          cd packages
+          sha256sum -c Jealousfin.ipa.sha256
+          sha256sum -c Jealousfin-unsigned.ipa.sha256
+          python3 - <<'VERIFY'
+          import os, plistlib, zipfile
+          for name in ("Jealousfin.ipa", "Jealousfin-unsigned.ipa"):
+              with zipfile.ZipFile(name) as z:
+                  assert z.testzip() is None
+                  root = "Payload/Jealousfin.app/"
+                  info = plistlib.loads(z.read(root+"Info.plist"))
+                  assert info["CFBundleIdentifier"] == "com.example.jealousfin"
+                  assert info["CFBundleVersion"] == str(1000+int(os.environ["GITHUB_RUN_NUMBER"]))
+                  assert info["MinimumOSVersion"] == "15.0"
+                  assert info["LSRequiresIPhoneOS"] is True
+                  assert z.getinfo(root+"Jealousfin").external_attr >> 16 & 0o777 == 0o755
+                  assert (root+"_CodeSignature/CodeResources" in z.namelist()) == (name=="Jealousfin.ipa")
+                  assert root+"JealousfinDefaults.plist" not in z.namelist()
+          VERIFY
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="v0.1.13-build${JEALOUSFIN_BUILD_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-          baseline="$(python3 -c 'import json;print(json.load(open("Promoted/baseline.json"))["revision"])')"
-          gh release create "$tag" build/Jealousfin.ipa build/Jealousfin.ipa.sha256 build/Jealousfin-unsigned.ipa build/Jealousfin-unsigned.ipa.sha256 --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build ${JEALOUSFIN_BUILD_NUMBER} (TrollStore candidate)" --notes "Two iOS 15+ arm64 IPA candidates with bundle identifier com.example.jealousfin: Jealousfin.ipa is ad hoc signed; Jealousfin-unsigned.ipa uses the original unsigned RC1 packaging format. For TrollStore testing, not Apple OTA distribution. No private login defaults or shared distribution provisioning profile. Source: $GITHUB_SHA. Embedded reviewed baseline: $baseline. Package signature and regressions verified by CI; physical installation and playback require separate acceptance." --prerelease
+          build_number=$((1000 + GITHUB_RUN_NUMBER))
+          tag="v0.1.13-build${build_number}-${GITHUB_RUN_ATTEMPT}"
+          baseline="$(cat packages/baseline-revision.txt)"
+          notes="Ad hoc signed and unsigned iOS 15+ ARM64 Jealousfin candidates. Source: $GITHUB_SHA. Reviewed baseline: $baseline. CI archive and signature checks passed; physical TrollStore installation unverified."
+          files=(packages/Jealousfin.ipa packages/Jealousfin.ipa.sha256 packages/Jealousfin-unsigned.ipa packages/Jealousfin-unsigned.ipa.sha256)
+          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build $build_number (TrollStore candidate)" --notes "$notes" --prerelease
+          for f in "${files[@]}"; do
+            name="$(basename "$f")"
+            expected="$(stat -c%s "$f")"
+            actual="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .size')"
+            test "$expected" = "$actual"
+          done
