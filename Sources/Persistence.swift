@@ -70,6 +70,23 @@ private final class DatabaseNoRedirect:NSObject,URLSessionTaskDelegate {
         guard let h=r as? HTTPURLResponse else { throw AppError.message("Invalid GitHub response") }
         return (d,h.statusCode)
     }
+    func privateConnectionDefaults()async throws->JellyfinConnectionDefaults {
+        guard enabled,repositoryAddress==GitHubRepositoryAddress.defaultURL,
+              let repository=repository,let endpoint=URL(string:String(repository.dropLast())),!token.isEmpty
+        else{throw AppError.message("Private JealousDB repository and token required")}
+        var request=URLRequest(url:endpoint);request.timeoutInterval=15
+        request.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")
+        request.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
+        let (data,response)=try await transport.data(for:request,delegate:DatabaseNoRedirect())
+        guard (response as? HTTPURLResponse)?.statusCode==200,
+              let metadata=try JSONSerialization.jsonObject(with:data) as? [String:Any],
+              metadata["private"] as? Bool==true,
+              metadata["full_name"] as? String=="mghazalyh/jealousdb"
+        else{throw AppError.message("Connection defaults require the verified private JealousDB")}
+        guard let file=try await read("database/connection-defaults-v1.json"),file.data.count<=16384
+        else{throw AppError.message("Private connection defaults are not configured")}
+        return try JSONCodec.decoder().decode(PrivateConnectionDefaults.self,from:file.data).checked()
+    }
     func read(_ path:String) async throws -> GitFile? {
         let (d,status)=try await call(path)
         if status==404 { return nil }

@@ -40,8 +40,10 @@ jobs:
           for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
             clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
           done
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/HLSReadiness.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
+          swiftc -parse-as-library Sources/Domain.swift Sources/JellyfinAdapterDomain.swift Sources/HLSReadiness.swift Tests/HLSReadinessTests.swift -o build/hls-readiness-tests
+          build/hls-readiness-tests
       - name: Native live Jellyfin and decoded AVPlayer acceptance
         timeout-minutes: 18
         env:
@@ -49,7 +51,7 @@ jobs:
           JELLYFIN_TEST_USERNAME: ${{ secrets.JELLYFIN_TEST_USERNAME }}
           JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
         run: |
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/LiveAcceptance.swift build/quickjs/*.o -framework AVFoundation -framework CoreVideo -o build/live-acceptance
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/HLSReadiness.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/LiveAcceptance.swift build/quickjs/*.o -framework AVFoundation -framework CoreVideo -o build/live-acceptance
           ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=440:sample_rate=44100 -t 15 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart -y build/control.mp4
           JEALOUSFIN_AVPLAYER_CONTROL="$PWD/build/control.mp4" build/live-acceptance
       - name: Generate project and build

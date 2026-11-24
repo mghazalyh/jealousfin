@@ -318,6 +318,11 @@ struct SettingsView:View{
                 }
                 Divider()
                 SecureField("GitHub repository access token",text:$model.settings.githubToken)
+                Toggle("Import missing connection settings from private JealousDB",isOn:Binding(get:{model.settings.provisionFromPrivateDB==true},set:{model.settings.provisionFromPrivateDB=$0;model.saveSettings()}))
+                if model.settings.provisionFromPrivateDB==true {
+                    Button("Import private connection settings"){Task{await model.provisionConnection()}}.buttonStyle(.bordered)
+                    Text(model.provisioningStatus).font(.caption).foregroundColor(subdued)
+                }
                 Text("Active: "+(model.db.repositoryAddress ?? "Not configured")).font(.caption).foregroundColor(subdued)
                 Text("Branch: main · Data folder: jealousfin/").font(.caption).foregroundColor(subdued)
                 if model.repositorySwitchPending && model.repositoryAddressValid {

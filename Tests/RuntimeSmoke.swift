@@ -47,9 +47,25 @@ import Foundation
             let config=try JSONCodec.decoder().decode(RuntimePolicy?.self,from:Data(output.utf8))
             _ = try (config ?? RuntimePolicy.baseline(Settings())).checked()
         }
+        let fixtureRoot=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer{try? FileManager.default.removeItem(at:fixtureRoot)}
+        let runtime=EngineeringRuntime(disk:Disk(root:fixtureRoot),engine:engine)
+        let fixtureChannel=Channel(id:"one",name:"Fixture",number:nil,logo:false,favorite:false,program:nil,genres:[])
+        _ = try await runtime.install(id:"abi2",source:"var hooks={playbackAttempt:function(p){p.policy.segmentContainer=p.attempt===1?'ts':'mp4';p.policy.forceEncode=p.attempt>1;return p.policy;}};",settings:Settings())
+        let first=try await runtime.playbackAttempt(channel:fixtureChannel,attempt:1,previousFailure:"",defaults:PlaybackAttemptPolicy())
+        let second=try await runtime.playbackAttempt(channel:fixtureChannel,attempt:2,previousFailure:"timeout",defaults:PlaybackAttemptPolicy())
+        precondition(first.segmentContainer=="ts" && !first.forceEncode && second.segmentContainer=="mp4" && second.forceEncode)
+        var invalidRejected=false
+        do{_ = try await runtime.install(id:"abi2-invalid",source:"var hooks={playbackAttempt:function(p){p.policy.maxWidth=99999;return p.policy;}};",settings:Settings())}catch{invalidRejected=true}
+        precondition(invalidRejected && runtime.activeID=="abi2")
+        _ = try await runtime.install(id:"abi2-next",source:"var hooks={playbackAttempt:function(p){p.policy.segmentContainer='ts';return p.policy;}};",settings:Settings())
+        _ = try await runtime.rollback(settings:Settings())
+        let restored=try await runtime.playbackAttempt(channel:fixtureChannel,attempt:2,previousFailure:"timeout",defaults:PlaybackAttemptPolicy())
+        precondition(restored.segmentContainer=="mp4")
+        print("PASS: ABI 2 per-attempt transport hook, bounded values and rollback")
         try await HotPatchIntegration.run(engine:engine)
         let lanFixture=LANServer(port:.any,advertise:false)
-        lanFixture.handler={body,complete in complete(body)}
+        lanFixture.handler={body,complete in complete("200 OK",body)}
         try lanFixture.start()
         defer{lanFixture.stop()}
         for _ in 0..<100 {
@@ -88,6 +104,47 @@ with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10) as s:
         oversizeProbe.waitUntilExit()
         guard oversizeProbe.terminationStatus==0 else{throw AppError.message("Oversized HTTP header was not rejected")}
         print("PASS: actual LAN listener rejects over-limit request")
+        let commandFixture=LANServer(port:.any,advertise:false)
+        var dispatchCount=0
+        commandFixture.handler={body,complete in
+            Task { @MainActor in
+                let response=await LANCommandResponse.make(body){cmd in
+                    dispatchCount+=1
+                    return Receipt(id:cmd.id,action:cmd.action,status:cmd.action=="get_status" ? "succeeded":"failed",result:"fixture")
+                }
+                complete(response.0,response.1)
+            }
+        }
+        try commandFixture.start()
+        defer{commandFixture.stop()}
+        for _ in 0..<100 {
+            if commandFixture.port != nil{break}
+            try await Task.sleep(nanoseconds:20_000_000)
+        }
+        guard let commandPort=commandFixture.port,let commandURL=URL(string:"http://127.0.0.1:\(commandPort)/command") else {
+            throw AppError.message("Command fixture did not start")
+        }
+        func commandRequest(_ data:Data)async throws->(Int,Data){
+            var req=URLRequest(url:commandURL);req.httpMethod="POST";req.httpBody=data;req.timeoutInterval=5
+            let (body,response)=try await localTransport.data(for:req)
+            return ((response as? HTTPURLResponse)?.statusCode ?? -1,body)
+        }
+        for data in [Data("{not-json".utf8),Data("{}".utf8),Data("[]".utf8)] {
+            let (status,body)=try await commandRequest(data)
+            precondition(status==400)
+            let reply=try JSONSerialization.jsonObject(with:body) as? [String:Any]
+            precondition(reply?["status"] as? String=="failed")
+        }
+        precondition(dispatchCount==0)
+        for (action,wanted) in [("get_status","succeeded"),("unknown","failed")] {
+            let command=Command(id:"fixture-"+action,action:action,arguments:[:],expiresAt:nil)
+            let (status,body)=try await commandRequest(JSONCodec.encoder().encode(command))
+            precondition(status==200)
+            let receipt=try JSONCodec.decoder().decode(Receipt.self,from:body)
+            precondition(receipt.id==command.id && receipt.status==wanted)
+        }
+        precondition(dispatchCount==2)
+        print("PASS: malformed LAN envelopes return 400 without dispatch; decoded commands retain HTTP 200 receipts")
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }

@@ -118,6 +118,7 @@ import Network
     private var lastProgressReport:Task<Void,Never>?
     private var cleanupTask:Task<Void,Never>?
     private var lastPlayerError:String?
+    private var manualHLSProbeBusy=false
     @Published private(set) var catalogueReady=false
     private var deviceObservers:[NSObjectProtocol]=[]
 
@@ -181,12 +182,11 @@ import Network
         jelly.log={ [weak self] severity,code,fields in self?.log(severity,"jellyfin",code,fields) }
         lan.handler={ [weak self] data,completion in
             Task { @MainActor in
-                guard let self=self else { completion(Data("{}".utf8)); return }
-                do {
-                    let c=try JSONCodec.decoder().decode(Command.self,from:data)
-                    let receipt=await self.execute(c,origin:"lan")
-                    completion(try JSONCodec.encoder().encode(receipt))
-                } catch { completion(Data("{\"status\":\"failed\",\"result\":\"Invalid command\"}".utf8)) }
+                guard let self=self else { completion("503 Service Unavailable",LANCommandResponse.error("Command dispatcher unavailable")); return }
+                let response=await LANCommandResponse.make(data){ command in
+                    await self.execute(command,origin:"lan")
+                }
+                completion(response.0,response.1)
             }
         }
         lan.queryHandler={ [weak self] path,completion in
@@ -222,6 +222,7 @@ import Network
             await self.bootJellyfinAPI()
             await self.bootRuntime()
             self.capturePatchArchive(reason:"launch-reconciliation")
+            if self.settings.provisionFromPrivateDB==true && [self.settings.server,self.settings.username,self.settings.password].contains(where:{$0.isEmpty}){await self.provisionConnection()}
             if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect()}
             self.resumeCampaignIfNeeded()
         }
@@ -356,6 +357,30 @@ import Network
     var hiatus:[Channel]{channels.filter{c in health[c.id].map{!$0.banned && !$0.eligible(at:Date())} ?? false}}
     var banned:[Channel]{channels.filter{health[$0.id]?.banned == true}}
     var validatedCount:Int{health.values.filter{$0.successes>0 || $0.lifetimeFailures>0}.count}
+    @Published private(set) var provisioningStatus=""
+    func provisionConnection()async {
+        guard !loginBusy,!apiChanging,settings.provisionFromPrivateDB==true else{return}
+        guard !settings.githubToken.isEmpty,GitHubRepositoryAddress.canonical(settings.repositoryAddress)==GitHubRepositoryAddress.defaultURL else {
+            provisioningStatus="Configure private JealousDB and a token first";return
+        }
+        let snapshot=[settings.server,settings.username,settings.password]
+        let provision=TorrioDB(address:settings.repositoryAddress);provision.token=settings.githubToken
+        provisioningStatus="Reading private defaults"
+        do{
+            let defaults=try await provision.privateConnectionDefaults()
+            guard snapshot==[settings.server,settings.username,settings.password],
+                  settings.provisionFromPrivateDB==true else{provisioningStatus="Settings changed; import cancelled";return}
+            var candidate=settings
+            candidate.applyConnectionDefaults(defaults)
+            guard disk.save(candidate,"settings.json") else{throw AppError.message("Cannot persist connection defaults")}
+            settings=candidate
+            provisioningStatus=snapshot==[settings.server,settings.username,settings.password] ? "Existing settings preserved" : "Missing connection fields imported"
+            log("INFO","settings","PRIVATE_DEFAULTS_CHECKED")
+        }catch{
+            provisioningStatus="Private defaults unavailable"
+            log("WARN","settings","PRIVATE_DEFAULTS_UNAVAILABLE",["errorType":String(describing:type(of:error))])
+        }
+    }
     func connect() async {
         guard apiReady,!apiChanging,!loginBusy else{return};loginBusy=true;defer{loginBusy=false}
         // Drain the old stream's operations before replacing server credentials.
@@ -516,22 +541,51 @@ import Network
         player.automaticallyWaitsToMinimizeStalling=policy.automaticallyWaits
         for attemptIndex in 1...max(1,policy.retries) {
             guard g==generation,!Task.isCancelled else{return}
+            let previousFailure=attemptIndex>1 ? errorReason : ""
             errorReason="Startup timeout"
             log("INFO","validator","ATTEMPT",["channelID":channel.id,"attempt":String(attemptIndex)])
             do {
-                let s=try await jelly.stream(channel,mbps:policy.qualityMbps)
+                // A pure bounded hook may choose a different transport per retry.
+                // Never expose session credentials or replace the shared gateway.
+                let candidate:PlaybackAttemptPolicy
+                if channel.isSurf {candidate=PlaybackAttemptPolicy()}
+                else {
+                    do{
+                        let proposed=try await engineering.playbackAttempt(channel:channel,attempt:attemptIndex,previousFailure:sanitized(previousFailure),defaults:policy.playback ?? PlaybackAttemptPolicy())
+                        guard (proposed.startupSeconds ?? policy.startupTimeout)>policy.validationSeconds else{throw AppError.message("Startup must exceed validation window")}
+                        candidate=proposed
+                    }catch{
+                        log("WARN","runtime","PLAYBACK_HOOK_FALLBACK",["channelID":channel.id,"attempt":String(attemptIndex),"errorType":String(describing:type(of:error))])
+                        candidate=PlaybackAttemptPolicy()
+                    }
+                }
+                let startup=candidate.startupSeconds ?? policy.startupTimeout
+                guard g==generation,!Task.isCancelled else{return}
+                let s=try await jelly.stream(channel,mbps:policy.qualityMbps,playback:candidate)
                 guard g==generation,!Task.isCancelled else{await jelly.close(s,position:0);return}
                 session=s;startedSession=false
                 log("INFO","player","TRANSPORT_SELECTED",["method":s.method])
+                let diagnosticTask:Task<Void,Never>?
+                if !s.isSharedSurf,candidate.diagnosticSeconds>0 {
+                    diagnosticTask=Task{[weak self] in
+                        guard let self=self else{return}
+                        let report=await self.jelly.hlsReadiness(s,budget:Double(candidate.diagnosticSeconds))
+                        guard !Task.isCancelled,self.generation==g else{return}
+                        self.log("INFO","player","HLS_READINESS",report.logFields.merging(["channelID":channel.id,"attempt":String(attemptIndex)]){_,b in b})
+                    }
+                }else{diagnosticTask=nil}
+                defer{diagnosticTask?.cancel()}
+                player.automaticallyWaitsToMinimizeStalling=candidate.automaticallyWaits ?? policy.automaticallyWaits
                 let item=AVPlayerItem(url:s.url)
-                item.preferredForwardBufferDuration=Double(policy.forwardBufferSeconds)
-                item.preferredPeakBitRate=Double(policy.qualityMbps)*1_000_000
+                item.preferredForwardBufferDuration=Double(candidate.forwardBufferSeconds ?? policy.forwardBufferSeconds)
+                item.preferredPeakBitRate=Double(candidate.peakMbps>0 ? candidate.peakMbps : policy.qualityMbps)*1_000_000
+                log("INFO","player","PLAYBACK_ATTEMPT_POLICY",["format":candidate.segmentContainer,"forceEncode":String(candidate.forceEncode),"startupSeconds":String(startup),"attempt":String(attemptIndex),"runtime":activePatchID,"adapter":jellyfinAPIRevision])
                 let output=AVPlayerItemVideoOutput(pixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA])
                 item.add(output);videoOutput=output
                 player.replaceCurrentItem(with:item)
                 if !intentionallyPaused {player.play()}
                 ready=false;lastPosition=position
-                var deadline=Date().addingTimeInterval(Double(policy.startupTimeout))
+                var deadline=Date().addingTimeInterval(Double(startup))
                 var firstPosition:Double?
                 var evidence=VideoEvidence()
                 while Date()<deadline && g==generation && !Task.isCancelled {
@@ -540,7 +594,7 @@ import Network
                     if intentionallyPaused {
                         firstPosition=nil
                         evidence=VideoEvidence()
-                        deadline=Date().addingTimeInterval(Double(policy.startupTimeout))
+                        deadline=Date().addingTimeInterval(Double(startup))
                         continue
                     }
                     if item.status == .failed {errorReason="AVPlayer item failed";break}
@@ -915,9 +969,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command,origin:String="internal") async -> Receipt {
         if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
@@ -945,7 +999,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
+            let structured:Set<String>=["get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -961,6 +1015,18 @@ import Network
             throw AppError.message("Patch restoration in progress")
         }
         switch action {
+        case "get_native_capabilities":
+            return try json(["runtimeABI":"2","adapterABI":"1","playbackAttemptHook":"true","playbackPolicyFields":"segmentContainer,forceEncode,segmentSeconds,minimumSegments,maxWidth,maxHeight,videoBitrate,audioBitrate,peakMbps,forwardBufferSeconds,automaticallyWaits,startupSeconds,diagnosticSeconds,preferDirect","hlsProbe":"active-session,same-origin,no-redirect","sharedSurf":"unchanged,server-owned","nativeLifecycle":"native-only"])
+        case "get_player_snapshot":
+            let item=player.currentItem
+            let access=item?.accessLog()?.events.last
+            return try json(["position":String(position),"rate":String(player.rate),"itemStatus":String(item?.status.rawValue ?? -1),"timeControl":String(player.timeControlStatus.rawValue),"waiting":player.reasonForWaitingToPlay?.rawValue ?? "none","bytes":String(access?.numberOfBytesTransferred ?? 0),"stalls":String(access?.numberOfStalls ?? 0),"droppedFrames":String(access?.numberOfDroppedVideoFrames ?? 0),"displayReady":String(ready),"validated":String(validated),"transport":session?.method ?? "none","runtime":activePatchID,"adapter":jellyfinAPIRevision,"channelID":current?.id ?? ""])
+        case "probe_active_hls":
+            guard !manualHLSProbeBusy,let active=session,!active.isSharedSurf else{throw AppError.message("No ordinary active HLS session or probe already running")}
+            manualHLSProbeBusy=true;defer{manualHLSProbeBusy=false}
+            let budget=max(1,min(20,args["seconds"].flatMap(Int.init) ?? 8))
+            let report=await jelly.hlsReadiness(active,budget:Double(budget))
+            return try json(report.logFields)
         case "get_status":return String(decoding:try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys]),as:UTF8.self)
         case "get_capabilities":return try json(Self.actions)
         case "get_version":return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
@@ -979,15 +1045,27 @@ import Network
         case "play","resume":resume()
         case "pause":pause()
         case "stop":stop()
-        case "next_channel":next()
-        case "previous_channel":guard let c=previous.first else{throw AppError.message("No previous channel")};open(c)
+        case "next_channel":
+            let reconnecting=usingSharedSurf
+            next()
+            if reconnecting{return "Shared Surf reconnect requested; underlying channel selection is server-owned"}
+        case "previous_channel":
+            guard let c=previous.first else{throw AppError.message("No previous channel")}
+            open(c)
+            if usingSharedSurf{return "Previous shared Surf category requested; underlying channel selection is server-owned"}
         case "start_surf":
             let category=args["category"] ?? "All Channels"
             guard ["All Channels","Favorites","Sports","Movies & Series"].contains(category),jelly.connected,catalogueReady,!loginBusy else{throw AppError.message("Invalid category or Jellyfin unavailable")}
             startSurf(category:category)
-        case "stop_surf":stopSurf()
-        case "pause_surf":if !surfPaused{toggleSurfPause()}
-        case "resume_surf":if surfPaused{toggleSurfPause()}
+        case "stop_surf":
+            stopSurf()
+            return "Surf mode stopped; use stop to stop the local player"
+        case "pause_surf":
+            try SurfCommandSemantics.requireRotationControl(surfing:surfing,shared:usingSharedSurf)
+            if !surfPaused{toggleSurfPause()}
+        case "resume_surf":
+            try SurfCommandSemantics.requireRotationControl(surfing:surfing,shared:usingSharedSurf)
+            if surfPaused{toggleSurfPause()}
         case "set_rotation_minutes":
             guard let n=args["minutes"].flatMap(Int.init),(1...1440).contains(n) else{throw AppError.message("Minutes must be 1–1440")}
             settings.rotationMinutes=n;saveSettings();if surfing && !surfPaused && validated && !usingSharedSurf{nextRotation=Date().addingTimeInterval(Double(n*60))}
@@ -1145,7 +1223,7 @@ import Network
         case "get_runtime_module":
             let data=try JSONCodec.encoder().encode(effectivePolicy)
             let p=try JSONSerialization.jsonObject(with:data)
-            return String(decoding:try JSONSerialization.data(withJSONObject:["abi":1,"id":activePatchID,"ready":policyReady,"fault":patchFault ?? "","policy":p],options:[.sortedKeys]),as:UTF8.self)
+            return String(decoding:try JSONSerialization.data(withJSONObject:["abi":2,"id":activePatchID,"ready":policyReady,"fault":patchFault ?? "","policy":p],options:[.sortedKeys]),as:UTF8.self)
         case "start_device_tests":
             guard let plan=args["plan"] else{throw AppError.message("Provide a JSON test plan")}
             try startCampaign(try JSONCodec.decoder().decode(DeviceTestPlan.self,from:Data(plan.utf8)));return "Campaign persisted and queued"
@@ -1398,6 +1476,9 @@ extension AppModel {
         }
         guard jelly.connected,catalogueReady else{return Observation(status:"blocked",evidence:["reason":"Live Jellyfin connection required"])}
         if step.kind=="surf_rotation" {
+            guard jelly.sharedSurfChannel(category:"All Channels",channels:channels)==nil else {
+                return Observation(status:"blocked",evidence:["reason":"Shared gateway owns rotation; distinct underlying channel identities are not available","rotationOwner":"server","alternativeTest":"shared_surf_continuity"])
+            }
             guard eligibleChannels.count>=2 else{return Observation(status:"blocked",evidence:["reason":"At least two eligible real channels required"])}
             startSurf(category:"All Channels")
             let deadline=ProcessInfo.processInfo.systemUptime+Double(seconds)
@@ -1412,19 +1493,30 @@ extension AppModel {
             return Observation(status:"failed",evidence:["reason":"Two distinct validated rotations were not observed within the test window","validatedCount":String(validatedIDs.count)])
         }
         let channel:Channel?
-        if let id=step.channelID{channel=eligibleChannels.first(where:{$0.id==id})}
+        if step.kind=="shared_surf_continuity" {
+            if let id=step.channelID,let requested=channels.first(where:{$0.id==id && $0.isSurf}),
+               let mode=SharedSurf.mode(for:requested) {
+                channel=jelly.sharedSurfChannel(category:mode,channels:channels)
+            } else if step.channelID==nil {
+                channel=jelly.sharedSurfChannel(category:"All Channels",channels:channels)
+            } else {channel=nil}
+        } else if let id=step.channelID{channel=eligibleChannels.first(where:{$0.id==id})}
         else {channel=eligibleChannels.first(where:{$0.id==current?.id}) ?? eligibleChannels.first}
         guard let channel=channel else{return Observation(status:"blocked",evidence:["reason":"Requested channel is not eligible"],channelID:step.channelID)}
         let reuse=CampaignPlaybackPolicy.reuse(kind:step.kind,requestedID:channel.id,currentID:current?.id,validated:validated,hasItem:player.currentItem?.status == .readyToPlay,hasSession:session != nil,playing:player.timeControlStatus == .playing,paused:intentionallyPaused,hasError:lastPlayerError != nil)
         if !reuse {open(channel)}
         else {log("INFO","engineering","CONTINUITY_REUSED",["kind":step.kind,"channelID":channel.id])}
-        let startupBudget=max(15,min(720,effectivePolicy.retries*(effectivePolicy.startupTimeout+45)))
+        let startupBudget=max(15,min(720,effectivePolicy.retries*((activePatchID=="native-baseline" ? effectivePolicy.startupTimeout : 120)+45)))
         guard await awaitPlayback(epoch:epoch,id:channel.id,seconds:startupBudget) else {
             return Observation(status:"failed",evidence:["reason":lastPlayerError ?? "No confirmed playback before deadline","startupBudgetSeconds":String(startupBudget)],channelID:channel.id)
         }
         let startupMs=Int((ProcessInfo.processInfo.systemUptime-start)*1000)
         let streamGeneration=generation
         var evidence:[String:String]=["startupMs":String(startupMs),"channel":channel.name,"displayReady":String(ready),"reusedValidatedStream":String(reuse)]
+        if step.kind=="shared_surf_continuity" {
+            evidence["rotationOwner"]="server"
+            evidence["underlyingRotationVerified"]="false"
+        }
         if step.kind=="pause_resume" {
             pause();await nap(0.75)
             let p=position

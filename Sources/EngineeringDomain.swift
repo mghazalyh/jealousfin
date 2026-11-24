@@ -12,6 +12,7 @@ struct RuntimePolicy: Codable, Equatable {
     var automaticallyWaits: Bool
     var recoveryMode: String
     var failureRetrySeconds: Int
+    var playback:PlaybackAttemptPolicy? = nil
     static func baseline(_ settings: Settings) -> RuntimePolicy {
         RuntimePolicy(startupTimeout: settings.startupTimeout, retries: settings.retries,
             qualityMbps: settings.qualityMbps, stallSeconds: 30, rotationSeconds: settings.rotationMinutes * 60,
@@ -24,7 +25,48 @@ struct RuntimePolicy: Codable, Equatable {
             (0...120).contains(forwardBufferSeconds), startupTimeout > validationSeconds,
             ["reopen","advance_surf","pause"].contains(recoveryMode),(5...600).contains(failureRetrySeconds)
         else { throw AppError.message("Runtime policy is outside supported native limits") }
+        _ = try playback?.checked()
         return self
+    }
+}
+struct PlaybackAttemptPolicy:Codable,Equatable {
+    var segmentContainer:String = "server"
+    var forceEncode:Bool = false
+    var segmentSeconds:Int = 0
+    var minimumSegments:Int = 0
+    var maxWidth:Int = 0
+    var maxHeight:Int = 0
+    var videoBitrate:Int = 0
+    var audioBitrate:Int = 0
+    var peakMbps:Int = 0
+    var forwardBufferSeconds:Int? = nil
+    var automaticallyWaits:Bool? = nil
+    var startupSeconds:Int? = nil
+    var diagnosticSeconds:Int = 0
+    var preferDirect:Bool = false
+    func checked()throws->Self {
+        guard ["server","ts","mp4"].contains(segmentContainer),
+              (0...15).contains(segmentSeconds),(0...8).contains(minimumSegments),
+              (0...3840).contains(maxWidth),(0...2160).contains(maxHeight),
+              (0...50_000_000).contains(videoBitrate),(0...512_000).contains(audioBitrate),
+              (0...50).contains(peakMbps),(0...120).contains(forwardBufferSeconds ?? 0),
+              (5...120).contains(startupSeconds ?? 25),(0...20).contains(diagnosticSeconds)
+        else{throw AppError.message("Playback attempt policy outside supported limits")}
+        return self
+    }
+    func applying(to url:URL)throws->URL {
+        guard var c=URLComponents(url:url,resolvingAgainstBaseURL:false) else{throw AppError.message("Invalid playback URL")}
+        // Only ordinary HLS paths receive format overrides.
+        guard c.path.lowercased().hasSuffix(".m3u8") else{return url}
+        var changes:[String:String]=[:]
+        if segmentContainer != "server"{changes["SegmentContainer"]=segmentContainer}
+        if forceEncode{for k in ["EnableAutoStreamCopy","AllowVideoStreamCopy","AllowAudioStreamCopy"]{changes[k]="false"}}
+        for (key,value) in [("SegmentLength",segmentSeconds),("MinSegments",minimumSegments),("MaxWidth",maxWidth),("MaxHeight",maxHeight),("VideoBitRate",videoBitrate),("AudioBitRate",audioBitrate)] where value>0 {changes[key]=String(value)}
+        guard !changes.isEmpty else{return url}
+        let keys=Set(changes.keys.map{$0.lowercased()})
+        c.queryItems=(c.queryItems ?? []).filter{!keys.contains($0.name.lowercased())}+changes.sorted{$0.key<$1.key}.map{URLQueryItem(name:$0.key,value:$0.value)}
+        guard let result=c.url else{throw AppError.message("Invalid playback format override")}
+        return result
     }
 }
 struct RuntimePatch: Codable, Equatable {
@@ -53,7 +95,7 @@ struct DeviceTestPlan: Codable, Equatable {
               (1...200).contains(steps.count), (1...10000).contains(repeatCount)
         else { throw AppError.message("Invalid test plan ID, step count or repeats") }
         for s in steps {
-            guard ["system","catalogue","playback","pause_resume","endurance","surf_rotation","background","stop","network","audio_route","reconnect","script_probe"].contains(s.kind),
+            guard ["system","catalogue","playback","pause_resume","endurance","surf_rotation","shared_surf_continuity","background","stop","network","audio_route","reconnect","script_probe"].contains(s.kind),
                   (1...3600).contains(s.seconds ?? 30) else {throw AppError.message("Invalid test step")}
             if s.kind=="script_probe" {
                 guard let source=s.source,!source.isEmpty,source.utf8.count<=24000 else{throw AppError.message("Invalid script probe")}

@@ -89,7 +89,23 @@ import Foundation
         let encoded=try JSONCodec.encoder().encode(defaults)
         guard let input=try JSONSerialization.jsonObject(with:encoded) as? [String:Any] else{throw AppError.message("Cannot encode native policy")}
         let configured=try await evaluate(patch,hook:"configure",input:input,as:RuntimePolicy?.self)
-        return try (configured ?? defaults).checked()
+        let result=try (configured ?? defaults).checked()
+        let fixture=Channel(id:"abi-fixture",name:"Fixture",number:nil,logo:false,favorite:false,program:nil,genres:[])
+        for attempt in [1,2] {
+            _ = try await playbackAttempt(patch:patch,channel:fixture,attempt:attempt,previousFailure:attempt==1 ? "" : "Startup timeout",defaults:result.playback ?? PlaybackAttemptPolicy())
+        }
+        return result
+    }
+    func playbackAttempt(channel:Channel,attempt:Int,previousFailure:String,defaults:PlaybackAttemptPolicy)async throws->PlaybackAttemptPolicy {
+        guard let patch=store.active,!loading else{return try defaults.checked()}
+        return try await playbackAttempt(patch:patch,channel:channel,attempt:attempt,previousFailure:previousFailure,defaults:defaults)
+    }
+    private func playbackAttempt(patch:RuntimePatch,channel:Channel,attempt:Int,previousFailure:String,defaults:PlaybackAttemptPolicy)async throws->PlaybackAttemptPolicy {
+        let encoded=try JSONCodec.encoder().encode(defaults)
+        let policy=try JSONSerialization.jsonObject(with:encoded)
+        let input:[String:Any]=["channelID":channel.id,"channelName":channel.name,"shared":channel.isSurf,"attempt":attempt,"previousFailure":previousFailure,"policy":policy]
+        let result=try await evaluate(patch,hook:"playbackAttempt",input:input,as:PlaybackAttemptPolicy?.self)
+        return try (result ?? defaults).checked()
     }
     func select(candidates:[Channel],currentID:String?) async throws -> String? {
         guard let patch=store.active,!loading else{return nil}

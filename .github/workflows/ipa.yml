@@ -54,8 +54,10 @@ jobs:
           for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
             clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
           done
-          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/HLSReadiness.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
+          swiftc -parse-as-library Sources/Domain.swift Sources/JellyfinAdapterDomain.swift Sources/HLSReadiness.swift Tests/HLSReadinessTests.swift -o build/hls-readiness-tests
+          build/hls-readiness-tests
       - name: Generate project and build
         run: |
           set -euo pipefail
@@ -166,7 +168,12 @@ jobs:
           baseline="$(cat packages/baseline-revision.txt)"
           notes="Ad hoc signed and unsigned iOS 15+ ARM64 Jealousfin packages using the build 1015 accepted packaging baseline. Source: $GITHUB_SHA. Reviewed baseline: $baseline. CI archive and signature checks passed. Build 1015 was physically accepted on iPad; this new build has not independently undergone physical installation testing."
           files=(packages/Jealousfin.ipa packages/Jealousfin.ipa.sha256 packages/Jealousfin-unsigned.ipa packages/Jealousfin-unsigned.ipa.sha256)
-          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build $build_number" --notes "$notes" --latest
+          release_flags=(--latest)
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            release_flags=(--prerelease --latest=false)
+            notes="$notes Candidate branch: $GITHUB_REF_NAME. Existing stable release remains latest."
+          fi
+          gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Jealousfin 0.1.13 build $build_number" --notes "$notes" "${release_flags[@]}"
           for f in "${files[@]}"; do
             name="$(basename "$f")"
             expected="$(stat -c%s "$f")"

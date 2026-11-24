@@ -5,6 +5,22 @@ import Network
 // JavaScriptCore is interpreted on the target device; native changes still require an IPA.
 @MainActor final class ScriptEngine {}
 
+// Transport failures are HTTP errors; decoded application commands retain
+// their durable receipt and application-level success/failure semantics.
+@MainActor enum LANCommandResponse {
+    static func make(_ data:Data,dispatch:(Command) async -> Receipt) async -> (String,Data) {
+        guard let command=try? JSONCodec.decoder().decode(Command.self,from:data) else {
+            return ("400 Bad Request",error("Invalid command"))
+        }
+        let receipt=await dispatch(command)
+        do { return ("200 OK",try JSONCodec.encoder().encode(receipt)) }
+        catch { return ("500 Internal Server Error",self.error("Cannot encode command receipt")) }
+    }
+    static func error(_ message:String)->Data {
+        (try? JSONSerialization.data(withJSONObject:["status":"failed","result":message])) ?? Data("{}".utf8)
+    }
+}
+
 // Direct local application control; no GitHub dependency.
 final class LANServer {
     private var listener:NWListener?
@@ -12,7 +28,7 @@ final class LANServer {
     private let listenPort:NWEndpoint.Port
     private let advertise:Bool
     private var connections:[ObjectIdentifier:NWConnection]=[:]
-    var handler:((Data,@escaping(Data)->Void)->Void)?
+    var handler:((Data,@escaping(String,Data)->Void)->Void)?
     var queryHandler:((String,@escaping(String,Data)->Void)->Void)?
     var state:((String)->Void)?
     init(port:NWEndpoint.Port=8765,advertise:Bool=true){listenPort=port;self.advertise=advertise}
@@ -82,7 +98,7 @@ final class LANServer {
             case .request(let method,let path,let body):
                 if method=="POST" && path=="/command"{
                     guard let handler=self.handler else{self.respond(c,"503 Service Unavailable",self.errorBody("Command dispatcher unavailable"));return}
-                    handler(body){[weak self] output in self?.respond(c,"200 OK",output)}
+                    handler(body){[weak self] status,output in self?.respond(c,status,output)}
                 }else if method=="GET"{
                     if path=="/health" && self.queryHandler==nil{
                         self.respond(c,"200 OK",Data("{\"service\":\"Jealousfin\",\"status\":\"reachable\"}".utf8));return

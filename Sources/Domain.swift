@@ -203,11 +203,25 @@ struct JellyfinConnectionDefaults {
         return JellyfinConnectionDefaults(server:server,username:username,password:password)
     }
 }
+struct PrivateConnectionDefaults:Codable {
+    var schemaVersion:Int
+    var server:String
+    var username:String
+    var password:String
+    func checked()throws->JellyfinConnectionDefaults {
+        guard schemaVersion==1,let u=URLComponents(string:server),
+              ["http","https"].contains(u.scheme ?? ""),u.host != nil,u.user==nil,u.password==nil,u.query==nil,u.fragment==nil,
+              !username.isEmpty,username.utf8.count<=256,!password.isEmpty,password.utf8.count<=1024,server.utf8.count<=2048
+        else{throw AppError.message("Invalid private connection defaults")}
+        return JellyfinConnectionDefaults(server:server,username:username,password:password)
+    }
+}
 struct Settings: Codable {
     var server = ""
     var username = ""
     var password = ""
     var githubToken = ""
+    var provisionFromPrivateDB:Bool? = nil
     // Optional on disk so decoding older settings preserves credentials,
     // player preferences and all other fields during an upgrade.
     var githubRepositoryURL:String?
@@ -297,6 +311,17 @@ enum CommandQueue {
     }
     static func pending(_ commands:[String],receipts:Set<String>,limit:Int)->[String] {
         Array(Set(commands).subtracting(receipts).sorted().prefix(max(0,limit)))
+    }
+}
+enum SurfCommandSemantics {
+    static func rotationOwner(surfing:Bool,shared:Bool)->String {
+        !surfing ? "none" : (shared ? "server" : "device")
+    }
+    static func requireRotationControl(surfing:Bool,shared:Bool)throws {
+        guard surfing else { throw AppError.message("No active Surf rotation") }
+        guard !shared else {
+            throw AppError.message("Rotation is server-owned; pause or resume the local player instead")
+        }
     }
 }
 enum SurfClock {

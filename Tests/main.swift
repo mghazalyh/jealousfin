@@ -341,3 +341,32 @@ alternateAccount.username="another-account"
 alternateAccount.applyConnectionDefaults(privateDefaultsFixture)
 check(alternateAccount.password.isEmpty,"defaults never cross into another account")
 print("PASS: \(checks) total assertions including private deployment connection defaults")
+
+
+check(SurfCommandSemantics.rotationOwner(surfing:false,shared:true)=="none","inactive rotation owner")
+check(SurfCommandSemantics.rotationOwner(surfing:true,shared:true)=="server","shared rotation owner")
+check(SurfCommandSemantics.rotationOwner(surfing:true,shared:false)=="device","local rotation owner")
+check((try? SurfCommandSemantics.requireRotationControl(surfing:true,shared:false)) != nil,"local rotation control supported")
+check((try? SurfCommandSemantics.requireRotationControl(surfing:true,shared:true)) == nil,"server rotation control rejected")
+check((try? SurfCommandSemantics.requireRotationControl(surfing:false,shared:false)) == nil,"inactive rotation control rejected")
+let sharedContinuityPlan=DeviceTestPlan(id:"shared-continuity",steps:[DeviceTestStep(kind:"shared_surf_continuity",channelID:nil,seconds:30,source:nil)],repeatCount:1,repeatForever:false)
+check((try? sharedContinuityPlan.checked()) != nil,"shared continuity has separate test kind")
+print("PASS: \(checks) assertions including honest shared rotation semantics")
+
+var playbackAttempt=PlaybackAttemptPolicy()
+playbackAttempt.segmentContainer="mp4"
+playbackAttempt.forceEncode=true
+playbackAttempt.videoBitrate=2_000_000
+playbackAttempt.segmentSeconds=3
+let rewritten=try playbackAttempt.checked().applying(to:URL(string:"http://fixture.invalid/videos/1/master.m3u8?SegmentContainer=ts&api_key=fixture&LiveStreamId=live")!)
+let rewrittenQuery=URLComponents(url:rewritten,resolvingAgainstBaseURL:false)!.queryItems!
+check(rewrittenQuery.filter{$0.name.lowercased()=="segmentcontainer"}.count==1,"replace format exactly once")
+check(rewrittenQuery.contains(URLQueryItem(name:"SegmentContainer",value:"mp4")),"fMP4 transport policy")
+check(rewrittenQuery.contains(URLQueryItem(name:"AllowVideoStreamCopy",value:"false")),"actual HLS URL forces encoding")
+check(rewrittenQuery.contains(URLQueryItem(name:"api_key",value:"fixture")),"native credentials preserved")
+check(rewrittenQuery.contains(URLQueryItem(name:"LiveStreamId",value:"live")),"live stream identity preserved")
+playbackAttempt.maxWidth=99999
+check((try? playbackAttempt.checked())==nil,"reject excessive playback dimensions")
+check((try? PrivateConnectionDefaults(schemaVersion:1,server:"http://fixture.invalid",username:"fixture",password:"fixture").checked()) != nil,"private connection defaults schema")
+check((try? PrivateConnectionDefaults(schemaVersion:1,server:"http://user:secret@fixture.invalid",username:"fixture",password:"fixture").checked()) == nil,"reject embedded URL credentials")
+print("PASS: \(checks) assertions including ABI 2 playback and provisioning rules")

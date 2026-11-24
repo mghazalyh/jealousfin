@@ -155,7 +155,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     func favorite(_ id: String, value: Bool) async throws {
         _ = try await request("Users/\(userID)/FavoriteItems/\(id)", method: value ? "POST" : "DELETE")
     }
-    func stream(_ channel: Channel, mbps: Int) async throws -> StreamSession {
+    func stream(_ channel: Channel, mbps: Int, playback:PlaybackAttemptPolicy = PlaybackAttemptPolicy()) async throws -> StreamSession {
         if sharedSurfAvailable,let mode=SharedSurf.mode(for:channel) {
             let url=try await sharedSurfTicket(mode:mode)
             log?("INFO","SURF_GATEWAY_TICKET",["mode":mode])
@@ -168,7 +168,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             "TranscodingProfiles":[["Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":2]],
             "CodecProfiles":[], "SubtitleProfiles":[["Format":"vtt","Method":"Hls"]]
         ]
-        let info = try await request("Items/\(channel.id)/PlaybackInfo", method:"POST", query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"], body:["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":false,"EnableDirectStream":false,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile])
+        let info = try await request("Items/\(channel.id)/PlaybackInfo", method:"POST", query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"], body:["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":false,"EnableDirectStream":playback.preferDirect,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile])
         guard let source = (info["MediaSources"] as? [[String:Any]])?.first else { throw AppError.message("No media source returned") }
         let sid = source["Id"] as? String ?? channel.id
         let playID = info["PlaySessionId"] as? String ?? UUID().uuidString
@@ -197,7 +197,13 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         var q=(c.queryItems ?? []).filter{!credentialKeys.contains($0.name.lowercased())}
         q.append(URLQueryItem(name:"api_key",value:token));c.queryItems=q
         guard let result=c.url else{throw AppError.message("Invalid playback URL")}
-        return StreamSession(url:result,itemID:channel.id,mediaSourceID:sid,playSessionID:playID,liveStreamID:liveID,method:method)
+        return StreamSession(url:try playback.applying(to:result),itemID:channel.id,mediaSourceID:sid,playSessionID:playID,liveStreamID:liveID,method:method)
+    }
+    func hlsReadiness(_ s:StreamSession,budget:TimeInterval) async -> HLSReadinessReport {
+        guard !s.isSharedSurf,let origin=base,s.url.path.lowercased().hasSuffix(".m3u8") else {
+            return HLSReadinessReport(outcome:.cancelled,reason:"Diagnostic only supports ordinary HLS")
+        }
+        return await HLSReadinessProbe.waitReady(url:s.url,origin:origin,budget:budget)
     }
     func report(_ s: StreamSession, action: String, position: Double, paused: Bool) async {
         // Shared media is not a Jellyfin allocated live-stream session.
