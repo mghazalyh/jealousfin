@@ -608,6 +608,7 @@ import Network
         log("INFO","telemetry","SYSTEM_SAMPLE",fields)
     }
     private func publishHeartbeat(now:Date){
+        if apiReady,policyReady,!apiChanging,!patchBusy{capturePatchArchive(reason:"heartbeat-reconciliation")}
         lastHeartbeat=now
         log("INFO","app","HEARTBEAT",["launchID":launchID,"status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
         recalculateInsights()
@@ -947,6 +948,7 @@ import Network
         case "reload_runtime_module":
             guard policyReady,!patchBusy else{throw AppError.message("Runtime busy")}
             await bootRuntime()
+            capturePatchArchive(reason:"runtime-reloaded")
             if let fault=patchFault{throw AppError.message(fault)}
             return "Runtime reloaded: "+activePatchID
         case "rollback_runtime_module":
@@ -1775,6 +1777,8 @@ extension AppModel {
         let selectedUI=BaselineMerge.select(local:ui?.active,previous:prior?.sources.ui,incoming:baseline.sources.ui,hadLocal:ui != nil,hadPrevious:prior != nil)
         // Keep interrupted activation journals untouched; their ordinary boot
         // recovery handles them. An upgrade must never erase a rollback marker.
+        // Do not acknowledge migration until these journals have been resolved.
+        if runtime?.activationPending==true || api?.pending==true{return}
         if runtime?.activationPending != true,selectedRuntime != oldRuntime || runtime==nil{
             let next=RuntimePatchStore(active:selectedRuntime.map{RuntimePatch(id:$0.id,source:$0.source)},previous:runtime?.active,activationPending:false)
             guard disk.save(next,"runtime-patch.json") else{throw AppError.message("Cannot install bundled runtime")}

@@ -114,3 +114,18 @@ Hooks: configure(spec) for authentication field names/response paths, auth heade
 Activation stages authentication, health and catalogue probes, attempts EPG retrieval, drains existing operations, persists the new adapter and resumes viewing or campaigns where possible. Request telemetry includes operation, revision, HTTP status, latency and X-Jealousfin-Request-ID for server-side correlation if that header is captured. Probe commands support health, channels, programs and recordings. Decision prompts can propose an API module revision and bind expectedJellyfinAPIRevision. Settings retains a native recovery control.
 
 Server-side changes remain separate: inspect Windows Jellyfin and companion logs, diagnose a real defect, prepare a scoped reversible change and verify both sides. This update changes no Windows services. The adapter does not expose OS shell execution or replace native transport.
+
+
+## Live patch archival and release promotion
+
+Runtime, dynamic UI and Jellyfin API activation, reset and rollback automatically capture the **complete active source set** in a durable local queue. Launch and heartbeat reconciliation recover a missed archive. No settings, form values, credentials or operational telemetry belong in the source set. The private archive lives at jealousfin/engineering/<deviceID>/patches/<archiveID>.json in TorrioDB. Each archive is immutable. Heartbeats expose the archive ID and bundled release revision/digest.
+
+Commands:
+- get_patch_archive: current source set metadata.
+- archive_active_patches: reconcile and return the current durable archive ID.
+- promote_patch_archive: id (current archive), expectedRevision (current canonical release revision), evidence (reviewed test/result references). Promotion is explicit so failed or experimental fixes do not become a release default. It publishes immutable release history and updates jealousfin/engineering/releases/baseline.json using its prior Git blob SHA. A changed active source set or competing baseline is rejected.
+- get_release_baseline: read the canonical reviewed baseline.
+
+GitHub Actions imports the reviewed baseline using the repository secret TORRIODB_RELEASE_TOKEN (a token scoped to private torriodb, Contents read-only), validates the manifest, generates actual Swift source containing the approved JavaScript and declarative UI source, runs regression and interpreter fixture tests, then packages the source into the IPA. The release notes identify the embedded revision. Without that secret the workflow warns and uses Promoted/baseline.json from the checked-out source commit. An engineer can also commit the reviewed baseline there directly. The build does not execute unreviewed device archives or automatically synthesize native Swift equivalents from JavaScript. Approved modules are shipped verbatim as application code interpreted by the native host.
+
+Fresh installs seed the packaged modules without downloading them. Upgrades replace components that still follow the previous packaged baseline, preserving independent local overrides and compatible UI form values. A source revision rejected during startup still uses the ordinary module recovery path. Device identity and review notes are excluded from the embedded manifest. Promotion does not remotely install an IPA: the next normal IPA installation carries the accepted sources.

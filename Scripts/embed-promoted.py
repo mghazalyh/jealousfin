@@ -22,6 +22,8 @@ def checked(raw):
     for k in ("archiveID","deviceID"):
         if m.get(k) is not None and not ident(m[k]):
             raise ValueError("Invalid "+k)
+    if m.get("evidence") is not None and (not isinstance(m["evidence"],str) or len(m["evidence"])>4000):
+        raise ValueError("Invalid review evidence")
     sources=m.get("sources")
     if not isinstance(sources,dict) or set(sources)-{"runtime","jellyfinAPI","ui"}:
         raise ValueError("Unexpected source components")
@@ -37,7 +39,10 @@ def checked(raw):
 
 def generate(raw):
     m=checked(raw)
-    data=json.dumps(m,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+    # Only the approved revision and executable sources enter the binary.
+    # The originating device identity and private review remain in TorrioDB.
+    exported={"schemaVersion":m["schemaVersion"],"revision":m["revision"],"sources":m["sources"]}
+    data=json.dumps(exported,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
     digest=hashlib.sha256(data).hexdigest()
     encoded=base64.b64encode(data).decode()
     chunks=[encoded[i:i+100] for i in range(0,len(encoded),100)]

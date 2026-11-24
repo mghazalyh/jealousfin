@@ -53,7 +53,7 @@ jobs:
           mkdir -p build/Payload
           ditto "$APP" build/Payload/Jealousfin.app
           cp Vendor/QuickJS/LICENSE build/Payload/Jealousfin.app/QuickJS-LICENSE.txt
-          cp Promoted/baseline.json build/Payload/Jealousfin.app/PromotedBaseline.json
+          python3 -c 'import json; m=json.load(open("Promoted/baseline.json")); print(json.dumps({k:m[k] for k in ("schemaVersion","revision","sources")},sort_keys=True))' > build/Payload/Jealousfin.app/PromotedBaseline.json
           cd build
           /usr/bin/zip -qry Jealousfin.ipa Payload
           unzip -t Jealousfin.ipa
