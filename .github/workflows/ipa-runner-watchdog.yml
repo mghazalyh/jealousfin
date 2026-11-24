@@ -1,0 +1,41 @@
+name: Jealousfin macOS allocation watchdog
+on:
+  workflow_run:
+    workflows: [Build and release Jealousfin IPA]
+    types: [requested]
+    branches: [main]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  watch:
+    if: ${{ github.repository == 'mghazalyh/jealousfin' && github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Observe runner allocation without changing the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_RUN" =~ ^[0-9]+$ ]]
+          for ((i=0; i<30; i++)); do
+            data="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TARGET_RUN")"
+            status="$(jq -r .status <<< "$data")"
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$TARGET_RUN/jobs?per_page=100")"
+            echo "Run $TARGET_RUN: $status"
+            jq -r '.jobs[] | [.name,.status,(.runner_name // "unassigned")] | @tsv' <<< "$jobs"
+            if [[ "$status" == completed ]]; then
+              echo "Run completed: $(jq -r .conclusion <<< "$data")" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            waiting="$(jq -r '[.jobs[] | select(.status == "queued" and (.runner_id // 0) == 0 and (.steps | length) == 0 and any(.labels[]?; startswith("macos-"))) | .name] | join(", ")' <<< "$jobs")"
+            if [[ -n "$waiting" && "$i" -ge 10 ]]; then
+              echo "::warning::macOS runner still unallocated: $waiting. No build was cancelled automatically."
+              echo "Runner allocation delay: $waiting. Use the guarded recovery path after a never-started job cancellation, or dispatch with another runner pool after the current run is safely cancelled." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Observation window ended without automatic cancellation." >> "$GITHUB_STEP_SUMMARY"
