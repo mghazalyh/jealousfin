@@ -68,8 +68,8 @@ import Foundation
             print("PASS: actual LAN HTTP listener round trip \(size) bytes")
         }
         var over=URLRequest(url:url);over.httpMethod="POST";over.httpBody=Data(repeating:65,count:LANHTTP.maxBody+1)
-        let (_,response)=try await localTransport.data(for:over)
-        precondition((response as? HTTPURLResponse)?.statusCode==413)
+        let (_,overLimitResponse)=try await localTransport.data(for:over)
+        precondition((overLimitResponse as? HTTPURLResponse)?.statusCode==413)
         print("PASS: actual LAN listener rejects over-limit request")
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
