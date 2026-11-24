@@ -24,6 +24,8 @@ struct DynamicUINode: Codable, Equatable, Identifiable {
     var options:[DynamicUIOption]?
     var action:DynamicUIAction?
     var targetPage:String?
+    var html:String?
+    var height:Double?
     var children:[DynamicUINode]?
     var visibleWhen:String?
     var enabledWhen:String?
@@ -45,7 +47,7 @@ struct DynamicUILayout: Codable, Equatable {
     var slots:[DynamicUISlot]
     var pages:[DynamicUIPage]
     static let locations=["guide.top","guide.bottom","player.top","player.controls","player.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
-    static let kinds=["text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer"]
+    static let kinds=["text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
     static let commands:Set<String>=["get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
     static func validID(_ value:String)->Bool {
         value.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil
@@ -76,7 +78,7 @@ struct DynamicUILayout: Codable, Equatable {
                 let editable=["input","toggle","picker","slider"].contains(n.kind)
                 if editable {
                     guard let key=n.valueKey,key.hasPrefix("form."),key.split(separator:".").count==2 else{throw AppError.message("Editable controls require a form key")}
-                    fields.insert(key)
+                    guard fields.insert(key).inserted else{throw AppError.message("Duplicate editable form field")}
                     guard fields.count<=64 else{throw AppError.message("Too many form fields")}
                 }
                 if n.kind=="picker" {
@@ -91,6 +93,12 @@ struct DynamicUILayout: Codable, Equatable {
                     guard lo.isFinite,hi.isFinite,step.isFinite,hi>lo,hi-lo<=1e9,step>0,step<=hi-lo,
                         abs(lo)<=1e9,abs(hi)<=1e9 else{throw AppError.message("Invalid numeric range")}
                 }
+                if n.kind=="web" {
+                    guard let html=n.html,!html.isEmpty,html.utf8.count<=65536,
+                        let height=n.height,height.isFinite,(80...1200).contains(height)
+                    else{throw AppError.message("Invalid custom HTML component")}
+                }else if n.html != nil || n.height != nil{throw AppError.message("HTML and height belong to web components")}
+                if editable,let initial=n.defaultValue {try Self.validateValue(initial,for:n)}
                 if n.kind=="link" {
                     guard let target=n.targetPage,pageIDs.contains(target) else{throw AppError.message("Unknown custom page")}
                 }
@@ -121,6 +129,38 @@ struct DynamicUILayout: Codable, Equatable {
         for s in slots{if let n=find(s.nodes){return n}}
         for p in pages{if let n=find(p.nodes){return n}}
         return nil
+    }
+    static func validateValue(_ value:String,for node:DynamicUINode)throws{
+        guard value.utf8.count<=4096 else{throw AppError.message("Form value too large")}
+        switch node.kind {
+        case "toggle":
+            guard ["true","false"].contains(value) else{throw AppError.message("Toggle value must be true or false")}
+        case "picker":
+            guard (node.options ?? []).contains(where:{$0.value==value}) else{throw AppError.message("Unknown picker option")}
+        case "slider":
+            guard let number=Double(value),number.isFinite,number>=(node.minimum ?? 0),number<=(node.maximum ?? 100) else{throw AppError.message("Slider value outside supported range")}
+        case "input":break
+        default:throw AppError.message("Node is not an editable field")
+        }
+    }
+    func formNode(_ field:String)->DynamicUINode?{
+        func find(_ nodes:[DynamicUINode])->DynamicUINode?{
+            for n in nodes {
+                if n.valueKey=="form."+field,["input","toggle","picker","slider"].contains(n.kind){return n}
+                if let child=find(n.children ?? []){return child}
+            }
+            return nil
+        }
+        for s in slots{if let n=find(s.nodes){return n}}
+        for p in pages{if let n=find(p.nodes){return n}}
+        return nil
+    }
+    func retainedValues(_ old:[String:String])->[String:String]{
+        var values=formDefaults()
+        for (key,value) in old{
+            if let node=formNode(key),(try? Self.validateValue(value,for:node)) != nil {values[key]=value}
+        }
+        return values
     }
     func formDefaults()->[String:String]{
         var result:[String:String]=[:]

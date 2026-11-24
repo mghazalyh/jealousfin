@@ -123,6 +123,8 @@ struct DynamicUINodeView:View{
             return AnyView(VStack(alignment:.leading,spacing:10){DynamicUINodes(nodes:node.children ?? [])})
         case "hstack":
             return AnyView(HStack(alignment:.center,spacing:8){DynamicUINodes(nodes:node.children ?? [])})
+        case "web":
+            return AnyView(DynamicWebComponent(node:node,revision:model.dynamicUI.active?.revision ?? "").frame(height:CGFloat(node.height ?? 200)))
         case "divider":return AnyView(Divider())
         case "spacer":return AnyView(Spacer(minLength:8))
         case "link":

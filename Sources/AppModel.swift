@@ -114,8 +114,7 @@ import Network
             }
             if let previous=stored.previous,(try? previous.checked())==nil {stored.previous=nil}
             if let layout=stored.active {
-                let defaults=layout.formDefaults()
-                stored.values=defaults.merging(stored.values.filter{defaults[$0.key] != nil && $0.value.utf8.count<=4096}){_,saved in saved}
+                stored.values=layout.retainedValues(stored.values)
             }else{stored.values=[:]}
             dynamicUI=stored
         }
@@ -1327,6 +1326,7 @@ extension AppModel {
 extension AppModel {
     func dynamicValue(_ key:String?) -> String? {
         guard let key=key else{return nil}
+        if key.hasPrefix("form.") {return dynamicUI.values[String(key.dropFirst(5))]}
         return DynamicUIBinding.resolve(key,values:dynamicUI.values,state:stateSnapshot())
     }
     func dynamicVisible(_ node:DynamicUINode)->Bool{
@@ -1351,13 +1351,14 @@ extension AppModel {
     private func installUILayout(_ layout:DynamicUILayout)throws {
         let layout=try layout.checked()
         guard layout.revision != dynamicUI.active?.revision else{throw AppError.message("Use a new UI revision")}
-        let defaults=layout.formDefaults()
-        try commitUILayout(DynamicUIStore(active:layout,previous:dynamicUI.active,values:defaults))
+        let values=layout.retainedValues(dynamicUI.values)
+        try commitUILayout(DynamicUIStore(active:layout,previous:dynamicUI.active,values:values))
     }
     func setDynamicUIValue(_ key:String,value:String)throws{
         guard let layout=dynamicUI.active else{throw AppError.message("No active UI layout")}
         let field=key.hasPrefix("form.") ? String(key.dropFirst(5)):key
-        guard layout.formDefaults()[field] != nil,value.utf8.count<=4096 else{throw AppError.message("Unknown form field or oversized value")}
+        guard let node=layout.formNode(field) else{throw AppError.message("Unknown form field")}
+        try DynamicUILayout.validateValue(value,for:node)
         guard dynamicUI.values[field] != value else{return}
         var copy=dynamicUI;copy.values[field]=value
         guard disk.save(copy,"dynamic-ui.json") else{throw AppError.message("Cannot persist form value")}
@@ -1405,6 +1406,23 @@ extension AppModel {
         log(result.status=="succeeded" ? "INFO":"WARN","dynamic-ui","ACTION_FINISHED",["node":id,"origin":origin,"revision":layout.revision,"status":result.status,"receipt":result.id])
         requestSync()
         return result
+    }
+    func executeWebUI(nodeID:String,revision:String,action:DynamicUIAction) async -> Receipt {
+        guard dynamicUI.active?.revision==revision,let node=dynamicUI.active?.node(nodeID),node.kind=="web",
+            dynamicVisible(node),dynamicEnabled(node),DynamicUILayout.commands.contains(action.command),
+            action.command != "script",(action.arguments?.count ?? 0)<=32,
+            (action.arguments ?? [:]).allSatisfy({$0.key.count<=128 && $0.value.utf8.count<=65536})
+        else{return Receipt(id:UUID().uuidString,action:action.command,status:"failed",result:"Web component or command unavailable")}
+        guard dynamicUIBusy.insert(nodeID).inserted else{return Receipt(id:UUID().uuidString,action:action.command,status:"running",result:"Component busy")}
+        defer{dynamicUIBusy.remove(nodeID)}
+        do{
+            let args=try DynamicUIBinding.arguments(action.arguments ?? [:],values:dynamicUI.values,state:stateSnapshot())
+            log("INFO","dynamic-ui","WEB_ACTION_STARTED",["node":nodeID,"revision":revision,"command":action.command])
+            let receipt=await execute(Command(id:UUID().uuidString,action:action.command,arguments:args,expiresAt:nil))
+            log(receipt.status=="succeeded" ? "INFO":"WARN","dynamic-ui","WEB_ACTION_FINISHED",["node":nodeID,"revision":revision,"status":receipt.status,"receipt":receipt.id])
+            requestSync()
+            return receipt
+        }catch{return Receipt(id:UUID().uuidString,action:action.command,status:"failed",result:sanitized(error.localizedDescription))}
     }
     func triggerDynamicUIFromView(_ id:String){
         Task{
