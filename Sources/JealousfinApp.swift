@@ -26,6 +26,7 @@ struct RootView:View {
             NavigationView{EngineeringView()}.navigationViewStyle(.stack).tabItem{Label("More",systemImage:"ellipsis.circle")}.tag(4)
         }
         .accentColor(accent)
+        .overlay{if model.dynamicPage==nil{DecisionOverlay().environmentObject(model)}}
         .sheet(item:$model.dynamicPage){page in DynamicUIPageView(page:page).environmentObject(model)}
     }
 }
@@ -209,6 +210,7 @@ struct InsightsView:View{
             DynamicUISlotView(location:"insights.top")
             Text("Insights").font(.largeTitle.bold())
             Text("What needs your attention").foregroundColor(subdued)
+            DecisionHistoryView()
             if model.insights.isEmpty{Panel{Label("No active issues detected",systemImage:"checkmark.circle").foregroundColor(.green);Text("This reflects current observations, not a complete system health certification.").font(.caption).foregroundColor(subdued)}}
             ForEach(model.insights){i in
                 Panel{

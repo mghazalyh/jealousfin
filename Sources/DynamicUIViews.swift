@@ -29,6 +29,7 @@ struct DynamicUIPageView:View{
                 .toolbar{ToolbarItem(placement:.cancellationAction){Button("Close"){model.dynamicPage=nil}}}
                 .onAppear{model.observeDynamicSlot("page:"+page.id)}
         }.navigationViewStyle(.stack)
+        .overlay{DecisionOverlay().environmentObject(model)}
     }
 }
 struct DynamicUINodeView:View{

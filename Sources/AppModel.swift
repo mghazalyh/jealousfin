@@ -42,6 +42,8 @@ import Network
     let lan=LANServer()
     let scripts=ScriptEngine()
     @Published private(set) var dynamicUI=DynamicUIStore()
+    @Published private(set) var decisions=DecisionJournal()
+    private var decisionTask:Task<Void,Never>?
     @Published var dynamicPage:DynamicUIPage?
     @Published private(set) var dynamicUIResults:[String:String]=[:]
     @Published private(set) var dynamicUIBusy=Set<String>()
@@ -108,6 +110,7 @@ import Network
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
+        decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()
         if var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
             if let layout=stored.active,(try? layout.checked())==nil {
                 stored.active=nil;stored.values=[:]
@@ -594,6 +597,7 @@ import Network
     private func tick() async {
         let now=Date()
         sampleSystemTelemetry()
+        processDecisions(now:now)
         let elapsed=now.timeIntervalSince(lastTick);lastTick=now
         if elapsed>5 {log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])}
         if let deadline=nextRotation,surfing,!surfPaused,!intentionallyPaused {
@@ -674,6 +678,8 @@ import Network
         lastSync=Date();syncStatus="Synchronizing"
         // Telemetry must not depend on health-ledger merge or command success.
         var telemetryError:String?
+        do {try await uploadDecisions()}
+        catch{log("WARN","decisions","UPLOAD_FAILED",["error":error.localizedDescription])}
         do {try await uploadEngineeringResults()}
         catch {log("WARN","engineering","RESULT_UPLOAD_FAILED",["error":error.localizedDescription])}
         do {try await uploadTelemetry()}
@@ -740,9 +746,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -760,7 +766,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -817,6 +823,21 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "present_decision":
+            guard let source=args["prompt"],source.utf8.count<=48*1024 else{throw AppError.message("Provide decision prompt JSON")}
+            let prompt=try JSONCodec.decoder().decode(DecisionPrompt.self,from:Data(source.utf8))
+            try queueDecision(prompt)
+            return "Decision queued; awaiting local user choice: "+prompt.id
+        case "get_decisions":
+            if let id=args["id"]{
+                guard let record=decisions.records.first(where:{$0.id==id}) else{throw AppError.message("Unknown decision")}
+                return try json(record)
+            }
+            let summaries=decisions.records.suffix(50).map{["id":$0.id,"title":$0.prompt.title,"status":$0.status,"priority":$0.prompt.priority,"choice":$0.selectedChoiceID ?? ""]}
+            return try json(Array(summaries))
+        case "cancel_decision":
+            guard let id=args["id"] else{throw AppError.message("Decision ID required")}
+            try cancelDecision(id)
         case "install_ui_layout":
             guard let source=args["layout"],source.utf8.count<=192*1024 else{throw AppError.message("Provide layout JSON up to 192 KiB")}
             let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data(source.utf8))
@@ -1258,14 +1279,14 @@ extension AppModel {
                     guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot journal module decision")}
                     self.moduleCheckpoint=cp
                 }
-                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests"]
+                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","present_decision","get_decisions"]
                 // Journal the actual command IDs before execution. After a crash
                 // the ordinary command receipt prevents a duplicate mutation.
                 while let command=cp.pending?.first {
                     guard !Task.isCancelled,self.activePatchID==module,!self.patchBusy else{return}
                     if !allowed.contains(command.action) {
                         cp.lastReceipt.append(command.action+": unsupported hook action")
-                    } else if self.engineeringOwnsPlayback && !["get_status","get_telemetry","get_insights","get_device_tests","pause_device_tests","stop_device_tests","sync_now"].contains(command.action) {
+                    } else if self.engineeringOwnsPlayback && !["get_status","get_telemetry","get_insights","get_device_tests","pause_device_tests","stop_device_tests","sync_now","present_decision","get_decisions"].contains(command.action) {
                         cp.lastReceipt.append(command.action+": campaign owns playback")
                     } else {
                         let result=await self.execute(command)
@@ -1431,6 +1452,111 @@ extension AppModel {
                 dynamicUIResults[id]=sanitized(error.localizedDescription)
                 log("WARN","dynamic-ui","ACTION_FAILED",["node":id,"error":error.localizedDescription])
             }
+        }
+    }
+}
+
+
+// User decisions are separate from the remote command mailbox. Only the
+// native prompt interaction can select a choice. Remote cancellation is not approval.
+extension AppModel {
+    var activeDecision:DecisionRecord? {decisions.next(at:Date())}
+    private func saveDecisions(_ journal:DecisionJournal)throws{
+        guard disk.save(journal,"decision-journal.json") else{throw AppError.message("Cannot persist decision journal")}
+        decisions=journal
+    }
+    private func queueDecision(_ prompt:DecisionPrompt)throws{
+        let existed=decisions.records.contains(where:{$0.id==prompt.id})
+        var copy=decisions
+        try copy.insert(prompt,at:Date())
+        guard !existed else{return}
+        try saveDecisions(copy)
+        log("INFO","decisions","PROMPT_QUEUED",["id":prompt.id,"priority":prompt.priority])
+        requestSync()
+    }
+    private func cancelDecision(_ id:String)throws{
+        var copy=decisions
+        guard let i=copy.records.firstIndex(where:{$0.id==id}) else{throw AppError.message("Unknown decision")}
+        try copy.records[i].cancel(at:Date())
+        try saveDecisions(copy)
+        log("INFO","decisions","PROMPT_CANCELLED",["id":id,"origin":"remote"])
+        requestSync()
+    }
+    func decisionPresented(_ id:String){
+        var copy=decisions
+        guard let i=copy.records.firstIndex(where:{$0.id==id}),copy.records[i].presentedAt==nil,
+              activeDecision?.id==id else{return}
+        copy.records[i].present(at:Date())
+        guard copy.records[i].presentedAt != nil else{return}
+        do{
+            try saveDecisions(copy)
+            log("INFO","decisions","PROMPT_PRESENTED",["id":id,"tab":String(tab),"page":dynamicPage?.id ?? ""])
+            requestSync()
+        }catch{log("ERROR","decisions","PRESENTATION_PERSIST_FAILED",["id":id])}
+    }
+    func answerDecision(_ id:String,choice:String)throws{
+        var copy=decisions
+        guard activeDecision?.id==id,let i=copy.records.firstIndex(where:{$0.id==id}) else{throw AppError.message("Prompt no longer active")}
+        // Persist the exact choice before any effect, then execute via the
+        // regular durable command receipt with a stable command ID.
+        try copy.records[i].choose(choice,at:Date())
+        try saveDecisions(copy)
+        log("INFO","decisions","USER_ANSWERED",["id":id,"choice":choice,"status":copy.records[i].status,"origin":"touch"])
+        requestSync()
+        processDecisions(now:Date())
+    }
+    private func processDecisions(now:Date){
+        var copy=decisions
+        var changed=false
+        for i in copy.records.indices where copy.records[i].status=="pending" && copy.records[i].prompt.expiresAt<=now {
+            copy.records[i].expire(at:now);changed=true
+        }
+        if changed {
+            do{try saveDecisions(copy);requestSync()}
+            catch{log("ERROR","decisions","EXPIRY_PERSIST_FAILED");return}
+        }
+        guard decisionTask==nil,policyReady,!patchBusy,
+            let record=decisions.records.first(where:{$0.status=="approved"}),
+            let action=record.chosenAction else{return}
+        decisionTask=Task{[weak self] in
+            guard let self=self else{return}
+            defer{self.decisionTask=nil}
+            let receipt:Receipt?
+            // An interrupted process might have applied the command before
+            // persisting the decision outcome. Recover its original receipt.
+            if let existing=self.disk.load(Receipt.self,"receipt-\(record.commandID).json"){
+                receipt=existing
+            }else if record.prompt.expiresAt<=Date() ||
+                !record.prompt.contextMatches(channelID:self.current?.id,patchID:self.activePatchID){
+                receipt=nil
+            }else{
+                receipt=await self.execute(Command(id:record.commandID,action:action.command,arguments:action.arguments,expiresAt:record.prompt.expiresAt))
+            }
+            guard var latest=self.decisions.records.first(where:{$0.id==record.id}),latest.status=="approved" else{return}
+            if let receipt=receipt{
+                if receipt.status=="running"{return}
+                latest.finish(receipt,at:Date())
+            }else{latest.stale(at:Date())}
+            var journal=self.decisions
+            guard let i=journal.records.firstIndex(where:{$0.id==record.id}) else{return}
+            journal.records[i]=latest
+            do{
+                try self.saveDecisions(journal)
+                self.log(latest.status=="succeeded" ? "INFO":"WARN","decisions","DECISION_COMPLETED",["id":latest.id,"status":latest.status,"commandID":record.commandID])
+                self.requestSync()
+            }catch{self.log("ERROR","decisions","OUTCOME_PERSIST_FAILED",["id":record.id])}
+        }
+    }
+    private func uploadDecisions() async throws{
+        // Each revision is an immutable transition record. Local updates during
+        // network awaits are not overwritten by an older upload acknowledgement.
+        for record in decisions.pendingUpload.prefix(12){
+            let path="engineering/"+deviceID+"/decisions/"+record.id+"/revision-"+String(record.revision)+".json"
+            let data=try JSONCodec.encoder().encode(record)
+            try await db.immutable(path,data:data)
+            var copy=decisions
+            copy.markUploaded(id:record.id,revision:record.revision)
+            try saveDecisions(copy)
         }
     }
 }
