@@ -1,0 +1,127 @@
+name: Surf direct native HLS verification
+on:
+  push:
+    branches: [diagnostics/jellyfin-connection-only]
+    paths: ['.github/workflows/surf-direct-hls.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Install decoder
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+      - name: Verify ticket authorization, rolling media, and decoded playback
+        env:
+          JELLYFIN_TEST_URL: ${{ secrets.JELLYFIN_TEST_URL }}
+          JELLYFIN_TEST_USERNAME: ${{ secrets.JELLYFIN_TEST_USERNAME }}
+          JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,time,uuid,subprocess,sys,hashlib,re
+          base=os.environ["JELLYFIN_TEST_URL"].strip().rstrip("/")
+          p=U.urlsplit(base)
+          if p.scheme!="https" or p.hostname!="desktop-hb9oshs.tail1fc8b.ts.net" or p.username or p.password or p.query or p.fragment: sys.exit("Unexpected public URL")
+          class NoRedirect(R.HTTPRedirectHandler):
+              def redirect_request(self,*args): return None
+          op=R.build_opener(NoRedirect(),R.HTTPSHandler(context=ssl.create_default_context()))
+          token=None
+          auth='MediaBrowser Client="Surf native HLS test", Device="GitHub Actions", DeviceId="'+uuid.uuid4().hex+'", Version="1"'
+          def get(path,method="GET",body=None,authorized=False,limit=2200000,extra=None):
+              url=U.urljoin(base+"/",path)
+              q=U.urlsplit(url)
+              if (q.scheme,q.hostname,q.port or 443)!=("https",p.hostname,p.port or 443):raise ValueError("Cross-origin blocked")
+              h={"Cache-Control":"no-cache"}
+              if authorized:h.update({"X-Emby-Token":token,"Authorization":auth+', Token="'+token+'"'})
+              elif q.path=="/Users/AuthenticateByName":h["Authorization"]=auth
+              if body is not None:h["Content-Type"]="application/json"
+              if extra:h.update(extra)
+              with op.open(R.Request(url,method=method,headers=h,data=json.dumps(body).encode() if body is not None else None),timeout=20) as r:
+                  data=r.read(limit+1)
+                  if len(data)>limit:raise ValueError("Response too large")
+                  return r.status,r.headers.get_content_type(),data
+          def deny(path,method="GET"):
+              try:get(path,method)
+              except E.HTTPError as e:
+                  if e.code==401:return
+                  raise
+              raise ValueError("Unauthorized access allowed")
+          def refs(path):
+              code,mime,data=get(path,limit=100000)
+              if code!=200 or mime!="application/vnd.apple.mpegurl":raise ValueError("Invalid playlist type")
+              lines=data.decode().splitlines()
+              if lines[0]!="#EXTM3U" or "#EXT-X-ENDLIST" in lines:raise ValueError("Not live HLS")
+              return [U.urljoin(path,l) for l in lines if l and not l.startswith("#")]
+          errs=0
+          stage="startup"
+          try:
+              stage="player version"
+              _,_,js=get("/web/surf-ps3.js?v=202611250130",limit=100000)
+              if b"/hls/ticket" not in js:raise ValueError("Wrong player build")
+              stage="authentication"
+              _,_,raw=get("/Users/AuthenticateByName","POST",{"Username":os.environ["JELLYFIN_TEST_USERNAME"],"Pw":os.environ["JELLYFIN_TEST_PASSWORD"]})
+              token=json.loads(raw)["AccessToken"]
+              print("::add-mask::"+token,flush=True)
+              for mode in ("all","movies-series","sports"):
+                  try:
+                      root="/api/surf/"+mode+"/hls/"
+                      stage=mode+" authorization"
+                      deny(root+"ticket","POST");deny(root+"index.m3u8");deny(root+"segments/1.ts")
+                      _,_,raw=get(root+"ticket","POST",{},True)
+                      path=json.loads(raw)["url"]
+                      u=U.urlsplit(path)
+                      if u.path!=root+"index.m3u8" or u.netloc or u.scheme:raise ValueError("Unexpected ticket route")
+                      ticket=U.parse_qs(u.query)["ticket"][0]
+                      print("::add-mask::"+ticket,flush=True)
+                      stage=mode+" initial playlist"
+                      first=refs(path)
+                      if len(first)<3:raise ValueError("Insufficient media")
+                      latest=first[-1]
+                      stage=mode+" range"
+                      code,mime,data=get(latest,extra={"Range":"bytes=0-187"})
+                      if code!=206 or len(data)!=188 or data[0]!=0x47:raise ValueError("Invalid range")
+                      stage=mode+" rolling playback"
+                      seen=set(); hashes=set(); chunks=[]
+                      deadline=time.monotonic()+38
+                      candidates=first[-3:]
+                      while time.monotonic()<deadline and len(chunks)<9:
+                          for seg in candidates:
+                              if seg in seen:continue
+                              seen.add(seg)
+                              q=U.urlsplit(seg)
+                              if not re.fullmatch(root.replace(".","\\.")+r"segments/\d+\.ts",q.path):raise ValueError("Unexpected segment")
+                              code,mime,data=get(seg)
+                              if code!=200 or mime!="video/mp2t" or data[0]!=0x47:raise ValueError("Invalid TS")
+                              digest=hashlib.sha256(data).digest()
+                              if digest in hashes:continue
+                              hashes.add(digest);chunks.append(data)
+                              if len(chunks)>=9:break
+                          if len(chunks)>=9:break
+                          time.sleep(3)
+                          candidates=refs(path)
+                          if candidates[-1]==latest:continue
+                          candidates=candidates[-6:]
+                      if len(chunks)<6:raise ValueError("Live playlist did not advance sufficiently")
+                      stage=mode+" decode"
+                      proc=subprocess.run(["ffmpeg","-v","error","-nostdin","-progress","pipe:1","-i","pipe:0","-map","0:v:0","-map","0:a:0","-f","null","-"],input=b"".join(chunks),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=25)
+                      frames=max([int(x.split("=")[1].strip()) for x in proc.stdout.decode(errors="replace").splitlines() if x.startswith("frame=") and x.split("=")[1].strip().isdigit()],default=0)
+                      print(mode,"segments",len(chunks),"frames",frames,"decoder_exit",proc.returncode,"error_lines",len(proc.stderr.splitlines()),flush=True)
+                      if proc.returncode or frames<100:raise ValueError("Decode failed")
+                      print(mode,"PASS rolling authenticated native HLS",flush=True)
+                  except E.HTTPError as e:
+                      errs+=1;print(stage,"HTTP",e.code,flush=True)
+                  except Exception as e:
+                      errs+=1;print(stage,"FAIL",type(e).__name__,flush=True)
+          except E.HTTPError as e:errs+=1;print(stage,"HTTP",e.code,flush=True)
+          except Exception as e:errs+=1;print(stage,"FAIL",type(e).__name__,flush=True)
+          finally:
+              if token:
+                  try:get("/Sessions/Logout","POST",authorized=True)
+                  except Exception:errs+=1;print("Logout failed",flush=True)
+          sys.exit(1 if errs else 0)
+          PY
