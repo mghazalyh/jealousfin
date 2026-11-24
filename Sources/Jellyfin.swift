@@ -12,6 +12,10 @@ struct StreamSession {
     var base: URL?
     var token = ""
     var userID = ""
+    var adapter:JellyfinAPIAdapter?
+    private(set) var inFlight=0
+    var adapterID:String{adapter?.revision.id ?? "native-baseline"}
+    private var adapterSpec:JellyfinAdapterSpec{adapter?.spec ?? JellyfinAdapterSpec()}
     let deviceID: String
     var log: ((String, String, [String: String]) -> Void)?
     init(deviceID: String) { self.deviceID = deviceID }
@@ -25,20 +29,44 @@ struct StreamSession {
         guard let result = c.url else { throw AppError.message("Invalid server URL") }; return result
     }
     func request(_ path: String, method: String = "GET", query: [String: String] = [:], body: [String: Any]? = nil) async throws -> [String: Any] {
-        var r = URLRequest(url: try url(path, query)); r.httpMethod = method; r.timeoutInterval = 20
-        r.setValue(auth, forHTTPHeaderField: "Authorization")
-        r.setValue("application/json", forHTTPHeaderField: "Accept")
-        if let body = body { r.httpBody = try JSONSerialization.data(withJSONObject: body); r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        let start = ProcessInfo.processInfo.systemUptime
+        let operation=JellyfinAdapterRules.operation(path)
+        let active=adapter
+        let revision=active?.revision.id ?? "native-baseline"
+        let spec=active?.spec ?? JellyfinAdapterSpec()
+        inFlight+=1;defer{inFlight-=1}
+        let start=ProcessInfo.processInfo.systemUptime
+        let requestID=UUID().uuidString
+        var phase="request_hook"
         do {
+            let plan:(path:String,method:String,query:[String:String],body:[String:Any]?)
+            if let active=active{plan=try await active.request(operation:operation,path:path,method:method,query:query,body:body)}
+            else{plan=(path,method,query,body)}
+            phase="transport"
+            var r=URLRequest(url:try url(plan.path,plan.query));r.httpMethod=plan.method;r.timeoutInterval=Double(spec.timeoutSeconds)
+            if spec.authorizationHeader != "X-Emby-Authorization"{r.setValue(auth,forHTTPHeaderField:"Authorization")}
+            if spec.authorizationHeader != "Authorization"{r.setValue(auth,forHTTPHeaderField:"X-Emby-Authorization")}
+            r.setValue("application/json",forHTTPHeaderField:"Accept")
+            r.setValue(requestID,forHTTPHeaderField:"X-Jealousfin-Request-ID")
+            if let payload=plan.body{r.httpBody=try JSONSerialization.data(withJSONObject:payload);r.setValue("application/json",forHTTPHeaderField:"Content-Type")}
             let (data, response) = try await URLSession.shared.data(for: r)
             guard let http = response as? HTTPURLResponse else { throw AppError.message("Invalid HTTP response") }
-            log?(http.statusCode < 400 ? "INFO" : "ERROR", "HTTP_RESULT", ["endpoint": path, "method": method, "status": String(http.statusCode), "bytes": String(data.count), "ms": String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
+            log?(http.statusCode < 400 ? "INFO" : "ERROR","HTTP_RESULT",["operation":operation,"endpoint":plan.path,"method":plan.method,"adapter":revision,"requestID":requestID,"status":String(http.statusCode),"bytes":String(data.count),"ms":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
             guard (200..<300).contains(http.statusCode) else { throw AppError.message("Jellyfin HTTP \(http.statusCode)") }
-            if data.isEmpty { return [:] }
-            return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            phase="response_decode"
+            let response:[String:Any]
+            if data.isEmpty{response=[:]}
+            else{
+                let parsed=try JSONSerialization.jsonObject(with:data)
+                if let object=parsed as? [String:Any]{response=object}
+                else if let array=parsed as? [Any]{response=["Items":array]}
+                else{throw AppError.message("Unexpected Jellyfin JSON shape")}
+            }
+            phase="response_hook"
+            if let active=active{return try await active.response(operation:operation,response:response)}
+            return response
         } catch {
-            log?("ERROR", "HTTP_FAILURE", ["endpoint": path, "method": method, "errorType": String(describing: type(of: error))])
+            log?("ERROR","HTTP_FAILURE",["operation":operation,"adapter":revision,"requestID":requestID,"phase":phase,"errorType":String(describing:type(of:error))])
+            if phase=="request_hook" || phase=="response_hook"{throw AppError.message("Jellyfin API adapter failed during "+operation+" "+phase)}
             throw error
         }
     }
@@ -47,7 +75,8 @@ struct StreamSession {
         guard let u = URL(string: s), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil else { throw AppError.message("Enter an HTTP or HTTPS server URL") }
         base = u; token = ""; userID = ""
         let a = try await request("Users/AuthenticateByName", method: "POST", body: ["Username": settings.username, "Pw": settings.password])
-        guard let t = a["AccessToken"] as? String, let user = a["User"] as? [String: Any], let id = user["Id"] as? String, !t.isEmpty else { throw AppError.message("Jellyfin authentication failed") }
+        let spec=adapterSpec
+        guard let t=JellyfinAdapterRules.string(at:spec.tokenPath,in:a),let id=JellyfinAdapterRules.string(at:spec.userIDPath,in:a),!t.isEmpty,!id.isEmpty else{throw AppError.message("Jellyfin authentication failed")}
         token = t; userID = id
     }
     static func program(_ x: [String: Any]) -> Program? {
@@ -75,7 +104,8 @@ struct StreamSession {
     }
     func logo(_ channel: Channel) -> URL? {
         guard channel.logo else { return nil }
-        return try? url("Items/\(channel.id)/Images/Primary", ["maxWidth":"160","quality":"80","api_key":token])
+        guard JellyfinAdapterRules.validPath(channel.id),!channel.id.contains("/") else{return nil}
+        return try? url(adapterSpec.logoPath.replacingOccurrences(of:"{id}",with:channel.id),["maxWidth":"160","quality":"80","api_key":token])
     }
     func favorite(_ id: String, value: Bool) async throws {
         _ = try await request("Users/\(userID)/FavoriteItems/\(id)", method: value ? "POST" : "DELETE")
@@ -102,9 +132,21 @@ struct StreamSession {
             if let liveID = liveID { q["LiveStreamId"] = liveID }
             resolved = try url("Videos/\(channel.id)/stream",q); method = "DirectStream"
         }
-        guard var c = URLComponents(url:resolved,resolvingAgainstBaseURL:false) else { throw AppError.message("Invalid stream URL") }
-        var q = c.queryItems ?? []; if !q.contains(where:{$0.name.lowercased()=="api_key"}) { q.append(URLQueryItem(name:"api_key",value:token)) }; c.queryItems = q
-        guard let result = c.url else { throw AppError.message("Invalid playback URL") }
+        guard let origin=base,JellyfinAdapterRules.sameOrigin(resolved,origin),
+            var c=URLComponents(url:resolved,resolvingAgainstBaseURL:false) else{throw AppError.message("Invalid or non-server playback URL")}
+        // Supply the hook a token-free path and add the actual token natively.
+        let credentialKeys:Set<String>=["api_key","access_token","token"]
+        c.queryItems=c.queryItems?.filter{!credentialKeys.contains($0.name.lowercased())}
+        if let active=adapter {
+            let path=c.percentEncodedPath+(c.percentEncodedQuery.map{"?"+$0} ?? "")
+            let patched=try await active.stream(path:path,method:method,itemID:channel.id)
+            guard let u=URL(string:patched.0,relativeTo:origin)?.absoluteURL,JellyfinAdapterRules.sameOrigin(u,origin),
+                let parts=URLComponents(url:u,resolvingAgainstBaseURL:false) else{throw AppError.message("Patched stream must target configured Jellyfin")}
+            c=parts;method=patched.1
+        }
+        var q=(c.queryItems ?? []).filter{!credentialKeys.contains($0.name.lowercased())}
+        q.append(URLQueryItem(name:"api_key",value:token));c.queryItems=q
+        guard let result=c.url else{throw AppError.message("Invalid playback URL")}
         return StreamSession(url:result,itemID:channel.id,mediaSourceID:sid,playSessionID:playID,liveStreamID:liveID,method:method)
     }
     func report(_ s: StreamSession, action: String, position: Double, paused: Bool) async {

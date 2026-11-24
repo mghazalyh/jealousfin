@@ -16,8 +16,9 @@ struct DecisionPrompt:Codable,Equatable,Identifiable {
     var expiresAt:Date
     var expectedChannelID:String?
     var expectedPatchID:String?
+    var expectedJellyfinAPIRevision:String?
     var choices:[DecisionChoice]
-    static let repairCommands:Set<String>=DynamicUILayout.commands.subtracting(["script"]).union(["install_runtime_module_from_db","rollback_runtime_module","reload_runtime_module","install_ui_layout_from_db","rollback_ui_layout","reset_runtime_module","reset_ui_layout"])
+    static let repairCommands:Set<String>=DynamicUILayout.commands.subtracting(["script"]).union(["install_runtime_module_from_db","rollback_runtime_module","reload_runtime_module","install_ui_layout_from_db","rollback_ui_layout","reset_runtime_module","reset_ui_layout","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api"])
     func checked(now:Date)throws->DecisionPrompt{
         guard schemaVersion==1,DynamicUILayout.validID(id),!title.isEmpty,title.count<=160,
               !message.isEmpty,message.count<=4000,["Emergency","High","Attention","Informational"].contains(priority),
@@ -25,7 +26,7 @@ struct DecisionPrompt:Codable,Equatable,Identifiable {
               (2...4).contains(choices.count),Set(choices.map(\.id)).count==choices.count,
               choices.contains(where:{$0.action==nil}),(evidence?.count ?? 0)<=12,
               (evidence ?? [:]).allSatisfy({$0.key.count<=100 && $0.value.count<=1000}),
-              (expectedChannelID?.count ?? 0)<=100,(expectedPatchID?.count ?? 0)<=100
+              (expectedChannelID?.count ?? 0)<=100,(expectedPatchID?.count ?? 0)<=100,(expectedJellyfinAPIRevision?.count ?? 0)<=100
         else{throw AppError.message("Invalid or expired decision prompt")}
         for choice in choices {
             guard DynamicUILayout.validID(choice.id),!choice.title.isEmpty,choice.title.count<=100,
@@ -38,8 +39,8 @@ struct DecisionPrompt:Codable,Equatable,Identifiable {
         }
         return self
     }
-    func contextMatches(channelID:String?,patchID:String)->Bool{
-        (expectedChannelID.map{$0==channelID} ?? true) && (expectedPatchID.map{$0==patchID} ?? true)
+    func contextMatches(channelID:String?,patchID:String,apiRevision:String?=nil)->Bool{
+        (expectedChannelID.map{$0==channelID} ?? true) && (expectedPatchID.map{$0==patchID} ?? true) && (expectedJellyfinAPIRevision.map{$0==apiRevision} ?? true)
     }
 }
 struct DecisionRecord:Codable,Identifiable {

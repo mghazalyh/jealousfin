@@ -41,6 +41,11 @@ import Network
     let db=TorrioDB()
     let lan=LANServer()
     let scripts=ScriptEngine()
+    @Published private(set) var jellyfinAPIRevision="native-baseline"
+    @Published private(set) var jellyfinAPIFault:String?
+    private var jellyfinAPIStore=JellyfinAdapterStore()
+    private var apiChanging=false
+    private var apiReady=false
     @Published private(set) var dynamicUI=DynamicUIStore()
     @Published private(set) var decisions=DecisionJournal()
     private var decisionTask:Task<Void,Never>?
@@ -109,6 +114,7 @@ import Network
 
     init() {
         settings=disk.load(Settings.self,"settings.json") ?? Settings()
+        jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
         decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()
         if var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
@@ -161,6 +167,7 @@ import Network
         requestSync()
         Task { [weak self] in
             guard let self=self else{return}
+            await self.bootJellyfinAPI()
             await self.bootRuntime()
             if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect()}
             self.resumeCampaignIfNeeded()
@@ -235,7 +242,7 @@ import Network
     var banned:[Channel]{channels.filter{health[$0.id]?.banned == true}}
     var validatedCount:Int{health.values.filter{$0.successes>0 || $0.lifetimeFailures>0}.count}
     func connect() async {
-        guard !loginBusy else{return};loginBusy=true;defer{loginBusy=false}
+        guard apiReady,!apiChanging,!loginBusy else{return};loginBusy=true;defer{loginBusy=false}
         // Drain the old stream's operations before replacing server credentials.
         let resumeLoop=settings.resumeSurf || surfing
         let category=settings.surfCategory
@@ -259,7 +266,7 @@ import Network
         recalculateInsights();requestSync()
     }
     func refresh() async throws {
-        guard !catalogueBusy else{return};catalogueBusy=true;defer{catalogueBusy=false}
+        guard !apiChanging,!catalogueBusy else{return};catalogueBusy=true;defer{catalogueBusy=false}
         let items=try await jelly.channels()
         channels=items;catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
         log("INFO","catalogue","REFRESHED",["count":String(items.count),"favorites":String(items.filter(\.favorite).count)])
@@ -269,7 +276,7 @@ import Network
     }
     func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
     func favorite(_ channel:Channel) async throws {
-        guard jelly.connected,!loginBusy else{throw AppError.message("Jellyfin unavailable")}
+        guard !apiChanging,jelly.connected,!loginBusy else{throw AppError.message("Jellyfin unavailable")}
         guard favoriteInFlight.insert(channel.id).inserted else{throw AppError.message("Favorite update already in progress")}
         defer{favoriteInFlight.remove(channel.id)}
         let value = !(channels.first(where:{$0.id==channel.id})?.favorite ?? channel.favorite)
@@ -285,7 +292,7 @@ import Network
     func loadRecordings(){Task{do{recordings=try await jelly.recordings();log("INFO","dvr","RECORDINGS_LOADED",["count":String(recordings.count)])}catch{log("WARN","dvr","UNAVAILABLE")}}}
     func schedule(_ program:Program){Task{do{try await jelly.record(program);log("INFO","dvr","TIMER_CREATED",["programID":program.id])}catch{log("ERROR","dvr","TIMER_FAILED",["error":error.localizedDescription])}}}
     func startSurf(category:String="All Channels"){
-        guard !loginBusy,jelly.connected,catalogueReady else{log("WARN","surf","NOT_CONNECTED");return}
+        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady else{log("WARN","surf","NOT_CONNECTED");return}
         surfing=true;surfPaused=false;settings.resumeSurf=true;settings.surfCategory=category;disk.save(settings,"settings.json")
         attemptedIDs.removeAll();log("INFO","surf","START",["category":category,"minutes":String(settings.rotationMinutes)])
         next()
@@ -313,7 +320,7 @@ import Network
         }
     }
     func next(){
-        guard !loginBusy,jelly.connected,catalogueReady,policyReady else{return}
+        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady,policyReady else{return}
         selectionTask?.cancel();selectionID=UUID();let ticket=selectionID
         let candidates=pool()
         guard !candidates.isEmpty else {
@@ -344,7 +351,7 @@ import Network
         }
     }
     func open(_ c:Channel){
-        guard !loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
+        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
         if c.isSurf {
             // App-owned Surf rotation identifies the actual channel for validation and Favorites.
             let category=String(c.name.dropFirst("Surf:".count)).trimmingCharacters(in:.whitespacesAndNewlines)
@@ -356,7 +363,7 @@ import Network
         stopSurf();begin(c,keepSurf:false)
     }
     private func begin(_ channel:Channel,keepSurf:Bool){
-        guard !loginBusy,jelly.connected,catalogueReady,policyReady else{log("WARN","player","NOT_CONNECTED");return}
+        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady,policyReady else{log("WARN","player","NOT_CONNECTED");return}
         guard health[channel.id]?.eligible(at:Date()) ?? true else{status="Channel is excluded by validation policy";return}
         work?.cancel();generation=UUID();let g=generation
         retryCurrentAfterResume=false;pausedRotationSeconds=nil;lastPlayerError=nil
@@ -640,7 +647,7 @@ import Network
         if jelly.connected && now.timeIntervalSince(lastRefresh)>180 {
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        if apiReady && !apiChanging && policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
         resumeCampaignIfNeeded()
         runModuleIfDue()
         if now.timeIntervalSince(lastHeartbeat)>30 {publishHeartbeat(now:now)}
@@ -729,6 +736,7 @@ import Network
     }
     func recalculateInsights(){
         var list:[Insight]=[]
+        if let fault=jellyfinAPIFault{list.append(Insight(id:"jellyfin-api",priority:"High",title:"Jellyfin API adapter needs attention",explanation:fault,action:"Inspect API traces or restore the previous adapter."))}
         if let fault=patchFault {list.append(Insight(id:"patch",priority:"High",title:"Runtime module needs attention",explanation:fault,action:"Inspect module status and roll back or install a corrected module."))}
         if let result=campaign?.lastResult,result.status=="failed" {list.append(Insight(id:"device-test",priority:"High",title:"On-device test failed: "+result.kind,explanation:result.evidence["reason"] ?? "See the correlated engineering result.",action:"Inspect campaign evidence and revise the runtime policy."))}
         if status=="Connection failed"{list.append(Insight(id:"connection",priority:"Emergency",title:"Jellyfin connection failed",explanation:"The application cannot authenticate or reach the server. Channel penalties are suspended for infrastructure failures.",action:"Check server availability and connection settings."))}
@@ -746,9 +754,9 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision"]
+    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command) async -> Receipt {
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
@@ -766,7 +774,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions"]
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -823,6 +831,27 @@ import Network
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "get_jellyfin_api":
+            return try json(["revision":jellyfinAPIRevision,"ready":String(apiReady),"fault":jellyfinAPIFault ?? "","previous":jellyfinAPIStore.previous?.id ?? "","operations":JellyfinAdapterRules.operations.joined(separator:",")])
+        case "install_jellyfin_api":
+            guard let id=args["id"],let source=args["source"] else{throw AppError.message("API revision ID and source required")}
+            try await activateJellyfinAPI(JellyfinAdapterRevision(id:id,source:source))
+            return "Jellyfin API revision active: "+jellyfinAPIRevision
+        case "install_jellyfin_api_from_db":
+            guard let id=args["id"],DynamicUILayout.validID(id),let sha=args["sha"],sha.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil,
+                let file=try await db.read("engineering/jellyfin-api/"+id+".js"),file.sha==sha,file.data.count<=192*1024,
+                let source=String(data:file.data,encoding:.utf8) else{throw AppError.message("API module source or exact blob SHA mismatch")}
+            try await activateJellyfinAPI(JellyfinAdapterRevision(id:id,source:source))
+            return "Jellyfin API revision active: "+jellyfinAPIRevision
+        case "rollback_jellyfin_api":
+            guard jellyfinAPIStore.active != nil else{throw AppError.message("Already using native API")}
+            try await activateJellyfinAPI(jellyfinAPIStore.previous)
+            return "Jellyfin API rolled back: "+jellyfinAPIRevision
+        case "reset_jellyfin_api":
+            try await activateJellyfinAPI(nil)
+            return "Native Jellyfin API restored"
+        case "probe_jellyfin_api":
+            return try json(try await probeJellyfinAPI(args["operation"] ?? "health"))
         case "present_decision":
             guard let source=args["prompt"],source.utf8.count<=48*1024 else{throw AppError.message("Provide decision prompt JSON")}
             let prompt=try JSONCodec.decoder().decode(DecisionPrompt.self,from:Data(source.utf8))
@@ -918,7 +947,7 @@ import Network
         input["form"]=uiInputs
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger"].contains(c.action) {
+        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -1527,7 +1556,7 @@ extension AppModel {
             if let existing=self.disk.load(Receipt.self,"receipt-\(record.commandID).json"){
                 receipt=existing
             }else if record.prompt.expiresAt<=Date() ||
-                !record.prompt.contextMatches(channelID:self.current?.id,patchID:self.activePatchID){
+                !record.prompt.contextMatches(channelID:self.current?.id,patchID:self.activePatchID,apiRevision:self.jellyfinAPIRevision){
                 receipt=nil
             }else{
                 receipt=await self.execute(Command(id:record.commandID,action:action.command,arguments:action.arguments,expiresAt:record.prompt.expiresAt))
@@ -1558,5 +1587,113 @@ extension AppModel {
             copy.markUploaded(id:record.id,revision:record.revision)
             try saveDecisions(copy)
         }
+    }
+}
+
+
+extension AppModel {
+    private func persistJellyfinAPI(_ store:JellyfinAdapterStore)throws{
+        guard disk.save(store,"jellyfin-api.json") else{throw AppError.message("Cannot persist Jellyfin API revision")}
+        jellyfinAPIStore=store
+    }
+    private func bootJellyfinAPI()async{
+        apiChanging=true
+        defer{apiReady=true;apiChanging=false}
+        do{
+            if jellyfinAPIStore.pending {
+                try persistJellyfinAPI(JellyfinAdapterStore(active:jellyfinAPIStore.previous,previous:nil,pending:false))
+                jellyfinAPIFault="Interrupted API activation rolled back"
+            }
+            if let revision=jellyfinAPIStore.active{
+                do{
+                    jelly.adapter=try await JellyfinAPIAdapter.load(revision,engine:scripts)
+                }catch{
+                    let fallback=jellyfinAPIStore.previous
+                    if let fallback=fallback,let loaded=try? await JellyfinAPIAdapter.load(fallback,engine:scripts){
+                        jelly.adapter=loaded
+                        try persistJellyfinAPI(JellyfinAdapterStore(active:fallback,previous:nil,pending:false))
+                    }else{
+                        jelly.adapter=nil
+                        try persistJellyfinAPI(JellyfinAdapterStore(active:nil,previous:nil,pending:false))
+                    }
+                    jellyfinAPIFault="Persisted API module rejected at launch; fallback restored"
+                }
+            }
+        }catch{jelly.adapter=nil;jellyfinAPIFault="API restoration failed; native fallback in use"}
+        jellyfinAPIRevision=jelly.adapterID
+        log(jellyfinAPIFault==nil ? "INFO":"WARN","jellyfin-api","RESTORED",["revision":jellyfinAPIRevision,"fault":jellyfinAPIFault ?? ""])
+        recalculateInsights()
+    }
+    private func activateJellyfinAPI(_ candidate:JellyfinAdapterRevision?)async throws{
+        guard apiReady,!apiChanging,!loginBusy,!catalogueBusy,favoriteInFlight.isEmpty,!patchBusy else{throw AppError.message("Jellyfin adapter busy; retry after current operation")}
+        guard candidate?.id != jellyfinAPIStore.active?.id || candidate==nil else{throw AppError.message("Use a new API revision ID")}
+        apiChanging=true
+        defer{apiChanging=false;resumeCampaignIfNeeded();requestSync()}
+        let previous=jellyfinAPIStore
+        let resumeLoop=surfing || settings.resumeSurf
+        let category=settings.surfCategory
+        let channelID=current?.id
+        do {
+            // A candidate must pass interpreter fixtures and real read-only
+            // catalogue/health probes before replacing the active adapter.
+            let loaded:JellyfinAPIAdapter?
+            if let candidate=candidate{loaded=try await JellyfinAPIAdapter.load(candidate,engine:scripts)}
+            else{loaded=nil}
+            let staged=Jellyfin(deviceID:deviceID)
+            staged.adapter=loaded
+            staged.log={ [weak self] severity,code,fields in self?.log(severity,"jellyfin-api-stage",code,fields)}
+            try await staged.connect(settings)
+            guard await staged.healthy() else{throw AppError.message("Candidate health probe failed")}
+            let catalogue=try await staged.channels()
+            guard !catalogue.isEmpty else{throw AppError.message("Candidate returned an empty live catalogue")}
+            let epg=try? await staged.programs()
+            try suspendCampaignForPatch()
+            let oldWork=work
+            stop()
+            await oldWork?.value
+            await cleanupTask?.value
+            let deadline=ProcessInfo.processInfo.systemUptime+30
+            while jelly.inFlight>0 && ProcessInfo.processInfo.systemUptime<deadline{await nap(0.2)}
+            guard jelly.inFlight==0 else{throw AppError.message("Old Jellyfin operations have not drained")}
+            try persistJellyfinAPI(JellyfinAdapterStore(active:candidate,previous:previous.active,pending:false))
+            jelly.adapter=loaded;jelly.base=staged.base;jelly.token=staged.token;jelly.userID=staged.userID
+            jellyfinAPIRevision=jelly.adapterID;jellyfinAPIFault=nil
+            channels=catalogue;programs=epg ?? [];catalogueReady=true;lastRefresh=Date()
+            disk.save(catalogue,"channels.json")
+            status="Connected"
+            log("INFO","jellyfin-api","ACTIVATED",["revision":jellyfinAPIRevision,"channels":String(catalogue.count),"epgProbe":epg==nil ? "unavailable":"passed"])
+            apiChanging=false
+            if !engineeringOwnsPlayback && campaign?.canResume != true{
+                if resumeLoop{startSurf(category:category)}
+                else if let id=channelID,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true{open(c)}
+            }
+            recalculateInsights()
+        }catch{
+            jellyfinAPIFault="Candidate API revision rejected; previous adapter retained"
+            log("ERROR","jellyfin-api","ACTIVATION_REJECTED",["candidate":candidate?.id ?? "native-baseline","errorType":String(describing:type(of:error))])
+            apiChanging=false
+            if current==nil,jelly.connected,catalogueReady,campaign?.canResume != true{
+                if resumeLoop{startSurf(category:category)}
+                else if let id=channelID,let c=channels.first(where:{$0.id==id}){open(c)}
+            }
+            recalculateInsights()
+            throw AppError.message(jellyfinAPIFault ?? "API activation failed")
+        }
+    }
+    private func probeJellyfinAPI(_ operation:String)async throws->[String:String]{
+        guard apiReady,!apiChanging,jelly.connected else{throw AppError.message("Jellyfin API unavailable")}
+        let start=ProcessInfo.processInfo.systemUptime
+        var result=["revision":jellyfinAPIRevision,"operation":operation]
+        switch operation{
+        case "health":guard await jelly.healthy() else{throw AppError.message("Health probe failed")}
+        case "channels":result["count"]=String(try await jelly.channels().count)
+        case "programs":result["count"]=String(try await jelly.programs().count)
+        case "recordings":result["count"]=String(try await jelly.recordings().count)
+        default:throw AppError.message("Unsupported read-only probe")
+        }
+        result["elapsedMs"]=String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))
+        result["status"]="passed"
+        log("INFO","jellyfin-api","PROBE_COMPLETED",result)
+        return result
     }
 }
