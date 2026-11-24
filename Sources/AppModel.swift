@@ -1126,7 +1126,7 @@ extension AppModel {
     }
     func startCampaign(_ plan:DeviceTestPlan)throws{
         let plan=try plan.checked()
-        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        guard policyReady,!patchBusy,!apiChanging,!versionBusy else{throw AppError.message("Runtime not ready")}
         guard campaignTask==nil,!(campaign.map{["queued","running","paused"].contains($0.state)} ?? false) else{throw AppError.message("Stop or finish the existing campaign first")}
         try saveCampaign(DeviceTestCheckpoint(plan:plan))
         stop()
@@ -1866,6 +1866,7 @@ extension AppModel {
             guard record.deviceID==deviceID,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid patch archive")}
             try dbArchiveCheck(record)
             try PatchVersionStore.retain(record,disk:disk)
+            if !patchVersions.contains(where:{$0.id==record.id}){patchVersions=PatchVersionStore.history(disk:disk)}
             try await db.immutable("engineering/"+deviceID+"/patches/"+record.id+".json",data:data)
             disk.remove(url)
         }
@@ -1910,7 +1911,9 @@ extension AppModel {
         let nextRuntime=target.runtime.map{RuntimePatch(id:$0.id,source:$0.source)}
         let nextAPI=target.jellyfinAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source)}
         // Evaluate the candidate before touching the live engines.
-        let policy=runtimeChanged ? try await engineering.preview(nextRuntime,settings:settings):effectivePolicy
+        let policy:RuntimePolicy
+        if runtimeChanged{policy=try await engineering.preview(nextRuntime,settings:settings)}
+        else{policy=effectivePolicy}
         let adapter:JellyfinAPIAdapter?
         if apiChanged{
             if let nextAPI=nextAPI{adapter=try await JellyfinAPIAdapter.load(nextAPI,engine:scripts)}
@@ -1924,6 +1927,7 @@ extension AppModel {
         moduleTask?.cancel()
         await moduleTask?.value
         try suspendCampaignForPatch()
+        campaignTask?.cancel()
         await campaignTask?.value
         if apiChanged{
             let oldWork=work
@@ -1942,7 +1946,8 @@ extension AppModel {
         do{
             try PatchVersionStore.commit(before:before,after:after,targetID:id,scope:scope,disk:disk)
         }catch{
-            if let journal=disk.load(PatchRestoreJournal.self,"patch-restore.json"),!journal.committed{
+            if FileManager.default.fileExists(atPath:disk.root.appendingPathComponent("patch-restore.json").path),
+               disk.load(PatchRestoreJournal.self,"patch-restore.json")?.committed != true{
                 versionRecoveryFailed=true;policyReady=false;apiReady=false
                 stop()
             }
@@ -1967,7 +1972,7 @@ extension AppModel {
         let newHead=patchArchiveID ?? ""
         log("INFO","patch-version","RESTORED",["target":id,"scope":scope.rawValue,"head":newHead])
         recalculateInsights()
-        versionBusy=false;patchBusy=false;apiChanging=false
+        apiChanging=false
         if apiChanged,wasConnected || settings.autoLogin{
             await connect()
             if !resumeLoop,campaign?.canResume != true,let channel=priorChannel,

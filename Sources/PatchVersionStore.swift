@@ -59,7 +59,7 @@ struct PatchRestoreJournal:Codable{
         _ = try record.sources.checked()
         let name="patch-version-"+record.id+".json"
         if let existing=disk.load(PatchArchive.self,name){
-            guard existing==record else{throw AppError.message("Immutable patch version collision")}
+            guard try JSONCodec.encoder().encode(existing)==JSONCodec.encoder().encode(record) else{throw AppError.message("Immutable patch version collision")}
             return
         }
         guard disk.save(record,name) else{throw AppError.message("Cannot retain patch version")}
@@ -79,13 +79,18 @@ struct PatchRestoreJournal:Codable{
               disk.save(snapshot.ui,"dynamic-ui.json") else{throw AppError.message("Cannot write complete patch source set")}
     }
     static func recover(disk:Disk)throws->Bool{
-        guard let journal=disk.load(PatchRestoreJournal.self,"patch-restore.json"),!journal.committed else{return false}
+        guard FileManager.default.fileExists(atPath:disk.root.appendingPathComponent("patch-restore.json").path) else{return false}
+        guard let journal=disk.load(PatchRestoreJournal.self,"patch-restore.json") else{throw AppError.message("Unreadable patch recovery journal")}
+        guard !journal.committed else{return false}
         try write(journal.before,disk:disk)
         var resolved=journal;resolved.committed=true
         guard disk.save(resolved,"patch-restore.json") else{throw AppError.message("Cannot finish interrupted restore recovery")}
         return true
     }
     static func commit(before:PatchRestoreSnapshot,after:PatchRestoreSnapshot,targetID:String,scope:PatchVersionScope,disk:Disk)throws{
+        if FileManager.default.fileExists(atPath:disk.root.appendingPathComponent("patch-restore.json").path){
+            guard disk.load(PatchRestoreJournal.self,"patch-restore.json")?.committed==true else{throw AppError.message("An earlier restore requires recovery")}
+        }
         var journal=PatchRestoreJournal(before:before,targetID:targetID,scope:scope)
         guard disk.save(journal,"patch-restore.json") else{throw AppError.message("Cannot journal patch restore")}
         do{

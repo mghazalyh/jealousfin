@@ -109,5 +109,40 @@ final class JellyfinFixture:URLProtocol {
         try require(installDisk.save(override,"runtime-patch.json"),"write local override fixture")
         try BaselineInstaller.install(ReleaseBaseline(revision:"release-three",sources:PatchSourceSet()),disk:installDisk)
         try require(installDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="local","real upgrade preserves independent local override")
+
+        let versionDisk=Disk(root:root.appendingPathComponent("versions"))
+        let oldVersion=PatchArchive(deviceID:"fixture",reason:"checkpoint",build:"1",sources:baseline.sources,label:"Working playback",knownGood:true)
+        let newVersion=PatchArchive(deviceID:"fixture",reason:"runtime-activated",build:"1",sources:newer.sources,parentID:oldVersion.id)
+        try PatchVersionStore.retain(oldVersion,disk:versionDisk)
+        try PatchVersionStore.retain(newVersion,disk:versionDisk)
+        try PatchVersionStore.retain(oldVersion,disk:versionDisk)
+        try require(PatchVersionStore.history(disk:versionDisk).count==2,"immutable history survives multiple revisions")
+        var conflicting=oldVersion;conflicting.reason="edited"
+        var collision=false
+        do{try PatchVersionStore.retain(conflicting,disk:versionDisk)}catch{collision=true}
+        try require(collision,"immutable history rejects overwrite")
+        let history=PatchVersionStore.history(disk:Disk(root:versionDisk.root))
+        try require(history.contains(where:{$0.id==oldVersion.id && $0.knownGood && $0.label=="Working playback"}),"known-good checkpoint survives reload")
+        guard let archived=PatchVersionStore.load(oldVersion.id,disk:versionDisk) else{throw AppError.message("Missing old version")}
+        try require(archived.sources==baseline.sources,"older complete source set recoverable")
+        let comparison=PatchVersionComparison(from:oldVersion,to:newVersion)
+        try require(comparison.runtimeChanged && comparison.apiChanged && !comparison.uiChanged,"source comparison detects changed components")
+        let onlyRuntime=PatchVersionScope.runtime.merge(current:newVersion.sources,target:oldVersion.sources)
+        try require(onlyRuntime.runtime==oldVersion.sources.runtime && onlyRuntime.jellyfinAPI==newVersion.sources.jellyfinAPI && onlyRuntime.ui==newVersion.sources.ui,"component restore preserves unrelated components")
+        let before=PatchRestoreSnapshot(runtime:RuntimePatchStore(active:RuntimePatch(id:"two",source:second)),api:JellyfinAdapterStore(),ui:DynamicUIStore(active:layout,values:["minutes":"10"]))
+        let after=PatchRestoreSnapshot(runtime:RuntimePatchStore(active:RuntimePatch(id:"one",source:first)),api:JellyfinAdapterStore(active:JellyfinAdapterRevision(id:"api-test",source:source)),ui:DynamicUIStore(active:layout,values:["minutes":"10"]))
+        try PatchVersionStore.write(before,disk:versionDisk)
+        try PatchVersionStore.commit(before:before,after:after,targetID:oldVersion.id,scope:.all,disk:versionDisk)
+        let restoredRuntime=EngineeringRuntime(disk:Disk(root:versionDisk.root),engine:engine)
+        let restoredPolicy=try await restoredRuntime.boot(settings:settings)
+        try require(restoredPolicy.retries==3 && versionDisk.load(JellyfinAdapterStore.self,"jellyfin-api.json")?.active?.id=="api-test","actual older source set restored and executable")
+        let completeRecovery=try PatchVersionStore.recover(disk:versionDisk)
+        try require(!completeRecovery,"committed restore survives relaunch")
+        let journal=PatchRestoreJournal(before:before,targetID:oldVersion.id,scope:.all)
+        try require(versionDisk.save(journal,"patch-restore.json"),"write interrupted restoration fixture")
+        // Simulate a process dying after only its first store was replaced.
+        try require(versionDisk.save(after.runtime,"runtime-patch.json"),"write partial restoration fixture")
+        let recoveredRestore=try PatchVersionStore.recover(disk:Disk(root:versionDisk.root))
+        try require(recoveredRestore && versionDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="two" && versionDisk.load(JellyfinAdapterStore.self,"jellyfin-api.json")?.active==nil && versionDisk.load(DynamicUIStore.self,"dynamic-ui.json")?.values["minutes"]=="10","interrupted restoration recovers all previous stores")
     }
 }
