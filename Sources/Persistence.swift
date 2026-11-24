@@ -29,7 +29,7 @@ struct GitFile {
 }
 private struct TorrioWriteFailure:LocalizedError {
     let status:Int
-    var errorDescription:String?{"TorrioDB write HTTP \(status)"}
+    var errorDescription:String?{"JealousDB write HTTP \(status)"}
 }
 @MainActor final class TorrioDB {
     private let transport:URLSession
@@ -38,12 +38,12 @@ private struct TorrioWriteFailure:LocalizedError {
     private func conflictBackoff(_ attempt:Int) async throws {
         try await Task.sleep(nanoseconds:UInt64(250_000_000 * (1 << attempt)))
     }
-    let repository = "https://api.github.com/repos/mghazalyh/torriodb/"
+    let repository = "https://api.github.com/repos/mghazalyh/jealousdb/"
     var base:String {repository+"contents/jealousfin/"}
     var token = ""
     var configured:Bool { !token.isEmpty }
     func call(_ path:String, method:String="GET", body:[String:Any]?=nil,gitTree:Bool=false) async throws -> (Data,Int) {
-        guard configured, let u=URL(string:(gitTree ? repository+"git/trees/" : base)+path) else { throw AppError.message("Configure TorrioDB token") }
+        guard configured, let u=URL(string:(gitTree ? repository+"git/trees/" : base)+path) else { throw AppError.message("Configure JealousDB token") }
         var req=URLRequest(url:u); req.httpMethod=method; req.timeoutInterval=20
         req.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")
         req.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
@@ -56,7 +56,7 @@ private struct TorrioWriteFailure:LocalizedError {
     func read(_ path:String) async throws -> GitFile? {
         let (d,status)=try await call(path)
         if status==404 { return nil }
-        guard status==200, let j=try JSONSerialization.jsonObject(with:d) as? [String:Any], let sha=j["sha"] as? String, let c=j["content"] as? String, let bytes=Data(base64Encoded:c,options:.ignoreUnknownCharacters) else { throw AppError.message("TorrioDB read HTTP \(status)") }
+        guard status==200, let j=try JSONSerialization.jsonObject(with:d) as? [String:Any], let sha=j["sha"] as? String, let c=j["content"] as? String, let bytes=Data(base64Encoded:c,options:.ignoreUnknownCharacters) else { throw AppError.message("JealousDB read HTTP \(status)") }
         return GitFile(sha:sha,data:bytes)
     }
     private func writeOnce(_ path:String,data:Data,sha:String?) async throws {
@@ -110,7 +110,7 @@ private struct TorrioWriteFailure:LocalizedError {
     func directory(_ path:String) async throws -> [String] {
         let (d,status)=try await call(path)
         if status==404 { return [] }
-        guard status==200, let a=try JSONSerialization.jsonObject(with:d) as? [[String:Any]] else { throw AppError.message("TorrioDB listing HTTP \(status)") }
+        guard status==200, let a=try JSONSerialization.jsonObject(with:d) as? [[String:Any]] else { throw AppError.message("JealousDB listing HTTP \(status)") }
         var names=a.filter{$0["type"] as? String=="file"}.compactMap{$0["name"] as? String}
         // Contents API caps directory listings at 1000 entries. Resolve its tree
         // instead of silently losing later commands/receipts after long operation.

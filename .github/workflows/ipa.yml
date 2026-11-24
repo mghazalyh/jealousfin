@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Import reviewed patch baseline (required)
         env:
-          TORRIODB_RELEASE_TOKEN: ${{ secrets.TORRIODB_RELEASE_TOKEN }}
+          JEALOUSDB_RELEASE_TOKEN: ${{ secrets.JEALOUSDB_RELEASE_TOKEN }}
         run: |
           python3 Scripts/import-promoted.py
       - name: Generate reviewed baseline source

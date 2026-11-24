@@ -234,7 +234,7 @@ struct EngineeringView:View{
             Text("Engineering").font(.largeTitle.bold())
             Panel{
                 VStack(alignment:.leading,spacing:12){
-                    Label("TorrioDB",systemImage:"externaldrive").font(.headline)
+                    Label("JealousDB",systemImage:"externaldrive").font(.headline)
                     Text(model.syncStatus).font(.subheadline).foregroundColor(subdued)
                     Text("Device: \(model.deviceID)").font(.caption.monospaced()).textSelection(.enabled)
                     Button("Synchronize now"){model.requestSync()}.buttonStyle(.borderedProminent)
@@ -292,8 +292,8 @@ struct SettingsView:View{
                 Button("Connect & refresh"){Task{await model.connect()}}.buttonStyle(.borderedProminent)
                 Text(model.status).font(.caption).foregroundColor(subdued)
             }}
-            SectionLabel(title:"TorrioDB")
-            Panel{VStack(alignment:.leading,spacing:10){SecureField("GitHub repository access token",text:$model.settings.githubToken);Text("Private repository: torriodb/jealousfin").font(.caption).foregroundColor(subdued);Text(model.syncStatus).font(.caption)}}
+            SectionLabel(title:"JealousDB")
+            Panel{VStack(alignment:.leading,spacing:10){SecureField("GitHub repository access token",text:$model.settings.githubToken);Text("Private repository: jealousdb/jealousfin").font(.caption).foregroundColor(subdued);Text(model.syncStatus).font(.caption)}}
             SectionLabel(title:"Playback and operation")
             Panel{VStack(alignment:.leading,spacing:12){
                 Stepper("Quality: \(model.settings.qualityMbps) Mbps",value:$model.settings.qualityMbps,in:1...50)
@@ -400,7 +400,7 @@ struct DeviceTestsView:View{
                 Text("Active runtime module").font(.headline)
                 Text(model.activePatchID).font(.system(.caption,design:.monospaced)).foregroundColor(accent)
                 if let fault=model.patchFault{Text(fault).foregroundColor(.orange).font(.caption)}
-                Text("Runtime modules, diagnostics and campaign plans can be updated from TorrioDB.").font(.caption).foregroundColor(subdued)
+                Text("Runtime modules, diagnostics and campaign plans can be updated from JealousDB.").font(.caption).foregroundColor(subdued)
             }}
             Panel{VStack(alignment:.leading,spacing:10){
                 Text("Device test campaign").font(.headline)

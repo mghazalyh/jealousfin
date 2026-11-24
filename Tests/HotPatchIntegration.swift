@@ -93,6 +93,7 @@ final class TorrioConflictFixture:URLProtocol {
         TorrioConflictFixture.reset()
         let dbConfig=URLSessionConfiguration.ephemeral;dbConfig.protocolClasses=[TorrioConflictFixture.self]
         let conflictDB=TorrioDB(transport:URLSession(configuration:dbConfig));conflictDB.token="fixture"
+        try require(conflictDB.base=="https://api.github.com/repos/mghazalyh/jealousdb/contents/jealousfin/","dedicated private JealousDB route")
         let receipt=Data("receipt".utf8)
         try await conflictDB.replaceDeviceSnapshot("snapshot.json",data:Data("new snapshot".utf8))
         try require(TorrioConflictFixture.count("PUT snapshot.json")==2 && TorrioConflictFixture.count("GET snapshot.json")==2,"TorrioDB heartbeat conflict re-reads and retries")

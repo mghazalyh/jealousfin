@@ -705,7 +705,7 @@ import Network
     func requestSync(){
         guard syncTask==nil else{return}
         db.token=settings.githubToken
-        guard db.configured else{syncStatus="Configure TorrioDB token";return}
+        guard db.configured else{syncStatus="Configure JealousDB token";return}
         syncTask=Task{[weak self] in
             guard let self=self else{return}
             await self.synchronize()
@@ -798,9 +798,9 @@ import Network
         if status=="Connection failed"{list.append(Insight(id:"connection",priority:"Emergency",title:"Jellyfin connection failed",explanation:"The application cannot authenticate or reach the server. Channel penalties are suspended for infrastructure failures.",action:"Check server availability and connection settings."))}
         if disk.error != nil {list.append(Insight(id:"disk",priority:"Emergency",title:"Local persistence needs attention",explanation:disk.error ?? "",action:"Check available device storage."))}
         if failureRun>=3 {list.append(Insight(id:"failure-run",priority:"High",title:"Multiple consecutive playback failures",explanation:"The validator cannot establish channel-specific failure. Automatic exclusions are restrained.",action:"Inspect server and player traces."))}
-        if syncStatus.hasPrefix("Sync pending"){list.append(Insight(id:"sync",priority:"High",title:"TorrioDB synchronization delayed",explanation:syncStatus,action:"Check connectivity and repository access; local records remain queued."))}
+        if syncStatus.hasPrefix("Sync pending"){list.append(Insight(id:"sync",priority:"High",title:"JealousDB synchronization delayed",explanation:syncStatus,action:"Check connectivity and repository access; local records remain queued."))}
         if surfing && pool().isEmpty {list.append(Insight(id:"empty-pool",priority:"Attention",title:"No eligible channels in Surf category",explanation:"The current category has no eligible channels or the server did not supply category metadata.",action:"Choose All Channels or another populated category. The scheduler will retry automatically."))}
-        if settings.githubToken.isEmpty{list.append(Insight(id:"token",priority:"Attention",title:"TorrioDB is not configured",explanation:"Validation and telemetry are stored locally until repository access is configured.",action:"Enter a token in Settings."))}
+        if settings.githubToken.isEmpty{list.append(Insight(id:"token",priority:"Attention",title:"JealousDB is not configured",explanation:"Validation and telemetry are stored locally until repository access is configured.",action:"Enter a token in Settings."))}
         for c in channels where health[c.id]?.banned==true {list.append(Insight(id:"ban-"+c.id,priority:"High",title:c.name+" permanently excluded",explanation:"The final validation retry failed after progressive hiatus.",action:"Explicitly approve reinstatement only if desired."))}
         for c in channels where health[c.id]?.failures==7 && health[c.id]?.banned==false {list.append(Insight(id:"final-"+c.id,priority:"Attention",title:c.name+" at final hiatus",explanation:"The next confirmed failure after eligibility becomes permanent.",action:"Review its failure evidence."))}
         if moduleCheckpoint?.moduleID==activePatchID {
@@ -919,7 +919,7 @@ import Network
             return try await restorePatchVersion(target,scope:scope,expected:expected)
         case "get_patch_archive":
             guard let archive=disk.load(PatchArchive.self,"last-patch-archive.json") else{throw AppError.message("No archived source set")}
-            // Query metadata only. Complete executable sources are in private TorrioDB.
+            // Query metadata only. Complete executable sources are in private JealousDB.
             return try json(["id":archive.id,"runtime":archive.sources.runtime?.id ?? "native-baseline","jellyfinAPI":archive.sources.jellyfinAPI?.id ?? "native-baseline","ui":archive.sources.ui?.revision ?? "native-baseline","reason":archive.reason])
         case "archive_active_patches":
             guard apiReady,policyReady,!apiChanging,!patchBusy else{throw AppError.message("Patch engines busy")}
@@ -1905,7 +1905,7 @@ extension AppModel {
             guard local.deviceID==deviceID else{throw AppError.message("Version belongs to another device")}
             return local
         }
-        guard let file=try await db.read("engineering/"+deviceID+"/patches/"+id+".json") else{throw AppError.message("Version not found locally or in TorrioDB")}
+        guard let file=try await db.read("engineering/"+deviceID+"/patches/"+id+".json") else{throw AppError.message("Version not found locally or in JealousDB")}
         let record=try JSONCodec.decoder().decode(PatchArchive.self,from:file.data)
         guard record.id==id,record.deviceID==deviceID else{throw AppError.message("Archive identity mismatch")}
         try PatchVersionStore.retain(record,disk:disk)
