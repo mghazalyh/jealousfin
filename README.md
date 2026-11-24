@@ -30,3 +30,11 @@ GitHub-hosted macOS Actions only. Push to main triggers policy regressions, Xcod
 
 ## Initial release limitations
 Physical iOS 15/16 playback and TrollStore installation, later iOS, long backgrounding, recovery after process termination, global Jellyfin exclusion, exact server Surf category membership, complete decoder/renderer instrumentation, advanced script hooks and full DVR lifecycle remain unverified or incomplete. AVPlayer codec limits may require server transcoding. No existing PlayTorrio or PS3 components are used or modified.
+
+## Review corrections
+
+The post-initial-release audit adds serialized playback session teardown, pause-aware rotation clocks, foreground failure classification, multiple distinct decoded-frame samples with playback progression, bounded retries and recovery, separation of client-managed versus server-managed Surf, serialized Favorites requests, full-size paginated channel query responses, malformed-command isolation, command queue fairness beyond 1000 GitHub entries, and canonical health-ledger ordering with fractional timestamps. The test suite covers these policy and queue invariants and the offline server filter's progressive ban and reinstatement behavior.
+
+Selecting a Jellyfin virtual Surf row normally starts client-managed rotation; the antenna button requests the original opaque server Surf stream. Category membership is derived from server-provided genres/tags, not guessed. An empty category is surfaced in Insights and retried. The command protocol distinguishes a request to open a channel from confirmed playback.
+
+The server filtering adapter remains an offline integration component, not an installed or active server-wide enforcement service.

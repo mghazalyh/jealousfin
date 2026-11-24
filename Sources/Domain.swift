@@ -183,6 +183,11 @@ enum PlaybackFailurePolicy {
     }
 }
 enum CommandQueue {
+    static func decode(_ data:Data,expectedID:String)throws->Command{
+        let command=try JSONCodec.decoder().decode(Command.self,from:data)
+        guard command.id==expectedID,command.schemaVersion==1 else{throw AppError.message("Command identity or schema mismatch")}
+        return command
+    }
     static func pending(_ commands:[String],receipts:Set<String>,limit:Int)->[String] {
         Array(Set(commands).subtracting(receipts).sorted().prefix(max(0,limit)))
     }

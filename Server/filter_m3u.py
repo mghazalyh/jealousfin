@@ -35,9 +35,11 @@ def filter_m3u(source, ledger, mapping, now):
     missing = excluded - mapping.keys()
     if missing:
         raise ValueError("Missing verified item-ID mapping for excluded channels")
-    ids = {mapping[k] for k in excluded}
-    if any(not isinstance(x,str) or not x for x in ids):
+    if any(not isinstance(v,str) or not v for v in mapping.values()):
         raise ValueError("Invalid channel mapping")
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError("Ambiguous channel mapping: multiple item IDs share a tvg-id")
+    ids = {mapping[k] for k in excluded}
     lines = source.splitlines(keepends=True)
     if not lines or not lines[0].startswith("#EXTM3U"):
         raise ValueError("Not an M3U catalogue")

@@ -505,15 +505,25 @@ import MediaPlayer
             let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
             let old=try await db.read(prefix+"/heartbeat.json")
             try await db.put(prefix+"/heartbeat.json",data:snapshot,sha:old?.sha)
-            let commandFiles=try await db.directory(prefix+"/commands")
+            let commandFiles=try await db.directory(prefix+"/commands").filter{validID(String($0.dropLast(5)))}
             let receiptFiles=Set(try await db.directory(prefix+"/receipts"))
             for file in CommandQueue.pending(commandFiles,receipts:receiptFiles,limit:20) {
-                guard let remote=try await db.read(prefix+"/commands/"+file) else{continue}
-                let command=try JSONCodec.decoder().decode(Command.self,from:remote.data)
-                guard validID(command.id),file==command.id+".json" else{continue}
-                let result=await execute(command)
-                if result.status != "running" {
-                    try await db.immutable(prefix+"/receipts/"+file,data:JSONCodec.encoder().encode(result))
+                do {
+                    guard let remote=try await db.read(prefix+"/commands/"+file) else{continue}
+                    let expected=String(file.dropLast(5))
+                    let result:Receipt
+                    do {
+                        let command=try CommandQueue.decode(remote.data,expectedID:expected)
+                        result=await execute(command)
+                    } catch {
+                        result=Receipt(id:expected,action:"invalid",status:"failed",result:"Malformed command, schema or filename mismatch")
+                    }
+                    if result.status != "running" {
+                        try await db.immutable(prefix+"/receipts/"+file,data:JSONCodec.encoder().encode(result))
+                    }
+                }catch{
+                    // A malformed or temporarily unreadable file cannot block all later commands.
+                    log("WARN","commands","REMOTE_COMMAND_SYNC_FAILED",["file":file,"error":error.localizedDescription])
                 }
             }
             // Persist immutable batches before deleting their source records.
@@ -575,7 +585,10 @@ import MediaPlayer
             if let expiry=c.expiresAt,expiry<Date(){throw AppError.message("Command expired")}
             let output=try await dispatch(c.action,args:c.arguments ?? [:])
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
-            result.result=sanitized(output,limit:524288)
+            // Structured query results contain only explicitly selected application fields.
+            // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
+            let structured:Set<String>=["get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights"]
+            result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
             result.status="interrupted";result.result="Operation finished but its receipt could not be persisted"
