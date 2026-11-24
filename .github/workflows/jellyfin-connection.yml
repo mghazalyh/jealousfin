@@ -1,0 +1,97 @@
+name: Jellyfin connection dry run
+on:
+  push:
+    branches: [diagnostics/jellyfin-connection-only]
+    paths: ['.github/workflows/jellyfin-connection.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  connection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Verify Jellyfin connection and authentication only
+        env:
+          JELLYFIN_URL: ${{ secrets.JELLYFIN_URL || secrets.JELLYFIN_SERVER_URL || secrets.JELLYFIN_BASE_URL || secrets.JELLYFIN_TEST_URL }}
+          JELLYFIN_USERNAME: ${{ secrets.JELLYFIN_USERNAME || secrets.JELLYFIN_USER || secrets.JELLYFIN_TEST_USERNAME || secrets.JELLYFIN_TEST_USER }}
+          JELLYFIN_PASSWORD: ${{ secrets.JELLYFIN_PASSWORD || secrets.JELLYFIN_PASS || secrets.JELLYFIN_TEST_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import json, os, ssl, sys, socket, urllib.request, urllib.error, urllib.parse, uuid
+          def report(stage, message):
+              print(f"{stage}: {message}", flush=True)
+          def fail(stage, message):
+              report(stage, "FAIL - " + message)
+              sys.exit(1)
+          names = ["JELLYFIN_URL", "JELLYFIN_USERNAME", "JELLYFIN_PASSWORD"]
+          missing = [n for n in names if not os.environ.get(n)]
+          if missing:
+              fail("Secrets", "missing " + ", ".join(missing))
+          report("Secrets", "PASS - URL, username and password present")
+          base = os.environ["JELLYFIN_URL"].strip().rstrip("/")
+          try:
+              parsed = urllib.parse.urlsplit(base)
+              if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                  raise ValueError()
+              port = parsed.port or (443 if parsed.scheme == "https" else 80)
+          except ValueError:
+              fail("URL", "invalid server URL")
+          report("URL", "PASS - valid server URL")
+          socket.setdefaulttimeout(12)
+          try:
+              socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+          except OSError:
+              fail("DNS", "hostname resolution failed")
+          report("DNS", "PASS")
+          if parsed.scheme != "https":
+              fail("TLS", "HTTPS is required before transmitting credentials")
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+          device = "jealousfin-preflight-" + uuid.uuid4().hex
+          auth = f'MediaBrowser Client="Jealousfin Preflight", Device="GitHub Actions", DeviceId="{device}", Version="1"'
+          def call(stage, path, method="GET", body=None, token=None, required=True):
+              headers = {"Accept":"application/json", "Authorization":auth + (f', Token="{token}"' if token else "")}
+              if token:
+                  headers["X-Emby-Token"] = token
+              if body is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(base + "/" + path, data=json.dumps(body).encode() if body is not None else None, headers=headers, method=method)
+              try:
+                  with opener.open(req, timeout=15) as r:
+                      raw = r.read(1024*1024+1)
+                      if len(raw)>1024*1024:
+                          raise ValueError("oversized")
+                      result = json.loads(raw) if raw else {}
+                      report(stage, f"PASS - HTTP {r.status}")
+                      return result
+              except urllib.error.HTTPError as e:
+                  msg = f"HTTP {e.code}" + (" (redirect blocked)" if 300<=e.code<400 else "")
+              except urllib.error.URLError as e:
+                  msg = "TLS validation failed" if isinstance(e.reason, ssl.SSLError) else "network connection failed or timed out"
+              except (ValueError, OSError, TypeError):
+                  msg = "invalid response or connection failure"
+              if required:
+                  fail(stage, msg)
+              report(stage, "WARN - " + msg)
+              return None
+          info = call("Public server endpoint", "System/Info/Public")
+          if not isinstance(info, dict) or not isinstance(info.get("Version"), str) or not isinstance(info.get("ServerName"), str):
+              fail("Server identity", "response is not a Jellyfin public info object")
+          report("TLS and server identity", "PASS - HTTPS and Jellyfin JSON response verified")
+          login = call("Authentication", "Users/AuthenticateByName", "POST", {"Username":os.environ["JELLYFIN_USERNAME"], "Pw":os.environ["JELLYFIN_PASSWORD"]})
+          if not isinstance(login, dict) or not isinstance(login.get("AccessToken"), str) or not login["AccessToken"] or not isinstance(login.get("User"), dict) or not login["User"].get("Id"):
+              fail("Authentication response", "no valid access token or user ID")
+          token = login["AccessToken"]
+          print("::add-mask::" + token, flush=True)
+          report("Authentication response", "PASS - valid token and user ID returned")
+          try:
+              me = call("Authenticated API", "Users/Me", token=token)
+              if not isinstance(me, dict) or me.get("Id") != login["User"]["Id"]:
+                  fail("Authenticated identity", "user identity mismatch")
+              report("Authenticated identity", "PASS")
+          finally:
+              call("Test session logout", "Sessions/Logout", "POST", token=token, required=False)
+          report("Connection-only result", "PASS - no playback, build or release performed")
+          PY
