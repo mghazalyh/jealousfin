@@ -71,12 +71,16 @@ struct DeviceTestResult: Codable, Identifiable {
 }
 struct DeviceTestCheckpoint: Codable {
     var plan: DeviceTestPlan
+    var runID = UUID().uuidString
     var cycle = 0
     var stepIndex = 0
     var state = "queued"
     var updatedAt = Date()
     var lastResult: DeviceTestResult?
+    var resultID:String {"\(runID)-\(cycle)-\(stepIndex)"}
+    var canResume:Bool {["queued","running"].contains(state) && !plan.steps.isEmpty && stepIndex>=0 && stepIndex<plan.steps.count && cycle>=0}
     mutating func advance(_ result: DeviceTestResult) {
+        guard result.planID==plan.id,result.cycle==cycle,result.stepIndex==stepIndex else{return}
         lastResult=result
         stepIndex+=1
         if stepIndex>=plan.steps.count {

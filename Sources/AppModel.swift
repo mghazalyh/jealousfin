@@ -49,6 +49,8 @@ import Network
     private var policyReady=false
     private var patchBusy=false
     private var campaignTask:Task<Void,Never>?
+    private var campaignEpoch=UUID()
+    private var backgroundTransitions=0
     private var selectionTask:Task<Void,Never>?
     private var selectionID=UUID()
     private var engineeringOwnsPlayback:Bool {campaign?.state=="running"}
@@ -175,6 +177,7 @@ import Network
                 Task { @MainActor in
                     guard let self=self else {return}
                     self.log("INFO","lifecycle",name.rawValue)
+                    if name==UIApplication.didEnterBackgroundNotification{self.backgroundTransitions+=1}
                     if name==UIApplication.willEnterForegroundNotification || name==UIApplication.didEnterBackgroundNotification {
                         self.sampleSystemTelemetry(force:true)
                         self.publishHeartbeat(now:Date())
@@ -821,5 +824,320 @@ import Network
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
         log("INFO","runtime","SCRIPT_COMPLETED",["commands":String(commands.count),"ms":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
         return scriptOutput
+    }
+}
+
+
+// The test runner uses the same player and Jellyfin interfaces as ordinary viewing.
+// All test mutations are checkpointed. Test outcomes do not modify the production health ledger.
+extension AppModel {
+    private func applyRuntime(_ policy:RuntimePolicy?) {
+        policyOverride=policy
+        activePatchID=engineering.activeID
+        patchFault=engineering.fault
+        player.automaticallyWaitsToMinimizeStalling=effectivePolicy.automaticallyWaits
+        if let item=player.currentItem {
+            item.preferredForwardBufferDuration=Double(effectivePolicy.forwardBufferSeconds)
+            item.preferredPeakBitRate=Double(effectivePolicy.qualityMbps)*1_000_000
+        }
+        if surfing && !surfPaused && !intentionallyPaused && validated {
+            nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
+        }
+        sampleSystemTelemetry(force:true)
+        recalculateInsights()
+    }
+    private func suspendCampaignForPatch() throws {
+        if campaign?.state=="running" {
+            try setCampaignState("queued")
+        }
+    }
+    private func bootRuntime() async {
+        guard !patchBusy else{return}
+        patchBusy=true;policyReady=false
+        defer{patchBusy=false;policyReady=true;resumeCampaignIfNeeded();requestSync()}
+        do {
+            try suspendCampaignForPatch()
+            let p=try await engineering.boot(settings:settings)
+            applyRuntime(engineering.activeID=="native-baseline" ? nil:p)
+            log(patchFault==nil ? "INFO":"WARN","runtime","MODULE_LOADED",["module":activePatchID,"fault":patchFault ?? ""])
+        }catch{
+            policyOverride=nil;activePatchID="native-baseline"
+            patchFault=sanitized(error.localizedDescription)
+            log("ERROR","runtime","BOOT_FALLBACK",["error":patchFault ?? ""])
+        }
+    }
+    private func installRuntime(id:String,source:String) async throws {
+        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        patchBusy=true
+        defer{patchBusy=false;resumeCampaignIfNeeded();requestSync()}
+        try suspendCampaignForPatch()
+        do {
+            let p=try await engineering.install(id:id,source:source,settings:settings)
+            applyRuntime(p)
+            log("INFO","runtime","MODULE_ACTIVATED",["module":id])
+        }catch{
+            patchFault=sanitized(error.localizedDescription)
+            log("ERROR","runtime","MODULE_REJECTED",["module":id,"error":patchFault ?? ""])
+            throw error
+        }
+    }
+    private func changeRuntime(reset:Bool) async throws {
+        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        patchBusy=true
+        defer{patchBusy=false;resumeCampaignIfNeeded();requestSync()}
+        try suspendCampaignForPatch()
+        let p:RuntimePolicy
+        if reset {p=try engineering.reset(settings:settings)}
+        else {p=try await engineering.rollback(settings:settings)}
+        applyRuntime(engineering.activeID=="native-baseline" ? nil:p)
+        log("INFO","runtime","MODULE_ROLLBACK",["module":activePatchID])
+    }
+
+    private func saveCampaign(_ value:DeviceTestCheckpoint) throws {
+        guard disk.save(value,"device-campaign.json") else{throw AppError.message("Cannot persist test checkpoint")}
+        campaign=value
+    }
+    func startCampaign(_ plan:DeviceTestPlan)throws{
+        let plan=try plan.checked()
+        guard policyReady,!patchBusy else{throw AppError.message("Runtime not ready")}
+        guard campaignTask==nil,!(campaign.map{["queued","running","paused"].contains($0.state)} ?? false) else{throw AppError.message("Stop or finish the existing campaign first")}
+        try saveCampaign(DeviceTestCheckpoint(plan:plan))
+        stop()
+        log("INFO","engineering","CAMPAIGN_CREATED",["plan":plan.id,"steps":String(plan.steps.count),"repeatForever":String(plan.repeatForever)])
+        resumeCampaignIfNeeded()
+        requestSync()
+    }
+    func setCampaignState(_ state:String)throws{
+        guard var cp=campaign else{throw AppError.message("No device test campaign")}
+        guard ["queued","paused","stopped"].contains(state) else{throw AppError.message("Invalid campaign state")}
+        if state=="queued" {
+            guard cp.state != "completed",cp.state != "stopped" else{throw AppError.message("Create a new plan for a completed or stopped campaign")}
+        }
+        cp.state=state;cp.updatedAt=Date()
+        try saveCampaign(cp)
+        campaignEpoch=UUID();campaignTask?.cancel()
+        stop()
+        log("INFO","engineering","CAMPAIGN_STATE",["plan":cp.plan.id,"state":state])
+        requestSync()
+    }
+    private func resumeCampaignIfNeeded(){
+        guard policyReady,!patchBusy,campaignTask==nil,let cp=campaign,cp.canResume else{return}
+        // Re-enter the current checkpoint after a process restart. Never infer that
+        // an interrupted step succeeded.
+        campaignEpoch=UUID();let epoch=campaignEpoch
+        campaignTask=Task{[weak self] in
+            guard let self=self else{return}
+            await self.runCampaign(epoch:epoch)
+            self.campaignTask=nil
+        }
+    }
+    private func campaignCurrent(_ epoch:UUID)->Bool {
+        !Task.isCancelled && campaignEpoch==epoch && campaign?.canResume==true
+    }
+    private func runCampaign(epoch:UUID) async {
+        while campaignCurrent(epoch),var cp=campaign {
+            do{
+                if cp.state != "running" {
+                    cp.state="running";cp.updatedAt=Date();try saveCampaign(cp)
+                }
+                let file="qa-result-"+cp.resultID+".json"
+                if let existing=disk.load(DeviceTestResult.self,file) {
+                    cp.advance(existing);try saveCampaign(cp)
+                    requestSync()
+                }else{
+                    let step=cp.plan.steps[cp.stepIndex]
+                    // A test plan starts only when commanded. Offline steps report
+                    // blocked instead of pretending that the hardware passed.
+                    let started=Date()
+                    let module=activePatchID
+                    log("INFO","engineering","STEP_STARTED",["plan":cp.plan.id,"cycle":String(cp.cycle),"step":String(cp.stepIndex),"kind":step.kind,"module":module])
+                    let observation=await runDeviceStep(step,epoch:epoch)
+                    guard campaignCurrent(epoch),let actual=campaign,actual.runID==cp.runID,
+                          actual.stepIndex==cp.stepIndex,actual.cycle==cp.cycle else{return}
+                    let result=DeviceTestResult(id:cp.resultID,planID:cp.plan.id,cycle:cp.cycle,stepIndex:cp.stepIndex,kind:step.kind,
+                        channelID:observation.channelID ?? step.channelID,startedAt:started,status:observation.status,
+                        evidence:observation.evidence.mapValues{sanitized($0)},launchID:launchID,patchID:module)
+                    guard disk.save(result,file) else{throw AppError.message("Cannot persist device test result")}
+                    cp.advance(result);try saveCampaign(cp)
+                    log(result.status=="failed" ? "ERROR":"INFO","engineering","STEP_RESULT",["plan":cp.plan.id,"kind":step.kind,"status":result.status,"resultID":result.id])
+                    recalculateInsights();requestSync()
+                }
+                if cp.state=="completed" {
+                    stop();log("INFO","engineering","CAMPAIGN_COMPLETED",["plan":cp.plan.id,"cycles":String(cp.cycle)])
+                    requestSync();return
+                }
+                // Avoid a tight retry loop for an offline device or a zero-work plan.
+                try await Task.sleep(nanoseconds:2_000_000_000)
+            }catch{
+                if !campaignCurrent(epoch){return}
+                var failed=cp;failed.state="paused";failed.updatedAt=Date()
+                try? saveCampaign(failed)
+                stop()
+                log("ERROR","engineering","CAMPAIGN_PERSISTENCE_FAILED",["error":error.localizedDescription])
+                return
+            }
+        }
+    }
+    private struct Observation {
+        var status:String
+        var evidence:[String:String]
+        var channelID:String? = nil
+    }
+    private func nap(_ seconds:Double) async {
+        try? await Task.sleep(nanoseconds:UInt64(max(0,min(seconds,3600))*1_000_000_000))
+    }
+    private func awaitPlayback(epoch:UUID,id:String,seconds:Int) async -> Bool{
+        let deadline=ProcessInfo.processInfo.systemUptime+Double(seconds)
+        while campaignCurrent(epoch),ProcessInfo.processInfo.systemUptime<deadline {
+            if current?.id==id && validated && player.timeControlStatus == .playing {return true}
+            if current?.id==id && lastPlayerError != nil && player.currentItem==nil{return false}
+            await nap(0.5)
+        }
+        return false
+    }
+    private func runDeviceStep(_ step:DeviceTestStep,epoch:UUID) async -> Observation {
+        let seconds=step.seconds ?? 30
+        let start=ProcessInfo.processInfo.systemUptime
+        switch step.kind {
+        case "system":
+            sampleSystemTelemetry(force:true)
+            var evidence=systemMetrics
+            evidence["telemetryActive"]=String(telemetryActive)
+            return Observation(status:telemetryActive && telemetryLastSample != nil ? "passed":"failed",evidence:evidence)
+        case "catalogue":
+            guard jelly.connected else{return Observation(status:"blocked",evidence:["reason":"Jellyfin is not connected"])}
+            do{
+                // Query actual server instead of treating cached channels as live evidence.
+                let fresh=try await jelly.channels()
+                return Observation(status:fresh.isEmpty ? "failed":"passed",evidence:["channelCount":String(fresh.count),"requestMs":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
+            }catch{return Observation(status:"failed",evidence:["reason":error.localizedDescription])}
+        case "stop":
+            stop()
+            let close=cleanupTask
+            await close?.value
+            return Observation(status:player.currentItem==nil && player.rate==0 && current==nil ? "passed":"failed",evidence:["playerItemReleased":String(player.currentItem==nil),"rate":String(player.rate),"sessionCleared":String(session==nil)])
+        default:break
+        }
+        guard jelly.connected,catalogueReady else{return Observation(status:"blocked",evidence:["reason":"Live Jellyfin connection required"])}
+        if step.kind=="surf_rotation" {
+            guard eligibleChannels.count>=2 else{return Observation(status:"blocked",evidence:["reason":"At least two eligible real channels required"])}
+            startSurf(category:"All Channels")
+            let deadline=ProcessInfo.processInfo.systemUptime+Double(seconds)
+            var validatedIDs=Set<String>()
+            while campaignCurrent(epoch),ProcessInfo.processInfo.systemUptime<deadline {
+                if surfing,validated,player.timeControlStatus == .playing,let id=current?.id{validatedIDs.insert(id)}
+                if validatedIDs.count>=2 {
+                    return Observation(status:"passed",evidence:["validatedChannelIDs":validatedIDs.sorted().joined(separator:","),"elapsedSeconds":String(format:"%.2f",ProcessInfo.processInfo.systemUptime-start)])
+                }
+                await nap(0.5)
+            }
+            return Observation(status:"failed",evidence:["reason":"Two distinct validated rotations were not observed within the test window","validatedCount":String(validatedIDs.count)])
+        }
+        let channel:Channel?
+        if let id=step.channelID{channel=eligibleChannels.first(where:{$0.id==id})}
+        else {channel=eligibleChannels.first(where:{$0.id==current?.id}) ?? eligibleChannels.first}
+        guard let channel=channel else{return Observation(status:"blocked",evidence:["reason":"Requested channel is not eligible"],channelID:step.channelID)}
+        open(channel)
+        let startupBudget=max(15,min(720,effectivePolicy.retries*(effectivePolicy.startupTimeout+45)))
+        guard await awaitPlayback(epoch:epoch,id:channel.id,seconds:startupBudget) else {
+            return Observation(status:"failed",evidence:["reason":lastPlayerError ?? "No confirmed playback before deadline","startupBudgetSeconds":String(startupBudget)],channelID:channel.id)
+        }
+        let startupMs=Int((ProcessInfo.processInfo.systemUptime-start)*1000)
+        let streamGeneration=generation
+        var evidence:[String:String]=["startupMs":String(startupMs),"channel":channel.name,"displayReady":String(ready)]
+        if step.kind=="pause_resume" {
+            pause();await nap(0.75)
+            let p=position
+            await nap(Double(max(2,min(seconds,10))))
+            let delta=abs(position-p)
+            evidence["pausedClockDelta"]=String(format:"%.3f",delta)
+            guard campaignCurrent(epoch),generation==streamGeneration else{return Observation(status:"blocked",evidence:["reason":"Playback changed during pause test"],channelID:channel.id)}
+            resume()
+            if delta>0.5{return Observation(status:"failed",evidence:evidence.merging(["reason":"Playback clock advanced while paused"]){_,b in b},channelID:channel.id)}
+        }
+        let before=position
+        let observationStart=ProcessInfo.processInfo.systemUptime
+        let backgroundBaseline=backgroundTransitions
+        let deadline=observationStart+Double(step.kind=="pause_resume" ? 8:max(4,seconds))
+        var frames=VideoEvidence()
+        var maxGap=0.0
+        var lastFrame=observationStart
+        var backgroundSamples=0
+        var backgroundProgress=0.0
+        var prior=before
+        var priorWasBackground=false
+        var maxTickGap=0.0
+        var lastTick=observationStart
+        while campaignCurrent(epoch),ProcessInfo.processInfo.systemUptime<deadline {
+            guard generation==streamGeneration,current?.id==channel.id,let item=player.currentItem else {
+                return Observation(status:"failed",evidence:evidence.merging(["reason":"Playback generation changed during observation"]){_,b in b},channelID:channel.id)
+            }
+            let now=ProcessInfo.processInfo.systemUptime
+            maxTickGap=max(maxTickGap,now-lastTick);lastTick=now
+            if item.status == .failed {
+                return Observation(status:"failed",evidence:evidence.merging(["reason":"AVPlayer item failed during observation"]){_,b in b},channelID:channel.id)
+            }
+            let background=UIApplication.shared.applicationState == .background
+            if background {
+                backgroundSamples+=1
+                if priorWasBackground{backgroundProgress+=max(0,position-prior)}
+            }
+            prior=position;priorWasBackground=background
+            if let output=videoOutput,output.hasNewPixelBuffer(forItemTime:player.currentTime()){
+                var display=CMTime.invalid
+                if output.copyPixelBuffer(forItemTime:player.currentTime(),itemTimeForDisplay:&display) != nil {
+                    let oldCount=frames.frameCount
+                    frames.observe(frameTime:display.seconds,monotonic:now)
+                    if frames.frameCount>oldCount{maxGap=max(maxGap,now-lastFrame);lastFrame=now}
+                }
+            }
+            await nap(0.5)
+        }
+        let finish=ProcessInfo.processInfo.systemUptime
+        let progress=position-before
+        evidence["observedSeconds"]=String(format:"%.2f",finish-observationStart)
+        evidence["clockProgress"]=String(format:"%.2f",progress)
+        evidence["decodedSamples"]=String(frames.frameCount)
+        evidence["maximumFrameSampleGap"]=String(format:"%.2f",max(maxGap,finish-lastFrame))
+        evidence["maximumExecutionGap"]=String(format:"%.2f",maxTickGap)
+        if let access=player.currentItem?.accessLog()?.events.last {
+            evidence["droppedFrames"]=String(access.numberOfDroppedVideoFrames)
+            evidence["stalls"]=String(access.numberOfStalls)
+            evidence["observedBitrate"]=String(format:"%.0f",access.observedBitrate)
+        }
+        if step.kind=="background" {
+            evidence["backgroundTransitions"]=String(backgroundTransitions-backgroundBaseline)
+            evidence["backgroundSamples"]=String(backgroundSamples)
+            evidence["backgroundClockProgress"]=String(format:"%.2f",backgroundProgress)
+            guard backgroundSamples>=2 else{
+                evidence["reason"]="No actual background execution observed; test needs a real Home/lock transition"
+                return Observation(status:"blocked",evidence:evidence,channelID:channel.id)
+            }
+            let ok=backgroundProgress>=3 && maxTickGap<=5
+            if !ok{evidence["reason"]="Background clock progression or execution cadence did not meet threshold"}
+            return Observation(status:ok ? "passed":"failed",evidence:evidence,channelID:channel.id)
+        }
+        let duration=max(0,finish-observationStart)
+        let enough=progress>=max(3,duration*0.70) && frames.qualifies(progress:progress,monotonic:finish)
+        let continuous=step.kind != "endurance" || max(maxGap,finish-lastFrame)<=5
+        let ok=enough && continuous
+        if !ok{evidence["reason"]="Insufficient continuous video evidence or media clock progression"}
+        return Observation(status:ok ? "passed":"failed",evidence:evidence,channelID:channel.id)
+    }
+    private func uploadEngineeringResults() async throws {
+        // Keep completed step evidence until the corresponding checkpoint is durable.
+        for url in disk.files(prefix:"qa-result-").prefix(12) {
+            if let cp=campaign,cp.canResume,url.lastPathComponent=="qa-result-"+cp.resultID+".json"{continue}
+            let data=try Data(contentsOf:url)
+            let result=try JSONCodec.decoder().decode(DeviceTestResult.self,from:data)
+            try await db.immutable("engineering/"+deviceID+"/results/"+result.id+".json",data:data)
+            disk.remove(url)
+        }
+        if let cp=campaign {
+            let path="engineering/"+deviceID+"/checkpoint.json"
+            let data=try JSONCodec.encoder().encode(cp)
+            let existing=try await db.read(path)
+            if existing?.data != data {try await db.put(path,data:data,sha:existing?.sha)}
+        }
     }
 }
