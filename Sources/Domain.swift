@@ -216,3 +216,15 @@ struct VideoEvidence {
         return progress.isFinite && progress>=3 && frameCount>=3 && monotonic-seen<=2
     }
 }
+
+struct TelemetryCadence {
+    let interval: TimeInterval
+    private(set) var lastSample: TimeInterval?
+    init(interval: TimeInterval = 15) { self.interval = max(1, interval) }
+    mutating func shouldSample(at monotonic: TimeInterval, force: Bool = false) -> Bool {
+        guard monotonic.isFinite, monotonic >= 0 else { return false }
+        if !force, let previous = lastSample, monotonic >= previous, monotonic - previous < interval { return false }
+        lastSample = monotonic
+        return true
+    }
+}

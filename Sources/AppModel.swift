@@ -3,6 +3,7 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import MediaPlayer
+import Network
 
 @MainActor final class AppModel: ObservableObject {
     @Published var settings:Settings
@@ -23,6 +24,15 @@ import MediaPlayer
     @Published var remaining=0
     @Published var ready=false
     @Published var metrics:[String:String]=[:]
+    @Published private(set) var systemMetrics:[String:String]=[:]
+    @Published private(set) var telemetryActive=false
+    @Published private(set) var telemetryLastSample:Date?
+    private var telemetryCadence=TelemetryCadence()
+    private let launchID=UUID().uuidString
+    private let launchUptime=ProcessInfo.processInfo.systemUptime
+    private let pathMonitor=NWPathMonitor()
+    private var networkState="unknown"
+    private var networkInterfaces="unknown"
     @Published var tab=0
     @Published var scriptOutput=""
     @Published var commandOutput=""
@@ -101,10 +111,15 @@ import MediaPlayer
     }
     func start() {
         guard !started else {return}; started=true
-        log("INFO","app","START",["version":Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown","os":UIDevice.current.systemVersion])
+        telemetryActive=true
+        log("INFO","app","START",["version":Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown","os":UIDevice.current.systemVersion,"launchID":launchID])
+        sampleSystemTelemetry(force:true)
+        startNetworkTelemetry()
         configureAudio()
         observeLifecycle()
         configureLAN()
+        publishHeartbeat(now:Date())
+        requestSync()
         if settings.autoLogin && !settings.server.isEmpty { Task { await connect() } }
         supervisor=Task { [weak self] in
             while !Task.isCancelled {
@@ -142,7 +157,11 @@ import MediaPlayer
                 Task { @MainActor in
                     guard let self=self else {return}
                     self.log("INFO","lifecycle",name.rawValue)
-                    if name==UIApplication.willEnterForegroundNotification {self.requestSync()}
+                    if name==UIApplication.willEnterForegroundNotification || name==UIApplication.didEnterBackgroundNotification {
+                        self.sampleSystemTelemetry(force:true)
+                        self.publishHeartbeat(now:Date())
+                        self.requestSync()
+                    }
                 }
             }
             deviceObservers.append(o)
@@ -283,6 +302,7 @@ import MediaPlayer
         retryCurrentAfterResume=false;pausedRotationSeconds=nil;lastPlayerError=nil
         let old=session;let oldPosition=position
         session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil
+        metrics=[:]
         if let old=old{queueClose(old,position:oldPosition)}
         let cleanup=cleanupTask
         if let c=current,c.id != channel.id{previous.removeAll{$0.id==c.id};previous.insert(c,at:0);if previous.count>30{previous.removeLast()}}
@@ -422,6 +442,7 @@ import MediaPlayer
     private func clearPlayback(){
         work?.cancel();generation=UUID();let old=session;let p=position
         session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil;current=nil;validated=false;playing=false;ready=false
+        metrics=[:]
         nextRotation=nil;remaining=0;retryCurrentAfterResume=false;lastAdvance=nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo=nil
         if let old=old{queueClose(old,position:p)}
@@ -440,8 +461,77 @@ import MediaPlayer
         guard health[channel.id]?.banned==true else{return}
         appendHealth(channel,"approve","Explicit administrator approval")
     }
+    private func startNetworkTelemetry(){
+        pathMonitor.pathUpdateHandler={ [weak self] path in
+            let status=String(describing:path.status)
+            let interfaces:[(NWInterface.InterfaceType,String)]=[(.wifi,"wifi"),(.wiredEthernet,"ethernet"),(.cellular,"cellular"),(.loopback,"loopback"),(.other,"other")]
+            let active=interfaces.filter{path.usesInterfaceType($0.0)}.map{$0.1}.joined(separator:",")
+            let expensive=String(path.isExpensive)
+            let constrained=String(path.isConstrained)
+            Task{@MainActor in
+                guard let self=self else{return}
+                self.networkState=status
+                self.networkInterfaces=active.isEmpty ? "none":active
+                self.log("INFO","network","PATH_CHANGED",["status":status,"interfaces":self.networkInterfaces,"expensive":expensive,"constrained":constrained,"launchID":self.launchID])
+                self.sampleSystemTelemetry(force:true)
+            }
+        }
+        pathMonitor.start(queue:DispatchQueue(label:"jealousfin.network.telemetry"))
+    }
+    private func sampleSystemTelemetry(force:Bool=false){
+        let process=ProcessInfo.processInfo
+        let now=process.systemUptime
+        guard telemetryActive,telemetryCadence.shouldSample(at:now,force:force) else{return}
+        let device=UIDevice.current
+        let appState:String
+        switch UIApplication.shared.applicationState {
+        case .active:appState="active"
+        case .inactive:appState="inactive"
+        case .background:appState="background"
+        @unknown default:appState="unknown"
+        }
+        var fields:[String:String]=[
+            "launchID":launchID,
+            "appUptimeSeconds":String(format:"%.2f",max(0,now-launchUptime)),
+            "systemUptimeSeconds":String(format:"%.2f",now),
+            "appVersion":Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
+            "buildNumber":Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",
+            "osVersion":device.systemVersion,
+            "deviceModel":device.model,
+            "appState":appState,
+            "thermalState":String(describing:process.thermalState),
+            "lowPowerMode":String(process.isLowPowerModeEnabled),
+            "physicalMemoryBytes":String(process.physicalMemory),
+            "activeProcessorCount":String(process.activeProcessorCount),
+            "batteryState":String(describing:device.batteryState),
+            "networkState":networkState,
+            "networkInterfaces":networkInterfaces,
+            "jellyfinConnected":String(jelly.connected),
+            "catalogueReady":String(catalogueReady),
+            "playbackState":String(describing:player.timeControlStatus),
+            "surfing":String(surfing),
+            "syncStatus":sanitized(syncStatus),
+            "lanStatus":lanStatus,
+            "queuedEvents":String(disk.files(prefix:"event-").count),
+            "queuedBatches":String(disk.files(prefix:"batch-").count)
+        ]
+        if device.batteryLevel>=0 {fields["batteryPercent"]=String(format:"%.0f",device.batteryLevel*100)}
+        if let attributes=try? FileManager.default.attributesOfFileSystem(forPath:disk.root.path),
+           let free=attributes[.systemFreeSize] as? NSNumber {
+            fields["storageFreeBytes"]=free.stringValue
+        }
+        systemMetrics=fields
+        telemetryLastSample=Date()
+        log("INFO","telemetry","SYSTEM_SAMPLE",fields)
+    }
+    private func publishHeartbeat(now:Date){
+        lastHeartbeat=now
+        log("INFO","app","HEARTBEAT",["launchID":launchID,"status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
+        recalculateInsights()
+    }
     private func tick() async {
         let now=Date()
+        sampleSystemTelemetry()
         let elapsed=now.timeIntervalSince(lastTick);lastTick=now
         if elapsed>5 {log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])}
         if let deadline=nextRotation,surfing,!surfPaused,!intentionallyPaused {
@@ -479,11 +569,8 @@ import MediaPlayer
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
         if (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>60 {Task{await connect()}}
+        if now.timeIntervalSince(lastHeartbeat)>30 {publishHeartbeat(now:now)}
         if now.timeIntervalSince(lastSync)>30 {requestSync()}
-        if now.timeIntervalSince(lastHeartbeat)>30 {
-            lastHeartbeat=now;log("INFO","app","HEARTBEAT",["status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
-            recalculateInsights()
-        }
     }
     func requestSync(){
         guard syncTask==nil else{return}
@@ -495,8 +582,30 @@ import MediaPlayer
             self.syncTask=nil
         }
     }
+    private func uploadTelemetry() async throws {
+        // Persist immutable batches before deleting their source records.
+        for url in disk.files(prefix:"batch-").prefix(5) {
+            let b=try Data(contentsOf:url)
+            try await db.immutable("telemetry/\(deviceID)/"+url.lastPathComponent,data:b)
+            disk.remove(url)
+        }
+        let urls=Array(disk.files(prefix:"event-").prefix(200))
+        if !urls.isEmpty {
+            let records=try urls.map{try JSONCodec.decoder().decode(Event.self,from:Data(contentsOf:$0))}
+            let name="batch-\(UUID().uuidString).json"
+            guard disk.save(records,name) else{throw AppError.message("Local batch write failed")}
+            for url in urls{disk.remove(url)}
+            let data=try Data(contentsOf:disk.root.appendingPathComponent(name))
+            try await db.immutable("telemetry/\(deviceID)/"+name,data:data)
+            disk.remove(disk.root.appendingPathComponent(name))
+        }
+    }
     private func synchronize() async {
         lastSync=Date();syncStatus="Synchronizing"
+        // Telemetry must not depend on health-ledger merge or command success.
+        var telemetryError:String?
+        do {try await uploadTelemetry()}
+        catch {telemetryError=sanitized(error.localizedDescription);log("WARN","torriodb","TELEMETRY_UPLOAD_FAILED",["error":error.localizedDescription])}
         do {
             let merged=try await db.merge(ledger)
             ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
@@ -526,27 +635,12 @@ import MediaPlayer
                     log("WARN","commands","REMOTE_COMMAND_SYNC_FAILED",["file":file,"error":error.localizedDescription])
                 }
             }
-            // Persist immutable batches before deleting their source records.
-            for url in disk.files(prefix:"batch-").prefix(5) {
-                let b=try Data(contentsOf:url)
-                try await db.immutable("telemetry/\(deviceID)/"+url.lastPathComponent,data:b)
-                disk.remove(url)
-            }
-            let urls=Array(disk.files(prefix:"event-").prefix(200))
-            if !urls.isEmpty {
-                let records=try urls.map{try JSONCodec.decoder().decode(Event.self,from:Data(contentsOf:$0))}
-                let name="batch-\(UUID().uuidString).json"
-                guard disk.save(records,name) else{throw AppError.message("Local batch write failed")}
-                for url in urls{disk.remove(url)}
-                let data=try Data(contentsOf:disk.root.appendingPathComponent(name))
-                try await db.immutable("telemetry/\(deviceID)/"+name,data:data)
-                disk.remove(disk.root.appendingPathComponent(name))
-            }
             let insightBytes=try JSONCodec.encoder().encode(insights)
             let insightPath="insights/\(deviceID).json"
             let existing=try await db.read(insightPath)
             if existing?.data != insightBytes {try await db.put(insightPath,data:insightBytes,sha:existing?.sha)}
-            syncStatus="Synced \(Date().formatted(date:.omitted,time:.shortened))"
+            if let error=telemetryError {syncStatus="Sync pending: telemetry "+error}
+            else {syncStatus="Synced \(Date().formatted(date:.omitted,time:.shortened))"}
         } catch {
             syncStatus="Sync pending: \(sanitized(error.localizedDescription))"
             log("WARN","torriodb","SYNC_FAILED",["error":error.localizedDescription])
@@ -567,7 +661,7 @@ import MediaPlayer
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
     static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
@@ -639,7 +733,8 @@ import MediaPlayer
         case "approve_reinstatement":
             guard args["approval"]=="explicit",let id=args["id"],let c=channels.first(where:{$0.id==id}),health[id]?.banned==true else{throw AppError.message("Explicit approval and banned channel ID required")};approve(c)
         case "get_logs":return try json(Array(events.suffix(50)))
-        case "get_telemetry":return try json(metrics)
+        case "get_telemetry":
+            return String(decoding:try JSONSerialization.data(withJSONObject:["active":telemetryActive,"launchID":launchID,"lastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","system":systemMetrics,"playback":metrics],options:[.sortedKeys]),as:UTF8.self)
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
         case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}

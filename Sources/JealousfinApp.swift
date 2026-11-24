@@ -289,8 +289,15 @@ struct TelemetryView:View{
     @EnvironmentObject var model:AppModel
     var body:some View{
         Screen{
+            Panel{VStack(alignment:.leading,spacing:8){
+                Label(model.telemetryActive ? "Collecting automatically":"Starting collector",systemImage:"waveform.path.ecg").foregroundColor(model.telemetryActive ? .green:subdued)
+                Text(model.syncStatus).font(.caption).foregroundColor(subdued)
+                if let last=model.telemetryLastSample{Text("Last system sample: "+last.formatted()).font(.caption).foregroundColor(subdued)}
+            }}
+            SectionLabel(title:"System and application")
+            ForEach(model.systemMetrics.keys.sorted(),id:\.self){key in Panel{HStack{Text(key).font(.caption);Spacer();Text(model.systemMetrics[key] ?? "").font(.caption).foregroundColor(accent)}}}
             Text("Playback measurements").font(.title2.bold())
-            if model.metrics.isEmpty{Panel{Text("No active playback sample").foregroundColor(subdued)}}
+            if model.metrics.isEmpty{Panel{Text("No active playback sample; system telemetry remains active.").foregroundColor(subdued)}}
             ForEach(model.metrics.keys.sorted(),id:\.self){key in Panel{HStack{Text(key).font(.caption);Spacer();Text(model.metrics[key] ?? "").monospacedDigit().foregroundColor(accent)}}}
             Text("AVPlayer-reported measurements; actual physical A/V synchronization is not measured by these values.").font(.caption).foregroundColor(subdued)
         }.navigationTitle("Telemetry").navigationBarTitleDisplayMode(.inline)

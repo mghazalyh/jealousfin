@@ -38,3 +38,7 @@ The post-initial-release audit adds serialized playback session teardown, pause-
 Selecting a Jellyfin virtual Surf row normally starts client-managed rotation; the antenna button requests the original opaque server Surf stream. Category membership is derived from server-provided genres/tags, not guessed. An empty category is surfaced in Insights and retried. The command protocol distinguishes a request to open a channel from confirmed playback.
 
 The server filtering adapter remains an offline integration component, not an installed or active server-wide enforcement service.
+
+## Automatic telemetry
+
+System telemetry begins immediately on launch, before Jellyfin login, and repeats every 15 seconds while executing. Startup, network changes, foreground/background lifecycle transitions and heartbeats produce durable structured events. System samples include launch ID, build, uptime, device/OS, thermal and battery state, physical memory capacity, available storage, network path, connection and queue status. Playback samples remain separate and are cleared when changing or stopping streams. TorrioDB upload is attempted immediately when configured, independent of successful health merging or remote command execution; pending records remain local on failure. The Telemetry page and get_telemetry expose system and playback measurements separately. No telemetry enable switch or manual start is required.
