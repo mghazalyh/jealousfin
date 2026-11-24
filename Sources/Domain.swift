@@ -186,6 +186,23 @@ enum GitHubRepositoryAddress {
         return "https://api.github.com/repos"+path+"/"
     }
 }
+// Private deployment defaults are optional bundle configuration, not credentials
+// committed to the public source repository or public release artifacts.
+struct JellyfinConnectionDefaults {
+    var server:String
+    var username:String
+    var password:String
+    static func bundled(_ bundle:Bundle = .main)->JellyfinConnectionDefaults? {
+        guard let url=bundle.url(forResource:"JealousfinDefaults",withExtension:"plist"),
+              let data=try? Data(contentsOf:url),
+              let values=(try? PropertyListSerialization.propertyList(from:data,options:[],format:nil)) as? [String:String],
+              let server=values["server"],let username=values["username"],let password=values["password"],
+              let parsed=URLComponents(string:server),["http","https"].contains(parsed.scheme ?? ""),
+              parsed.host != nil,parsed.user==nil,parsed.password==nil,parsed.query==nil,parsed.fragment==nil
+        else{return nil}
+        return JellyfinConnectionDefaults(server:server,username:username,password:password)
+    }
+}
 struct Settings: Codable {
     var server = ""
     var username = ""
@@ -214,6 +231,17 @@ struct Settings: Codable {
     var autoLogin = true
     var resumeSurf = false
     var surfCategory = "All Channels"
+    // Fill missing fields only; never overwrite an already configured server or
+    // mix credentials from a different server into a saved account.
+    mutating func applyConnectionDefaults(_ defaults:JellyfinConnectionDefaults?) {
+        guard let defaults=defaults else{return}
+        if server.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+            server=defaults.server
+        }
+        guard server.trimmingCharacters(in:.whitespacesAndNewlines).trimmingCharacters(in:CharacterSet(charactersIn:"/")) == defaults.server.trimmingCharacters(in:CharacterSet(charactersIn:"/")) else{return}
+        if username.isEmpty{username=defaults.username}
+        if username==defaults.username && password.isEmpty{password=defaults.password}
+    }
 }
 enum JSONCodec {
     static func encoder() -> JSONEncoder {

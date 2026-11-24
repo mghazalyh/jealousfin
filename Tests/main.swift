@@ -323,3 +323,21 @@ check(lanAccepted(lanRequest(LANHTTP.maxBody,body:Data(repeating:65,count:LANHTT
 if case .incomplete=LANHTTP.parse(lanRequest(200000,body:Data(repeating:65,count:65536))){check(true,"LAN waits for fragmented body")}else{check(false,"LAN waits for fragmented body")}
 if case .invalid(let status)=LANHTTP.parse(lanRequest(LANHTTP.maxBody+1)){check(status.hasPrefix("413"),"LAN returns 413 for oversized request")}else{check(false,"LAN returns 413 for oversized request")}
 print("PASS: \(checks) total assertions including LAN control selection and request limits")
+
+let privateDefaultsFixture=JellyfinConnectionDefaults(server:"http://fixture.invalid:8096",username:"fixture-user",password:"fixture-password")
+var freshConnection=Settings()
+freshConnection.applyConnectionDefaults(privateDefaultsFixture)
+check(freshConnection.server==privateDefaultsFixture.server && freshConnection.username==privateDefaultsFixture.username && freshConnection.password==privateDefaultsFixture.password,"private deployment connection defaults prefill fresh settings")
+freshConnection.password="saved-password"
+freshConnection.applyConnectionDefaults(privateDefaultsFixture)
+check(freshConnection.password=="saved-password","saved credentials are not overwritten")
+var otherConnection=Settings()
+otherConnection.server="https://other.invalid"
+otherConnection.applyConnectionDefaults(privateDefaultsFixture)
+check(otherConnection.username.isEmpty && otherConnection.password.isEmpty,"defaults never cross into a different saved server")
+var alternateAccount=Settings()
+alternateAccount.server=privateDefaultsFixture.server
+alternateAccount.username="another-account"
+alternateAccount.applyConnectionDefaults(privateDefaultsFixture)
+check(alternateAccount.password.isEmpty,"defaults never cross into another account")
+print("PASS: \(checks) total assertions including private deployment connection defaults")

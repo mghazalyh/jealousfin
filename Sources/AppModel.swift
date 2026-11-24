@@ -123,6 +123,11 @@ import Network
 
     init() {
         var storedSettings=disk.load(Settings.self,"settings.json") ?? Settings()
+        let originalConnection=[storedSettings.server,storedSettings.username,storedSettings.password]
+        storedSettings.applyConnectionDefaults(JellyfinConnectionDefaults.bundled())
+        if originalConnection != [storedSettings.server,storedSettings.username,storedSettings.password] {
+            disk.save(storedSettings,"settings.json")
+        }
         if storedSettings.githubRepositoryURL==nil {
             storedSettings.repositoryAddress=GitHubRepositoryAddress.defaultURL
             disk.save(storedSettings,"settings.json")
