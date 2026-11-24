@@ -38,12 +38,82 @@ final class JellyfinFixture:URLProtocol {
     override func stopLoading(){}
 }
 
+// Deterministic concurrent-commit fixture: no production repository writes.
+final class TorrioConflictFixture:URLProtocol {
+    private static let lock=NSLock()
+    private static var counts:[String:Int]=[:]
+    static func reset(){lock.lock();defer{lock.unlock()};counts=[:]}
+    static func count(_ key:String)->Int{lock.lock();defer{lock.unlock()};return counts[key,default:0]}
+    override class func canInit(with request:URLRequest)->Bool{true}
+    override class func canonicalRequest(for request:URLRequest)->URLRequest{request}
+    override func startLoading(){
+        guard let url=request.url else{return}
+        let path=url.lastPathComponent
+        let method=request.httpMethod ?? "GET"
+        let key=method+" "+path
+        Self.lock.lock();Self.counts[key,default:0]+=1;let n=Self.counts[key]!;Self.lock.unlock()
+        var status=200
+        var object:[String:Any]=[:]
+        func blob(_ sha:String,_ data:Data){object=["sha":sha,"content":data.base64EncodedString()]}
+        if method=="GET" {
+            switch path {
+            case "snapshot.json":blob(n==1 ? "old" : "new",Data("old snapshot".utf8))
+            case "cas.json":blob(n==1 ? "old" : "changed",Data("concurrent value".utf8))
+            case "immutable.json":
+                if n==1{status=404}else{blob("existing",Data("receipt".utf8))}
+            case "collision.json":
+                if n==1{status=404}else{blob("existing",Data("different receipt".utf8))}
+            case "channel-health-v1.json":
+                let event=HealthEvent(id:n==1 ? "remote-one":"remote-two",channelID:"a",channelName:"A",action:"success",reason:"fixture")
+                var ledger=HealthLedger()
+                ledger.events=[event]
+                if n>1{ledger.events.append(HealthEvent(id:"remote-one",channelID:"a",channelName:"A",action:"success",reason:"fixture"))}
+                blob(n==1 ? "old":"new",(try? JSONCodec.encoder().encode(ledger)) ?? Data())
+            default:status=404
+            }
+        }else if method=="PUT" {
+            if path=="auth.json"{status=401}
+            else if path=="exhausted.json"{status=409}
+            else{status=n==1 ? 409:200}
+        }else{status=405}
+        let data=(try? JSONSerialization.data(withJSONObject:object)) ?? Data()
+        let response=HTTPURLResponse(url:url,statusCode:status,httpVersion:"HTTP/1.1",headerFields:["Content-Type":"application/json"])!
+        client?.urlProtocol(self,didReceive:response,cacheStoragePolicy:.notAllowed)
+        client?.urlProtocol(self,didLoad:data);client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading(){}
+}
+
 @MainActor enum HotPatchIntegration{
     static func require(_ value:Bool,_ message:String)throws{
         guard value else{throw AppError.message("Integration failed: "+message)}
         print("PASS: hot patch "+message)
     }
     static func run(engine:ScriptEngine) async throws{
+        TorrioConflictFixture.reset()
+        let dbConfig=URLSessionConfiguration.ephemeral;dbConfig.protocolClasses=[TorrioConflictFixture.self]
+        let conflictDB=TorrioDB(transport:URLSession(configuration:dbConfig));conflictDB.token="fixture"
+        let receipt=Data("receipt".utf8)
+        try await conflictDB.replaceDeviceSnapshot("snapshot.json",data:Data("new snapshot".utf8))
+        try require(TorrioConflictFixture.count("PUT snapshot.json")==2 && TorrioConflictFixture.count("GET snapshot.json")==2,"TorrioDB heartbeat conflict re-reads and retries")
+        try await conflictDB.immutable("immutable.json",data:receipt)
+        try require(TorrioConflictFixture.count("PUT immutable.json")==1,"TorrioDB identical concurrent receipt is idempotent")
+        var rejected=false
+        do{try await conflictDB.immutable("collision.json",data:receipt)}catch{rejected=true}
+        try require(rejected && TorrioConflictFixture.count("PUT collision.json")==1,"TorrioDB immutable collision never overwrites")
+        rejected=false
+        do{try await conflictDB.put("cas.json",data:receipt,sha:"old")}catch{rejected=true}
+        try require(rejected && TorrioConflictFixture.count("PUT cas.json")==1,"TorrioDB compare-and-swap preserves concurrent baseline")
+        var local=HealthLedger()
+        local.events=[HealthEvent(id:"local",channelID:"a",channelName:"A",action:"success",reason:"fixture")]
+        let merged=try await conflictDB.merge(local)
+        try require(Set(merged.events.map(\.id))==Set(["local","remote-one","remote-two"]) && TorrioConflictFixture.count("PUT channel-health-v1.json")==2,"TorrioDB ledger conflict merges fresh remote events")
+        rejected=false
+        do{try await conflictDB.put("auth.json",data:receipt)}catch{rejected=true}
+        try require(rejected && TorrioConflictFixture.count("PUT auth.json")==1,"TorrioDB unauthorized write is not retried")
+        rejected=false
+        do{try await conflictDB.replaceDeviceSnapshot("exhausted.json",data:receipt)}catch{rejected=true}
+        try require(rejected && TorrioConflictFixture.count("PUT exhausted.json")==4,"TorrioDB conflict retry is bounded")
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("jealousfin-tests-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}
         let disk=Disk(root:root)

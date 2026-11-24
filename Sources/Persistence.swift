@@ -27,7 +27,17 @@ struct GitFile {
     var sha: String
     var data: Data
 }
+private struct TorrioWriteFailure:LocalizedError {
+    let status:Int
+    var errorDescription:String?{"TorrioDB write HTTP \(status)"}
+}
 @MainActor final class TorrioDB {
+    private let transport:URLSession
+    init(transport:URLSession = .shared){self.transport=transport}
+    private let writeAttempts=4
+    private func conflictBackoff(_ attempt:Int) async throws {
+        try await Task.sleep(nanoseconds:UInt64(250_000_000 * (1 << attempt)))
+    }
     let repository = "https://api.github.com/repos/mghazalyh/torriodb/"
     var base:String {repository+"contents/jealousfin/"}
     var token = ""
@@ -39,7 +49,7 @@ struct GitFile {
         req.setValue("application/vnd.github+json",forHTTPHeaderField:"Accept")
         req.setValue("2022-11-28",forHTTPHeaderField:"X-GitHub-Api-Version")
         if let body=body { req.httpBody=try JSONSerialization.data(withJSONObject:body); req.setValue("application/json",forHTTPHeaderField:"Content-Type") }
-        let (d,r)=try await URLSession.shared.data(for:req)
+        let (d,r)=try await transport.data(for:req)
         guard let h=r as? HTTPURLResponse else { throw AppError.message("Invalid GitHub response") }
         return (d,h.statusCode)
     }
@@ -49,17 +59,53 @@ struct GitFile {
         guard status==200, let j=try JSONSerialization.jsonObject(with:d) as? [String:Any], let sha=j["sha"] as? String, let c=j["content"] as? String, let bytes=Data(base64Encoded:c,options:.ignoreUnknownCharacters) else { throw AppError.message("TorrioDB read HTTP \(status)") }
         return GitFile(sha:sha,data:bytes)
     }
-    func put(_ path:String, data:Data, sha:String?=nil) async throws {
+    private func writeOnce(_ path:String,data:Data,sha:String?) async throws {
         var b:[String:Any]=["message":"jealousfin: synchronize \(path)","content":data.base64EncodedString(),"branch":"main"]
-        if let sha=sha { b["sha"]=sha }
+        if let sha=sha {b["sha"]=sha}
         let (_,status)=try await call(path,method:"PUT",body:b)
-        guard status==200 || status==201 else { throw AppError.message("TorrioDB write HTTP \(status)") }
+        guard status==200 || status==201 else{throw TorrioWriteFailure(status:status)}
+    }
+    // Preserve compare-and-swap semantics for reviewed baseline promotion.
+    // A branch-head conflict can be retried only while the target blob is unchanged.
+    func put(_ path:String,data:Data,sha:String?=nil) async throws {
+        for attempt in 0..<writeAttempts {
+            do{try await writeOnce(path,data:data,sha:sha);return}
+            catch let error as TorrioWriteFailure where error.status==409 {
+                let current=try await read(path)
+                if current?.data==data{return}
+                guard current?.sha==sha,attempt+1<writeAttempts else{throw error}
+                try await conflictBackoff(attempt)
+            }
+        }
+    }
+    // For device-owned mutable observations only, re-read the current blob
+    // and replace it. Never use this operation for immutable data or promotion.
+    func replaceDeviceSnapshot(_ path:String,data:Data) async throws {
+        for attempt in 0..<writeAttempts {
+            let current=try await read(path)
+            if current?.data==data{return}
+            do{try await writeOnce(path,data:data,sha:current?.sha);return}
+            catch let error as TorrioWriteFailure where error.status==409 && attempt+1<writeAttempts {
+                try await conflictBackoff(attempt)
+            }
+        }
     }
     func immutable(_ path:String,data:Data) async throws {
-        if let existing=try await read(path) {
-            guard existing.data==data else { throw AppError.message("Immutable record collision") }; return
+        for attempt in 0..<writeAttempts {
+            if let current=try await read(path){
+                guard current.data==data else{throw AppError.message("Immutable record collision")}
+                return
+            }
+            do{try await writeOnce(path,data:data,sha:nil);return}
+            catch let error as TorrioWriteFailure where error.status==409 {
+                if let current=try await read(path){
+                    guard current.data==data else{throw AppError.message("Immutable record collision")}
+                    return
+                }
+                guard attempt+1<writeAttempts else{throw error}
+                try await conflictBackoff(attempt)
+            }
         }
-        try await put(path,data:data)
     }
     func directory(_ path:String) async throws -> [String] {
         let (d,status)=try await call(path)
@@ -84,12 +130,18 @@ struct GitFile {
     }
     func merge(_ local:HealthLedger) async throws -> HealthLedger {
         let path="database/channel-health-v1.json"
-        let file=try await read(path)
-        var merged=local
-        if let file=file { merged.merge(try JSONCodec.decoder().decode(HealthLedger.self,from:file.data)) }
-        merged.events.sort { $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at }
-        let bytes=try JSONCodec.encoder().encode(merged)
-        if file?.data != bytes { try await put(path,data:bytes,sha:file?.sha) }
-        return merged
+        for attempt in 0..<writeAttempts {
+            let file=try await read(path)
+            var merged=local
+            if let file=file{merged.merge(try JSONCodec.decoder().decode(HealthLedger.self,from:file.data))}
+            merged.events.sort{$0.at == $1.at ? $0.id < $1.id : $0.at < $1.at}
+            let bytes=try JSONCodec.encoder().encode(merged)
+            if file?.data==bytes{return merged}
+            do{try await writeOnce(path,data:bytes,sha:file?.sha);return merged}
+            catch let error as TorrioWriteFailure where error.status==409 && attempt+1<writeAttempts {
+                try await conflictBackoff(attempt)
+            }
+        }
+        throw TorrioWriteFailure(status:409)
     }
 }

@@ -724,26 +724,11 @@ import Network
     }
     private func synchronize() async {
         lastSync=Date();syncStatus="Synchronizing"
-        // Telemetry must not depend on health-ledger merge or command success.
-        var telemetryError:String?
-        do {try await uploadPatchArchives()}
-        catch{log("WARN","patch-archive","UPLOAD_FAILED",["errorType":String(describing:type(of:error))])}
-        do {try await uploadDecisions()}
-        catch{log("WARN","decisions","UPLOAD_FAILED",["error":error.localizedDescription])}
-        do {try await uploadEngineeringResults()}
-        catch {log("WARN","engineering","RESULT_UPLOAD_FAILED",["error":error.localizedDescription])}
-        do {try await uploadTelemetry()}
-        catch {telemetryError=sanitized(error.localizedDescription);log("WARN","torriodb","TELEMETRY_UPLOAD_FAILED",["error":error.localizedDescription])}
+        var errors:[String]=[]
+        let prefix="control/devices/\(deviceID)"
+        // Command processing is independent of every repository write, including
+        // heartbeat, telemetry, health, archive and insight publication.
         do {
-            do {
-                let merged=try await db.merge(ledger)
-                ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
-            }catch{log("WARN","health","MERGE_FAILED",["error":error.localizedDescription])}
-            let prefix="control/devices/\(deviceID)"
-            // Publish a small heartbeat before consuming pending commands.
-            let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
-            let old=try await db.read(prefix+"/heartbeat.json")
-            try await db.put(prefix+"/heartbeat.json",data:snapshot,sha:old?.sha)
             let commandFiles=try await db.directory(prefix+"/commands").filter{validID(String($0.dropLast(5)))}
             let receiptFiles=Set(try await db.directory(prefix+"/receipts"))
             for file in CommandQueue.pending(commandFiles,receipts:receiptFiles,limit:20) {
@@ -762,19 +747,38 @@ import Network
                     }
                 }catch{
                     // A malformed or temporarily unreadable file cannot block all later commands.
-                    log("WARN","commands","REMOTE_COMMAND_SYNC_FAILED",["file":file,"error":error.localizedDescription])
+                    errors.append("command receipt pending");log("WARN","commands","REMOTE_COMMAND_SYNC_FAILED",["file":file,"error":error.localizedDescription])
                 }
             }
-            let insightBytes=try JSONCodec.encoder().encode(insights)
-            let insightPath="insights/\(deviceID).json"
-            let existing=try await db.read(insightPath)
-            if existing?.data != insightBytes {try await db.put(insightPath,data:insightBytes,sha:existing?.sha)}
-            if let error=telemetryError {syncStatus="Sync pending: telemetry "+error}
-            else {syncStatus="Synced \(Date().formatted(date:.omitted,time:.shortened))"}
-        } catch {
-            syncStatus="Sync pending: \(sanitized(error.localizedDescription))"
-            log("WARN","torriodb","SYNC_FAILED",["error":error.localizedDescription])
+        }catch{
+            errors.append("commands "+sanitized(error.localizedDescription))
+            log("WARN","commands","COMMAND_POLL_FAILED",["error":error.localizedDescription])
         }
+        do {
+            let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
+            try await db.replaceDeviceSnapshot(prefix+"/heartbeat.json",data:snapshot)
+        }catch{
+            errors.append("heartbeat "+sanitized(error.localizedDescription))
+            log("WARN","torriodb","HEARTBEAT_WRITE_FAILED",["error":error.localizedDescription])
+        }
+        do {try await uploadPatchArchives()}
+        catch{errors.append("patch archives");log("WARN","patch-archive","UPLOAD_FAILED",["errorType":String(describing:type(of:error))])}
+        do {try await uploadDecisions()}
+        catch{errors.append("decisions");log("WARN","decisions","UPLOAD_FAILED",["error":error.localizedDescription])}
+        do {try await uploadEngineeringResults()}
+        catch{errors.append("engineering results");log("WARN","engineering","RESULT_UPLOAD_FAILED",["error":error.localizedDescription])}
+        do {try await uploadTelemetry()}
+        catch{errors.append("telemetry "+sanitized(error.localizedDescription));log("WARN","torriodb","TELEMETRY_UPLOAD_FAILED",["error":error.localizedDescription])}
+        do {
+            let merged=try await db.merge(ledger)
+            ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
+        }catch{errors.append("health");log("WARN","health","MERGE_FAILED",["error":error.localizedDescription])}
+        do {
+            let insightBytes=try JSONCodec.encoder().encode(insights)
+            try await db.replaceDeviceSnapshot("insights/\(deviceID).json",data:insightBytes)
+        }catch{errors.append("insights");log("WARN","torriodb","INSIGHT_WRITE_FAILED",["error":error.localizedDescription])}
+        if errors.isEmpty{syncStatus="Synced \(Date().formatted(date:.omitted,time:.shortened))"}
+        else{syncStatus="Sync pending: "+errors.joined(separator:", ")}
         recalculateInsights()
     }
     func recalculateInsights(){
