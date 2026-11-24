@@ -104,3 +104,68 @@ struct PatchRestoreJournal:Codable{
         }
     }
 }
+
+struct ApplicationSnapshot:Codable{
+    var patches:PatchRestoreSnapshot
+    var configuration:HotConfigurationStore
+}
+struct ApplicationTrialJournal:Codable{
+    var id:String
+    var before:ApplicationSnapshot
+    var target:ApplicationRevision
+    var expiresAt:Date
+    var pending=true
+    var outcome:String?
+}
+@MainActor enum ApplicationRevisionStore{
+    static let journalName="application-trial.json"
+    static func write(_ snapshot:ApplicationSnapshot,disk:Disk)throws{
+        try PatchVersionStore.write(snapshot.patches,disk:disk)
+        try disk.saveConfiguration(snapshot.configuration)
+    }
+    static func recover(disk:Disk)throws->ApplicationTrialJournal?{
+        guard FileManager.default.fileExists(atPath:disk.root.appendingPathComponent(journalName).path) else{return nil}
+        guard var trial=disk.load(ApplicationTrialJournal.self,journalName) else{throw AppError.message("Unreadable application trial journal")}
+        guard trial.pending else{return trial}
+        try write(trial.before,disk:disk)
+        trial.pending=false;trial.outcome="recovered-on-launch"
+        guard disk.save(trial,journalName) else{throw AppError.message("Cannot finalize application trial recovery")}
+        return trial
+    }
+    static func retain(_ revision:ApplicationRevision,disk:Disk)throws{
+        _ = try revision.checked()
+        let name="application-revision-"+revision.id+".json"
+        if FileManager.default.fileExists(atPath:disk.root.appendingPathComponent(name).path){
+            guard disk.load(ApplicationRevision.self,name)==revision else{throw AppError.message("Immutable application revision collision")}
+        }else if !disk.save(revision,name){throw AppError.message("Cannot retain application revision")}
+    }
+    static func begin(_ trial:ApplicationTrialJournal,after:ApplicationSnapshot,disk:Disk)throws{
+        try retain(trial.target,disk:disk)
+        guard disk.save(trial,journalName) else{throw AppError.message("Cannot journal application trial")}
+        do{try write(after,disk:disk)}
+        catch{_ = try recover(disk:disk);throw error}
+    }
+    // Native recovery preserves broken files for inspection; it does not erase
+    // account settings, health history, receipts or archived source revisions.
+    static func completeSafeResetIfNeeded(disk:Disk)throws{
+        if disk.load(Bool.self,"native-safe-reset-complete.json")==true{return}
+        try safeReset(disk:disk)
+    }
+    static func safeReset(disk:Disk)throws{
+        let folder=disk.root.appendingPathComponent("native-recovery-"+UUID().uuidString,isDirectory:true)
+        try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+        let names=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","patch-restore.json","hot-config-trial.json","application-trial.json","hot-config-staged.json","device-campaign.json","decision-journal.json"]
+        for name in names{
+            let path=disk.root.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath:path.path){try FileManager.default.copyItem(at:path,to:folder.appendingPathComponent(name))}
+        }
+        guard disk.save(false,"native-safe-reset-complete.json"),disk.save(true,"native-safe-mode.json") else{throw AppError.message("Cannot persist safe mode")}
+        // A safe mode marker is written before touching any source file.
+        for name in names{
+            let path=disk.root.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath:path.path){try FileManager.default.removeItem(at:path)}
+        }
+        try write(ApplicationSnapshot(patches:PatchRestoreSnapshot(runtime:RuntimePatchStore(),api:JellyfinAdapterStore(),ui:DynamicUIStore()),configuration:HotConfigurationStore()),disk:disk)
+        guard disk.save(true,"native-safe-reset-complete.json") else{throw AppError.message("Cannot finalize safe mode")}
+    }
+}

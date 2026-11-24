@@ -67,3 +67,58 @@ enum BaselineMerge{
         return local
     }
 }
+
+// A complete application update is declarative source, never native code.
+struct ApplicationRevision:Codable,Equatable{
+    var schemaVersion=1
+    var id:String
+    var sources:PatchSourceSet
+    var configuration:HotConfiguration?
+    var runtimeABI:Int=2
+    var adapterABI:Int=1
+    var uiABI:Int=1
+    var configurationABI:Int=1
+    var acceptance:DeviceTestPlan?
+    func checked()throws->Self{
+        guard schemaVersion==1,DynamicUILayout.validID(id),id != "native-baseline",
+              (1...2).contains(runtimeABI),adapterABI==1,uiABI==1,configurationABI==1 else{throw AppError.message("Unsupported application revision or native ABI")}
+        _ = try sources.checked();_ = try configuration?.checked()
+        _ = try acceptance?.checked()
+        guard acceptance?.repeatForever != true else{throw AppError.message("Application acceptance must be finite")}
+        guard try JSONCodec.encoder().encode(self).count<=950*1024 else{throw AppError.message("Application revision too large")}
+        return self
+    }
+    var identity:[String:String]{
+        ["runtime":sources.runtime?.id ?? "native-baseline","api":sources.jellyfinAPI?.id ?? "native-baseline","ui":sources.ui?.revision ?? "native-baseline","configuration":configuration?.revision ?? "native-baseline"]
+    }
+}
+
+enum ApplicationCapabilitySchema{
+    static let commands:[String:[String:String]]=[
+        "get_application_revision":[:],
+        "validate_patch_bundle":["manifest":"ApplicationRevision JSON"],
+        "begin_application_trial":["manifest":"ApplicationRevision JSON","expected":"identity JSON from get_application_revision","seconds":"30...3600"],
+        "restore_application_revision":["id":"archived application revision","expected":"identity JSON","seconds":"30...3600"],
+        "finish_application_trial":["id":"trial ID","outcome":"accept|rollback","approval":"explicit when accepting"],
+        "enter_safe_mode":["approval":"explicit"],
+        "exit_safe_mode":["approval":"explicit"],
+        "install_hot_configuration":["configuration":"HotConfiguration JSON","expectedRevision":"active config revision"],
+        "stage_hot_configuration":["configuration":"HotConfiguration JSON","expectedRevision":"active config revision"],
+        "reload_hot_configuration":["expectedRevision":"active config revision","stagedRevision":"optional staged revision"],
+        "begin_configuration_trial":["stagedRevision":"staged config","expectedRevision":"active config revision","seconds":"30...3600"],
+        "finish_configuration_trial":["id":"trial ID","expectedRevision":"active config","outcome":"accept|rollback","approval":"explicit when accepting"],
+        "reload_current_stream":[:],
+        "seek_live":["offsetSeconds":"0...60"],
+        "select_media_track":["kind":"audio|subtitle","index":"available option index|auto|off"],
+        "set_fullscreen":["visible":"true|false"],
+        "set_fullscreen_controls":["visible":"true|false"]
+    ]
+    static let configuration:[String:[String:String]]=[
+        "root":["schemaVersion":"1","revision":"unique ID, 1...80 characters","runtime":"RuntimePolicy; optional","playbackRules":"ordered rules, max 64","operations":"OperationalConfiguration; optional","interpreter":"InterpreterBudget; optional","presentation":"DynamicPresentation; optional","gateway":"GatewayConfiguration; optional"],
+        "runtime":["startupTimeout":"5...120","retries":"1...5","qualityMbps":"1...50","stallSeconds":"5...300","rotationSeconds":"5...86400","validationSeconds":"3...60, less than startupTimeout","minimumFrames":"3...120","forwardBufferSeconds":"0...120","automaticallyWaits":"boolean","recoveryMode":"reopen|advance_surf|pause","failureRetrySeconds":"5...600"],
+        "interpreter":["timeoutMs":"100...10000","memoryMiB":"8...64","maxCommands":"1...100"],
+        "gateway":["lanServerPort":"1...65535, default 8096","lanGatewayPort":"1...65535, default 8097","routePrefix":"validated absolute path, default /api/surf","ticketField":"JSON key, default url","timeoutSeconds":"5...90, default 20"],
+        "operations":["systemSampleSeconds":"5...300","playbackSampleSeconds":"5...120","heartbeatSeconds":"15...600","syncSeconds":"15...600","catalogueRefreshSeconds":"60...3600","reconnectSeconds":"15...600","eventRetentionCount":"500...20000","eventRetentionMiB":"4...128","resourceWarningMiB":"64...2048","suspendAutomationOnPressure":"boolean","playerEventDiagnostics":"boolean","playerEventSampleSeconds":"1...60","surfTransport":"auto|device"],
+        "presentation":["videoGravity":"fit|fill|stretch","fullscreenOpacity":"0.15...1","fullscreenMaxHeight":"0.20...0.80","fullscreenInitiallyVisible":"boolean","nativePlaybackControls":"boolean","pictureInPictureAllowed":"boolean","automaticPictureInPicture":"boolean"]
+    ]
+}

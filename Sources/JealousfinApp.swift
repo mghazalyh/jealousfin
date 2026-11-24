@@ -274,6 +274,7 @@ struct EngineeringView:View{
             }
             Panel{
                 VStack(alignment:.leading,spacing:16){
+                    NavigationLink(destination:NativeRecoveryView()){Label("Native recovery & LAN access",systemImage:"shield.lefthalf.filled")}
                     NavigationLink(destination:SettingsView()){Label("Settings",systemImage:"gear")}
                     NavigationLink(destination:RuntimeView()){Label("Remote & Runtime",systemImage:"terminal")}
                     NavigationLink(destination:DeviceTestsView()){Label("Device tests & hot patches",systemImage:"checklist")}
@@ -353,7 +354,9 @@ struct SettingsView:View{
                 Text("Active: "+(model.db.repositoryAddress ?? "Not configured")).font(.caption).foregroundColor(subdued)
                 Text("Branch: main · Data folder: jealousfin/").font(.caption).foregroundColor(subdued)
                 if model.repositorySwitchPending && model.repositoryAddressValid {
-                    Text("Save settings, then close and reopen Jealousfin to switch repositories safely.").font(.caption).foregroundColor(subdued)
+                    Text("Validate the new repository and drain pending data before switching.").font(.caption).foregroundColor(subdued)
+                    Button("Validate & reload repository"){Task{do{try await model.reloadDatabaseConnection()}catch{model.commandOutput=error.localizedDescription}}}.buttonStyle(.bordered)
+                    Text(model.commandOutput).font(.caption)
                 }
                 Text(model.syncStatus).font(.caption)
             }}
@@ -490,5 +493,49 @@ struct DeviceTestsView:View{
     private func change(_ state:String){
         do{try model.setCampaignState(state);issue=""}
         catch{issue=error.localizedDescription}
+    }
+}
+
+struct NativeRecoveryView:View{
+    @EnvironmentObject var model:AppModel
+    @State private var message=""
+    @State private var confirmRecovery=false
+    var body:some View{
+        Form{
+            Section("Native recovery"){
+                Text(model.nativeSafeMode ? "Native safe mode active":"Custom revisions enabled")
+                Button("Enter native safe mode",role:.destructive){confirmRecovery=true}
+                if model.nativeSafeMode{
+                    Button("Exit safe mode"){
+                        Task{
+                            let receipt=await model.execute(Command(id:UUID().uuidString,action:"exit_safe_mode",arguments:["approval":"explicit"],expiresAt:nil))
+                            message=receipt.result
+                        }
+                    }
+                }
+                Text("Recovery preserves account settings, health data, receipts and archived revisions. It stops the current playback and disables active custom sources.")
+                    .font(.caption)
+            }
+            Section("LAN authentication"){
+                Text(model.settings.lanAccessToken == nil ? "Legacy trusted LAN mode (unauthenticated)":"Bearer token required for commands and private queries")
+                Button(model.settings.lanAccessToken == nil ? "Enable LAN authentication":"Rotate LAN access token"){
+                    do{try model.setLANAuthentication(enabled:true);message="New LAN access token generated"}
+                    catch{message=error.localizedDescription}
+                }
+                if let token=model.settings.lanAccessToken{
+                    Text(token).font(.caption.monospaced()).textSelection(.enabled)
+                    Button("Disable LAN authentication",role:.destructive){
+                        do{try model.setLANAuthentication(enabled:false);message="Legacy LAN access enabled"}
+                        catch{message=error.localizedDescription}
+                    }
+                }
+                Text("Use Authorization: Bearer <token> on a trusted private LAN. This does not encrypt HTTP.").font(.caption)
+            }
+            if !message.isEmpty{Text(message).font(.caption)}
+        }.navigationTitle("Native recovery")
+            .confirmationDialog("Disable active custom sources?",isPresented:$confirmRecovery,titleVisibility:.visible){
+                Button("Enter safe mode",role:.destructive){Task{do{try await model.enterNativeSafeMode();message="Native safe mode active"}catch{message=error.localizedDescription}}}
+                Button("Cancel",role:.cancel){}
+            }
     }
 }

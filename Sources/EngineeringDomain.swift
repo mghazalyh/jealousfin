@@ -206,6 +206,7 @@ struct HotConfiguration:Codable,Equatable {
     var operations:OperationalConfiguration?=nil
     var interpreter:InterpreterBudget?=nil
     var presentation:DynamicPresentation?=nil
+    var gateway:GatewayConfiguration?=nil
     static let baseline=HotConfiguration(revision:"native-baseline")
     func checked()throws->Self{
         guard schemaVersion==1,revision.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil,
@@ -213,7 +214,7 @@ struct HotConfiguration:Codable,Equatable {
         _ = try runtime?.checked()
         _ = try operations?.checked()
         _ = try interpreter?.checked()
-        _ = try presentation?.checked()
+        _ = try presentation?.checked();_ = try gateway?.checked()
         for rule in playbackRules ?? []{_ = try rule.checked()}
         return self
     }
@@ -230,7 +231,7 @@ struct HotConfiguration:Codable,Equatable {
         func keys(_ object:[String:Any],_ permitted:Set<String>)throws{
             guard Set(object.keys).isSubset(of:permitted) else{throw AppError.message("Unknown configuration field")}
         }
-        try keys(root,["schemaVersion","revision","runtime","playbackRules","operations","interpreter","presentation"])
+        try keys(root,["schemaVersion","revision","runtime","playbackRules","operations","interpreter","presentation","gateway"])
         let playbackKeys:Set<String>=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect","preferredMaximumWidth","preferredMaximumHeight","networkWhilePaused"]
         if let runtime=root["runtime"] as? [String:Any]{
             try keys(runtime,["startupTimeout","retries","qualityMbps","stallSeconds","rotationSeconds","validationSeconds","minimumFrames","forwardBufferSeconds","automaticallyWaits","recoveryMode","failureRetrySeconds","playback"])
@@ -245,6 +246,7 @@ struct HotConfiguration:Codable,Equatable {
         }
         if let budget=root["interpreter"] as? [String:Any]{try keys(budget,["timeoutMs","memoryMiB","maxCommands"])}
         if let ui=root["presentation"] as? [String:Any]{try keys(ui,["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture"])}
+        if let gateway=root["gateway"] as? [String:Any]{try keys(gateway,["lanServerPort","lanGatewayPort","routePrefix","ticketField","timeoutSeconds"])}
         var normalized=root
         if let runtime=root["runtime"] as? [String:Any]{
             let defaults=try JSONCodec.encoder().encode(RuntimePolicy.baseline(Settings()))

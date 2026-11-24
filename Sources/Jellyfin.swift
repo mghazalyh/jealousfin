@@ -19,6 +19,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     var userID = ""
     private(set) var sharedSurfAvailable=false
     var adapter:JellyfinAPIAdapter?
+    var gatewayConfiguration=GatewayConfiguration()
     private(set) var inFlight=0
     var adapterID:String{adapter?.revision.id ?? "native-baseline"}
     private var adapterSpec:JellyfinAdapterSpec{adapter?.spec ?? JellyfinAdapterSpec()}
@@ -90,26 +91,26 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         guard let t=JellyfinAdapterRules.string(at:spec.tokenPath,in:a),let id=JellyfinAdapterRules.string(at:spec.userIDPath,in:a),!t.isEmpty,!id.isEmpty else{throw AppError.message("Jellyfin authentication failed")}
         token = t; userID = id
         // Probe the authenticated shared gateway without exposing tickets to hot-patch hooks.
-        if SharedSurf.gatewayOrigin(for:u) != nil {
+        if SharedSurf.gatewayOrigin(for:u,configuration:gatewayConfiguration) != nil {
             do {
                 _ = try await sharedSurfTicket(mode:"all")
                 sharedSurfAvailable=true
                 log?("INFO","SURF_GATEWAY_AVAILABLE",[:])
             } catch {
                 // The known production public origin must not silently regress to the broken session path.
-                sharedSurfAvailable=u.scheme?.lowercased()=="https" && u.host?.lowercased()=="desktop-hb9oshs.tail1fc8b.ts.net"
+                sharedSurfAvailable=gatewayConfiguration==GatewayConfiguration() && u.scheme?.lowercased()=="https" && u.host?.lowercased()=="desktop-hb9oshs.tail1fc8b.ts.net"
                 log?("WARN","SURF_GATEWAY_PROBE_FAILED",["errorType":String(describing:type(of:error))])
             }
         }
     }
     private func sharedSurfTicket(mode:String) async throws -> URL {
-        guard connected,let server=base,let origin=SharedSurf.gatewayOrigin(for:server),
+        guard connected,let server=base,let origin=SharedSurf.gatewayOrigin(for:server,configuration:gatewayConfiguration),
               ["all","movies-series","sports"].contains(mode),
-              let endpoint=URL(string:"/api/surf/"+mode+"/hls/ticket",relativeTo:origin)?.absoluteURL,
+              let endpoint=URL(string:gatewayConfiguration.path(mode:mode,leaf:"ticket"),relativeTo:origin)?.absoluteURL,
               JellyfinAdapterRules.sameOrigin(endpoint,origin)
         else{throw AppError.message("Shared Surf requires an authenticated supported gateway")}
         var request=URLRequest(url:endpoint)
-        request.httpMethod="POST";request.timeoutInterval=20
+        request.httpMethod="POST";request.timeoutInterval=Double(gatewayConfiguration.timeoutSeconds ?? 20)
         request.setValue(auth,forHTTPHeaderField:"Authorization")
         request.setValue(token,forHTTPHeaderField:"X-Emby-Token")
         request.setValue("application/json",forHTTPHeaderField:"Content-Type")
@@ -121,8 +122,8 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
               JellyfinAdapterRules.sameOrigin(final,origin),http.statusCode==200
         else{throw AppError.message("Shared Surf ticket HTTP "+String((response as? HTTPURLResponse)?.statusCode ?? 0))}
         guard data.count<=65536,let object=try JSONSerialization.jsonObject(with:data) as? [String:Any],
-              let raw=object["url"] as? String else{throw AppError.message("Invalid shared Surf ticket response")}
-        return try SharedSurf.ticketURL(raw,origin:origin,mode:mode)
+              let raw=object[gatewayConfiguration.ticketField ?? "url"] as? String else{throw AppError.message("Invalid shared Surf ticket response")}
+        return try SharedSurf.ticketURL(raw,origin:origin,mode:mode,configuration:gatewayConfiguration)
     }
     func sharedSurfChannel(category:String,channels:[Channel])->Channel? {
         guard sharedSurfAvailable else{return nil}

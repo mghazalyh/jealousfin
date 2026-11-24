@@ -42,7 +42,8 @@ import Network
     @Published var commandOutput=""
     let player=AVPlayer()
     let disk=Disk()
-    let db:TorrioDB
+    @Published private(set) var db:TorrioDB
+    private var repositoryChanging=false
     let lan=LANServer()
     let scripts=ScriptEngine()
     @Published private(set) var bundledBaselineRevision="native-baseline"
@@ -52,6 +53,10 @@ import Network
     @Published private(set) var versionBusy=false
     private var promotionBusy=false
     private var versionRecoveryFailed=false
+    @Published private(set) var nativeSafeMode=false
+    @Published private(set) var applicationTrial:ApplicationTrialJournal?
+    @Published private(set) var applicationRevisionID:String?
+    private var lastApplicationRollback=Date.distantPast
     @Published private(set) var jellyfinAPIRevision="native-baseline"
     @Published private(set) var jellyfinAPIFault:String?
     private var jellyfinAPIStore=JellyfinAdapterStore()
@@ -160,13 +165,26 @@ import Network
         let database=TorrioDB(address:storedSettings.repositoryAddress)
         database.enabled=storedSettings.controlMode == .github
         db=database
+        ledger=disk.load(HealthLedger.self,"health.json") ?? HealthLedger()
+        let storedDeviceID=disk.load(String.self,"device.json") ?? UUID().uuidString
+        deviceID=storedDeviceID
+        jelly=Jellyfin(deviceID:storedDeviceID)
+        nativeSafeMode=disk.load(Bool.self,"native-safe-mode.json") ?? false
+        let interruptedApplicationTrial=disk.load(ApplicationTrialJournal.self,ApplicationRevisionStore.journalName)?.pending==true
         do {
+            if nativeSafeMode{try ApplicationRevisionStore.completeSafeResetIfNeeded(disk:disk);automationSuspended=true}
+            else{
+                applicationTrial=try ApplicationRevisionStore.recover(disk:disk)
+                applicationRevisionID=disk.load(String.self,"application-active.json")
+                if let trial=applicationTrial,trial.outcome=="explicitly-confirmed"{applicationRevisionID=trial.target.id}
+                if applicationTrial?.outcome=="recovered-on-launch"{applicationRevisionID=nil}
+            }
             _ = try PatchVersionStore.recover(disk:disk)
         }catch{
             versionRecoveryFailed=true
             patchArchiveFault="Interrupted patch restoration could not be recovered"
         }
-        if !versionRecoveryFailed{
+        if !versionRecoveryFailed,!nativeSafeMode{
             do {
                 let baseline=try BundledPatchBaseline.load()
                 try BaselineInstaller.install(baseline,disk:disk)
@@ -180,8 +198,11 @@ import Network
         patchArchiveID=disk.load(PatchArchive.self,"last-patch-archive.json")?.id
         jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
         campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
+        if interruptedApplicationTrial,applicationTrial?.outcome=="recovered-on-launch",var cp=campaign,cp.canResume{
+            cp.state="paused";campaign=cp;_ = disk.save(cp,"device-campaign.json")
+        }
         decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()
-        if var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
+        if !nativeSafeMode,!versionRecoveryFailed,var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
             if let layout=stored.active,(try? layout.checked())==nil {
                 stored.active=nil;stored.values=[:]
             }
@@ -192,10 +213,7 @@ import Network
             dynamicUI=stored
         }
         moduleCheckpoint=disk.load(ModuleCheckpoint.self,"module-checkpoint.json")
-        ledger=disk.load(HealthLedger.self,"health.json") ?? HealthLedger()
         health=ledger.states()
-        deviceID=disk.load(String.self,"device.json") ?? UUID().uuidString
-        jelly=Jellyfin(deviceID:deviceID)
         disk.save(deviceID,"device.json")
         channels=disk.load([Channel].self,"channels.json") ?? []
         for url in disk.files(prefix:"event-").suffix(150) {
@@ -250,6 +268,7 @@ import Network
         Task { [weak self] in
             guard let self=self else{return}
             if self.versionRecoveryFailed{
+                self.automationSuspended=true
                 self.log("ERROR","patch-version","RECOVERY_BLOCKED")
                 return
             }
@@ -288,14 +307,42 @@ import Network
             syncStatus="Cannot save settings"
             return
         }
-        if repositorySwitchPending {syncStatus="Repository saved. Relaunch Jealousfin to switch."}
+        if repositorySwitchPending {syncStatus="Repository saved. Validate and reload connection."}
         configureLAN()
         log("INFO","settings","SAVED")
     }
     // Keep discovery and takeover available even when GitHub is selected.
     // A GitHub outage cannot disable the independent local recovery channel.
     private func configureLAN() {
+        lan.setAccessToken(settings.lanAccessToken)
         do {try lan.start()} catch {lanStatus="Failed to listen";log("ERROR","lan","START_FAILED")}
+    }
+    func setLANAuthentication(enabled:Bool)throws{
+        var next=settings
+        next.lanAccessToken=enabled ? UUID().uuidString.replacingOccurrences(of:"-",with:"")+UUID().uuidString.replacingOccurrences(of:"-",with:"") : nil
+        guard disk.save(next,"settings.json") else{throw AppError.message("Cannot persist LAN access policy")}
+        settings=next
+        lan.setAccessToken(next.lanAccessToken)
+        log("INFO","lan","AUTHENTICATION_CHANGED",["enabled":String(enabled)])
+    }
+    func reloadDatabaseConnection()async throws{
+        guard !repositoryChanging,!versionBusy,!patchBusy,!apiChanging,pending.isEmpty,applicationTrial?.pending != true,
+              let address=GitHubRepositoryAddress.canonical(settings.repositoryAddress),!settings.githubToken.isEmpty else{throw AppError.message("Repository or token unavailable, or engine busy")}
+        // No queued writes are silently migrated to an unrelated repository.
+        guard address==db.repositoryAddress || (disk.files(prefix:"event-").isEmpty && disk.files(prefix:"batch-").isEmpty && disk.files(prefix:"patch-archive-").isEmpty && disk.files(prefix:"qa-result-").isEmpty) else{throw AppError.message("Synchronize pending data to the old repository before switching")}
+        repositoryChanging=true
+        defer{repositoryChanging=false;requestSync()}
+        let old=syncTask;old?.cancel();await old?.value
+        let candidate=TorrioDB(address:address)
+        candidate.token=settings.githubToken
+        let (_,status)=try await candidate.call("")
+        guard status==200 else{throw AppError.message("Repository data root is unavailable")}
+        guard GitHubRepositoryAddress.canonical(settings.repositoryAddress)==address,candidate.token==settings.githubToken else{throw AppError.message("Repository settings changed during validation")}
+        guard disk.save(settings,"settings.json") else{throw AppError.message("Cannot persist repository selection")}
+        candidate.enabled=controlMode == .github
+        db=candidate
+        lastSync=Date.distantPast
+        syncStatus="Repository validated and reloaded"
     }
     func selectControlMode(_ mode:RemoteControlMode)throws {
         var saved=disk.load(Settings.self,"settings.json") ?? settings
@@ -414,6 +461,119 @@ import Network
         center.pauseCommand.addTarget{[weak self] _ in Task{@MainActor in self?.pause()};return .success}
         center.nextTrackCommand.addTarget{[weak self] _ in Task{@MainActor in self?.next()};return .success}
     }
+    private func currentApplicationIdentity()->[String:String]{
+        ["runtime":activePatchID,"api":jellyfinAPIRevision,"ui":dynamicUI.active?.revision ?? "native-baseline","configuration":hotConfiguration.revision]
+    }
+    private func decodeApplicationManifest(_ raw:String)throws->ApplicationRevision{
+        guard raw.utf8.count<=950*1024 else{throw AppError.message("Manifest too large")}
+        for secret in [settings.githubToken,jelly.token,settings.password] where secret.utf8.count>=8{
+            guard !raw.contains(secret) else{throw AppError.message("Manifest contains configured credential")}
+        }
+        return try JSONCodec.decoder().decode(ApplicationRevision.self,from:Data(raw.utf8)).checked()
+    }
+    private func applicationSnapshot()->ApplicationSnapshot{
+        ApplicationSnapshot(patches:PatchRestoreSnapshot(runtime:engineering.store,api:jellyfinAPIStore,ui:dynamicUI),configuration:hotConfiguration)
+    }
+    private func applicationIdle()->Bool{
+        !repositoryChanging && !versionBusy && !patchBusy && !apiChanging && !promotionBusy && !configurationBusy && !loginBusy && !catalogueBusy && favoriteInFlight.isEmpty && dynamicUIBusy.isEmpty
+    }
+    private func drainApplicationWork()async throws{
+        moduleTask?.cancel();selectionTask?.cancel()
+        if campaign?.canResume==true{try setCampaignState("paused")}
+        let oldWork=work
+        stop()
+        await oldWork?.value;await cleanupTask?.value;await moduleTask?.value;await campaignTask?.value
+        let deadline=ProcessInfo.processInfo.systemUptime+30
+        while jelly.inFlight>0 && ProcessInfo.processInfo.systemUptime<deadline{await nap(0.2)}
+        guard jelly.inFlight==0 else{throw AppError.message("API requests have not drained")}
+    }
+    private func loadApplicationSnapshot(_ snapshot:ApplicationSnapshot,policy:RuntimePolicy,adapter:JellyfinAPIAdapter?)throws{
+        engineering=EngineeringRuntime(disk:disk,engine:scripts)
+        jellyfinAPIStore=snapshot.patches.api;jelly.adapter=adapter
+        jellyfinAPIRevision=jelly.adapterID;jellyfinAPIFault=nil
+        dynamicUI=snapshot.patches.ui;dynamicPage=nil;dynamicUIResults=[:];dynamicUISeen.removeAll()
+        try applyHotConfiguration(snapshot.configuration)
+        applyRuntime(snapshot.patches.runtime.active==nil ? nil:policy)
+        jelly.token="";jelly.userID="";catalogueReady=false
+        apiReady=true;policyReady=true;versionRecoveryFailed=false
+        status="Connection failed"
+    }
+    private func beginApplicationTrial(_ manifest:ApplicationRevision,seconds:Int)async throws{
+        guard applicationIdle(),apiReady,policyReady,!nativeSafeMode,!versionRecoveryFailed,applicationTrial?.pending != true,configurationTrial?.pending != true,campaign?.canResume != true,(30...3600).contains(seconds) else{throw AppError.message("Application engines busy or trial duration invalid")}
+        versionBusy=true;patchBusy=true;apiChanging=true
+        defer{versionBusy=false;patchBusy=false;apiChanging=false;requestSync()}
+        let before=applicationSnapshot()
+        let runtime=manifest.sources.runtime.map{RuntimePatch(id:$0.id,source:$0.source)}
+        let api=manifest.sources.jellyfinAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source)}
+        let previewEngine=ScriptEngine();previewEngine.budget=manifest.configuration?.interpreter ?? InterpreterBudget()
+        let preview=EngineeringRuntime(disk:disk,engine:previewEngine)
+        let policy=try await preview.preview(runtime,settings:settings)
+        // Preflight with candidate budget; live adapter uses the shared engine.
+        let adapter:JellyfinAPIAdapter?
+        if let api=api{let checked=try await JellyfinAPIAdapter.load(api,engine:previewEngine);adapter=JellyfinAPIAdapter(revision:api,spec:checked.spec,engine:scripts)}else{adapter=nil}
+        let after=ApplicationSnapshot(patches:PatchRestoreSnapshot(runtime:RuntimePatchStore(active:runtime,previous:before.patches.runtime.active),api:JellyfinAdapterStore(active:api,previous:before.patches.api.active),ui:DynamicUIStore(active:manifest.sources.ui,previous:before.patches.ui.active,values:manifest.sources.ui?.retainedValues(before.patches.ui.values) ?? [:])),configuration:HotConfigurationStore(active:manifest.configuration,previous:before.configuration.active))
+        let trial=ApplicationTrialJournal(id:UUID().uuidString,before:before,target:manifest,expiresAt:Date().addingTimeInterval(Double(seconds)),outcome:nil)
+        try await drainApplicationWork()
+        try ApplicationRevisionStore.begin(trial,after:after,disk:disk)
+        applicationTrial=trial
+        try loadApplicationSnapshot(after,policy:policy,adapter:adapter)
+        capturePatchArchive(reason:"application-trial")
+        apiChanging=false
+        if settings.autoLogin{await connect()}
+        versionBusy=false;patchBusy=false
+        if let plan=manifest.acceptance{try startCampaign(plan)}
+    }
+    private func finishApplicationTrial(accept:Bool)async throws{
+        guard applicationIdle(),var trial=applicationTrial,trial.pending else{throw AppError.message("Application trial unavailable or engines busy")}
+        if accept{
+            guard Date()<trial.expiresAt,currentApplicationIdentity()==trial.target.identity,campaign?.canResume != true else{throw AppError.message("Expired trial, changed source or active campaign")}
+            if let plan=trial.target.acceptance{
+                guard let cp=campaign,cp.plan==plan,cp.state=="completed",!plan.repeatForever else{throw AppError.message("Manifest acceptance campaign not completed")}
+                let results=disk.files(prefix:"qa-result-"+cp.runID+"-").compactMap{disk.load(DeviceTestResult.self,$0.lastPathComponent)}
+                guard results.count==plan.steps.count*plan.repeatCount,results.allSatisfy({$0.status=="passed" && $0.patchID==trial.target.identity["runtime"] && $0.evidence["configurationRevision"]==trial.target.identity["configuration"] && $0.evidence["adapterRevision"]==trial.target.identity["api"] && $0.evidence["uiRevision"]==trial.target.identity["ui"]}) else{throw AppError.message("Acceptance results missing, failed or from another revision")}
+            }
+            trial.pending=false;trial.outcome="explicitly-confirmed"
+        }else{
+            versionBusy=true;patchBusy=true;apiChanging=true
+            defer{versionBusy=false;patchBusy=false;apiChanging=false;requestSync()}
+            let recoveryEngine=ScriptEngine();recoveryEngine.budget=trial.before.configuration.active?.interpreter ?? InterpreterBudget()
+            let preview=EngineeringRuntime(disk:disk,engine:recoveryEngine)
+            let policy=try await preview.preview(trial.before.patches.runtime.active,settings:settings)
+            let adapter:JellyfinAPIAdapter?
+            if let api=trial.before.patches.api.active{let checked=try await JellyfinAPIAdapter.load(api,engine:recoveryEngine);adapter=JellyfinAPIAdapter(revision:api,spec:checked.spec,engine:scripts)}else{adapter=nil}
+            try await drainApplicationWork()
+            try ApplicationRevisionStore.write(trial.before,disk:disk)
+            try loadApplicationSnapshot(trial.before,policy:policy,adapter:adapter)
+            trial.pending=false;trial.outcome="rolled-back"
+            guard disk.save(trial,ApplicationRevisionStore.journalName) else{throw AppError.message("Cannot finalize rollback")}
+            applicationTrial=trial
+            capturePatchArchive(reason:"application-rollback")
+            apiChanging=false
+            if settings.autoLogin{await connect()}
+            return
+        }
+        guard disk.save(trial,ApplicationRevisionStore.journalName) else{throw AppError.message("Cannot finalize application trial")}
+        applicationTrial=trial;applicationRevisionID=trial.target.id
+        _ = disk.save(trial.target.id,"application-active.json")
+    }
+    func enterNativeSafeMode()async throws{
+        guard applicationIdle() else{throw AppError.message("Wait for active native operation to finish")}
+        versionBusy=true;patchBusy=true;apiChanging=true
+        defer{versionBusy=false;patchBusy=false;apiChanging=false;requestSync()}
+        try await drainApplicationWork()
+        do{try ApplicationRevisionStore.safeReset(disk:disk)}
+        catch{versionRecoveryFailed=true;throw error}
+        nativeSafeMode=true;applicationTrial=nil;configurationTrial=nil;stagedConfiguration=nil;applicationRevisionID=nil
+        _ = disk.save("", "application-active.json")
+        campaign=nil;decisions=DecisionJournal();automationSuspended=true
+        let snapshot=ApplicationSnapshot(patches:PatchRestoreSnapshot(runtime:RuntimePatchStore(),api:JellyfinAdapterStore(),ui:DynamicUIStore()),configuration:HotConfigurationStore())
+        try loadApplicationSnapshot(snapshot,policy:RuntimePolicy.baseline(settings),adapter:nil)
+        tab=4;fullscreenPresented=false;patchArchiveFault=nil
+        try selectControlMode(.lan)
+        capturePatchArchive(reason:"native-safe-mode")
+        apiChanging=false
+        if settings.autoLogin{await connect()}
+    }
     private func readHotConfiguration()throws->HotConfigurationStore{
         let url=disk.root.appendingPathComponent("hot-config.json")
         guard FileManager.default.fileExists(atPath:url.path) else{return HotConfigurationStore()}
@@ -424,6 +584,7 @@ import Network
         _ = try stored.checked()
         let oldInterval=operational.systemSampleSeconds ?? 15
         hotConfiguration=stored
+        jelly.gatewayConfiguration=stored.active?.gateway ?? GatewayConfiguration()
         scripts.budget=stored.active?.interpreter ?? InterpreterBudget()
         if oldInterval != (operational.systemSampleSeconds ?? 15){
             telemetryCadence=TelemetryCadence(interval:Double(operational.systemSampleSeconds ?? 15))
@@ -515,7 +676,7 @@ import Network
     }
     func sanitized(_ value:String,limit:Int=8192)->String {
         var s=value
-        for secret in [settings.password,settings.githubToken,jelly.token] where !secret.isEmpty {s=s.replacingOccurrences(of:secret,with:"[redacted]")}
+        for secret in [settings.password,settings.githubToken,jelly.token,settings.lanAccessToken ?? ""] where !secret.isEmpty {s=s.replacingOccurrences(of:secret,with:"[redacted]")}
         // URLSession errors can include a URL with an encoded access token.
         s=s.replacingOccurrences(of:"(?i)(api_key|access_token|token|password|ticket)=([^&\\s\"']+)",with:"$1=[redacted]",options:.regularExpression)
         return String(s.prefix(limit))
@@ -999,6 +1160,11 @@ import Network
         let now=Date()
         if (lanStatus.hasPrefix("failed") || lanStatus=="Failed to listen") && Int(now.timeIntervalSince1970)%15==0{configureLAN()}
         sampleSystemTelemetry()
+        if let trial=applicationTrial,trial.pending,now>=trial.expiresAt,now.timeIntervalSince(lastApplicationRollback)>5,!versionBusy,!patchBusy,!apiChanging,!loginBusy,!catalogueBusy {
+            lastApplicationRollback=now
+            do{try await finishApplicationTrial(accept:false)}
+            catch{patchArchiveFault="Application trial rollback failed; use native recovery"}
+        }
         if configurationTrial?.expired(at:now)==true,now.timeIntervalSince(lastTrialRollbackAttempt)>5,!patchBusy,!apiChanging,!versionBusy,!promotionBusy {
             lastTrialRollbackAttempt=now
             do{try finishConfigurationTrial(accept:false,reason:"expired")}
@@ -1066,12 +1232,12 @@ import Network
     }
     func requestSync(){
         guard controlMode == .github else{syncStatus="LAN control active; GitHub paused";return}
-        guard syncTask==nil else{return}
+        guard syncTask==nil,!repositoryChanging else{return}
         guard repositoryAddressValid else{syncStatus="Invalid GitHub repository address";return}
         // Pin the repository for the life of the process. A user may save a
         // different target, but no multi-request Git transaction can cross
         // repositories while it is in flight.
-        guard !repositorySwitchPending else{syncStatus="Save settings and relaunch to switch repository";return}
+        guard !repositorySwitchPending else{syncStatus="Validate and reload saved repository";return}
         db.token=settings.githubToken
         guard db.configured else{syncStatus="Configure GitHub repository token";return}
         syncTask=Task{[weak self] in
@@ -1194,6 +1360,11 @@ import Network
     func stateSnapshot()->[String:Any]{
         var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing || currentSharedTransport,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
         snapshot["configurationRevision"]=hotConfiguration.revision
+        snapshot["nativeSafeMode"]=nativeSafeMode
+        let accepted=applicationTrial?.outcome=="explicitly-confirmed" ? applicationTrial?.target : nil
+        snapshot["applicationRevision"]=(accepted?.identity==currentApplicationIdentity() ? accepted?.id : nil) ?? ""
+        snapshot["lanAuthenticationRequired"]=settings.lanAccessToken?.isEmpty==false
+        snapshot["applicationTrialPending"]=applicationTrial?.pending ?? false
         snapshot["configurationFault"]=configurationFault ?? ""
         snapshot["stagedConfigurationRevision"]=stagedConfiguration?.candidate.revision ?? ""
         snapshot["configurationTrialID"]=configurationTrial?.pending==true ? configurationTrial?.id ?? "" : ""
@@ -1205,7 +1376,7 @@ import Network
         snapshot["playerAudio"]=["volume":String(player.volume),"muted":String(player.isMuted)]
         return snapshot
     }
-    static let actions=["stage_hot_configuration","stage_hot_configuration_from_db","get_configuration_trial","begin_configuration_trial","finish_configuration_trial","get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","list_hot_configurations","restore_hot_configuration","resume_automation","get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["get_command_schema","get_configuration_schema","get_application_revision","validate_patch_bundle","begin_application_trial","finish_application_trial","restore_application_revision","list_application_revisions","get_recovery_status","enter_safe_mode","exit_safe_mode","get_native_defaults","export_diagnostics","stage_hot_configuration","stage_hot_configuration_from_db","get_configuration_trial","begin_configuration_trial","finish_configuration_trial","get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","list_hot_configurations","restore_hot_configuration","resume_automation","get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command,origin:String="internal") async -> Receipt {
         if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
@@ -1233,7 +1404,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_configuration_trial","get_media_tracks","get_hot_configuration","list_hot_configurations","get_preferences","set_preferences","get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
+            let structured:Set<String>=["get_command_schema","get_configuration_schema","get_application_revision","validate_patch_bundle","list_application_revisions","get_recovery_status","get_native_defaults","export_diagnostics","get_configuration_trial","get_media_tracks","get_hot_configuration","list_hot_configurations","get_preferences","set_preferences","get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -1248,7 +1419,63 @@ import Network
         if versionBusy && !["get_status","get_version","get_capabilities","get_logs","get_telemetry","get_insights","list_patch_versions","get_patch_archive","get_runtime_module","get_jellyfin_api","get_ui_layout"].contains(action){
             throw AppError.message("Patch restoration in progress")
         }
+        let protectedMutations:Set<String>=["install_runtime_module","install_runtime_module_from_db","rollback_runtime_module","reset_runtime_module","reload_runtime_module","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","restore_hot_configuration","begin_configuration_trial","restore_patch_version","restore_known_good","promote_patch_archive"]
+        if (applicationTrial?.pending==true || nativeSafeMode) && protectedMutations.contains(action){throw AppError.message("Finish the application trial or exit native safe mode before changing individual revisions")}
         switch action {
+        case "get_command_schema":
+            return try json(ApplicationCapabilitySchema.commands)
+        case "get_configuration_schema":
+            return try json(ApplicationCapabilitySchema.configuration)
+        case "get_application_revision":
+            var result=currentApplicationIdentity()
+            result["trialID"]=applicationTrial?.pending==true ? applicationTrial?.id ?? "" : ""
+            result["acceptedID"]=applicationTrial?.outcome=="explicitly-confirmed" && applicationTrial?.target.identity==currentApplicationIdentity() ? applicationTrial?.target.id ?? "" : ""
+            // The four-component CAS identity deliberately excludes these metadata keys.
+            return try json(["identity":currentApplicationIdentity(),"metadata":result])
+
+        case "list_application_revisions":
+            return try json(disk.files(prefix:"application-revision-").prefix(100).map{$0.deletingPathExtension().lastPathComponent.replacingOccurrences(of:"application-revision-",with:"")})
+        case "validate_patch_bundle":
+            guard let raw=args["manifest"] else{throw AppError.message("Manifest JSON required")}
+            let manifest=try decodeApplicationManifest(raw)
+            let engine=ScriptEngine();engine.budget=manifest.configuration?.interpreter ?? InterpreterBudget()
+            let preview=EngineeringRuntime(disk:disk,engine:engine)
+            _ = try await preview.preview(manifest.sources.runtime.map{RuntimePatch(id:$0.id,source:$0.source)},settings:settings)
+            if let api=manifest.sources.jellyfinAPI{_ = try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:api.id,source:api.source),engine:engine)}
+            return try json(manifest.identity)
+        case "begin_application_trial","restore_application_revision":
+            let manifest:ApplicationRevision
+            if action=="restore_application_revision"{
+                guard let id=args["id"],DynamicUILayout.validID(id),let stored=disk.load(ApplicationRevision.self,"application-revision-"+id+".json"),stored.id==id else{throw AppError.message("Unknown application revision")}
+                manifest=try stored.checked()
+            }else{
+                guard let raw=args["manifest"] else{throw AppError.message("Manifest JSON required")}
+                manifest=try decodeApplicationManifest(raw)
+            }
+            guard let expected=args["expected"],let identity=try? JSONCodec.decoder().decode([String:String].self,from:Data(expected.utf8)),identity==currentApplicationIdentity(),let seconds=args["seconds"].flatMap(Int.init) else{throw AppError.message("Exact current revision identity and trial seconds required")}
+            try await beginApplicationTrial(manifest,seconds:seconds)
+            return "Application trial active; explicit confirmation required"
+        case "finish_application_trial":
+            guard let trial=applicationTrial,trial.pending,args["id"]==trial.id,let outcome=args["outcome"],["accept","rollback"].contains(outcome) else{throw AppError.message("Current trial ID and outcome required")}
+            if outcome=="accept",args["approval"] != "explicit"{throw AppError.message("Explicit acceptance required")}
+            try await finishApplicationTrial(accept:outcome=="accept")
+            return "Application trial "+outcome+" recorded"
+        case "get_recovery_status":
+            return try json(["safeMode":String(nativeSafeMode),"patchRecoveryBlocked":String(versionRecoveryFailed),"applicationTrial":applicationTrial?.pending==true ? applicationTrial?.id ?? "" : "","configurationTrial":configurationTrial?.pending==true ? configurationTrial?.id ?? "" : ""])
+        case "enter_safe_mode":
+            guard args["approval"]=="explicit" else{throw AppError.message("Explicit recovery approval required")}
+            try await enterNativeSafeMode()
+            return "Native safe mode active; archived sources retained"
+        case "exit_safe_mode":
+            guard nativeSafeMode,!versionRecoveryFailed,args["approval"]=="explicit" else{throw AppError.message("Safe mode unavailable or approval missing")}
+            guard disk.save(false,"native-safe-mode.json") else{throw AppError.message("Cannot persist safe mode exit")}
+            nativeSafeMode=false;automationSuspended=false
+            return "Safe mode exited; native sources remain active"
+        case "get_native_defaults":
+            return try json(HotConfiguration(revision:"native-baseline",runtime:RuntimePolicy.baseline(Settings()),operations:OperationalConfiguration(),interpreter:InterpreterBudget(),presentation:DynamicPresentation()))
+        case "export_diagnostics":
+            let payload:[String:Any]=["state":stateSnapshot(),"events":try JSONSerialization.jsonObject(with:JSONCodec.encoder().encode(Array(events.suffix(50)))),"revisions":currentApplicationIdentity()]
+            return String(decoding:try JSONSerialization.data(withJSONObject:payload,options:[.sortedKeys]),as:UTF8.self)
         case "get_media_tracks":
             guard let item=player.currentItem,item.status == .readyToPlay else{throw AppError.message("No ready player item")}
             var tracks:[String:[[String:String]]]=[:]
@@ -1333,7 +1560,7 @@ import Network
         case "install_hot_configuration":
             guard let source=args["configuration"],let expected=args["expectedRevision"] else{throw AppError.message("Configuration JSON and expectedRevision required")}
             try installHotConfiguration(HotConfiguration.decode(Data(source.utf8)),expected:expected)
-            return "Configuration activated: "+hotConfiguration.revision+"; transport changes apply on next open"
+            return "Configuration activated: "+hotConfiguration.revision+"; transport changes apply on next open, gateway availability on reconnect"
         case "install_hot_configuration_from_db":
             guard let id=args["id"],DynamicUILayout.validID(id),let sha=args["sha"],sha.range(of:"^[0-9a-f]{40}$",options:.regularExpression) != nil,
                   let expected=args["expectedRevision"],!configurationBusy else{throw AppError.message("Configuration ID, blob SHA and expectedRevision required")}
@@ -1435,7 +1662,8 @@ import Network
             var contract:[String:Any]=[:]
             contract["runtimeABI"]=2
             contract["configurationABI"]=1
-            contract["configurationSections"]=["runtime","playbackRules","operations","interpreter","presentation"]
+            contract["configurationSections"]=["runtime","playbackRules","operations","interpreter","presentation","gateway"]
+            contract["applicationRevisionABI"]=1
             contract["configurationActivation"]="CAS revision; staged local/DB files; trial expiry/relaunch rollback; live properties now; transport on next open"
             contract["adapterABI"]=1
             contract["uiABI"]=1
@@ -1711,7 +1939,7 @@ import Network
         input["form"]=uiInputs
         let (output,commands)=try await scripts.evaluateAsync(source,snapshot:input)
         var results=[sanitized(output)]
-        for c in commands where c.action != "script" && c.action != "approve_reinstatement" && !["stage_hot_configuration","stage_hot_configuration_from_db","begin_configuration_trial","finish_configuration_trial","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","restore_hot_configuration","resume_automation","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive","checkpoint_patch_version","restore_patch_version","restore_known_good"].contains(c.action) {
+        for c in commands where !["enter_safe_mode","exit_safe_mode","begin_application_trial","finish_application_trial","restore_application_revision"].contains(c.action) && c.action != "script" && c.action != "approve_reinstatement" && !["stage_hot_configuration","stage_hot_configuration_from_db","begin_configuration_trial","finish_configuration_trial","install_hot_configuration","install_hot_configuration_from_db","reload_hot_configuration","rollback_hot_configuration","reset_hot_configuration","restore_hot_configuration","resume_automation","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","install_ui_layout","install_ui_layout_from_db","rollback_ui_layout","reset_ui_layout","ui_trigger","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","promote_patch_archive","checkpoint_patch_version","restore_patch_version","restore_known_good"].contains(c.action) {
             let r=await execute(c);results.append("\(c.action): \(r.status) \(r.result)")
         }
         scriptOutput=sanitized(results.joined(separator:"\n"),limit:524288)
@@ -2147,6 +2375,7 @@ extension AppModel {
     private func uploadEngineeringResults() async throws {
         // Keep completed step evidence until the corresponding checkpoint is durable.
         for url in disk.files(prefix:"qa-result-").prefix(12) {
+            if applicationTrial?.pending==true,let cp=campaign,url.lastPathComponent.hasPrefix("qa-result-"+cp.runID+"-"){continue}
             if let cp=campaign,cp.canResume,url.lastPathComponent=="qa-result-"+cp.resultID+".json"{continue}
             let data=try Data(contentsOf:url)
             let result=try JSONCodec.decoder().decode(DeviceTestResult.self,from:data)
@@ -2444,6 +2673,7 @@ extension AppModel {
             else{loaded=nil}
             validatedCandidate=loaded;locallyValidated=true
             let staged=Jellyfin(deviceID:deviceID)
+            staged.gatewayConfiguration=jelly.gatewayConfiguration
             staged.adapter=loaded
             staged.log={ [weak self] severity,code,fields in self?.log(severity,"jellyfin-api-stage",code,fields)}
             try await staged.connect(savedSettings)

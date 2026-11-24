@@ -29,17 +29,17 @@ enum SharedSurf {
     // The LAN gateway is a separate authenticated service on the same configured
     // server. Only the explicitly supported private IPv4 Jellyfin port pairing
     // can use it; no arbitrary cross-host or public HTTP token forwarding.
-    static func gatewayOrigin(for server:URL)->URL? {
-        guard var c=URLComponents(url:server,resolvingAgainstBaseURL:false),
+    static func gatewayOrigin(for server:URL,configuration:GatewayConfiguration=GatewayConfiguration())->URL? {
+        guard (try? configuration.checked()) != nil,var c=URLComponents(url:server,resolvingAgainstBaseURL:false),
               c.user==nil,c.password==nil,c.query==nil,c.fragment==nil,
               c.path.isEmpty || c.path=="/",let host=c.host else{return nil}
         if c.scheme?.lowercased()=="https" {c.path="";return c.url}
-        guard c.scheme?.lowercased()=="http",c.port==8096 else{return nil}
+        guard c.scheme?.lowercased()=="http",c.port==(configuration.lanServerPort ?? 8096) else{return nil}
         let octets=host.split(separator:".").compactMap{UInt8($0)}
         guard octets.count==4,host==octets.map{String($0)}.joined(separator:"."),
               octets[0]==10 || (octets[0]==172 && (16...31).contains(octets[1])) || (octets[0]==192 && octets[1]==168)
         else{return nil}
-        c.port=8097;c.path="";return c.url
+        c.port=configuration.lanGatewayPort ?? 8097;c.path="";return c.url
     }
     static func mode(for category:String)->String? {
         let value=category.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
@@ -58,8 +58,9 @@ enum SharedSurf {
         guard let mode=mode(for:category) else{return nil}
         return channels.first{Self.mode(for:$0)==mode}
     }
-    static func ticketURL(_ raw:String,origin:URL,mode:String)throws->URL {
-        let expected="/api/surf/"+mode+"/hls/index.m3u8"
+    static func ticketURL(_ raw:String,origin:URL,mode:String,configuration:GatewayConfiguration=GatewayConfiguration())throws->URL {
+        _ = try configuration.checked()
+        let expected=configuration.path(mode:mode,leaf:"index.m3u8")
         guard ["all","movies-series","sports"].contains(mode),
               let parts=URLComponents(string:raw),parts.scheme==nil,parts.host==nil,
               parts.user==nil,parts.password==nil,parts.fragment==nil,
@@ -237,6 +238,7 @@ struct Settings: Codable {
     var unattended = true
     var lanEnabled = true
     var remoteControlMode:RemoteControlMode?
+    var lanAccessToken:String?
     var controlMode:RemoteControlMode {
         get {remoteControlMode ?? .lan}
         set {remoteControlMode=newValue}
@@ -417,6 +419,21 @@ enum LANHTTP {
         case invalid(String)
         case request(method:String,path:String,body:Data)
     }
+    static func authorized(_ buffer:Data,token:String?)->Bool{
+        guard let token=token,!token.isEmpty else{return true}
+        guard let end=buffer.range(of:Data("\r\n\r\n".utf8)),
+              let header=String(data:buffer[..<end.lowerBound],encoding:.utf8) else{return false}
+        let values=header.components(separatedBy:"\r\n").dropFirst().compactMap{line->String? in
+            guard let colon=line.firstIndex(of:":"),line[..<colon].lowercased()=="authorization" else{return nil}
+            return line[line.index(after:colon)...].trimmingCharacters(in:.whitespaces)
+        }
+        guard values.count==1 else{return false}
+        let a=Array(values[0].utf8),b=Array(("Bearer "+token).utf8)
+        guard a.count==b.count else{return false}
+        var difference:UInt8=0
+        for i in a.indices{difference |= a[i] ^ b[i]}
+        return difference==0
+    }
     static func parse(_ buffer:Data)->Parsed {
         guard buffer.count<=maxHeader+maxBody else{return .invalid("413 Payload Too Large")}
         guard let end=buffer.range(of:Data("\r\n\r\n".utf8)) else {
@@ -448,4 +465,23 @@ enum LANHTTP {
         guard buffer.count-end.upperBound>=size else{return .incomplete}
         return .request(method:method,path:path,body:Data(buffer[end.upperBound..<(end.upperBound+size)]))
     }
+}
+
+// Same configured origin on HTTPS, or explicit private IPv4 port pairing.
+// No arbitrary host, protocol, URL or authentication forwarding is allowed.
+struct GatewayConfiguration:Codable,Equatable{
+    var lanServerPort:Int?=nil
+    var lanGatewayPort:Int?=nil
+    var routePrefix:String?=nil
+    var ticketField:String?=nil
+    var timeoutSeconds:Int?=nil
+    func checked()throws->Self{
+        let path=routePrefix ?? "/api/surf"
+        guard (1...65535).contains(lanServerPort ?? 8096),(1...65535).contains(lanGatewayPort ?? 8097),
+              path.hasPrefix("/"),JellyfinAdapterRules.validPath(String(path.dropFirst())),
+              (ticketField ?? "url").range(of:"^[A-Za-z_][A-Za-z0-9_]{0,79}$",options:.regularExpression) != nil,
+              (5...90).contains(timeoutSeconds ?? 20) else{throw AppError.message("Invalid shared gateway configuration")}
+        return self
+    }
+    func path(mode:String,leaf:String)->String{(routePrefix ?? "/api/surf")+"/"+mode+"/hls/"+leaf}
 }

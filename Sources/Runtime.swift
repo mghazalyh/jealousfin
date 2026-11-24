@@ -37,6 +37,8 @@ final class LANServer {
     private let queue=DispatchQueue(label:"jealousfin.lan")
     private let listenPort:NWEndpoint.Port
     private let advertise:Bool
+    private var accessToken:String?
+    func setAccessToken(_ token:String?){queue.sync{accessToken=token}}
     private var connections:[ObjectIdentifier:NWConnection]=[:]
     var handler:((Data,@escaping(String,Data)->Void)->Void)?
     var queryHandler:((String,@escaping(String,Data)->Void)->Void)?
@@ -106,6 +108,9 @@ final class LANServer {
                 if done{self.finish(c)}else{self.receive(c,buffer:b)}
             case .invalid(let status):self.respond(c,status,self.errorBody(status))
             case .request(let method,let path,let body):
+                guard (method=="GET" && path=="/health") || LANHTTP.authorized(b,token:self.accessToken) else{
+                    self.respond(c,"401 Unauthorized",self.errorBody("LAN authentication required"));return
+                }
                 if method=="POST" && path=="/command"{
                     guard let handler=self.handler else{self.respond(c,"503 Service Unavailable",self.errorBody("Command dispatcher unavailable"));return}
                     handler(body){[weak self] status,output in self?.respond(c,status,output)}
