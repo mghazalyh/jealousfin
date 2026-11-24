@@ -41,14 +41,30 @@ struct DynamicUIPage: Codable, Equatable, Identifiable {
     var symbol:String?
     var nodes:[DynamicUINode]
 }
+// Versioned with the layout, so rollback restores both content and appearance.
+struct DynamicPresentation: Codable, Equatable {
+    var videoGravity:String? = nil
+    var fullscreenOpacity:Double? = nil
+    var fullscreenMaxHeight:Double? = nil
+    var fullscreenInitiallyVisible:Bool? = nil
+    func checked()throws->Self{
+        guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
+              (0.15...1).contains(fullscreenOpacity ?? 0.82),
+              (0.20...0.80).contains(fullscreenMaxHeight ?? 0.48)
+        else{throw AppError.message("Invalid presentation options")}
+        return self
+    }
+}
 struct DynamicUILayout: Codable, Equatable {
     var schemaVersion:Int
     var revision:String
     var slots:[DynamicUISlot]
     var pages:[DynamicUIPage]
-    static let locations=["guide.top","guide.bottom","player.top","player.controls","player.bottom","player.fullscreen.top","player.fullscreen.controls","player.fullscreen.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
+    var presentation:DynamicPresentation? = nil
+    static let replacementLocations=["guide.body","health.body","insights.body","more.body","player.transport","player.surf","player.history","player.fullscreen.header","player.fullscreen.transport","player.fullscreen.surf","player.fullscreen.footer"]
+    static let locations=replacementLocations+["guide.top","guide.bottom","player.top","player.controls","player.bottom","player.fullscreen.top","player.fullscreen.controls","player.fullscreen.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
     static let kinds=["text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
-    static let commands:Set<String>=["set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
+    static let commands:Set<String>=["get_native_capabilities","get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
     static func validID(_ value:String)->Bool {
         value.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil
     }
@@ -61,6 +77,7 @@ struct DynamicUILayout: Codable, Equatable {
             slots.allSatisfy({Self.locations.contains($0.location)}),
             pages.allSatisfy({Self.validID($0.id) && !$0.title.isEmpty && $0.title.count<=100})
         else{throw AppError.message("Invalid UI layout header, slots or pages")}
+        _ = try presentation?.checked()
         var seen=Set<String>();var fields=Set<String>();var count=0
         let pageIDs=Set(pages.map(\.id))
         func walk(_ nodes:[DynamicUINode],depth:Int)throws{

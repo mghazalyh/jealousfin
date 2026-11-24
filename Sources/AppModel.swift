@@ -971,9 +971,12 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        snapshot["preferences"]=PatchablePreferences.snapshot(settings)
+        snapshot["playerAudio"]=["volume":String(player.volume),"muted":String(player.isMuted)]
+        return snapshot
     }
-    static let actions=["set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","set_fullscreen","set_fullscreen_controls","get_native_capabilities","get_player_snapshot","probe_active_hls","set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
     func execute(_ c:Command,origin:String="internal") async -> Receipt {
         if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
@@ -1001,7 +1004,7 @@ import Network
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
-            let structured:Set<String>=["get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
+            let structured:Set<String>=["get_preferences","set_preferences","get_native_capabilities","get_player_snapshot","probe_active_hls","get_status","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","get_logs","get_telemetry","get_insights","get_runtime_module","get_device_tests","get_ui_layout","ui_get_capabilities","get_decisions","get_jellyfin_api","probe_jellyfin_api","get_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions"]
             result.result=structured.contains(c.action) ? output : sanitized(output,limit:524288)
         } catch {result.status="failed";result.result=sanitized(error.localizedDescription)}
         if !disk.save(result,"receipt-\(c.id).json") {
@@ -1017,9 +1020,49 @@ import Network
             throw AppError.message("Patch restoration in progress")
         }
         switch action {
+        case "get_preferences":
+            return try json(PatchablePreferences.snapshot(settings))
+        case "set_preferences":
+            guard !loginBusy,!apiChanging,!patchBusy else{throw AppError.message("Settings or patch engine busy")}
+            let candidate=try PatchablePreferences.applying(args,to:settings)
+            let previous=settings
+            // A category change while surfing must use the actual session transition.
+            guard !surfing || candidate.surfCategory==previous.surfCategory else{throw AppError.message("Use start_surf to change an active category")}
+            guard disk.save(candidate,"settings.json") else{throw AppError.message("Cannot persist preferences")}
+            settings=candidate
+            if surfing,!surfPaused,!usingSharedSurf,validated,previous.rotationMinutes != settings.rotationMinutes{
+                nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
+            }
+            if activePatchID=="native-baseline"{
+                player.currentItem?.preferredPeakBitRate=Double(settings.qualityMbps)*1_000_000
+            }
+            log("INFO","settings","PREFERENCES_PATCHED",["keys":args.keys.sorted().joined(separator:",")])
+            return try json(PatchablePreferences.snapshot(settings))
+        case "set_player_audio":
+            guard !args.isEmpty,args.keys.allSatisfy({["volume","muted"].contains($0)}) else{throw AppError.message("Expected volume or muted")}
+            var volume=player.volume
+            var muted=player.isMuted
+            if let raw=args["volume"]{
+                guard let n=Float(raw),n.isFinite,(0...1).contains(n) else{throw AppError.message("Volume must be 0 to 1")}
+                volume=n
+            }
+            if let raw=args["muted"]{
+                guard ["true","false"].contains(raw) else{throw AppError.message("Expected muted=true or false")}
+                muted=raw=="true"
+            }
+            player.volume=volume;player.isMuted=muted
+            return "Player audio updated"
+        case "navigate":
+            guard let target=args["screen"],let index=["guide","player","health","insights","more"].firstIndex(of:target) else{throw AppError.message("Unknown screen")}
+            fullscreenPresented=false;dynamicPage=nil;tab=index
+            return "Navigation requested"
+        case "refresh_catalogue":
+            guard jelly.connected,!catalogueBusy else{throw AppError.message("Catalogue unavailable or busy")}
+            try await refresh()
+            return "Catalogue refreshed"
         case "set_fullscreen":
             guard let raw=args["visible"],["true","false"].contains(raw) else{throw AppError.message("Expected visible=true or false")}
-            if raw=="true"{tab=1;fullscreenControlsVisible=true}
+            if raw=="true"{tab=1;fullscreenControlsVisible=dynamicUI.active?.presentation?.fullscreenInitiallyVisible ?? true}
             fullscreenPresented=raw=="true"
             return "Fullscreen presentation requested"
         case "set_fullscreen_controls":
@@ -1027,7 +1070,22 @@ import Network
             fullscreenControlsVisible=raw=="true"
             return "Fullscreen controls updated"
         case "get_native_capabilities":
-            return try json(["runtimeABI":"2","adapterABI":"1","playbackAttemptHook":"true","playbackPolicyFields":"segmentContainer,forceEncode,segmentSeconds,minimumSegments,maxWidth,maxHeight,videoBitrate,audioBitrate,peakMbps,forwardBufferSeconds,automaticallyWaits,startupSeconds,diagnosticSeconds,preferDirect","hlsProbe":"active-session,same-origin,no-redirect","sharedSurf":"unchanged,server-owned","nativeLifecycle":"native-only","fullscreenUI":"player.fullscreen.top,player.fullscreen.controls,player.fullscreen.bottom"])
+            var contract:[String:Any]=[:]
+            contract["runtimeABI"]=2
+            contract["adapterABI"]=1
+            contract["uiABI"]=1
+            contract["actions"]=Self.actions
+            contract["runtimeHooks"]=["configure","playbackAttempt","select","tick"]
+            contract["adapterHooks"]=["configure","request","response","stream"]
+            contract["playbackPolicyFields"]=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect"]
+            contract["uiLocations"]=DynamicUILayout.locations
+            contract["uiReplacementLocations"]=DynamicUILayout.replacementLocations.filter{$0 != "more.body"}
+            contract["uiPrimitives"]=DynamicUILayout.kinds
+            contract["uiCommands"]=DynamicUILayout.commands.sorted()
+            contract["presentationFields"]=["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible"]
+            contract["preferences"]=PatchablePreferences.keys
+            contract["nativeOnly"]=["credential ownership","signing","entitlements","new OS frameworks","native recovery shell","native media decoding","shared gateway server internals"]
+            return String(decoding:try JSONSerialization.data(withJSONObject:contract,options:[.sortedKeys]),as:UTF8.self)
         case "get_player_snapshot":
             let item=player.currentItem
             let access=item?.accessLog()?.events.last
@@ -1652,7 +1710,7 @@ extension AppModel {
                     guard self.disk.save(cp,"module-checkpoint.json") else{throw AppError.message("Cannot journal module decision")}
                     self.moduleCheckpoint=cp
                 }
-                let allowed:Set<String>=["get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","present_decision","get_decisions"]
+                let allowed:Set<String>=["get_preferences","get_native_capabilities","get_player_snapshot","set_fullscreen","set_fullscreen_controls","set_player_audio","navigate","refresh_catalogue","get_status","get_telemetry","get_insights","list_channels","get_channel_health","open_channel","play","pause","resume","stop","next_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","reconnect","sync_now","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","present_decision","get_decisions"]
                 // Journal the actual command IDs before execution. After a crash
                 // the ordinary command receipt prevents a duplicate mutation.
                 while let command=cp.pending?.first {

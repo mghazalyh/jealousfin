@@ -6,6 +6,10 @@ struct PlayerSurface: UIViewControllerRepresentable {
     var player: AVPlayer
     var onReady: (Bool)->Void
     var showsControls:Bool = true
+    var gravity:String = "fit"
+    private var videoGravity:AVLayerVideoGravity {
+        switch gravity{case "fill":return .resizeAspectFill;case "stretch":return .resize;default:return .resizeAspect}
+    }
     func makeCoordinator()->Coordinator { Coordinator(onReady) }
     final class Coordinator {
         var callback:(Bool)->Void
@@ -16,6 +20,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
         let c=AVPlayerViewController()
         c.player=player
         c.showsPlaybackControls=showsControls
+        c.videoGravity=videoGravity
         c.allowsPictureInPicturePlayback=true
         context.coordinator.observation=c.observe(\.isReadyForDisplay,options:[.initial,.new]){ [weak coordinator=context.coordinator] vc,_ in
             let ready=vc.isReadyForDisplay
@@ -27,6 +32,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
         context.coordinator.callback=onReady
         if uiViewController.player !== player {uiViewController.player=player}
         uiViewController.showsPlaybackControls=showsControls
+        uiViewController.videoGravity=videoGravity
     }
     static func dismantleUIViewController(_ uiViewController:AVPlayerViewController,coordinator:Coordinator){
         coordinator.observation?.invalidate()

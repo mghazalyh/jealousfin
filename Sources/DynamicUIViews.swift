@@ -13,6 +13,33 @@ struct DynamicUISlotView: View {
         }
     }
 }
+struct PatchableRegion<Content:View>:View {
+    @EnvironmentObject var model:AppModel
+    let location:String
+    let fallback:Content
+    init(_ location:String,@ViewBuilder fallback:()->Content){self.location=location;self.fallback=fallback()}
+    var body:some View{
+        if let slot=model.dynamicUI.active?.slots.first(where:{$0.location==location}),!slot.nodes.isEmpty {
+            DynamicUISlotView(location:location)
+        }else{fallback}
+    }
+}
+struct PatchableTab<Content:View>:View{
+    @EnvironmentObject var model:AppModel
+    let location:String
+    let content:Content
+    init(_ location:String,@ViewBuilder content:()->Content){self.location=location;self.content=content()}
+    var body:some View{
+        if let slot=model.dynamicUI.active?.slots.first(where:{$0.location==location}),!slot.nodes.isEmpty{
+            Screen{
+                Button("Restore native interface"){
+                    Task{_ = await model.execute(Command(id:UUID().uuidString,action:"reset_ui_layout",arguments:nil,expiresAt:nil))}
+                }.buttonStyle(.bordered)
+                DynamicUISlotView(location:location)
+            }.navigationBarHidden(true)
+        }else{content}
+    }
+}
 struct DynamicUINodes:View{
     let nodes:[DynamicUINode]
     var body:some View{

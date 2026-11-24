@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "revision": "fullscreen-replacement-example",
+  "presentation": {"videoGravity":"fit","fullscreenOpacity":0.7,"fullscreenMaxHeight":0.5,"fullscreenInitiallyVisible":true},
+  "slots": [
+    {"location":"player.fullscreen.transport","nodes":[
+      {"id":"custom-transport","kind":"hstack","children":[
+        {"id":"custom-pause","kind":"button","title":"Pause","symbol":"pause.fill","action":{"command":"pause"}},
+        {"id":"custom-play","kind":"button","title":"Play","symbol":"play.fill","action":{"command":"resume"}},
+        {"id":"custom-stop","kind":"button","title":"Stop","symbol":"stop.fill","action":{"command":"stop"}}
+      ]}
+    ]},
+    {"location":"player.fullscreen.surf","nodes":[
+      {"id":"custom-sports","kind":"button","title":"Surf Sports","action":{"command":"start_surf","arguments":{"category":"Sports"}}},
+      {"id":"custom-all","kind":"button","title":"Surf All","action":{"command":"start_surf","arguments":{"category":"All Channels"}}},
+      {"id":"custom-stop-surf","kind":"button","title":"Stop Surf","action":{"command":"stop_surf"}}
+    ]},
+    {"location":"player.fullscreen.footer","nodes":[
+      {"id":"custom-diagnostic","kind":"metric","title":"Playback clock","valueKey":"state.metrics.position"},
+      {"id":"custom-player-snapshot","kind":"button","title":"Live diagnostics","action":{"command":"get_player_snapshot"}}
+    ]}
+  ],
+  "pages":[]
+}

@@ -257,6 +257,43 @@ struct Settings: Codable {
         if username==defaults.username && password.isEmpty{password=defaults.password}
     }
 }
+enum PatchablePreferences {
+    static let keys=["rotationMinutes","retries","startupTimeout","qualityMbps","random","validation","unattended","autoLogin","surfCategory"]
+    static func snapshot(_ s:Settings)->[String:String]{
+        ["rotationMinutes":String(s.rotationMinutes),"retries":String(s.retries),"startupTimeout":String(s.startupTimeout),
+         "qualityMbps":String(s.qualityMbps),"random":String(s.random),"validation":String(s.validation),
+         "unattended":String(s.unattended),"autoLogin":String(s.autoLogin),"surfCategory":s.surfCategory]
+    }
+    static func applying(_ changes:[String:String],to settings:Settings)throws->Settings {
+        guard !changes.isEmpty,changes.keys.allSatisfy({keys.contains($0)}) else{throw AppError.message("Unknown or empty preference change")}
+        var s=settings
+        for (key,value) in changes {
+            func integer(_ range:ClosedRange<Int>)throws->Int{
+                guard let n=Int(value),range.contains(n) else{throw AppError.message("Invalid "+key)}
+                return n
+            }
+            func boolean()throws->Bool{
+                guard ["true","false"].contains(value) else{throw AppError.message("Invalid "+key)}
+                return value=="true"
+            }
+            switch key {
+            case "rotationMinutes":s.rotationMinutes=try integer(1...1440)
+            case "retries":s.retries=try integer(1...5)
+            case "startupTimeout":s.startupTimeout=try integer(5...120)
+            case "qualityMbps":s.qualityMbps=try integer(1...50)
+            case "random":s.random=try boolean()
+            case "validation":s.validation=try boolean()
+            case "unattended":s.unattended=try boolean()
+            case "autoLogin":s.autoLogin=try boolean()
+            case "surfCategory":
+                guard ["All Channels","Favorites","Sports","Movies & Series"].contains(value) else{throw AppError.message("Invalid Surf category")}
+                s.surfCategory=value
+            default:throw AppError.message("Unsupported preference")
+            }
+        }
+        return s
+    }
+}
 enum JSONCodec {
     static func encoder() -> JSONEncoder {
         let e = JSONEncoder()

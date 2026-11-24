@@ -5,18 +5,19 @@ import AVKit
 // changes. Native buttons remain available if a dynamic UI revision is rejected.
 struct FullscreenSurfPlayer:View {
     @EnvironmentObject var model:AppModel
+    private var presentation:DynamicPresentation{model.dynamicUI.active?.presentation ?? DynamicPresentation()}
     var body:some View {
         GeometryReader{geometry in
             ZStack {
                 Color.black.ignoresSafeArea()
-                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:false)
+                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:false,gravity:presentation.videoGravity ?? "fit")
                     .ignoresSafeArea()
                     .accessibilityLabel("Fullscreen video")
                 if model.fullscreenControlsVisible {
                     VStack(spacing:0){
                         header
                         Spacer(minLength:8)
-                        footer(maxHeight:max(100,geometry.size.height*0.48))
+                        footer(maxHeight:max(100,geometry.size.height*CGFloat(presentation.fullscreenMaxHeight ?? 0.48)))
                     }.padding(.horizontal,12).padding(.vertical,8)
                 }else{
                     VStack{
@@ -39,9 +40,11 @@ struct FullscreenSurfPlayer:View {
     private var header:some View{
         VStack(alignment:.leading,spacing:8){
             HStack(spacing:10){
+                PatchableRegion("player.fullscreen.header"){
                 VStack(alignment:.leading,spacing:3){
                     Text(model.current?.name ?? "Choose a channel").font(.headline).lineLimit(1)
                     Text(model.current?.program?.title ?? model.status).font(.caption).lineLimit(1)
+                }
                 }
                 Spacer(minLength:4)
                 Button{model.fullscreenControlsVisible=false}label:{
@@ -51,7 +54,7 @@ struct FullscreenSurfPlayer:View {
                 closeButton
             }
             DynamicUISlotView(location:"player.fullscreen.top")
-        }.padding(10).background(Color.black.opacity(0.78)).cornerRadius(14)
+        }.padding(10).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.78)).cornerRadius(14)
     }
     private var closeButton:some View{
         Button{model.fullscreenPresented=false}label:{
@@ -70,6 +73,7 @@ struct FullscreenSurfPlayer:View {
                     Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
                         .font(.subheadline.monospacedDigit())
                 }
+                PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:8){
                     control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill","playPause"){
                         if model.playing{model.pause()}else{model.resume()}
@@ -82,6 +86,8 @@ struct FullscreenSurfPlayer:View {
                         control("Favorite",c.favorite ? "heart.fill":"heart","favorite"){model.favoriteFromUI(c)}
                     }
                 }
+                }
+                PatchableRegion("player.fullscreen.surf"){
                 HStack(spacing:8){
                     Menu{
                         ForEach(["All Channels","Favorites","Sports","Movies & Series"],id:\.self){category in
@@ -110,10 +116,13 @@ struct FullscreenSurfPlayer:View {
                     Text("Server manages source rotation. Reconnect refreshes the live stream.")
                         .font(.caption).foregroundColor(.secondary)
                 }
-                DynamicUISlotView(location:"player.fullscreen.controls")
-                DynamicUISlotView(location:"player.fullscreen.bottom")
+                }
+                PatchableRegion("player.fullscreen.footer"){
+                    DynamicUISlotView(location:"player.fullscreen.controls")
+                    DynamicUISlotView(location:"player.fullscreen.bottom")
+                }
             }.padding(12)
-        }.frame(maxHeight:maxHeight).background(Color.black.opacity(0.82)).cornerRadius(14)
+        }.frame(maxHeight:maxHeight).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.82)).cornerRadius(14)
     }
     private func control(_ title:String,_ image:String,_ id:String,action:@escaping()->Void)->some View{
         Button(action:action){

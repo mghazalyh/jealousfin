@@ -41,3 +41,20 @@ player.fullscreen.controls and player.fullscreen.bottom. Commands
 set_fullscreen and set_fullscreen_controls accept visible=true/false.
 The app's own fullscreen entry replaces the inline system transport controls.
 Physical transition and accessibility acceptance remains required.
+
+## Consolidated extensibility contract
+The native capability command returns the actual supported actions, hook names,
+UI node types, replacement regions, presentation fields and preference keys.
+A layout can replace Guide, Health and Insights tab bodies, inline player
+transport/Surf/history, and fullscreen header/transport/Surf/footer. The
+More custom region is additive so native recovery remains reachable. Fullscreen
+exit and hide/show controls are always native. Empty regions use native defaults.
+Optional layout presentation controls video fit/fill/stretch, overlay opacity,
+height and initial visibility; these are archived with the layout revision.
+HTML/CSS/JS components may build custom controls via the existing command bridge.
+Preferences are validated and persisted as a transaction, without exposing or
+altering server credentials or PATs. Existing runtime overrides take precedence.
+Player audio is application-level only. Navigation and catalogue refresh use
+native actions. See Examples/fullscreen-replacement.json for a full replacement.
+The native media engine, OS entitlements, credential ownership, installation
+and recovery shell remain native. This is not arbitrary native code injection.

@@ -19,10 +19,10 @@ struct RootView:View {
     @EnvironmentObject var model:AppModel
     var body:some View{
         TabView(selection:$model.tab){
-            NavigationView{GuideView()}.navigationViewStyle(.stack).tabItem{Label("Guide",systemImage:"tv")}.tag(0)
+            NavigationView{PatchableTab("guide.body"){GuideView()}}.navigationViewStyle(.stack).tabItem{Label("Guide",systemImage:"tv")}.tag(0)
             NavigationView{PlaybackView()}.navigationViewStyle(.stack).tabItem{Label("Player",systemImage:"play.rectangle")}.tag(1)
-            NavigationView{HealthView()}.navigationViewStyle(.stack).tabItem{Label("Health",systemImage:"waveform.path.ecg")}.tag(2)
-            NavigationView{InsightsView()}.navigationViewStyle(.stack).tabItem{Label("Insights",systemImage:"lightbulb")}.tag(3)
+            NavigationView{PatchableTab("health.body"){HealthView()}}.navigationViewStyle(.stack).tabItem{Label("Health",systemImage:"waveform.path.ecg")}.tag(2)
+            NavigationView{PatchableTab("insights.body"){InsightsView()}}.navigationViewStyle(.stack).tabItem{Label("Insights",systemImage:"lightbulb")}.tag(3)
             NavigationView{EngineeringView()}.navigationViewStyle(.stack).tabItem{Label("More",systemImage:"ellipsis.circle")}.tag(4)
         }
         .accentColor(accent)
@@ -123,11 +123,11 @@ struct PlaybackView:View{
                 if model.fullscreenPresented {
                     Color.black.aspectRatio(16/9,contentMode:.fit)
                 }else{
-                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:false)
+                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:false,gravity:model.dynamicUI.active?.presentation?.videoGravity ?? "fit")
                         .aspectRatio(16/9,contentMode:.fit)
                 }
                 Button{
-                    model.fullscreenControlsVisible=true
+                    model.fullscreenControlsVisible=model.dynamicUI.active?.presentation?.fullscreenInitiallyVisible ?? true
                     model.fullscreenPresented=true
                 }label:{
                     Image(systemName:"arrow.up.left.and.arrow.down.right")
@@ -137,6 +137,7 @@ struct PlaybackView:View{
                     .accessibilityLabel("Enter fullscreen with Surf controls")
                     .accessibilityIdentifier("player.fullscreen.enter")
             }.background(.black).cornerRadius(14)
+            PatchableRegion("player.transport"){
             Panel{
                 VStack(alignment:.leading,spacing:8){
                     Text(model.current?.name ?? "Choose a channel").font(.title2.bold())
@@ -150,7 +151,9 @@ struct PlaybackView:View{
                     }.buttonStyle(.bordered)
                 }
             }
+            }
             DynamicUISlotView(location:"player.controls")
+            PatchableRegion("player.surf"){
             SectionLabel(title:"Surf controls")
             Panel{
                 VStack(alignment:.leading,spacing:12){
@@ -165,8 +168,11 @@ struct PlaybackView:View{
                     }
                 }
             }
-            SectionLabel(title:"Recently played")
-            ForEach(model.previous){c in ChannelRow(channel:c)}
+            }
+            PatchableRegion("player.history"){
+                SectionLabel(title:"Recently played")
+                ForEach(model.previous){c in ChannelRow(channel:c)}
+            }
             DynamicUISlotView(location:"player.bottom")
         }.navigationBarHidden(true)
         .fullScreenCover(isPresented:$model.fullscreenPresented){
@@ -251,6 +257,7 @@ struct EngineeringView:View{
     var body:some View{
         Screen{
             DynamicUISlotView(location:"more.top")
+            DynamicUISlotView(location:"more.body")
             Text("Engineering").font(.largeTitle.bold())
             Panel{
                 VStack(alignment:.leading,spacing:12){
