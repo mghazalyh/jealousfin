@@ -3,7 +3,7 @@ set -euo pipefail
 : "${JEALOUSFIN_BUILD_NUMBER:?Expected numeric build number}"
 [[ "$JEALOUSFIN_BUILD_NUMBER" =~ ^[0-9]+$ ]]
 APP="DerivedData/Build/Products/Release-iphoneos/Jealousfin.app"
-STAGED="build/Payload/Jealousfin.app"
+STAGED="build/release-app/Jealousfin.app"
 BUNDLE="com.example.jealousfin"
 test -f "$APP/Jealousfin"
 test -f "$APP/Info.plist"
@@ -15,15 +15,16 @@ check_metadata() {
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")" == "15.0" ]]
   [[ "$(lipo -archs "$app/Jealousfin")" == arm64 ]]
   [[ -z "$(find "$app" -type f \( -iname 'JealousfinDefaults.plist' -o -iname '*.mobileprovision' -o -iname '*.p12' -o -iname '*.pfx' -o -iname '*.key' \) -print -quit)" ]]
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSRequiresIPhoneOS' "$app/Info.plist")" == true ]]
   test -x "$app/Jealousfin"
   [[ "$(stat -f %Lp "$app/Jealousfin")" == 755 ]]
 }
 chmod 755 "$APP/Jealousfin"
 check_metadata "$APP"
 mkdir -p build
-rm -rf build/Payload
-mkdir -p build/Payload
-ditto "$APP" "$STAGED"
+rm -rf build/Payload build/release-app
+mkdir -p build/Payload build/release-app
+cp -R "$APP" "$STAGED"
 cp Vendor/QuickJS/LICENSE "$STAGED/QuickJS-LICENSE.txt"
 python3 -c 'import json; m=json.load(open("Promoted/baseline.json")); print(json.dumps({k:m[k] for k in ("schemaVersion","revision","sources")},sort_keys=True))' > "$STAGED/PromotedBaseline.json"
 # Preserve the unsigned packaging format used by the previously installed RC1.
@@ -45,7 +46,9 @@ verify_unsigned() {
 }
 verify_unsigned "$STAGED"
 rm -f build/Jealousfin-unsigned.ipa build/Jealousfin-unsigned.ipa.sha256
+cp -R "$STAGED" build/Payload/
 (cd build && /usr/bin/zip -qry Jealousfin-unsigned.ipa Payload)
+rm -rf build/Payload/Jealousfin.app
 unzip -tq build/Jealousfin-unsigned.ipa
 unsigned_check="$(mktemp -d)"
 trap 'rm -rf "$unsigned_check"' EXIT
@@ -57,12 +60,12 @@ trap - EXIT
 # Sign only after every resource is staged. Do not copy shared profile entitlements.
 # This is an ad hoc signature for TrollStore, not an Apple distribution signature.
 xattr -cr "$STAGED"
-codesign --force --sign - --identifier "$BUNDLE" "$STAGED"
+codesign --force --deep --sign - --timestamp=none "$STAGED"
 verify_signature() {
   local app="$1"
   local details
   check_metadata "$app"
-  codesign --verify --strict --verbose=2 "$app"
+  codesign --verify --deep --strict --verbose=2 "$app"
   details="$(codesign -dv --verbose=4 "$app" 2>&1)"
   grep -Fx "Identifier=$BUNDLE" <<< "$details"
   grep -Fx 'Signature=adhoc' <<< "$details"
@@ -74,6 +77,8 @@ verify_signature() {
 }
 verify_signature "$STAGED"
 rm -f build/Jealousfin.ipa build/Jealousfin.ipa.sha256
+cp -R "$STAGED" build/Payload/
+verify_signature build/Payload/Jealousfin.app
 (cd build && /usr/bin/zip -qry Jealousfin.ipa Payload)
 unzip -tq build/Jealousfin.ipa
 scratch="$(mktemp -d)"
