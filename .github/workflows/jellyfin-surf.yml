@@ -1,4 +1,4 @@
-name: Real Jellyfin Surf transport diagnostics
+name: Real Jellyfin three-category Surf acceptance
 on:
   push:
     branches: [diagnostics/jellyfin-connection-only]
@@ -9,6 +9,11 @@ jobs:
   surf:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        category: [0, 1, 2]
     steps:
       - name: Ensure FFmpeg decoder is available
         run: |
@@ -17,17 +22,19 @@ jobs:
             sudo apt-get install -y -qq ffmpeg
           fi
           ffmpeg -version | head -n 1
-      - name: Probe one Surf channel and close session
+      - name: Verify distinct HLS segments, video and audio, and cleanup
         env:
           JELLYFIN_TEST_URL: ${{ secrets.JELLYFIN_TEST_URL }}
           JELLYFIN_TEST_USERNAME: ${{ secrets.JELLYFIN_TEST_USERNAME }}
           JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
+          SURF_CATEGORY: ${{ matrix.category }}
         run: |
           python3 - <<'PY'
-          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,uuid,time,sys,subprocess
+          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,uuid,time,sys,subprocess,hashlib
           base=os.environ["JELLYFIN_TEST_URL"].strip().rstrip("/")
           p=U.urlsplit(base)
           if p.scheme!="https" or not p.hostname or p.username or p.password or p.query or p.fragment: sys.exit("Invalid HTTPS base URL")
+          if p.hostname.lower() != "desktop-hb9oshs.tail1fc8b.ts.net": sys.exit("Unexpected public tunnel hostname")
           def origin(url):
               q=U.urlsplit(url)
               return (q.scheme,q.hostname,q.port or (443 if q.scheme=="https" else 80))
@@ -86,16 +93,14 @@ jobs:
               stage="Surf selection"
               matches=[x for x in items if "surf" in x.get("Name","").lower()]
               print("Surf-named channels:",len(matches),flush=True)
-              chosen=next((x for x in matches if x.get("Name","").lower()=="surf all channels"),None)
-              if chosen is None: chosen=next((x for x in matches if "all" in x.get("Name","").lower()),None)
-              if chosen is None and matches: chosen=matches[0]
-              if not chosen: raise ValueError("no Surf channel found")
+              if len(matches)!=3: raise ValueError("expected exactly three Surf categories")
+              chosen=sorted(matches,key=lambda x:(x.get("Name","").casefold(),x["Id"]))[int(os.environ["SURF_CATEGORY"])]
               channel=chosen["Id"]
-              print("Selected virtual Surf channel",flush=True)
+              print("Selected virtual Surf category:",repr(chosen.get("Name",""))[:100],flush=True)
               bitrate=3000000
               profile={"Name":"Jealousfin AVPlayer","MaxStreamingBitrate":bitrate,"DirectPlayProfiles":[{"Container":"mp4,m4v,mov","Type":"Video","VideoCodec":"h264,hevc","AudioCodec":"aac,mp3,ac3,eac3"}],"TranscodingProfiles":[{"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":2}],"CodecProfiles":[],"SubtitleProfiles":[{"Format":"vtt","Method":"Hls"}]}
               stage="PlaybackInfo"
-              result=call(query("Items/"+channel+"/PlaybackInfo",UserId=uid,IsPlayback="true",AutoOpenLiveStream="true"),"POST",{"UserId":uid,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":True,"EnableDirectStream":True,"EnableTranscoding":True,"AutoOpenLiveStream":True,"DeviceProfile":profile})
+              result=call(query("Items/"+channel+"/PlaybackInfo",UserId=uid,IsPlayback="true",AutoOpenLiveStream="true"),"POST",{"UserId":uid,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":False,"EnableDirectStream":False,"EnableTranscoding":True,"AutoOpenLiveStream":True,"DeviceProfile":profile})
               play=result.get("PlaySessionId")
               sources=result.get("MediaSources") or []
               print("Media source count:",len(sources), "error code:",bool(result.get("ErrorCode")),flush=True)
@@ -104,11 +109,7 @@ jobs:
               print("Direct play:",bool(src.get("SupportsDirectPlay")),"Direct stream:",bool(src.get("SupportsDirectStream")),"Transcode:",bool(src.get("SupportsTranscoding")),"Live stream allocated:",bool(live),flush=True)
               stage="Stream URL"
               path=src.get("TranscodingUrl")
-              if not path:
-                  args={"Static":"true","MediaSourceId":sid}
-                  if play: args["PlaySessionId"]=play
-                  if live: args["LiveStreamId"]=live
-                  path=query("Videos/"+channel+"/stream",**args)
+              if not path: raise ValueError("expected HLS transcoding URL")
               print("Transcoding URL present:",bool(src.get("TranscodingUrl")),flush=True)
               url=mediaurl(path,base+"/")
               stage="Stream response"
@@ -134,17 +135,35 @@ jobs:
                           continue
                       stage="HLS segment"
                       print("Media playlist entries:",len(refs),flush=True)
-                      segments=[]
-                      for ref in refs[:2]:
-                          _,(seg,ctype)=child(ref,url,4000000)
-                          if not seg: raise ValueError("empty segment")
-                          segments.append(seg)
+                      segments=[]; seen=set(); hashes=set(); total=0
+                      deadline=time.monotonic()+25
+                      while time.monotonic()<deadline and len(segments)<4:
+                          for ref in refs:
+                              dest=U.urljoin(url,ref)
+                              if dest in seen: continue
+                              seen.add(dest)
+                              if origin(dest)!=origin(base): raise ValueError("cross-origin segment")
+                              seg,ctype=call(dest,limit=4000000,media=True,raw=True)
+                              if not seg: raise ValueError("empty segment")
+                              digest=hashlib.sha256(seg).hexdigest()
+                              if digest in hashes: continue
+                              hashes.add(digest); total+=len(seg); segments.append(seg)
+                              if total>12000000: raise ValueError("media budget exceeded")
+                              if len(segments)>=4: break
+                          if len(segments)>=4: break
+                          time.sleep(2)
+                          data,ctype=call(url,limit=1000000,media=True,raw=True)
+                          if not data.startswith(b"#EXTM3U"): raise ValueError("invalid refreshed playlist")
+                          refs=[x.strip() for x in data.decode("utf-8").splitlines() if x.strip() and not x.startswith("#")]
+                      print("Distinct media segments:",len(segments),"bytes:",total,flush=True)
+                      if len(segments)<3: raise ValueError("insufficient distinct segments")
                       stage="FFmpeg video decode"
-                      proc=subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-nostdin","-progress","pipe:1","-i","pipe:0","-map","0:v:0","-an","-f","null","-"],input=b"".join(segments),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
+                      proc=subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-nostdin","-progress","pipe:1","-i","pipe:0","-map","0:v:0","-map","0:a:0","-f","null","-"],input=b"".join(segments),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
                       frames=[int(line.split("=")[1].strip()) for line in proc.stdout.decode("utf-8","replace").splitlines() if line.startswith("frame=") and line.split("=")[1].strip().isdigit()]
                       count=max(frames,default=0)
                       print("FFmpeg return code:",proc.returncode,"decoded video frames:",count,flush=True)
-                      if proc.returncode!=0 or count<3: raise ValueError("video decode failed")
+                      print("Decoder error lines:",len(proc.stderr.splitlines()),flush=True)
+                      if proc.returncode!=0 or count<3 or proc.stderr.strip(): raise ValueError("video or audio decode failed")
                       if not seg: raise ValueError("empty segment")
                       print("Segment MPEG-TS sync byte:",seg[:1]==b"\x47",flush=True)
                       ok=True
@@ -172,6 +191,6 @@ jobs:
                       stage="Logout"
                       call("Sessions/Logout","POST")
                   except Exception as e: print("Logout failed:",type(e).__name__,flush=True); ok=False
-          print("Bounded Surf transport result:", "PASS (bounded media decode if HLS; not physical playback)" if ok else "FAIL",flush=True)
+          print("Bounded Surf transport result:", "PASS (distinct HLS segments and video/audio decode; not physical playback)" if ok else "FAIL",flush=True)
           sys.exit(0 if ok else 1)
           PY
