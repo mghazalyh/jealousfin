@@ -19,6 +19,10 @@ final class JellyfinFixture:URLProtocol {
                 URLComponents(url:url,resolvingAgainstBaseURL:false)?.queryItems?.contains(where:{$0.name=="Limit" && $0.value=="200"})==true{
                 object=["Channels":[["Key":"channel-a","Title":"Fixture channel"]]]
             }else{status=403}
+        case "/api/surf/all/hls/ticket","/api/surf/movies-series/hls/ticket","/api/surf/sports/hls/ticket":
+            if request.httpMethod=="POST" && request.value(forHTTPHeaderField:"X-Emby-Token")=="fixture-token" {
+                object=["url":url.path.replacingOccurrences(of:"ticket",with:"index.m3u8")+"?ticket=fixture-ticket"]
+            }else{status=401}
         case "/System/Info/Public":object=["ServerName":"Fixture"]
         case "/Items/channel-a/PlaybackInfo":
             object=["PlaySessionId":"fixture-play","MediaSources":[["Id":"fixture-source","LiveStreamId":"fixture-live","TranscodingUrl":"/original.m3u8?api_key=old"]]]
@@ -97,6 +101,17 @@ final class JellyfinFixture:URLProtocol {
         try require(client.inFlight==0,"session cleanup drains transport")
         let healthy=await client.healthy()
         try require(healthy,"patched server health probe")
+        var secureSettings=fixtureSettings;secureSettings.server="https://fixture.invalid"
+        let gateway=Jellyfin(deviceID:"gateway",transport:URLSession(configuration:config))
+        gateway.adapter=adapter
+        try await gateway.connect(secureSettings)
+        try require(gateway.sharedSurfAvailable,"shared gateway capability detected")
+        let surf=Channel(id:"surf-fixture",name:"Surf: Sports",number:nil,logo:false,favorite:false,program:nil,genres:[])
+        let shared=try await gateway.stream(surf,mbps:5)
+        try require(shared.isSharedSurf && shared.liveStreamID==nil && shared.url.path=="/api/surf/sports/hls/index.m3u8","shared Surf skips PlaybackInfo and adapter stream rewrite")
+        try require(URLComponents(url:shared.url,resolvingAgainstBaseURL:false)?.queryItems==[URLQueryItem(name:"ticket",value:"fixture-ticket")],"shared ticket stays native and excludes Jellyfin token")
+        await gateway.close(shared,position:0)
+        try require(gateway.inFlight==0,"shared close does not allocate or close Jellyfin live stream")
         let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data(contentsOf:URL(fileURLWithPath:"Examples/dynamic-ui.json"))).checked()
         let baseline=ReleaseBaseline(revision:"release-one",sources:PatchSourceSet(runtime:PatchSource(id:"one",source:first),jellyfinAPI:PatchSource(id:"api-test",source:source),ui:layout))
         let installDisk=Disk(root:root.appendingPathComponent("fresh"))

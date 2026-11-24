@@ -42,7 +42,7 @@ jobs:
           swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
           build/runtime-tests
       - name: Native live Jellyfin and decoded AVPlayer acceptance
-        timeout-minutes: 12
+        timeout-minutes: 18
         env:
           JELLYFIN_TEST_URL: ${{ secrets.JELLYFIN_TEST_URL }}
           JELLYFIN_TEST_USERNAME: ${{ secrets.JELLYFIN_TEST_USERNAME }}

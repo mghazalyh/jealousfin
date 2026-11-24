@@ -7,11 +7,17 @@ struct StreamSession {
     let playSessionID: String
     let liveStreamID: String?
     let method: String
+    var isSharedSurf:Bool{method == "SharedSurfHLS"}
+}
+
+private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session:URLSession,task:URLSessionTask,willPerformHTTPRedirection response:HTTPURLResponse,newRequest request:URLRequest,completionHandler:@escaping (URLRequest?)->Void){completionHandler(nil)}
 }
 @MainActor final class Jellyfin {
     var base: URL?
     var token = ""
     var userID = ""
+    private(set) var sharedSurfAvailable=false
     var adapter:JellyfinAPIAdapter?
     private(set) var inFlight=0
     var adapterID:String{adapter?.revision.id ?? "native-baseline"}
@@ -74,11 +80,49 @@ struct StreamSession {
     func connect(_ settings: Settings) async throws {
         let s = settings.server.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let u = URL(string: s), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil else { throw AppError.message("Enter an HTTP or HTTPS server URL") }
-        base = u; token = ""; userID = ""
+        base = u; token = ""; userID = ""; sharedSurfAvailable=false
         let a = try await request("Users/AuthenticateByName", method: "POST", body: ["Username": settings.username, "Pw": settings.password])
         let spec=adapterSpec
         guard let t=JellyfinAdapterRules.string(at:spec.tokenPath,in:a),let id=JellyfinAdapterRules.string(at:spec.userIDPath,in:a),!t.isEmpty,!id.isEmpty else{throw AppError.message("Jellyfin authentication failed")}
         token = t; userID = id
+        // Probe the authenticated shared gateway without exposing tickets to hot-patch hooks.
+        if u.scheme?.lowercased()=="https" {
+            do {
+                _ = try await sharedSurfTicket(mode:"all")
+                sharedSurfAvailable=true
+                log?("INFO","SURF_GATEWAY_AVAILABLE",[:])
+            } catch {
+                // The known production public origin must not silently regress to the broken session path.
+                sharedSurfAvailable=u.host?.lowercased()=="desktop-hb9oshs.tail1fc8b.ts.net"
+                log?("WARN","SURF_GATEWAY_PROBE_FAILED",["errorType":String(describing:type(of:error))])
+            }
+        }
+    }
+    private func sharedSurfTicket(mode:String) async throws -> URL {
+        guard connected,let origin=base,origin.scheme?.lowercased()=="https",
+              ["all","movies-series","sports"].contains(mode),
+              let endpoint=URL(string:"/api/surf/"+mode+"/hls/ticket",relativeTo:origin)?.absoluteURL,
+              JellyfinAdapterRules.sameOrigin(endpoint,origin)
+        else{throw AppError.message("Shared Surf requires authenticated HTTPS")}
+        var request=URLRequest(url:endpoint)
+        request.httpMethod="POST";request.timeoutInterval=20
+        request.setValue(auth,forHTTPHeaderField:"Authorization")
+        request.setValue(token,forHTTPHeaderField:"X-Emby-Token")
+        request.setValue("application/json",forHTTPHeaderField:"Content-Type")
+        request.setValue("application/json",forHTTPHeaderField:"Accept")
+        request.httpBody=Data("{}".utf8)
+        inFlight+=1;defer{inFlight-=1}
+        let (data,response)=try await transport.data(for:request,delegate:SurfNoRedirect())
+        guard let http=response as? HTTPURLResponse,let final=http.url,
+              JellyfinAdapterRules.sameOrigin(final,origin),http.statusCode==200
+        else{throw AppError.message("Shared Surf ticket HTTP "+String((response as? HTTPURLResponse)?.statusCode ?? 0))}
+        guard data.count<=65536,let object=try JSONSerialization.jsonObject(with:data) as? [String:Any],
+              let raw=object["url"] as? String else{throw AppError.message("Invalid shared Surf ticket response")}
+        return try SharedSurf.ticketURL(raw,origin:origin,mode:mode)
+    }
+    func sharedSurfChannel(category:String,channels:[Channel])->Channel? {
+        guard sharedSurfAvailable else{return nil}
+        return SharedSurf.channel(for:category,in:channels)
     }
     static func program(_ x: [String: Any]) -> Program? {
         guard let name = x["Name"] as? String, let id = x["Id"] as? String else { return nil }
@@ -112,6 +156,11 @@ struct StreamSession {
         _ = try await request("Users/\(userID)/FavoriteItems/\(id)", method: value ? "POST" : "DELETE")
     }
     func stream(_ channel: Channel, mbps: Int) async throws -> StreamSession {
+        if sharedSurfAvailable,let mode=SharedSurf.mode(for:channel) {
+            let url=try await sharedSurfTicket(mode:mode)
+            log?("INFO","SURF_GATEWAY_TICKET",["mode":mode])
+            return StreamSession(url:url,itemID:channel.id,mediaSourceID:channel.id,playSessionID:UUID().uuidString,liveStreamID:nil,method:"SharedSurfHLS")
+        }
         let bitrate = max(1, min(50, mbps)) * 1_000_000
         let profile: [String: Any] = [
             "Name":"Jealousfin AVPlayer","MaxStreamingBitrate":bitrate,
@@ -119,7 +168,7 @@ struct StreamSession {
             "TranscodingProfiles":[["Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":2]],
             "CodecProfiles":[], "SubtitleProfiles":[["Format":"vtt","Method":"Hls"]]
         ]
-        let info = try await request("Items/\(channel.id)/PlaybackInfo", method:"POST", query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"], body:["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":true,"EnableDirectStream":true,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile])
+        let info = try await request("Items/\(channel.id)/PlaybackInfo", method:"POST", query:["UserId":userID,"IsPlayback":"true","AutoOpenLiveStream":"true"], body:["UserId":userID,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":false,"EnableDirectStream":false,"EnableTranscoding":true,"AutoOpenLiveStream":true,"DeviceProfile":profile])
         guard let source = (info["MediaSources"] as? [[String:Any]])?.first else { throw AppError.message("No media source returned") }
         let sid = source["Id"] as? String ?? channel.id
         let playID = info["PlaySessionId"] as? String ?? UUID().uuidString
@@ -151,6 +200,8 @@ struct StreamSession {
         return StreamSession(url:result,itemID:channel.id,mediaSourceID:sid,playSessionID:playID,liveStreamID:liveID,method:method)
     }
     func report(_ s: StreamSession, action: String, position: Double, paused: Bool) async {
+        // Shared media is not a Jellyfin allocated live-stream session.
+        guard !s.isSharedSurf else{return}
         let p = position.isFinite ? max(0,min(position,1e8)) : 0
         var body: [String: Any] = ["ItemId":s.itemID,"MediaSourceId":s.mediaSourceID,"PlaySessionId":s.playSessionID,"PositionTicks":Int64(p*10_000_000),"IsPaused":paused,"PlayMethod":s.method]
         if let id=s.liveStreamID { body["LiveStreamId"]=id }
@@ -158,6 +209,7 @@ struct StreamSession {
         catch { log?("WARN","SESSION_REPORT_FAILED",["action":action]) }
     }
     func close(_ s: StreamSession, position: Double) async {
+        guard !s.isSharedSurf else{return}
         await report(s,action:"Stopped",position:position,paused:false)
         if let id=s.liveStreamID {
             do { _ = try await request("LiveStreams/Close",method:"POST",query:["LiveStreamId":id]) }

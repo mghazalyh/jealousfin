@@ -240,3 +240,14 @@ check((try? releaseFixture.checked()) != nil,"reviewed source set valid")
 let releaseRestoredFixture=try JSONCodec.decoder().decode(ReleaseBaseline.self,from:JSONCodec.encoder().encode(releaseFixture))
 check(releaseRestoredFixture==releaseFixture,"promotion serialization round trip")
 print("PASS: \(checks) total assertions including promoted baseline migration")
+
+let surfSportsFixture=Channel(id:"surf-sports",name:"Surf: Sports",number:nil,logo:false,favorite:false,program:nil,genres:[])
+check(SharedSurf.mode(for:surfSportsFixture)=="sports","shared category resolution")
+check(SharedSurf.channel(for:"Sports",in:[surfSportsFixture])?.id=="surf-sports","shared category does not depend on genres")
+check(SharedSurf.channel(for:"Favorites",in:[surfSportsFixture])==nil,"Favorites retains app-owned rotation")
+let sharedOrigin=URL(string:"https://fixture.invalid")!
+check((try? SharedSurf.ticketURL("/api/surf/sports/hls/index.m3u8?ticket=fixture",origin:sharedOrigin,mode:"sports")) != nil,"valid same-origin shared ticket")
+for bad in ["https://elsewhere.invalid/api/surf/sports/hls/index.m3u8?ticket=fixture","//elsewhere.invalid/api/surf/sports/hls/index.m3u8?ticket=fixture","/api/surf/all/hls/index.m3u8?ticket=fixture","/api/surf/sports/hls/index.m3u8?api_key=fixture","/api/surf/sports/hls/index.m3u8?ticket=fixture&api_key=fixture","/api/surf/sports/hls/index.m3u8?ticket="]{
+    check((try? SharedSurf.ticketURL(bad,origin:sharedOrigin,mode:"sports"))==nil,"reject unsafe ticket route")
+}
+print("PASS: \(checks) total assertions including shared Surf routing and ticket isolation")

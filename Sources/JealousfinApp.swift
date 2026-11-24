@@ -66,8 +66,8 @@ struct GuideView:View{
             }
             Panel{
                 VStack(alignment:.leading,spacing:10){
-                    HStack{Label("Surf: All Channels",systemImage:"shuffle").font(.headline);Spacer();Text("\(model.settings.rotationMinutes) min").font(.caption).foregroundColor(accent)}
-                    Text("Discover something new. Automatically rotate through eligible channels.").font(.subheadline).foregroundColor(subdued)
+                    HStack{Label("Surf: All Channels",systemImage:"shuffle").font(.headline);Spacer();Text(model.jelly.sharedSurfAvailable ? "Shared live" : "\(model.settings.rotationMinutes) min").font(.caption).foregroundColor(accent)}
+                    Text(model.jelly.sharedSurfAvailable ? "Watch the shared live Surf stream with server-managed source rotation." : "Discover something new. Automatically rotate through eligible channels.").font(.subheadline).foregroundColor(subdued)
                     Button{model.startSurf()}label:{Label("Start Surf",systemImage:"play.fill").frame(maxWidth:.infinity)}
                         .buttonStyle(.borderedProminent)
                 }
@@ -127,7 +127,7 @@ struct PlaybackView:View{
                     if let p=model.current?.program?.progress {ProgressView(value:p).tint(accent)}
                     HStack{
                         Button{if model.playing{model.pause()}else{model.resume()}}label:{Image(systemName:model.playing ? "pause.fill":"play.fill").frame(maxWidth:.infinity)}
-                        Button{model.next()}label:{Image(systemName:"forward.end.fill").frame(maxWidth:.infinity)}
+                        Button{model.next()}label:{Image(systemName:model.usingSharedSurf ? "arrow.clockwise":"forward.end.fill").frame(maxWidth:.infinity)}
                         Button{model.stop()}label:{Image(systemName:"stop.fill").frame(maxWidth:.infinity)}
                         if let c=model.current,!c.isSurf{Button{model.favoriteFromUI(c)}label:{Image(systemName:c.favorite ? "heart.fill":"heart").frame(maxWidth:.infinity)}}
                     }.buttonStyle(.bordered)
@@ -137,14 +137,14 @@ struct PlaybackView:View{
             SectionLabel(title:"Surf controls")
             Panel{
                 VStack(alignment:.leading,spacing:12){
-                    HStack{Label(model.surfing ? "Surf active":"Surf stopped",systemImage:"shuffle");Spacer();Text(String(format:"%02d:%02d",model.remaining/60,model.remaining%60)).font(.title2.monospacedDigit()).foregroundColor(accent)}
+                    HStack{Label(model.surfing ? "Surf active":"Surf stopped",systemImage:"shuffle");Spacer();Text(model.usingSharedSurf ? "Shared live" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60)).font(.title2.monospacedDigit()).foregroundColor(accent)}
                     Picker("Category",selection:$category){ForEach(["All Channels","Favorites","Sports","Movies & Series"],id:\.self){Text($0)}}
-                    Stepper("Rotate every \(model.settings.rotationMinutes) min",value:$model.settings.rotationMinutes,in:1...1440).onChange(of:model.settings.rotationMinutes){_ in model.saveSettings()}
+                    if model.usingSharedSurf {Text("The server rotates sources. Reconnect refreshes your playback ticket.").font(.caption).foregroundColor(subdued)} else {Stepper("Rotate every \(model.settings.rotationMinutes) min",value:$model.settings.rotationMinutes,in:1...1440).onChange(of:model.settings.rotationMinutes){_ in model.saveSettings()}}
                     Toggle("Random order",isOn:$model.settings.random).onChange(of:model.settings.random){_ in model.saveSettings()}
                     Toggle("Validate while watching",isOn:$model.settings.validation).onChange(of:model.settings.validation){_ in model.saveSettings()}
                     HStack{
                         Button(model.surfing ? "Stop Surf":"Start Surf"){if model.surfing{model.stopSurf()}else{model.startSurf(category:category)}}.buttonStyle(.borderedProminent)
-                        if model.surfing{Button(model.surfPaused ? "Resume rotation":"Pause rotation"){model.toggleSurfPause()}.buttonStyle(.bordered)}
+                        if model.surfing && !model.usingSharedSurf{Button(model.surfPaused ? "Resume rotation":"Pause rotation"){model.toggleSurfPause()}.buttonStyle(.bordered)}
                     }
                 }
             }

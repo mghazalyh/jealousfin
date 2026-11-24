@@ -257,7 +257,7 @@ import Network
         var s=value
         for secret in [settings.password,settings.githubToken,jelly.token] where !secret.isEmpty {s=s.replacingOccurrences(of:secret,with:"[redacted]")}
         // URLSession errors can include a URL with an encoded access token.
-        s=s.replacingOccurrences(of:"(?i)(api_key|access_token|token|password)=([^&\\s\"']+)",with:"$1=[redacted]",options:.regularExpression)
+        s=s.replacingOccurrences(of:"(?i)(api_key|access_token|token|password|ticket)=([^&\\s\"']+)",with:"$1=[redacted]",options:.regularExpression)
         return String(s.prefix(limit))
     }
     func log(_ severity:String,_ component:String,_ code:String,_ fields:[String:String]=[:]){
@@ -329,7 +329,7 @@ import Network
     }
     func stopSurf(){selectionTask?.cancel();selectionID=UUID();surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
     func toggleSurfPause(){
-        guard surfing else{return}
+        guard surfing,!usingSharedSurf else{return}
         surfPaused.toggle()
         if surfPaused {
             pausedRotationSeconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())}
@@ -340,6 +340,7 @@ import Network
         } else { emptyPoolRetry=Date() }
         log("INFO","surf",surfPaused ? "PAUSED":"RESUMED")
     }
+    var usingSharedSurf:Bool{surfing && jelly.sharedSurfChannel(category:settings.surfCategory,channels:channels) != nil}
     private func pool()->[Channel]{
         let all=eligibleChannels
         switch settings.surfCategory {
@@ -352,6 +353,9 @@ import Network
     func next(){
         guard !apiChanging,!loginBusy,jelly.connected,catalogueReady,policyReady else{return}
         selectionTask?.cancel();selectionID=UUID();let ticket=selectionID
+        if let shared=jelly.sharedSurfChannel(category:settings.surfCategory,channels:channels) {
+            emptyPoolRetry=nil;begin(shared,keepSurf:true);return
+        }
         let candidates=pool()
         guard !candidates.isEmpty else {
             clearPlayback();nextRotation=nil;remaining=0;status="No eligible channels for this filter"
@@ -429,6 +433,7 @@ import Network
                 let s=try await jelly.stream(channel,mbps:policy.qualityMbps)
                 guard g==generation,!Task.isCancelled else{await jelly.close(s,position:0);return}
                 session=s;startedSession=false
+                log("INFO","player","TRANSPORT_SELECTED",["method":s.method])
                 let item=AVPlayerItem(url:s.url)
                 item.preferredForwardBufferDuration=Double(policy.forwardBufferSeconds)
                 item.preferredPeakBitRate=Double(policy.qualityMbps)*1_000_000
@@ -466,7 +471,7 @@ import Network
                             status="Playing \(channel.name)"
                             log("INFO","validator","PLAYBACK_CONFIRMED",["channelID":channel.id,"decodedSamples":String(evidence.frameCount),"displayReady":String(ready),"progressSeconds":String(format:"%.2f",p-first),"startupMs":String(Int((ProcessInfo.processInfo.systemUptime-startUptime)*1000))])
                             if settings.validation && !engineeringOwnsPlayback && !channel.isSurf {appendHealth(channel,"success","Playback progressed with video evidence")}
-                            if surfing && !surfPaused {nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))}
+                            if surfing && !surfPaused && !s.isSharedSurf {nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))}
                             MPNowPlayingInfoCenter.default().nowPlayingInfo=[MPMediaItemPropertyTitle:channel.name,MPMediaItemPropertyArtist:channel.program?.title ?? "Live TV",MPNowPlayingInfoPropertyIsLiveStream:true,MPNowPlayingInfoPropertyPlaybackRate:1.0]
                             let report=lastProgressReport
                             lastProgressReport=Task{await report?.value;await jelly.report(s,action:"",position:p,paused:false)}
@@ -524,7 +529,7 @@ import Network
         if retryCurrentAfterResume,let c=current {begin(c,keepSurf:surfing)}
         else if session != nil {
             player.play()
-            if surfing && !surfPaused && validated {
+            if surfing && !surfPaused && validated && !usingSharedSurf {
                 nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? effectivePolicy.rotationSeconds)
             }
         }
@@ -858,7 +863,7 @@ import Network
         case "resume_surf":if surfPaused{toggleSurfPause()}
         case "set_rotation_minutes":
             guard let n=args["minutes"].flatMap(Int.init),(1...1440).contains(n) else{throw AppError.message("Minutes must be 1–1440")}
-            settings.rotationMinutes=n;saveSettings();if surfing && !surfPaused && validated{nextRotation=Date().addingTimeInterval(Double(n*60))}
+            settings.rotationMinutes=n;saveSettings();if surfing && !surfPaused && validated && !usingSharedSurf{nextRotation=Date().addingTimeInterval(Double(n*60))}
         case "favorite_current":guard let c=current,!c.isSurf else{throw AppError.message("No underlying channel selected")};try await favorite(c)
         case "favorite_previous":
             guard let id=args["id"],let c=previous.first(where:{$0.id==id}) else{throw AppError.message("Specify an immutable previous channel ID")};try await favorite(c)
@@ -1063,7 +1068,7 @@ extension AppModel {
             item.preferredForwardBufferDuration=Double(effectivePolicy.forwardBufferSeconds)
             item.preferredPeakBitRate=Double(effectivePolicy.qualityMbps)*1_000_000
         }
-        if surfing && !surfPaused && !intentionallyPaused && validated {
+        if surfing && !surfPaused && !intentionallyPaused && validated && !usingSharedSurf {
             nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
         }
         sampleSystemTelemetry(force:true)

@@ -1,12 +1,14 @@
 import Foundation
 import AVFoundation
 import CoreVideo
+import QuartzCore
 
 @main struct LiveAcceptance {
     @MainActor static func require(_ condition:Bool,_ stage:String) throws {
         guard condition else { throw AppError.message(stage) }
     }
     @MainActor static func observe(_ session:StreamSession) async -> Bool {
+        print("PROBE transport="+session.method)
         let item=AVPlayerItem(url:session.url)
         let output=AVPlayerItemVideoOutput(pixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA])
         item.add(output)
@@ -14,8 +16,8 @@ import CoreVideo
         player.automaticallyWaitsToMinimizeStalling=true
         defer { player.pause();player.replaceCurrentItem(with:nil) }
         player.play()
-        let deadline=Date().addingTimeInterval(45)
-        var start:Double?;var frames=0;var latest = -Double.infinity
+        let deadline=Date().addingTimeInterval(50)
+        var start:Double?;var frames=0;var latest = -Double.infinity;var lastState=""
         while Date()<deadline {
             try? await Task.sleep(nanoseconds:500_000_000)
             if item.status == .failed {
@@ -24,10 +26,14 @@ import CoreVideo
                 return false
             }
             let t=player.currentTime()
+            let state="item=\(item.status.rawValue) control=\(player.timeControlStatus.rawValue) waiting=\(player.reasonForWaitingToPlay?.rawValue ?? "none")"
+            if state != lastState {print("PLAYER_STATE "+state);lastState=state}
             if t.seconds.isFinite && player.timeControlStatus == .playing {
                 if start==nil { start=t.seconds }
                 var display=CMTime.invalid
-                if output.hasNewPixelBuffer(forItemTime:t),output.copyPixelBuffer(forItemTime:t,itemTimeForDisplay:&display) != nil,display.seconds.isFinite,display.seconds>latest {
+                let hostTime=output.itemTime(forHostTime:CACurrentMediaTime())
+                let sampleTime=hostTime.isValid && hostTime.seconds.isFinite ? hostTime:t
+                if output.hasNewPixelBuffer(forItemTime:sampleTime),output.copyPixelBuffer(forItemTime:sampleTime,itemTimeForDisplay:&display) != nil,display.seconds.isFinite,display.seconds>latest {
                     latest=display.seconds;frames+=1
                 }
                 if let initial=start,t.seconds-initial>=8,frames>=5 {
@@ -36,7 +42,9 @@ import CoreVideo
                 }
             }
         }
-        print("FAIL AVPlayer deadline decodedFrames=\(frames)")
+        let access=item.accessLog()?.events.last
+        let errors=item.errorLog()?.events.map{$0.errorStatusCode} ?? []
+        print("FAIL AVPlayer deadline decodedFrames=\(frames) position=\(player.currentTime().seconds) bytes=\(access?.numberOfBytesTransferred ?? 0) errorCodes=\(errors)")
         return false
     }
     @MainActor static func main() async {
@@ -70,36 +78,53 @@ import CoreVideo
             try require(!patched.isEmpty && client.adapterID=="ci-live","patched catalogue")
             print("PASS live adapter catalogue")
             client.adapter=nil
+            try require(client.sharedSurfAvailable,"shared Surf gateway unavailable")
             let modes=["All Channels","Movies & Series","Sports"]
             for mode in modes {
                 stage="native server Surf "+mode
-                guard let channel=channels.first(where:{$0.name.lowercased()=="surf: "+mode.lowercased()}) else {
+                guard let channel=client.sharedSurfChannel(category:mode,channels:channels) else {
                     failures+=1;print("FAIL "+stage+" missing channel");continue
                 }
                 do {
                     let session=try await client.stream(channel,mbps:settings.qualityMbps)
+                    try require(session.isSharedSurf,"wrong native shared transport")
                     let ok=await observe(session)
                     await client.close(session,position:0)
                     if !ok { failures+=1 }
                     print((ok ? "PASS ":"FAIL ")+stage)
                 } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
             }
-            let eligible=channels.filter{!$0.isSurf}
+            // Exercise the exact shared-category resolution used by AppModel.next,
+            // including a fresh ticket on every reconnect and an active API patch.
+            client.adapter=adapter
             for mode in modes {
                 stage="native app-owned Surf "+mode
-                let candidates=eligible.filter{ c in
-                    if mode=="Sports" {return c.genres.contains{$0.localizedCaseInsensitiveContains("sport")}}
-                    if mode=="Movies & Series" {return c.genres.contains{$0.localizedCaseInsensitiveContains("movie") || $0.localizedCaseInsensitiveContains("series") || $0.localizedCaseInsensitiveContains("drama")}}
-                    return true
+                guard let channel=client.sharedSurfChannel(category:mode,channels:patched) else {
+                    failures+=1;print("FAIL "+stage+" missing shared category");continue
                 }
-                guard let channel=candidates.first else {failures+=1;print("FAIL "+stage+" empty pool");continue}
                 do {
                     let session=try await client.stream(channel,mbps:settings.qualityMbps)
+                    try require(session.isSharedSurf,"shared category must not allocate a Jellyfin stream")
                     let ok=await observe(session)
                     await client.close(session,position:0)
                     if !ok {failures+=1}
                     print((ok ? "PASS ":"FAIL ")+stage)
                 } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
+            }
+            client.adapter=nil
+            stage="ordinary Jellyfin playback"
+            var ordinaryOK=false
+            for channel in channels.filter({!$0.isSurf}).prefix(3) {
+                do {
+                    let session=try await client.stream(channel,mbps:settings.qualityMbps)
+                    let ok=await observe(session)
+                    await client.close(session,position:0)
+                    if ok {ordinaryOK=true;break}
+                }catch{print("ordinary playback errorType="+String(describing:type(of:error)))}
+            }
+            if !ordinaryOK {failures+=1}
+            print((ordinaryOK ? "PASS ":"FAIL ")+stage)
+        } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
             }
         } catch {failures+=1;print("FAIL "+stage+" errorType="+String(describing:type(of:error)))}
         if client.connected {

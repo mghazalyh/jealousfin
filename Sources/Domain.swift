@@ -25,6 +25,38 @@ struct Channel: Codable, Identifiable, Equatable {
     var genres: [String]
     var isSurf: Bool { name.hasPrefix("Surf:") }
 }
+enum SharedSurf {
+    static func mode(for category:String)->String? {
+        let value=category.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
+        switch value {
+        case "all channels","all":return "all"
+        case "movies & series","movies-series":return "movies-series"
+        case "sports":return "sports"
+        default:return nil
+        }
+    }
+    static func mode(for channel:Channel)->String? {
+        guard channel.isSurf else{return nil}
+        return mode(for:String(channel.name.dropFirst("Surf:".count)))
+    }
+    static func channel(for category:String,in channels:[Channel])->Channel? {
+        guard let mode=mode(for:category) else{return nil}
+        return channels.first{Self.mode(for:$0)==mode}
+    }
+    static func ticketURL(_ raw:String,origin:URL,mode:String)throws->URL {
+        let expected="/api/surf/"+mode+"/hls/index.m3u8"
+        guard ["all","movies-series","sports"].contains(mode),
+              let parts=URLComponents(string:raw),parts.scheme==nil,parts.host==nil,
+              parts.user==nil,parts.password==nil,parts.fragment==nil,
+              parts.percentEncodedPath==expected,
+              let items=parts.queryItems,items.count==1,items[0].name=="ticket",
+              let ticket=items[0].value,!ticket.isEmpty,ticket.utf8.count<=8192,
+              let url=URL(string:raw,relativeTo:origin)?.absoluteURL,
+              JellyfinAdapterRules.sameOrigin(url,origin)
+        else{throw AppError.message("Invalid shared Surf ticket URL")}
+        return url
+    }
+}
 struct ChannelHealth: Codable, Equatable {
     var failures = 0
     var lifetimeFailures = 0
