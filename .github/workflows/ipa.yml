@@ -14,18 +14,19 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+      - name: Import reviewed patch baseline (required)
+        env:
+          TORRIODB_RELEASE_TOKEN: ${{ secrets.TORRIODB_RELEASE_TOKEN }}
+        run: |
+          python3 Scripts/import-promoted.py
+      - name: Generate reviewed baseline source
+        run: python3 Scripts/embed-promoted.py Promoted/baseline.json Sources/PromotedBaseline.generated.swift
       - name: Verify toolchain
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           brew install xcodegen
           bash Scripts/fetch-runtime.sh
-      - name: Import reviewed patch baseline
-        env:
-          TORRIODB_RELEASE_TOKEN: ${{ secrets.TORRIODB_RELEASE_TOKEN }}
-        run: |
-          python3 Scripts/import-promoted.py
-          python3 Scripts/embed-promoted.py Promoted/baseline.json Sources/PromotedBaseline.generated.swift
       - name: Test channel policy
         run: |
           mkdir -p build
