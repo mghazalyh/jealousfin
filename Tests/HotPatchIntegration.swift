@@ -108,6 +108,10 @@ final class TorrioConflictFixture:URLProtocol {
         var invalidRejected=false
         do{_ = try await invalidDB.read("invalid-route.json")}catch{invalidRejected=true}
         try require(invalidRejected && TorrioConflictFixture.count("GET invalid-route.json")==0,"invalid repository never sends a token")
+        alternateDB.enabled=false
+        var offlineRejected=false
+        do{_ = try await alternateDB.read("offline-probe.json")}catch{offlineRejected=true}
+        try require(offlineRejected && TorrioConflictFixture.count("GET offline-probe.json")==0,"LAN mode blocks database transport before network request")
         let receipt=Data("receipt".utf8)
         try await conflictDB.replaceDeviceSnapshot("snapshot.json",data:Data("new snapshot".utf8))
         try require(TorrioConflictFixture.count("PUT snapshot.json")==2 && TorrioConflictFixture.count("GET snapshot.json")==2,"TorrioDB heartbeat conflict re-reads and retries")

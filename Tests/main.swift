@@ -304,10 +304,12 @@ check(Settings().controlMode == .lan,"LAN is default remote control mode")
 var legacyControlSettings=Settings()
 legacyControlSettings.remoteControlMode=nil
 let legacyControlData=try JSONCodec.encoder().encode(legacyControlSettings)
-check(try JSONCodec.decoder().decode(Settings.self,from:legacyControlData).controlMode == .lan,"legacy settings default to LAN")
+let legacyDecoded=try JSONCodec.decoder().decode(Settings.self,from:legacyControlData)
+check(legacyDecoded.controlMode == .lan,"legacy settings default to LAN")
 legacyControlSettings.controlMode = .github
 let githubControlData=try JSONCodec.encoder().encode(legacyControlSettings)
-check(try JSONCodec.decoder().decode(Settings.self,from:githubControlData).controlMode == .github,"explicit GitHub control mode persists")
+let githubDecoded=try JSONCodec.decoder().decode(Settings.self,from:githubControlData)
+check(githubDecoded.controlMode == .github,"explicit GitHub control mode persists")
 func lanRequest(_ size:Int,body:Data=Data())->Data{
     var data=Data("POST /command HTTP/1.1\r\nContent-Length: \(size)\r\n\r\n".utf8)
     data.append(body);return data

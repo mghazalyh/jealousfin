@@ -49,8 +49,11 @@ private final class DatabaseNoRedirect:NSObject,URLSessionTaskDelegate {
     }
     var base:String? {repository.map{$0+"contents/jealousfin/"}}
     var token = ""
-    var configured:Bool { repository != nil && !token.isEmpty }
+    var enabled=true
+    var configured:Bool { enabled && repository != nil && !token.isEmpty }
     func call(_ path:String, method:String="GET", body:[String:Any]?=nil,gitTree:Bool=false) async throws -> (Data,Int) {
+        guard enabled else{throw AppError.message("LAN control selected: GitHub disabled")}
+        try Task.checkCancellation()
         guard let repository=repository,let base=base else{throw AppError.message("Invalid GitHub repository address")}
         guard !token.isEmpty else{throw AppError.message("Configure GitHub repository token")}
         guard var components=URLComponents(string:(gitTree ? repository+"git/trees/" : base)+path),

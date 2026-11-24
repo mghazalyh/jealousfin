@@ -239,6 +239,10 @@ struct EngineeringView:View{
                     Text("Device: \(model.deviceID)").font(.caption.monospaced()).textSelection(.enabled)
                     Button("Synchronize now"){model.requestSync()}.buttonStyle(.borderedProminent)
                     Text("LAN port 8765 · \(model.lanStatus)").font(.caption).foregroundColor(subdued)
+                    Text(model.controlMode == .lan ? "LAN machine control · GitHub paused":"GitHub database control").font(.caption)
+                    Button(model.controlMode == .lan ? "Switch to GitHub":"Take over via LAN"){
+                        do{try model.selectControlMode(model.controlMode == .lan ? .github:.lan)}catch{model.syncStatus=error.localizedDescription}
+                    }.buttonStyle(.bordered)
                 }
             }
             Panel{
@@ -292,6 +296,18 @@ struct SettingsView:View{
                 Button("Connect & refresh"){Task{await model.connect()}}.buttonStyle(.borderedProminent)
                 Text(model.status).font(.caption).foregroundColor(subdued)
             }}
+            SectionLabel(title:"Remote control")
+            Panel{VStack(alignment:.leading,spacing:10){
+                Picker("Control method",selection:Binding(get:{model.controlMode},set:{mode in
+                    do{try model.selectControlMode(mode)}catch{model.syncStatus=error.localizedDescription}
+                })){
+                    Text("LAN machine").tag(RemoteControlMode.lan)
+                    Text("GitHub database").tag(RemoteControlMode.github)
+                }.pickerStyle(.segmented)
+                Text("LAN control uses port 8765, Bonjour discovery and direct commands. No GitHub token is required.").font(.caption).foregroundColor(subdued)
+                Text("GitHub mode keeps the LAN takeover endpoint available during outages.").font(.caption).foregroundColor(subdued)
+                Text(model.lanStatus).font(.caption)
+            }}
             SectionLabel(title:"GitHub database")
             Panel{VStack(alignment:.leading,spacing:10){
                 Text("Repository URL").font(.caption).foregroundColor(subdued)
@@ -315,7 +331,7 @@ struct SettingsView:View{
                 Stepper("Attempts: \(model.settings.retries)",value:$model.settings.retries,in:1...5)
                 Stepper("Startup timeout: \(model.settings.startupTimeout)s",value:$model.settings.startupTimeout,in:5...120,step:5)
                 Toggle("Unattended recovery",isOn:$model.settings.unattended)
-                Toggle("LAN command interface",isOn:$model.settings.lanEnabled)
+                Text("LAN recovery interface is always available.").font(.caption).foregroundColor(subdued)
             }}
             Button("Save settings"){model.saveSettings();model.requestSync()}.buttonStyle(.borderedProminent)
             Text("Background execution depends on iOS and the installed device.").font(.caption).foregroundColor(subdued)

@@ -17,6 +17,7 @@ import Network
     @Published var status="Not connected"
     @Published var syncStatus="Not configured"
     @Published var lanStatus="Not started"
+    @Published private(set) var controlMode:RemoteControlMode = .lan
     @Published var current:Channel?
     @Published var previous:[Channel]=[]
     @Published var surfing=false
@@ -127,7 +128,9 @@ import Network
             disk.save(storedSettings,"settings.json")
         }
         settings=storedSettings
+        controlMode=storedSettings.controlMode
         db=TorrioDB(address:storedSettings.repositoryAddress)
+        db.enabled=storedSettings.controlMode == .github
         do {
             _ = try PatchVersionStore.recover(disk:disk)
         }catch{
@@ -175,9 +178,16 @@ import Network
                 guard let self=self else { completion(Data("{}".utf8)); return }
                 do {
                     let c=try JSONCodec.decoder().decode(Command.self,from:data)
-                    let receipt=await self.execute(c)
+                    let receipt=await self.execute(c,origin:"lan")
                     completion(try JSONCodec.encoder().encode(receipt))
                 } catch { completion(Data("{\"status\":\"failed\",\"result\":\"Invalid command\"}".utf8)) }
+            }
+        }
+        lan.queryHandler={ [weak self] path,completion in
+            Task { @MainActor in
+                guard let self=self else{completion("503 Service Unavailable",Data("{}".utf8));return}
+                let reply=self.lanQuery(path)
+                completion(reply.0,reply.1)
             }
         }
         lan.state={ [weak self] state in Task { @MainActor in self?.lanStatus=state; self?.log("INFO","lan","LISTENER_STATE",["state":state]) } }
@@ -241,10 +251,58 @@ import Network
         configureLAN()
         log("INFO","settings","SAVED")
     }
+    // Keep discovery and takeover available even when GitHub is selected.
+    // A GitHub outage cannot disable the independent local recovery channel.
     private func configureLAN() {
-        if settings.lanEnabled {
-            do {try lan.start()} catch {lanStatus="Failed to listen";log("ERROR","lan","START_FAILED")}
-        } else {lan.stop();lanStatus="Disabled"}
+        do {try lan.start()} catch {lanStatus="Failed to listen";log("ERROR","lan","START_FAILED")}
+    }
+    func selectControlMode(_ mode:RemoteControlMode)throws {
+        var saved=disk.load(Settings.self,"settings.json") ?? settings
+        saved.controlMode=mode
+        saved.lanEnabled=true
+        guard disk.save(saved,"settings.json") else{throw AppError.message("Cannot persist remote control mode")}
+        settings.controlMode=mode
+        settings.lanEnabled=true
+        controlMode=mode
+        db.enabled=mode == .github
+        if mode == .lan {
+            syncTask?.cancel()
+            syncStatus="LAN control active; GitHub paused"
+        }else{
+            syncStatus="GitHub control selected"
+            lastSync=Date.distantPast
+            requestSync()
+        }
+        log("INFO","lan","CONTROL_MODE",["mode":mode.rawValue])
+        configureLAN()
+    }
+    private func lanQuery(_ path:String)->(String,Data){
+        do {
+            switch path{
+            case "/health":
+                return ("200 OK",try JSONSerialization.data(withJSONObject:["service":"Jealousfin","status":"reachable","deviceID":deviceID,"controlMode":controlMode.rawValue,"cloudSyncStatus":syncStatus,"port":8765,"maxRequestBytes":LANHTTP.maxBody],options:[.sortedKeys]))
+            case "/status":return ("200 OK",try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys]))
+            case "/telemetry":
+                sampleSystemTelemetry(force:true)
+                return ("200 OK",try JSONSerialization.data(withJSONObject:["system":systemMetrics,"playback":metrics,"launchID":launchID],options:[.sortedKeys]))
+            case "/logs":return ("200 OK",try JSONCodec.encoder().encode(Array(events.suffix(150))))
+            case "/capabilities":return ("200 OK",try JSONCodec.encoder().encode(Self.actions))
+            case "/results":
+                let records=disk.files(prefix:"qa-result-").suffix(100).compactMap{url in
+                    try? JSONCodec.decoder().decode(DeviceTestResult.self,from:Data(contentsOf:url))
+                }
+                return ("200 OK",try JSONCodec.encoder().encode(records))
+            default:
+                if path.hasPrefix("/receipt/") {
+                    let id=String(path.dropFirst("/receipt/".count))
+                    guard validID(id) else{return ("400 Bad Request",Data("{\"status\":\"invalid_id\"}".utf8))}
+                    if pending.contains(id){return ("202 Accepted",Data("{\"status\":\"running\"}".utf8))}
+                    if let receipt=disk.load(Receipt.self,"receipt-"+id+".json"){return ("200 OK",try JSONCodec.encoder().encode(receipt))}
+                    return ("404 Not Found",Data("{\"status\":\"not_found\"}".utf8))
+                }
+                return ("404 Not Found",Data("{\"status\":\"not_found\"}".utf8))
+            }
+        }catch{return ("500 Internal Server Error",Data("{\"status\":\"failed\"}".utf8))}
     }
     private func configureAudio() {
         do {
@@ -667,6 +725,7 @@ import Network
     }
     private func tick() async {
         let now=Date()
+        if (lanStatus.hasPrefix("failed") || lanStatus=="Failed to listen") && Int(now.timeIntervalSince1970)%15==0{configureLAN()}
         sampleSystemTelemetry()
         if versionBusy || versionRecoveryFailed{
             if now.timeIntervalSince(lastHeartbeat)>30{publishHeartbeat(now:now)}
@@ -723,6 +782,7 @@ import Network
         if now.timeIntervalSince(lastSync)>30 {requestSync()}
     }
     func requestSync(){
+        guard controlMode == .github else{syncStatus="LAN control active; GitHub paused";return}
         guard syncTask==nil else{return}
         guard repositoryAddressValid else{syncStatus="Invalid GitHub repository address";return}
         // Pin the repository for the life of the process. A user may save a
@@ -735,6 +795,8 @@ import Network
             guard let self=self else{return}
             await self.synchronize()
             self.syncTask=nil
+            if self.controlMode == .lan{self.syncStatus="LAN control active; GitHub paused"}
+            else if Task.isCancelled{self.lastSync=Date.distantPast}
         }
     }
     private func uploadTelemetry() async throws {
@@ -756,22 +818,26 @@ import Network
         }
     }
     private func synchronize() async {
+        guard controlMode == .github,!Task.isCancelled else{return}
         lastSync=Date();syncStatus="Synchronizing"
         var errors:[String]=[]
         let prefix="control/devices/\(deviceID)"
         // Command processing is independent of every repository write, including
         // heartbeat, telemetry, health, archive and insight publication.
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {
             let commandFiles=try await db.directory(prefix+"/commands").filter{validID(String($0.dropLast(5)))}
             let receiptFiles=Set(try await db.directory(prefix+"/receipts"))
             for file in CommandQueue.pending(commandFiles,receipts:receiptFiles,limit:20) {
+                guard controlMode == .github,!Task.isCancelled else{return}
                 do {
                     guard let remote=try await db.read(prefix+"/commands/"+file) else{continue}
+                    guard controlMode == .github,!Task.isCancelled else{return}
                     let expected=String(file.dropLast(5))
                     let result:Receipt
                     do {
                         let command=try CommandQueue.decode(remote.data,expectedID:expected)
-                        result=await execute(command)
+                        result=await execute(command,origin:"github")
                     } catch {
                         result=Receipt(id:expected,action:"invalid",status:"failed",result:"Malformed command, schema or filename mismatch")
                     }
@@ -787,6 +853,7 @@ import Network
             errors.append("commands "+sanitized(error.localizedDescription))
             log("WARN","commands","COMMAND_POLL_FAILED",["error":error.localizedDescription])
         }
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {
             let snapshot=try JSONSerialization.data(withJSONObject:stateSnapshot(),options:[.sortedKeys])
             try await db.replaceDeviceSnapshot(prefix+"/heartbeat.json",data:snapshot)
@@ -794,22 +861,29 @@ import Network
             errors.append("heartbeat "+sanitized(error.localizedDescription))
             log("WARN","torriodb","HEARTBEAT_WRITE_FAILED",["error":error.localizedDescription])
         }
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {try await uploadPatchArchives()}
         catch{errors.append("patch archives");log("WARN","patch-archive","UPLOAD_FAILED",["errorType":String(describing:type(of:error))])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {try await uploadDecisions()}
         catch{errors.append("decisions");log("WARN","decisions","UPLOAD_FAILED",["error":error.localizedDescription])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {try await uploadEngineeringResults()}
         catch{errors.append("engineering results");log("WARN","engineering","RESULT_UPLOAD_FAILED",["error":error.localizedDescription])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {try await uploadTelemetry()}
         catch{errors.append("telemetry "+sanitized(error.localizedDescription));log("WARN","torriodb","TELEMETRY_UPLOAD_FAILED",["error":error.localizedDescription])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {
             let merged=try await db.merge(ledger)
             ledger.merge(merged);health=ledger.states();disk.save(ledger,"health.json");healthDirty=false
         }catch{errors.append("health");log("WARN","health","MERGE_FAILED",["error":error.localizedDescription])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         do {
             let insightBytes=try JSONCodec.encoder().encode(insights)
             try await db.replaceDeviceSnapshot("insights/\(deviceID).json",data:insightBytes)
         }catch{errors.append("insights");log("WARN","torriodb","INSIGHT_WRITE_FAILED",["error":error.localizedDescription])}
+        guard controlMode == .github,!Task.isCancelled else{return}
         if errors.isEmpty{syncStatus="Synced \(Date().formatted(date:.omitted,time:.shortened))"}
         else{syncStatus="Sync pending: "+errors.joined(separator:", ")}
         recalculateInsights()
@@ -835,11 +909,16 @@ import Network
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        ["schemaVersion":1,"deviceID":deviceID,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        ["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":1,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
     }
-    static let actions=["get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
+    static let actions=["set_control_mode","get_status","list_channels","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","get_channel_health","list_banned","list_hiatus","approve_reinstatement","get_logs","get_telemetry","get_insights","get_capabilities","sync_now","reconnect","script","get_version","install_runtime_module","install_runtime_module_from_db","reload_runtime_module","rollback_runtime_module","reset_runtime_module","get_runtime_module","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","install_ui_layout","install_ui_layout_from_db","get_ui_layout","rollback_ui_layout","reset_ui_layout","ui_set_value","ui_trigger","ui_open_page","ui_close_page","ui_get_capabilities","present_decision","get_decisions","cancel_decision","get_jellyfin_api","install_jellyfin_api","install_jellyfin_api_from_db","rollback_jellyfin_api","reset_jellyfin_api","probe_jellyfin_api","get_patch_archive","archive_active_patches","promote_patch_archive","get_release_baseline","list_patch_versions","compare_patch_versions","checkpoint_patch_version","restore_patch_version","restore_known_good"]
     private func validID(_ id:String)->Bool{id.count<=100 && id.range(of:"^[A-Za-z0-9_-]+$",options:.regularExpression) != nil}
-    func execute(_ c:Command) async -> Receipt {
+    func execute(_ c:Command,origin:String="internal") async -> Receipt {
+        if origin=="github" && controlMode != .github{return Receipt(id:c.id,action:c.action,status:"failed",result:"LAN control selected")}
+        if origin=="lan" && controlMode != .lan && c.action != "set_control_mode"{
+            return Receipt(id:c.id,action:c.action,status:"failed",result:"Select LAN control with set_control_mode first")
+        }
+        if c.action=="set_control_mode" && origin != "lan"{return Receipt(id:c.id,action:c.action,status:"failed",result:"Select control mode on device or LAN")}
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
         if pending.contains(c.id){return Receipt(id:c.id,action:c.action,status:"running",result:"Command already executing")}
         if let previous=disk.load(Receipt.self,"receipt-\(c.id).json"){return previous}
@@ -851,7 +930,12 @@ import Network
         var result=Receipt(id:c.id,action:c.action,status:"succeeded",result:"OK")
         do {
             if let expiry=c.expiresAt,expiry<Date(){throw AppError.message("Command expired")}
-            let output=try await dispatch(c.action,args:c.arguments ?? [:])
+            let output:String
+            if c.action=="set_control_mode"{
+                guard let raw=c.arguments?["mode"],let mode=RemoteControlMode(rawValue:raw) else{throw AppError.message("Expected lan or github")}
+                try selectControlMode(mode)
+                output="Control mode: "+mode.rawValue
+            }else{output=try await dispatch(c.action,args:c.arguments ?? [:])}
             guard output.utf8.count<=524288 else{throw AppError.message("Response too large; request a paginated result")}
             // Structured query results contain only explicitly selected application fields.
             // Redacting a short password inside JSON syntax can corrupt numbers and IDs.
