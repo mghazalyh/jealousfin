@@ -469,7 +469,7 @@ import Network
         for secret in [settings.githubToken,jelly.token,settings.password] where secret.utf8.count>=8{
             guard !raw.contains(secret) else{throw AppError.message("Manifest contains configured credential")}
         }
-        return try JSONCodec.decoder().decode(ApplicationRevision.self,from:Data(raw.utf8)).checked()
+        return try ApplicationRevision.decode(Data(raw.utf8))
     }
     private func applicationSnapshot()->ApplicationSnapshot{
         ApplicationSnapshot(patches:PatchRestoreSnapshot(runtime:engineering.store,api:jellyfinAPIStore,ui:dynamicUI),configuration:hotConfiguration)

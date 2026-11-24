@@ -440,6 +440,24 @@ let manifestFixture=try ApplicationRevision(id:"application-fixture",sources:Pat
 check(manifestFixture.identity["configuration"]==configFixture.revision,"application manifest identifies all four components")
 var unsupportedManifest=manifestFixture;unsupportedManifest.runtimeABI=99
 check((try? unsupportedManifest.checked())==nil,"manifest native ABI gate")
+let encodedManifest=try JSONCodec.encoder().encode(manifestFixture)
+let decodedManifest=try ApplicationRevision.decode(encodedManifest)
+check(decodedManifest==manifestFixture,"strict manifest roundtrip")
+func manifestWithConfiguration(_ configuration:Any)throws->Data{
+    var root=try JSONSerialization.jsonObject(with:encodedManifest) as! [String:Any]
+    root["configuration"]=configuration
+    return try JSONSerialization.data(withJSONObject:root)
+}
+let strictManifestTypo=try manifestWithConfiguration(["schemaVersion":1,"revision":"typo","notAField":true])
+check((try? ApplicationRevision.decode(strictManifestTypo))==nil,"manifest rejects unknown configuration key")
+let strictManifestNestedTypo=try manifestWithConfiguration(["schemaVersion":1,"revision":"typo","presentation":["fullscreeenOpacity":0.8]])
+check((try? ApplicationRevision.decode(strictManifestNestedTypo))==nil,"manifest rejects nested configuration typo")
+let strictManifestPartial=try ApplicationRevision.decode(manifestWithConfiguration(["schemaVersion":1,"revision":"partial-manifest","runtime":["retries":3]]))
+check(strictManifestPartial.configuration?.runtime?.retries==3,"manifest normalizes partial runtime configuration")
+let strictManifestBadType=try manifestWithConfiguration("invalid")
+check((try? ApplicationRevision.decode(strictManifestBadType))==nil,"manifest rejects non-object configuration")
+let strictManifestNull=try ApplicationRevision.decode(manifestWithConfiguration(NSNull()))
+check(strictManifestNull.configuration==nil,"manifest permits explicit null configuration")
 let gatewayFixture=GatewayConfiguration(lanServerPort:8096,lanGatewayPort:8098,routePrefix:"/custom/surf",ticketField:"url",timeoutSeconds:15)
 let gatewayURL=SharedSurf.gatewayOrigin(for:URL(string:"http://192.168.1.2:8096")!,configuration:gatewayFixture)
 check(gatewayURL?.port==8098,"configured same-host private gateway port")

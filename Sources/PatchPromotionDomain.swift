@@ -88,6 +88,20 @@ struct ApplicationRevision:Codable,Equatable{
         guard try JSONCodec.encoder().encode(self).count<=950*1024 else{throw AppError.message("Application revision too large")}
         return self
     }
+    // Use the same strict field validation and partial-runtime normalization as
+    // standalone hot configuration. Codable alone silently discards unknown keys.
+    static func decode(_ data:Data)throws->Self{
+        guard data.count<=950*1024 else{throw AppError.message("Manifest too large")}
+        guard var root=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{
+            throw AppError.message("Expected application manifest object")
+        }
+        if let raw=root["configuration"], !(raw is NSNull){
+            guard let object=raw as? [String:Any] else{throw AppError.message("Expected configuration object")}
+            let configuration=try HotConfiguration.decode(JSONSerialization.data(withJSONObject:object))
+            root["configuration"]=try JSONSerialization.jsonObject(with:JSONCodec.encoder().encode(configuration))
+        }
+        return try JSONCodec.decoder().decode(Self.self,from:JSONSerialization.data(withJSONObject:root)).checked()
+    }
     var identity:[String:String]{
         ["runtime":sources.runtime?.id ?? "native-baseline","api":sources.jellyfinAPI?.id ?? "native-baseline","ui":sources.ui?.revision ?? "native-baseline","configuration":configuration?.revision ?? "native-baseline"]
     }
