@@ -1,0 +1,149 @@
+name: Real Jellyfin Surf transport diagnostics
+on:
+  push:
+    branches: [diagnostics/jellyfin-connection-only]
+    paths: ['.github/workflows/jellyfin-surf.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  surf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe one Surf channel and close session
+        env:
+          JELLYFIN_TEST_URL: ${{ secrets.JELLYFIN_TEST_URL }}
+          JELLYFIN_TEST_USERNAME: ${{ secrets.JELLYFIN_TEST_USERNAME }}
+          JELLYFIN_TEST_PASSWORD: ${{ secrets.JELLYFIN_TEST_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import os,json,urllib.request as R,urllib.parse as U,urllib.error as E,ssl,uuid,time,sys
+          base=os.environ["JELLYFIN_TEST_URL"].strip().rstrip("/")
+          p=U.urlsplit(base)
+          if p.scheme!="https" or not p.hostname or p.username or p.password or p.query or p.fragment: sys.exit("Invalid HTTPS base URL")
+          def origin(url):
+              q=U.urlsplit(url)
+              return (q.scheme,q.hostname,q.port or (443 if q.scheme=="https" else 80))
+          class NoRedirect(R.HTTPRedirectHandler):
+              def redirect_request(self,*args): return None
+          op=R.build_opener(NoRedirect(),R.HTTPSHandler(context=ssl.create_default_context()))
+          token=None
+          auth='MediaBrowser Client="Jealousfin Surf Diagnostics", Device="GitHub Actions", DeviceId="'+uuid.uuid4().hex+'", Version="1"'
+          stage="startup"
+          def call(path,method="GET",body=None,limit=4000000,media=False):
+              global stage
+              url=U.urljoin(base+"/",path)
+              if origin(url)!=origin(base): raise ValueError("cross-origin URL blocked")
+              h={"Authorization":auth+(', Token="'+token+'"' if token else ""), "Accept":"*/*" if media else "application/json"}
+              if token: h["X-Emby-Token"]=token
+              if body is not None: h["Content-Type"]="application/json"
+              req=R.Request(url,data=json.dumps(body).encode() if body is not None else None,headers=h,method=method)
+              t=time.monotonic()
+              with op.open(req,timeout=20) as res:
+                  data=res.read(limit+1)
+                  if len(data)>limit: raise ValueError("response exceeds limit")
+                  print(f"{stage}: HTTP {res.status}, {len(data)} bytes, {time.monotonic()-t:.2f}s",flush=True)
+                  return (data,res.headers.get_content_type()) if media else (json.loads(data) if data else {})
+          def query(path,**args): return path+"?"+U.urlencode(args)
+          def mediaurl(url,ref):
+              dest=U.urljoin(ref,url)
+              if origin(dest)!=origin(base): raise ValueError("cross-origin media reference")
+              parts=U.urlsplit(dest)
+              q=[(k,v) for k,v in U.parse_qsl(parts.query,keep_blank_values=True) if k.lower() not in ("api_key","token","access_token")]
+              q.append(("api_key",token))
+              return U.urlunsplit(parts._replace(query=U.urlencode(q)))
+          live=None; play=None; sid=None; channel=None; ok=False
+          try:
+              stage="Public identity"
+              info=call("System/Info/Public")
+              print("Server version:",info.get("Version"),flush=True)
+              stage="Authentication"
+              login=call("Users/AuthenticateByName","POST",{"Username":os.environ["JELLYFIN_TEST_USERNAME"],"Pw":os.environ["JELLYFIN_TEST_PASSWORD"]})
+              token=login["AccessToken"]; uid=login["User"]["Id"]
+              print("::add-mask::"+token,flush=True)
+              stage="Live TV catalogue"
+              items=call(query("LiveTv/Channels",UserId=uid,EnableUserData="true",Fields="Genres,Tags"))["Items"]
+              print("Total channels:",len(items),flush=True)
+              stage="Surf selection"
+              matches=[x for x in items if "surf" in x.get("Name","").lower()]
+              print("Surf-named channels:",len(matches),flush=True)
+              chosen=next((x for x in matches if x.get("Name","").lower()=="surf all channels"),None)
+              if chosen is None: chosen=next((x for x in matches if "all" in x.get("Name","").lower()),None)
+              if chosen is None and matches: chosen=matches[0]
+              if not chosen: raise ValueError("no Surf channel found")
+              channel=chosen["Id"]
+              print("Selected virtual Surf channel",flush=True)
+              bitrate=3000000
+              profile={"Name":"Jealousfin AVPlayer","MaxStreamingBitrate":bitrate,"DirectPlayProfiles":[{"Container":"mp4,m4v,mov","Type":"Video","VideoCodec":"h264,hevc","AudioCodec":"aac,mp3,ac3,eac3"}],"TranscodingProfiles":[{"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2","MinSegments":2}],"CodecProfiles":[],"SubtitleProfiles":[{"Format":"vtt","Method":"Hls"}]}
+              stage="PlaybackInfo"
+              result=call(query("Items/"+channel+"/PlaybackInfo",UserId=uid,IsPlayback="true",AutoOpenLiveStream="true"),"POST",{"UserId":uid,"MaxStreamingBitrate":bitrate,"EnableDirectPlay":True,"EnableDirectStream":True,"EnableTranscoding":True,"AutoOpenLiveStream":True,"DeviceProfile":profile})
+              play=result.get("PlaySessionId")
+              sources=result.get("MediaSources") or []
+              print("Media source count:",len(sources), "error code:",bool(result.get("ErrorCode")),flush=True)
+              if not sources: raise ValueError("no media source")
+              src=sources[0]; live=src.get("LiveStreamId"); sid=src.get("Id",channel)
+              print("Direct play:",bool(src.get("SupportsDirectPlay")),"Direct stream:",bool(src.get("SupportsDirectStream")),"Transcode:",bool(src.get("SupportsTranscoding")),"Live stream allocated:",bool(live),flush=True)
+              stage="Stream URL"
+              path=src.get("TranscodingUrl")
+              if not path:
+                  args={"Static":"true","MediaSourceId":sid}
+                  if play: args["PlaySessionId"]=play
+                  if live: args["LiveStreamId"]=live
+                  path=query("Videos/"+channel+"/stream",**args)
+              print("Transcoding URL present:",bool(src.get("TranscodingUrl")),flush=True)
+              url=mediaurl(path,base+"/")
+              stage="Stream response"
+              if not src.get("TranscodingUrl"):
+                  # Direct streams can be unbounded; read only a small prefix.
+                  req=R.Request(url,headers={"X-Emby-Token":token,"Authorization":auth+', Token="'+token+'"'})
+                  with op.open(req,timeout=20) as res:
+                      data=res.read(65536)
+                      print("Direct stream prefix:",res.status,len(data),"bytes",flush=True)
+                      if not data: raise ValueError("empty direct stream")
+                      print("Direct stream returned bytes; HLS and decoding not established",flush=True)
+                  ok=True
+              else:
+                  data,ctype=call(url,limit=1000000,media=True)
+                  for depth in range(3):
+                      stage="HLS manifest"
+                      if not data.startswith(b"#EXTM3U"): raise ValueError("response is not HLS")
+                      lines=data.decode("utf-8").splitlines()
+                      refs=[x.strip() for x in lines if x.strip() and not x.startswith("#")]
+                      if not refs: raise ValueError("manifest has no media references")
+                      if any(x.startswith("#EXT-X-STREAM-INF") for x in lines):
+                          url=mediaurl(refs[0],url)
+                          data,ctype=call(url,limit=1000000,media=True)
+                          continue
+                      stage="HLS segment"
+                      print("Media playlist entries:",len(refs),flush=True)
+                      seg,ctype=call(mediaurl(refs[0],url),limit=4000000,media=True)
+                      if not seg: raise ValueError("empty segment")
+                      print("Segment MPEG-TS sync byte:",seg[:1]==b"\x47",flush=True)
+                      ok=True
+                      break
+                  if not ok: raise ValueError("playlist nesting exceeded")
+          except E.HTTPError as e:
+              print(f"{stage}: FAIL HTTP {e.code}",flush=True)
+          except Exception as e:
+              print(f"{stage}: FAIL {type(e).__name__}",flush=True)
+          finally:
+              if token:
+                  if sid and play:
+                      try:
+                          stage="Playback stop"
+                          body={"ItemId":channel,"MediaSourceId":sid,"PlaySessionId":play,"PositionTicks":0}
+                          if live: body["LiveStreamId"]=live
+                          call("Sessions/Playing/Stopped","POST",body)
+                      except Exception as e: print("Playback stop failed:",type(e).__name__,flush=True); ok=False
+                  if live:
+                      try:
+                          stage="Live stream close"
+                          call(query("LiveStreams/Close",LiveStreamId=live),"POST")
+                      except Exception as e: print("Live stream close failed:",type(e).__name__,flush=True); ok=False
+                  try:
+                      stage="Logout"
+                      call("Sessions/Logout","POST")
+                  except Exception as e: print("Logout failed:",type(e).__name__,flush=True); ok=False
+          print("Bounded Surf transport result:", "PASS (not decoded playback)" if ok else "FAIL",flush=True)
+          sys.exit(0 if ok else 1)
+          PY
