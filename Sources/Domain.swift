@@ -342,6 +342,10 @@ struct SurfRotationState: Codable, Equatable {
     var visited: [String:Set<String>] = [:]
     // Optional for decoding rotation state from previous IPAs.
     var cycles:[String:Int]?=nil
+    var checkpoints:[String:SurfResumeCheckpoint]?=nil
+    mutating func checkpoint(scope:String,value:SurfResumeCheckpoint){
+        var next=checkpoints ?? [:];next[scope]=value;checkpoints=next
+    }
     func progress(scope:String,ids:[String])->(cycle:Int,attempted:Int,remaining:Int){
         let unique=Set(ids)
         let attempted=unique.intersection(visited[scope] ?? []).count
@@ -362,6 +366,17 @@ struct SurfRotationState: Codable, Equatable {
     }
     mutating func seed(scope:String,ids:Set<String>) {
         if visited[scope]==nil {visited[scope]=ids}
+    }
+}
+struct SurfResumeCheckpoint:Codable,Equatable{
+    let channelID:String
+    let category:String
+    let paused:Bool
+    let remainingSeconds:Int
+    let at:Double
+    var valid:Bool{!channelID.isEmpty && channelID.utf8.count<=128 && !category.isEmpty && category.utf8.count<=128 && (0...86400).contains(remainingSeconds) && at.isFinite && at>=0}
+    static func choose(local:Self?,gateway:Self?,category:String,eligible:Set<String>,now:Double)->Self?{
+        [local,gateway].compactMap{$0}.filter{$0.valid && $0.category==category && eligible.contains($0.channelID) && $0.at<=now+60}.max{$0.at<$1.at}
     }
 }
 struct SustainedPlaybackEvidence {
@@ -587,9 +602,11 @@ struct GatewayHealthSnapshot:Codable,Equatable{
     let revision:String
     let channels:[String:GatewayChannelHealth]
     var penalty:HealthPenaltyPolicy?=nil
+    var resume:SurfResumeCheckpoint?=nil
     func checked()throws->Self{
         _ = try penalty?.checked()
         guard revision=="sqlite-policy-v2",!channels.isEmpty,channels.count<=10000,
+              resume.map({$0.valid && channels[$0.channelID] != nil}) ?? true,
               channels.allSatisfy({!$0.key.isEmpty && $0.key.utf8.count<=128 && $0.value.valid})
         else{throw AppError.message("Invalid gateway health snapshot")}
         return self

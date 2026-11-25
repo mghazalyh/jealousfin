@@ -140,6 +140,8 @@ import CryptoKit
     var healthPenalty:HealthPenaltyPolicy{jelly.gatewayHealth?.penalty ?? effectivePolicy.healthPenalty ?? HealthPenaltyPolicy()}
     private var failureRun=0
     private var rotationState=SurfRotationState()
+    private var resumeRotationSeconds:Int?
+    private var lastRotationCheckpoint=Date.distantPast
     private var startupProfiles=ChannelStartupProfiles()
     private func startupProfileKey(_ channel:Channel)->String{
         let value=(jelly.base?.absoluteString ?? "")+"|"+jelly.userID+"|"+channel.id
@@ -785,6 +787,7 @@ import CryptoKit
         let resumeLoop=settings.resumeSurf || surfing
         let category=settings.surfCategory
         let resumeChannel=current?.id
+        saveSurfCheckpoint(force:true)
         let oldWork=work
         if current != nil || session != nil { clearPlayback() }
         await oldWork?.value
@@ -798,7 +801,7 @@ import CryptoKit
             log("INFO","jellyfin","CONNECTED",["channels":String(channels.count)])
             failureRun=0
             loginBusy=false
-            if !engineeringOwnsPlayback && resumeLoop && current==nil {startSurf(category:category)}
+            if !engineeringOwnsPlayback && resumeLoop && current==nil {restoreSurf(category:category)}
             else if !engineeringOwnsPlayback,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
         } catch {status="Connection failed";log("ERROR","jellyfin","CONNECT_FAILED",["error":error.localizedDescription])}
         recalculateInsights();requestSync()
@@ -933,6 +936,33 @@ import CryptoKit
             self.begin(selected,keepSurf:self.surfing)
         }
     }
+    private func saveSurfCheckpoint(force:Bool=false){
+        guard surfing,!engineeringOwnsPlayback,let c=current,!c.isSurf else{return}
+        let now=Date()
+        guard force || now.timeIntervalSince(lastRotationCheckpoint)>=15 else{return}
+        lastRotationCheckpoint=now
+        let seconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:now)} ?? (pausedRotationSeconds ?? resumeRotationSeconds ?? remaining)
+        let checkpoint=SurfResumeCheckpoint(channelID:c.id,category:settings.surfCategory,paused:surfPaused,
+            remainingSeconds:max(0,min(86400,seconds)),at:now.timeIntervalSince1970)
+        rotationState.checkpoint(scope:rotationScope,value:checkpoint)
+        if !disk.save(rotationState,"surf-rotation.json"){log("ERROR","surf","ROTATION_PERSIST_FAILED")}
+    }
+    private func restoreSurf(category:String){
+        settings.surfCategory=category;settings.resumeSurf=true;saveSettings()
+        surfing=true;surfPaused=false
+        let candidates=pool()
+        let chosen=SurfResumeCheckpoint.choose(local:rotationState.checkpoints?[rotationScope],gateway:jelly.gatewayHealth?.resume,
+            category:category,eligible:Set(candidates.map(\.id)),now:Date().timeIntervalSince1970)
+        if let checkpoint=chosen,let c=candidates.first(where:{$0.id==checkpoint.channelID}){
+            surfPaused=checkpoint.paused
+            rotationState.record(scope:rotationScope,id:c.id)
+            begin(c,keepSurf:true)
+            resumeRotationSeconds=checkpoint.remainingSeconds>0 ? checkpoint.remainingSeconds:nil
+            if surfPaused{remaining=checkpoint.remainingSeconds;pausedRotationSeconds=checkpoint.remainingSeconds}
+            saveSurfCheckpoint(force:true)
+            log("INFO","surf","ROTATION_RESUMED",["channelID":c.id,"paused":String(surfPaused)])
+        }else{next(reason:"restore-next-eligible")}
+    }
     private func recordRotation(_ channel:Channel,scope:String){
         rotationState.record(scope:scope,id:channel.id)
         if !disk.save(rotationState,"surf-rotation.json"){log("ERROR","surf","ROTATION_PERSIST_FAILED")}
@@ -954,7 +984,7 @@ import CryptoKit
         guard health[channel.id]?.eligible(at:Date()) ?? true else{status="Channel is excluded by validation policy";return}
         log("INFO","platform","PLATFORM_BEFORE_PLAYBACK",["channelID":channel.id])
         work?.cancel();generation=UUID();let g=generation
-        retryCurrentAfterResume=false;pausedRotationSeconds=nil;lastPlayerError=nil
+        retryCurrentAfterResume=false;pausedRotationSeconds=nil;resumeRotationSeconds=nil;lastPlayerError=nil
         let old=session;let oldPosition=position
         session=nil;activeAttemptPolicy=nil;activeStreamConfigurationRevision=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil
         metrics=[:]
@@ -971,6 +1001,7 @@ import CryptoKit
         if !keepSurf{lastRotationReason="manual-open"}
         lastVideoFrameAt=nil
         log("INFO","player","OPEN",["channelID":channel.id,"name":channel.name])
+        if keepSurf{saveSurfCheckpoint(force:true)}
         work=Task{[weak self] in
             guard let self=self else{return}
             await cleanup?.value
@@ -1081,7 +1112,8 @@ import CryptoKit
                             }
                             log("INFO","validator","PLAYBACK_CONFIRMED",["channelID":channel.id,"decodedSamples":String(evidence.frameCount),"displayReady":String(ready),"progressSeconds":String(format:"%.2f",p-first),"startupMs":String(Int((ProcessInfo.processInfo.systemUptime-startUptime)*1000))])
                             if settings.validation && !engineeringOwnsPlayback && !channel.isSurf && !strictChannelHiatus {appendHealth(channel,"success","Playback progressed with video evidence");healthSuccessRecorded=true}
-                            if surfing && !surfPaused && !s.isSharedSurf {nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))}
+                            if surfing && !surfPaused && !s.isSharedSurf {nextRotation=Date().addingTimeInterval(Double(resumeRotationSeconds ?? effectivePolicy.rotationSeconds))}
+                            resumeRotationSeconds=nil;saveSurfCheckpoint(force:true)
                             MPNowPlayingInfoCenter.default().nowPlayingInfo=[MPMediaItemPropertyTitle:channel.name,MPMediaItemPropertyArtist:channel.program?.title ?? "Live TV",MPNowPlayingInfoPropertyIsLiveStream:true,MPNowPlayingInfoPropertyPlaybackRate:1.0]
                             let report=lastProgressReport
                             lastProgressReport=Task{await report?.value;await jelly.report(s,action:"",position:p,paused:false)}
@@ -1343,6 +1375,7 @@ import CryptoKit
     }
     private func tick() async {
         let now=Date()
+        saveSurfCheckpoint()
         if (lanStatus.hasPrefix("failed") || lanStatus=="Failed to listen") && Int(now.timeIntervalSince1970)%15==0{configureLAN()}
         sampleSystemTelemetry()
         if let trial=applicationTrial,trial.pending,now>=trial.expiresAt,now.timeIntervalSince(lastApplicationRollback)>5,!versionBusy,!patchBusy,!apiChanging,!loginBusy,!catalogueBusy {
@@ -2995,6 +3028,7 @@ extension AppModel {
         let resumeLoop=surfing || settings.resumeSurf
         let category=settings.surfCategory
         let channelID=current?.id
+        saveSurfCheckpoint(force:true)
         let savedSettings=settings
         var validatedCandidate:JellyfinAPIAdapter?
         var locallyValidated=false
@@ -3033,7 +3067,7 @@ extension AppModel {
             log("INFO","jellyfin-api","ACTIVATED",["revision":jellyfinAPIRevision,"channels":String(catalogue.count),"epgProbe":epg==nil ? "unavailable":"passed"])
             apiChanging=false
             if !engineeringOwnsPlayback && campaign?.canResume != true{
-                if resumeLoop{startSurf(category:category)}
+                if resumeLoop{restoreSurf(category:category)}
                 else if let id=channelID,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true{open(c)}
             }
             recalculateInsights()
@@ -3063,7 +3097,7 @@ extension AppModel {
             log("ERROR","jellyfin-api","ACTIVATION_REJECTED",["candidate":candidate?.id ?? "native-baseline","errorType":String(describing:type(of:error))])
             apiChanging=false
             if current==nil,jelly.connected,catalogueReady,campaign?.canResume != true{
-                if resumeLoop{startSurf(category:category)}
+                if resumeLoop{restoreSurf(category:category)}
                 else if let id=channelID,let c=channels.first(where:{$0.id==id}){open(c)}
             }
             recalculateInsights()

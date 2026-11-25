@@ -583,3 +583,13 @@ let standardTheme=try HotConfiguration.decode(Data("""
 check(standardTheme.presentation?.resolvedFullscreenControlTheme=="standard","theme hot configuration supported")
 check((try? DynamicPresentation(fullscreenControlTheme:"unknown").checked())==nil,"invalid native theme rejected")
 print("PASS: \(checks) assertions including native night mode and confirmed favorite toggle")
+
+let checkpoint=SurfResumeCheckpoint(channelID:"b",category:"All Channels",paused:true,remainingSeconds:50,at:100)
+var resumeLedger=SurfRotationState()
+resumeLedger.checkpoint(scope:"fixture",value:checkpoint)
+let restoredLedger=try JSONDecoder().decode(SurfRotationState.self,from:JSONEncoder().encode(resumeLedger))
+check(restoredLedger.checkpoints?["fixture"]==checkpoint,"rotation checkpoint persists across process restarts")
+check(SurfResumeCheckpoint.choose(local:checkpoint,gateway:nil,category:"All Channels",eligible:["b"],now:101)==checkpoint,"resume last channel")
+check(SurfResumeCheckpoint.choose(local:checkpoint,gateway:nil,category:"All Channels",eligible:["a"],now:101)==nil,"never resume excluded channel")
+check(SurfResumeCheckpoint.choose(local:checkpoint,gateway:nil,category:"Sports",eligible:["b"],now:101)==nil,"never resume across categories")
+print("PASS: \(checks) assertions including durable rotation resume")
