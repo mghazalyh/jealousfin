@@ -122,6 +122,7 @@ enum ApplicationCapabilitySchema{
         "begin_configuration_trial":["stagedRevision":"staged config","expectedRevision":"active config revision","seconds":"30...3600"],
         "finish_configuration_trial":["id":"trial ID","expectedRevision":"active config","outcome":"accept|rollback","approval":"explicit when accepting"],
         "reload_current_stream":[:],
+        "record_channel_failure":["id":"known channel ID","reason":"failure reason, max 512 bytes","approval":"explicit"],
         "seek_live":["offsetSeconds":"0...60"],
         "select_media_track":["kind":"audio|subtitle","index":"available option index|auto|off"],
         "set_fullscreen":["visible":"true|false"],
@@ -129,7 +130,7 @@ enum ApplicationCapabilitySchema{
     ]
     static let configuration:[String:[String:String]]=[
         "root":["schemaVersion":"1","revision":"unique ID, 1...80 characters","runtime":"RuntimePolicy; optional","playbackRules":"ordered rules, max 64","operations":"OperationalConfiguration; optional","interpreter":"InterpreterBudget; optional","presentation":"DynamicPresentation; optional","gateway":"GatewayConfiguration; optional"],
-        "runtime":["startupTimeout":"5...120","retries":"1...5","qualityMbps":"1...50","stallSeconds":"5...300","rotationSeconds":"5...86400","validationSeconds":"3...60, less than startupTimeout","minimumFrames":"3...120","forwardBufferSeconds":"0...120","automaticallyWaits":"boolean","recoveryMode":"reopen|advance_surf|pause","failureRetrySeconds":"5...600"],
+        "runtime":["startupTimeout":"5...120","retries":"1...5","qualityMbps":"1...50","stallSeconds":"5...300","rotationSeconds":"5...86400","validationSeconds":"3...60, less than startupTimeout","minimumFrames":"3...120","forwardBufferSeconds":"0...120","automaticallyWaits":"boolean","recoveryMode":"reopen|advance_surf|pause","failureRetrySeconds":"5...600","strictChannelHiatus":"boolean; default true"],
         "interpreter":["timeoutMs":"100...10000","memoryMiB":"8...64","maxCommands":"1...100"],
         "gateway":["lanServerPort":"1...65535, default 8096","lanGatewayPort":"1...65535, default 8097","routePrefix":"validated absolute path, default /api/surf","ticketField":"JSON key, default url","timeoutSeconds":"5...90, default 20"],
         "operations":["systemSampleSeconds":"5...300","playbackSampleSeconds":"5...120","heartbeatSeconds":"15...600","syncSeconds":"15...600","catalogueRefreshSeconds":"60...3600","reconnectSeconds":"15...600","eventRetentionCount":"500...20000","eventRetentionMiB":"4...128","resourceWarningMiB":"64...2048","suspendAutomationOnPressure":"boolean","playerEventDiagnostics":"boolean","playerEventSampleSeconds":"1...60","surfTransport":"auto|device"],

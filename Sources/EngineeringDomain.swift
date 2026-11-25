@@ -13,10 +13,11 @@ struct RuntimePolicy: Codable, Equatable {
     var recoveryMode: String
     var failureRetrySeconds: Int
     var playback:PlaybackAttemptPolicy? = nil
+    var strictChannelHiatus:Bool? = nil
     static func baseline(_ settings: Settings) -> RuntimePolicy {
         RuntimePolicy(startupTimeout: settings.startupTimeout, retries: settings.retries,
-            qualityMbps: settings.qualityMbps, stallSeconds: 30, rotationSeconds: settings.rotationMinutes * 60,
-            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true, recoveryMode:"reopen", failureRetrySeconds:30)
+            qualityMbps: settings.qualityMbps, stallSeconds: 15, rotationSeconds: settings.rotationMinutes * 60,
+            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true, recoveryMode:"advance_surf", failureRetrySeconds:30, strictChannelHiatus:true)
     }
     func checked() throws -> RuntimePolicy {
         guard (5...120).contains(startupTimeout), (1...5).contains(retries), (1...50).contains(qualityMbps),
@@ -234,7 +235,7 @@ struct HotConfiguration:Codable,Equatable {
         try keys(root,["schemaVersion","revision","runtime","playbackRules","operations","interpreter","presentation","gateway"])
         let playbackKeys:Set<String>=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect","preferredMaximumWidth","preferredMaximumHeight","networkWhilePaused"]
         if let runtime=root["runtime"] as? [String:Any]{
-            try keys(runtime,["startupTimeout","retries","qualityMbps","stallSeconds","rotationSeconds","validationSeconds","minimumFrames","forwardBufferSeconds","automaticallyWaits","recoveryMode","failureRetrySeconds","playback"])
+            try keys(runtime,["startupTimeout","retries","qualityMbps","stallSeconds","rotationSeconds","validationSeconds","minimumFrames","forwardBufferSeconds","automaticallyWaits","recoveryMode","failureRetrySeconds","playback","strictChannelHiatus"])
             if let p=runtime["playback"] as? [String:Any]{try keys(p,playbackKeys)}
         }
         for rule in root["playbackRules"] as? [[String:Any]] ?? [] {

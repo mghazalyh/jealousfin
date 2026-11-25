@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "ps3-live-v1",
+  "jellyfinRoute": "/Videos/{channelId}/stream.ts",
+  "container": "mpegts",
+  "video": {"codec":"h264","encoder":"h264_videotoolbox","profile":"high","level":"4.1","maxWidth":1280,"maxHeight":720,"maxFps":30,"bitrate":2500000,"gop":60},
+  "audio": {"codec":"mp3","channels":2,"sampleRate":48000,"bitrate":192000},
+  "alternateAudio": {"codec":"ac3","channels":6,"sampleRate":48000,"bitrate":640000},
+  "mode":"on-demand",
+  "status":"fixture-validation-only"
+}

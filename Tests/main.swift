@@ -63,6 +63,11 @@ check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:false,con
 check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:3,reason:"Startup timeout"),"systemic failure guard")
 check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout",paused:true),"user pause")
 check(!PlaybackFailurePolicy.confirms(serverHealthy:true,recentSuccess:true,consecutiveFailures:1,reason:"Startup timeout",cancelled:true),"cancellation")
+for reason in ["Network player error -1008","Stream HTTP 403","Stream HTTP 503","Startup timeout","Playback stalled after startup","No media source","Authentication failed"] {
+    check(PlaybackFailurePolicy.confirms(serverHealthy:false,recentSuccess:false,consecutiveFailures:9,reason:reason,strict:true),"strict hiatus: "+reason)
+}
+check(!PlaybackFailurePolicy.confirms(serverHealthy:false,recentSuccess:false,consecutiveFailures:9,reason:"Network",cancelled:true,strict:true),"strict cancellation excluded")
+check(!PlaybackFailurePolicy.confirms(serverHealthy:false,recentSuccess:false,consecutiveFailures:9,reason:"Network",paused:true,strict:true),"strict user pause excluded")
 print("PASS: \(checks) total assertions including scheduling, command fairness and failure classification")
 
 var video=VideoEvidence()
@@ -470,3 +475,28 @@ check(!LANHTTP.authorized(authRequest,token:"wrong-key"),"LAN invalid bearer")
 check(!LANHTTP.authorized(Data("GET /status HTTP/1.1\r\n\r\n".utf8),token:"test-key"),"LAN absent bearer rejected")
 check(LANHTTP.authorized(Data(),token:nil),"legacy LAN compatibility")
 print("PASS: \(checks) assertions including application revisions, gateway and LAN authentication")
+
+
+var rotationState=SurfRotationState()
+rotationState.seed(scope:"server|user|All",ids:["a","b"])
+check(rotationState.candidates(scope:"server|user|All",ids:["a","b","c","d"],current:"b")==["c","d"],"rotation migrates prior attempts")
+rotationState.record(scope:"server|user|All",id:"c")
+let rotationData=try JSONCodec.encoder().encode(rotationState)
+rotationState=try JSONCodec.decoder().decode(SurfRotationState.self,from:rotationData)
+check(rotationState.candidates(scope:"server|user|All",ids:["a","b","c","d"],current:"c")==["d"],"rotation survives restart")
+rotationState.record(scope:"server|user|All",id:"d")
+check(rotationState.candidates(scope:"server|user|All",ids:["a","b","c","d"],current:"d")==["a","b","c"],"complete cycle excludes immediate repeat")
+check(rotationState.candidates(scope:"other|user|All",ids:["a","b"],current:nil)==["a","b"],"rotation isolated by scope")
+var sustained=SustainedPlaybackEvidence()
+for _ in 0..<60{sustained.observe(delta:1,elapsed:1,playing:true)}
+check(sustained.qualifies(seconds:60),"sustained media progress passes")
+var stalled=SustainedPlaybackEvidence()
+for _ in 0..<60{stalled.observe(delta:0,elapsed:1,playing:true)}
+check(!stalled.qualifies(seconds:60),"wall clock alone cannot pass")
+sustained.observe(delta:0,elapsed:1,playing:false)
+check(!sustained.qualifies(seconds:60),"interrupted observation cannot reset hiatus")
+let strictDefaults=RuntimePolicy.baseline(Settings())
+check(strictDefaults.strictChannelHiatus==true && strictDefaults.stallSeconds==15 && strictDefaults.recoveryMode=="advance_surf","native strict recovery defaults")
+let strictConfig=try HotConfiguration.decode(Data("{\"schemaVersion\":1,\"revision\":\"strict-fixture\",\"runtime\":{\"strictChannelHiatus\":false}}".utf8))
+check(strictConfig.runtime?.strictChannelHiatus==false,"strict mode remains hot configurable")
+print("PASS: \(checks) assertions including persistent rotation and sustained health")

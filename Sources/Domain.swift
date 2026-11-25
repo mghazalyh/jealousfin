@@ -327,12 +327,46 @@ enum AppError: LocalizedError {
     var errorDescription: String? { if case .message(let s) = self { return s }; return nil }
 }
 
+// A cycle is scoped to the server, account and category, not the process.
+struct SurfRotationState: Codable, Equatable {
+    var visited: [String:Set<String>] = [:]
+    mutating func candidates(scope:String, ids:[String], current:String?) -> [String] {
+        var remaining=ids.filter{!(visited[scope] ?? []).contains($0)}
+        if remaining.isEmpty && !ids.isEmpty {
+            visited[scope]=[]
+            remaining=ids
+        }
+        let others=remaining.filter{$0 != current}
+        return others.isEmpty ? remaining : others
+    }
+    mutating func record(scope:String,id:String) {
+        visited[scope,default:[]].insert(id)
+    }
+    mutating func seed(scope:String,ids:Set<String>) {
+        if visited[scope]==nil {visited[scope]=ids}
+    }
+}
+struct SustainedPlaybackEvidence {
+    private(set) var progress=0.0
+    private(set) var observed=0.0
+    private(set) var interrupted=false
+    mutating func observe(delta:Double,elapsed:Double,playing:Bool) {
+        guard elapsed>0,elapsed<=5,playing,delta.isFinite,delta>=0 else{interrupted=true;return}
+        observed+=elapsed
+        progress+=min(delta,elapsed*1.5)
+    }
+    func qualifies(seconds:Double)->Bool {
+        !interrupted && observed>=max(3,seconds-2) && progress>=max(3,seconds*0.7)
+    }
+}
 enum PlaybackFailurePolicy {
-    // A healthy server is necessary but not sufficient. Never punish a channel
-    // for a canceled request, authentication failure, network loss or UI pause.
+    // Strict mode records completed playback failures regardless of cause.
+    // Cancellation and intentional pause never incur a penalty.
     static func confirms(serverHealthy:Bool, recentSuccess:Bool, consecutiveFailures:Int,
-                         reason:String, cancelled:Bool=false, paused:Bool=false)->Bool {
-        guard serverHealthy, !cancelled, !paused else { return false }
+                         reason:String, cancelled:Bool=false, paused:Bool=false, strict:Bool=false)->Bool {
+        guard !cancelled, !paused else { return false }
+        if strict { return true }
+        guard serverHealthy else { return false }
         let r=reason.lowercased()
         let infrastructure=["http 401","http 403","http 429","http 5","network","not connected","offline","cancelled","canceled","certificate","connection refused","dns","authentication","no media source"]
         if infrastructure.contains(where:{r.contains($0)}) { return false }
