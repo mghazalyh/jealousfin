@@ -627,7 +627,11 @@ def parse_programme(row):
  if not current:current=release_title
  if not current or (release_title and current!=release_title):return None
  if current.casefold() in ('unknown','no information','no programme information','no program information','n/a','live tv','tba','to be announced'):return None
- if current.casefold()==str(row.get('name','')).strip().casefold():return None
+ # Dedicated series channels can legitimately have the same channel and
+ # programme name. Require both explicit Now fields and a coherent boundary
+ # before accepting that case; never infer a show from the channel name alone.
+ if current.casefold()==str(row.get('name','')).strip().casefold():
+  if not release_title or not end_clock or not next_title or next_clock!=end_clock:return None
  return {'title':current,'nextTitle':next_title,'providerEndClock':end_clock,'providerNextClock':next_clock}
 
 def update_programmes(raw,observed=None):
