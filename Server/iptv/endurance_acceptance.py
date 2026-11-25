@@ -135,7 +135,7 @@ def evaluate_campaign_coverage(rotation,sessions,eligible_ids,start,max_gap):
             reasons.append("Unclosed, overlapping or discontinuous campaign sessions");break
     if tested and rollover and (not tested[-1][3] or not 0<=rollover[0]-tested[-1][3]<=max_gap):
         reasons.append("Final session closure not corroborated by rollover")
-    unresolved=[s[0] for s in tested if not (s[2]>=s[1] and s[2]>0 and not s[4] and s[5]=="sustained"
+    unresolved=[s[0] for s in tested if not (len(s)>10 and s[10]==1 and s[2]>=s[1] and s[2]>0 and not s[4] and s[5]=="sustained"
                  and s[6]>=2 and s[7] is not None and s[8] is not None and s[8]-s[7]>=3 and not s[9])]
     result["unresolvedChannels"]=unresolved
     if unresolved:reasons.append("Missing sustained decoded session evidence")
@@ -166,9 +166,12 @@ def main():
             if rotation_rows:
                 sessions=db.execute("SELECT cid,opened,confirmed,closed,failed,outcome,sample_count,first_position,last_position,stalls FROM sessions WHERE opened BETWEEN ? AND ? ORDER BY opened",(rotation_rows[0][0]-a.max_gap,rotation_rows[-1][0]+1)).fetchall()
                 if a.campaign_start is not None:
-                    campaign_sessions=db.execute("""SELECT s.cid,s.opened,s.confirmed,s.closed,s.failed,s.outcome,s.sample_count,s.first_position,s.last_position,s.stalls FROM sessions s
-                        WHERE s.opened BETWEEN ? AND ? AND EXISTS(SELECT 1 FROM playback_quality q WHERE q.trace=s.trace AND q.launch_id=? AND q.build=?)
-                        AND NOT EXISTS(SELECT 1 FROM playback_quality q WHERE q.trace=s.trace AND (coalesce(q.launch_id,\'\')!=? OR coalesce(q.build,\'\')!=?)) ORDER BY s.opened""",(a.campaign_start,rotation_rows[-1][0]+1,a.launch,a.build,a.launch,a.build)).fetchall()
+                    # Keep every session, including failed startups without
+                    # quality samples. Missing/mixed identity is unresolved.
+                    campaign_sessions=db.execute("""SELECT s.cid,s.opened,s.confirmed,s.closed,s.failed,s.outcome,s.sample_count,s.first_position,s.last_position,s.stalls,
+                        (EXISTS(SELECT 1 FROM playback_quality q WHERE q.trace=s.trace AND q.launch_id=? AND q.build=?)
+                        AND NOT EXISTS(SELECT 1 FROM playback_quality q WHERE q.trace=s.trace AND (coalesce(q.launch_id,'')!=? OR coalesce(q.build,'')!=?))) FROM sessions s
+                        WHERE s.opened BETWEEN ? AND ? ORDER BY s.opened""",(a.launch,a.build,a.launch,a.build,a.campaign_start,rotation_rows[-1][0]+1)).fetchall()
                     eligible_ids=[r[0] for r in db.execute("SELECT id FROM channel WHERE banned=0 AND hiatus_until<=?",(now,))]
     result=evaluate(rows,a.hours*3600,a.max_gap,a.max_growth_mib*1024*1024)
     result["rotation"]=evaluate_rotation(rotation_rows,a.max_gap)

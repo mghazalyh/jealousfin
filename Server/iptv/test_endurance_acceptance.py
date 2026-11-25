@@ -48,8 +48,13 @@ class EnduranceTests(unittest.TestCase):
         # must be present and launch-matched by the caller's query.
         rows=[(70,2,2,1,3,0,0,0,0,0,"b",1),(130,2,3,0,3,0,0,0,0,0,"c",1),(190,3,1,2,3,0,0,0,0,0,"a",1)]
         sessions=[(cid,at,at+5,at+60,0,"sustained",4,10,55,0) for cid,at in (("a",0),("b",60),("c",120))]
+        sessions=[(*s,1) for s in sessions]
         ids=["a","b","c"]
         self.assertTrue(evaluate_campaign_coverage(rows,sessions,ids,0,180)["passed"])
+        missing_identity=list(sessions);missing_identity[0]=(*sessions[0][:10],0)
+        self.assertFalse(evaluate_campaign_coverage(rows,missing_identity,ids,0,180)["passed"])
+        hidden_failure=[("a",0,0,1,1,"failed",0,None,None,0,0)]+sessions
+        self.assertFalse(evaluate_campaign_coverage(rows,hidden_failure,ids,0,180)["passed"])
         self.assertFalse(evaluate_campaign_coverage(rows[:-1],sessions,ids,0,180)["passed"])
         self.assertFalse(evaluate_campaign_coverage(rows,sessions[1:],ids,0,180)["passed"])
         self.assertFalse(evaluate_campaign_coverage(rows,sessions,["a","b","d"],0,180)["passed"])
