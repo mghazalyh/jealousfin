@@ -1,5 +1,5 @@
 import unittest
-from endurance_acceptance import evaluate,evaluate_rotation
+from endurance_acceptance import evaluate,evaluate_rotation,evaluate_cycle_playback
 
 class EnduranceTests(unittest.TestCase):
     def test_pass_and_failure(self):
@@ -21,5 +21,26 @@ class EnduranceTests(unittest.TestCase):
         self.assertFalse(evaluate_rotation(rows[:-1]+[(180,3,1,2,3,1,0,0,0,0)],180)["passed"])
         self.assertFalse(evaluate_rotation(rows[:-1]+[(180,3,1,2,3,0,1,0,0,0)],180)["passed"])
         self.assertFalse(evaluate_rotation([],180)["passed"])
+
+    def test_counter_integrity(self):
+        rows=[(0,2,1,2,3,0,0,0,0,0),(60,2,2,1,3,0,0,0,0,0),(120,2,3,0,3,0,0,0,0,0),(180,3,1,2,3,0,0,0,0,0)]
+        paused=list(rows);paused[1]=(60,2,2,1,3,1,0,0,0,0)
+        self.assertFalse(evaluate_rotation(paused,180)["passed"])
+        invalid=list(rows);invalid[1]=(60,2,2,2,3,0,0,0,0,0)
+        self.assertFalse(evaluate_rotation(invalid,180)["passed"])
+
+    def test_decoded_playback_corroborates_complete_cycle(self):
+        rows=[(10,2,1,2,3,0,0,0,0,0,"a",1),(70,2,2,1,3,0,0,0,0,0,"b",1),(130,2,3,0,3,0,0,0,0,0,"c",1),(190,3,1,2,3,0,0,0,0,0,"a",1)]
+        sessions=[(cid,at,at+5,at+60,0,"sustained",4,10,55,0) for cid,at in (("a",0),("b",60),("c",120))]
+        self.assertTrue(evaluate_cycle_playback(rows,sessions,[2],180)["passed"])
+        self.assertFalse(evaluate_cycle_playback(rows,sessions[:2],[2],180)["passed"])
+        self.assertFalse(evaluate_cycle_playback(rows[1:],sessions,[2],180)["passed"])
+        missing_decoded=list(sessions);missing_decoded[1]=("b",60,65,120,0,"sustained",1,10,10,0)
+        self.assertFalse(evaluate_cycle_playback(rows,missing_decoded,[2],180)["passed"])
+        failed=list(sessions);failed[1]=("b",60,0,120,1,"failed",0,None,None,0)
+        self.assertFalse(evaluate_cycle_playback(rows,failed,[2],180)["passed"])
+        self.assertFalse(evaluate_cycle_playback(rows,sessions,[],180)["passed"])
+        duplicate=list(rows);duplicate[1]=(*rows[1][:10],"a",1)
+        self.assertFalse(evaluate_cycle_playback(duplicate,sessions,[2],180)["passed"])
 
 if __name__=="__main__":unittest.main()
