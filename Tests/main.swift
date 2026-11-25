@@ -600,3 +600,12 @@ check(PlaybackBufferEvidence.ahead(position:5,ranges:[(0,10),(10,15),(18,25)])==
 check(PlaybackBufferEvidence.ahead(position:5,ranges:[(8,20)])==0,"future disconnected buffer not counted")
 check(PlaybackBufferEvidence.ahead(position:5,ranges:[(0,8),(3,12)])==7,"overlapping buffer is not double counted")
 print("PASS: \(checks) assertions including contiguous playback buffer evidence")
+
+check(JellyfinConnectionFault.authenticationStatus(401,gateway:true) == .authentication(401),"gateway authentication failure holds the server session")
+check(JellyfinConnectionFault.authenticationStatus(403,gateway:true) == .authentication(403),"gateway authentication forbidden holds the server session")
+check(JellyfinConnectionFault.authenticationStatus(403,gateway:false)==nil,"ordinary Jellyfin item permission remains separately evaluated")
+check(JellyfinConnectionFault.authenticationStatus(502,gateway:true)==nil,"relayed upstream failure stays under strict hiatus")
+check(JellyfinConnectionFault.networkError(URLError(.cannotConnectToHost)) != nil,"API connectivity is a connection fault")
+check(JellyfinConnectionFault.networkError(URLError(.timedOut))==nil,"unclassified source timeout remains a real failure")
+check(JellyfinConnectionFault.networkError(URLError(.cancelled))==nil,"cancellation remains distinct")
+print("PASS: \(checks) assertions including server-session recovery gate")

@@ -938,7 +938,7 @@ import CryptoKit
         }
     }
     private func saveSurfCheckpoint(force:Bool=false){
-        guard surfing,!engineeringOwnsPlayback,let c=current,!c.isSurf else{return}
+        guard surfing,!engineeringOwnsPlayback,let c=current,!c.isSurf,catalogueReady else{return}
         let now=Date()
         guard force || now.timeIntervalSince(lastRotationCheckpoint)>=15 else{return}
         lastRotationCheckpoint=now
@@ -1015,6 +1015,18 @@ import CryptoKit
         return time.isValid && time.seconds.isFinite ? time : player.currentTime()
     }
     private var position:Double {let n=player.currentTime().seconds;return n.isFinite ? max(0,n):0}
+    // An invalid server session or unavailable policy prevents any actual
+    // channel evaluation. Hold the rotation until authenticated recovery;
+    // don't march through hundreds of otherwise eligible channels.
+    private func holdForConnectionRecovery(channel:Channel,reason:String){
+        saveSurfCheckpoint(force:true)
+        nextRotation=nil;emptyPoolRetry=nil
+        catalogueReady=false;playing=false;validated=false
+        status="Connection failed";lastLogin=Date()
+        lastPlayerError=reason
+        log("WARN","jellyfin","PLAYBACK_CONNECTION_HELD",["channelID":channel.id,"reason":reason,"terminal":"false"])
+        requestSync();recalculateInsights()
+    }
     private func attempt(_ channel:Channel,generation g:UUID) async {
         var errorReason="Startup timeout"
         var failureCategory=PlaybackFailureCategory.timeout
@@ -1135,9 +1147,17 @@ import CryptoKit
                 session=nil;player.pause();player.replaceCurrentItem(with:nil);videoOutput=nil
                 queueClose(s,position:0)
                 await cleanupTask?.value
+            } catch let fault as JellyfinConnectionFault{
+                guard g==generation,!Task.isCancelled else{return}
+                holdForConnectionRecovery(channel:channel,reason:fault.localizedDescription)
+                return
             } catch let error as GatewayPolicyError{
                 guard g==generation,!Task.isCancelled else{return}
                 log("WARN","health","GATEWAY_PLAYBACK_BLOCKED",["channelID":channel.id,"reason":error.localizedDescription])
+                if error == .unavailable{
+                    holdForConnectionRecovery(channel:channel,reason:error.localizedDescription)
+                    return
+                }
                 await pollGatewayHealth()
                 guard g==generation,!Task.isCancelled else{return}
                 status=error.localizedDescription;playing=false;validated=false
@@ -1487,6 +1507,8 @@ import CryptoKit
                     values["itemStallsTotal"]=String(access.reduce(0){$0+max(0,$1.numberOfStalls)})
                     values["accessLogEvents"]=String(access.count)
                 }
+                values["launchID"]=launchID
+                values["buildNumber"]=Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
                 metrics=values;log("INFO","telemetry","PLAYBACK_SAMPLE",values)
             }
         }
@@ -1502,7 +1524,7 @@ import CryptoKit
             if remaining==0{nextRotation=nil;next(reason:"rotation-deadline");return}
         }
         if let retry=emptyPoolRetry,surfing,!surfPaused,!intentionallyPaused,!apiChanging,retry<=now {emptyPoolRetry=nil;next(reason:"failure-recovery")}
-        if jelly.connected && now.timeIntervalSince(lastRefresh)>Double(operational.catalogueRefreshSeconds ?? 180) {
+        if jelly.connected && catalogueReady && now.timeIntervalSince(lastRefresh)>Double(operational.catalogueRefreshSeconds ?? 180) {
             lastRefresh=now;Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
         if apiReady && !apiChanging && policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect()}}

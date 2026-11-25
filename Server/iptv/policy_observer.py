@@ -17,6 +17,9 @@ def connect(path=DB):
     CREATE TABLE IF NOT EXISTS observed(id TEXT PRIMARY KEY,at REAL NOT NULL,code TEXT NOT NULL,cid TEXT,trace TEXT,reason TEXT);
     CREATE TABLE IF NOT EXISTS samples(at INTEGER PRIMARY KEY,footprint INTEGER,cpu REAL,thermal TEXT,queued INTEGER,resources INTEGER,channel TEXT);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS playback_quality(event_id TEXT PRIMARY KEY,at REAL NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT,build TEXT,position REAL,rate REAL,buffer_total REAL,buffer_ahead REAL,live_edge REAL,frame_age REAL,dropped INTEGER,stalls INTEGER,observed_bitrate REAL,indicated_bitrate REAL);
+    CREATE INDEX IF NOT EXISTS playback_quality_at ON playback_quality(at);
+    CREATE INDEX IF NOT EXISTS playback_quality_channel_at ON playback_quality(cid,at);
     """)
     for column in ("approved_at","last_success"):
         if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
@@ -72,6 +75,25 @@ def seed(c,info,h):
             failure(c,row['id'],epoch(row['at']),row['reason'])
     c.execute("INSERT OR REPLACE INTO meta VALUES('seeded','1')")
     c.execute("INSERT OR REPLACE INTO meta VALUES('seed_time',?)",(str(time.time()),))
+def finite_number(value):
+    import math
+    try:
+        n=float(value)
+        return n if math.isfinite(n) else None
+    except (TypeError,ValueError,OverflowError):return None
+
+def retain_quality(c,e,cid,trace,at,fields,status):
+    # Store scalar playback evidence, not stream URLs or raw event bodies.
+    metrics=status.get('systemMetrics',{})
+    keys=('position','rate','bufferSeconds','bufferAheadSeconds','liveEdgeDistanceSeconds','videoSampleAgeSeconds','itemDroppedFramesTotal','itemStallsTotal','observedBitrate','indicatedBitrate')
+    values=[finite_number(fields.get(key)) for key in keys]
+    if values[6] is None:values[6]=finite_number(fields.get('droppedFrames'))
+    if values[7] is None:values[7]=finite_number(fields.get('stalls'))
+    # Old log samples can cross a launch boundary. Use explicit event identity
+    # when provided; unknown historical launch/build stays unknown.
+    c.execute("INSERT OR IGNORE INTO playback_quality VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (e['id'],at,cid,trace,fields.get('launchID'),fields.get('buildNumber'),*values))
+
 def ingest(c,events,status):
     rotation=int(status.get('rotationMinutes',1))*60
     for e in sorted(events,key=lambda v:v.get('timestamp','')):
@@ -104,6 +126,7 @@ def ingest(c,events,status):
         elif code in ('ITEM_STALLED','ITEM_FAILED_TO_END'):
             c.execute('UPDATE sessions SET stalls=max(stalls,1) WHERE trace=?',(trace,))
         elif code=='PLAYBACK_SAMPLE':
+            retain_quality(c,e,cid,trace,at,fields,status)
             try:
                 pos=float(fields['position'])
                 stalls=int(fields.get('stalls','0'))
@@ -132,6 +155,7 @@ def cycle(c):
         if not c.execute('SELECT 1 FROM samples WHERE at>=?',(now-60,)).fetchone():
             c.execute('INSERT OR REPLACE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision) VALUES(?,?,?,?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel',''),status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision','')))
         c.execute('DELETE FROM observed WHERE at<?',(now-30*DAY,))
+        c.execute('DELETE FROM playback_quality WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM samples WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM sessions WHERE closed>0 AND closed<?',(now-30*DAY,))
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(str(now),))

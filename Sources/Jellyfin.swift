@@ -69,6 +69,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
                 if marker=="excluded",http.statusCode==409{throw GatewayPolicyError.excluded}
                 if marker=="unavailable",http.statusCode==503{throw GatewayPolicyError.unavailable}
             }
+            if let fault=JellyfinConnectionFault.authenticationStatus(http.statusCode,gateway:gatewayHealth != nil){throw fault}
             guard (200..<300).contains(http.statusCode) else { throw AppError.message("Jellyfin HTTP \(http.statusCode)") }
             phase="response_decode"
             let response:[String:Any]
@@ -85,6 +86,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         } catch {
             log?("ERROR","HTTP_FAILURE",["operation":operation,"adapter":revision,"requestID":requestID,"phase":phase,"errorType":String(describing:type(of:error))])
             if phase=="request_hook" || phase=="response_hook"{throw AppError.message("Jellyfin API adapter failed during "+operation+" "+phase)}
+            if phase=="transport",let fault=JellyfinConnectionFault.networkError(error){throw fault}
             throw error
         }
     }

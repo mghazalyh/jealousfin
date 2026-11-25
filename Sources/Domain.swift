@@ -635,6 +635,30 @@ struct GatewayHealthSnapshot:Codable,Equatable{
         return merged
     }
 }
+// These are API/session failures before a channel can be evaluated. Upstream
+// media failures (including a provider HTTP 401/403 relayed as 502) remain
+// subject to strict channel hiatus. Never classify by a generic error string.
+enum JellyfinConnectionFault:LocalizedError,Equatable{
+    case authentication(Int),transport(Int)
+    var errorDescription:String?{
+        switch self{
+        case .authentication(let status):return "Jellyfin authentication HTTP "+String(status)
+        case .transport(let code):return "Jellyfin API connection error "+String(code)
+        }
+    }
+    static func authenticationStatus(_ status:Int,gateway:Bool)->Self?{
+        if status==401 || (gateway && status==403){return .authentication(status)}
+        return nil
+    }
+    static func networkError(_ error:Error)->Self?{
+        guard let e=error as? URLError else{return nil}
+        switch e.code{
+        case .notConnectedToInternet,.cannotConnectToHost,.cannotFindHost,.dnsLookupFailed,.networkConnectionLost:
+            return .transport(e.code.rawValue)
+        default:return nil
+        }
+    }
+}
 enum GatewayPolicyError:LocalizedError{
     case excluded,unavailable
     var errorDescription:String?{self == .excluded ? "Gateway channel excluded":"Gateway policy unavailable"}

@@ -1,7 +1,7 @@
 name: Build and release Jealousfin IPA
 on:
   push:
-    branches: [main]
+    branches: [main, engineering/hotpatch-abi2-20261125]
   workflow_dispatch:
     inputs:
       runner:
@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   primary:
+    if: ${{ github.ref_name == 'main' || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build-ipa]') }}
     name: Jealousfin primary macOS
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 35

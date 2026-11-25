@@ -28,3 +28,4 @@ with tempfile.TemporaryDirectory() as d:
         at+=n*3*p.DAY+1
     assert c.execute('SELECT failures,banned,hiatus_until FROM channel WHERE id="a"').fetchone()==(8,1,0)
 print('PASS: deduplication, stall attribution, strict failure, progressive hiatus, sustained playback, permanent ban')
+
