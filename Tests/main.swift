@@ -634,3 +634,23 @@ let iconConfig=try HotConfiguration.decode(Data("""
 {"schemaVersion":1,"revision":"icons","presentation":{"fullscreenIconOnly":true,"fullscreenIconSize":29,"fullscreenControlOrder":["rotationToggle","previous","playPause","next","stop","favorite"]}}
 """.utf8))
 check(iconConfig.presentation?.fullscreenIconSize==29 && iconConfig.presentation?.resolvedFullscreenControlOrder==DynamicPresentation.defaultControlOrder,"hot configuration admits icon presentation fields")
+
+ 
+// Fine-grained fullscreen slots coexist with legacy whole-row replacements.
+let componentSlots = DynamicUILayout.fullscreenComponentLocations
+check(componentSlots.count == 16 && Set(componentSlots).count == 16,"all independent fullscreen component slots are unique")
+let componentLayout = DynamicUILayout(schemaVersion:1,revision:"fullscreen-component-fixture",slots:componentSlots.map{DynamicUISlot(location:$0,nodes:[])},pages:[])
+check((try? componentLayout.checked()) != nil,"all fullscreen component locations accepted together")
+let brightnessSlotFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"brightness-slot","slots":[{"location":"player.fullscreen.brightness","nodes":[{"id":"brightness-native","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? brightnessSlotFixture.checked()) != nil,"standalone native brightness accepted")
+let duplicateBrightnessFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"duplicate-brightness","slots":[{"location":"player.fullscreen.brightness","nodes":[{"id":"brightness-child","kind":"liveBrightness"}]},{"location":"player.fullscreen.surf","nodes":[{"id":"brightness-parent","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? duplicateBrightnessFixture.checked()) == nil,"duplicate native brightness rejected across old and new slots")
+let misplacedBrightnessFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"misplaced-brightness","slots":[{"location":"player.fullscreen.countdown","nodes":[{"id":"brightness-wrong","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? misplacedBrightnessFixture.checked()) == nil,"brightness rejected outside supported slots")
+print("PASS: \(checks) assertions including independent fullscreen components")

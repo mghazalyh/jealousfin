@@ -33,3 +33,22 @@ The native fullscreen heading replaces the redundant Surf active/stopped label a
 The native six-button transport row is rotation, Previous, Play/Pause, Next/Reconnect, Stop and Favorite. Large 29pt icons, 48pt targets, semantic accessibility labels, muted night theme and confirmed favorite fill replace the WebView toolbar. Legacy five-control order remains accepted and gains Previous before playback; new controls are configurable with fullscreenIconOnly/fullscreenIconSize and the existing replacement slots. Channel-only header, current programme title with optional (YYYY), no Scheduled prefix, current catalogue preference, 60-second default gateway catalogue refresh, real brightness and compact footer are native. Previous selects the most recent eligible different channel in the current category, cancels stale selection tasks, records an explicit revisit without clearing visited channels, retains Surf and rotation-pause state, and starts a full dwell on successful validation. Press Previous while running and while paused, check ineligible history is skipped and no automatic duplicate is introduced, and verify countdown expiration advances normally. Pause/resume playback independently of rotation, then reload while paused; remaining time including zero survives. Shared-server transport cannot select a previous underlying channel. No gateway mutation is needed. Physical acceptance remains required.
 
 The standalone HLS readiness test must not depend on DynamicUILayout to validate adapter revision IDs. Deferred adapter IDs use the identical bounded ASCII identifier grammar in JellyfinAdapterRules, which restores the release workflow's isolated test compilation. Manual switches seed a full dwell checkpoint before validation; reload and restore explicitly supply their saved dwell instead.
+
+
+### Independent fullscreen component replacement
+
+The native layout advertises individual replacement locations under
+`player.fullscreen.`: showControls, hideControls, exit, programmeTitle,
+countdown, rotationToggle, previous, playPause, next, stop, favorite,
+category, surfToggle, brightness, favoriteError and sharedHint. Existing
+whole-region replacements remain supported and take precedence over their
+native descendants. An absent or empty replacement retains the native
+fallback. A nonempty spacer can intentionally suppress a component.
+The legacy Surf replacement can still host the fixed native brightness
+primitive; the new brightness location can also host it. Duplicate
+brightness primitives and brightness in unrelated locations are rejected.
+These regions do not recreate the AVPlayer or reopen the stream. Device
+acceptance must confirm that recovery, exit and reveal remain accessible
+under the chosen configuration. Engineering CI also executes the exact
+standalone HLS compilation and test command from the IPA workflow, without
+producing an IPA.

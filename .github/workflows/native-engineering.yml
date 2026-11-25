@@ -1,7 +1,7 @@
 name: Native engineering validation
 on:
   push:
-    branches: [engineering/hotpatch-abi2-20261125]
+    branches: [engineering/hotpatch-abi2-20261125, engineering/hotpatch-abi2-20261126]
     paths:
       - 'Sources/**'
       - 'Tests/**'
@@ -42,6 +42,9 @@ jobs:
           mkdir -p build
           swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Sources/JellyfinAdapterDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Tests/main.swift -o build/policy-tests
           build/policy-tests
+          # Match the separate IPA workflow's standalone dependency boundary.
+          swiftc -parse-as-library Sources/Domain.swift Sources/JellyfinAdapterDomain.swift Sources/HLSReadiness.swift Tests/HLSReadinessTests.swift -o build/hls-readiness-tests
+          build/hls-readiness-tests
           python3 -m unittest discover -s Tests -p 'test_*.py' -v
           python3 Server/iptv/test_policy_observer.py
           python3 Server/iptv/test_policy_snapshot.py

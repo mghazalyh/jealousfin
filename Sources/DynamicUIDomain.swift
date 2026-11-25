@@ -121,7 +121,10 @@ struct DynamicUILayout: Codable, Equatable {
     var pages:[DynamicUIPage]
     var presentation:DynamicPresentation? = nil
     var tabs:[DynamicTab]?=nil
-    static let replacementLocations=["guide.body","health.body","insights.body","more.body","player.transport","player.surf","player.history","player.fullscreen.header","player.fullscreen.heading","player.fullscreen.transport","player.fullscreen.surf","player.fullscreen.footer"]
+    // Parent replacements retain ABI compatibility and take precedence over their
+    // native child slots. Empty slots still fall back to the native implementation.
+    static let fullscreenComponentLocations=["showControls","hideControls","exit","programmeTitle","countdown","rotationToggle","previous","playPause","next","stop","favorite","category","surfToggle","brightness","favoriteError","sharedHint"].map{"player.fullscreen."+$0}
+    static let replacementLocations=["guide.body","health.body","insights.body","more.body","player.transport","player.surf","player.history","player.fullscreen.header","player.fullscreen.heading","player.fullscreen.transport","player.fullscreen.surf","player.fullscreen.footer"]+fullscreenComponentLocations
     static let locations=replacementLocations+["guide.top","guide.bottom","player.top","player.controls","player.bottom","player.fullscreen.top","player.fullscreen.controls","player.fullscreen.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
     static let kinds=["segmented","menu","disclosure","scroll","searchList","table","barChart","banner","liveBrightness","text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
     static let commands:Set<String>=["query_native_data","get_effective_configuration","get_capability_registry","list_event_modules","get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","get_native_capabilities","get_preferences","set_preferences","set_player_audio","set_video_brightness","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
@@ -199,7 +202,7 @@ struct DynamicUILayout: Codable, Equatable {
         }
         func containsBrightness(_ nodes:[DynamicUINode])->Bool{nodes.contains{$0.kind=="liveBrightness" || containsBrightness($0.children ?? [])}}
         for slot in slots{
-            guard !containsBrightness(slot.nodes) || slot.location=="player.fullscreen.surf" else{throw AppError.message("Native brightness belongs in the fullscreen Surf control replacement")}
+            guard !containsBrightness(slot.nodes) || ["player.fullscreen.surf","player.fullscreen.brightness"].contains(slot.location) else{throw AppError.message("Native brightness belongs in a fullscreen brightness or Surf replacement")}
             try walk(slot.nodes,depth:0)
         }
         for page in pages{guard !containsBrightness(page.nodes) else{throw AppError.message("Brightness is fullscreen-only")};try walk(page.nodes,depth:0)}

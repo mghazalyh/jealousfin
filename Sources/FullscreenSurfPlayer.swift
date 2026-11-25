@@ -40,11 +40,13 @@ struct FullscreenSurfPlayer:View {
                     VStack{
                         HStack{
                             Spacer()
-                            Button{model.fullscreenControlsVisible=true}label:{
-                                Label("Controls",systemImage:"slider.horizontal.3")
-                                    .font(.subheadline.bold()).padding(12)
-                                    .background(.black.opacity(0.8)).cornerRadius(12)
-                            }.accessibilityIdentifier("player.fullscreen.showControls")
+                            PatchableRegion("player.fullscreen.showControls"){
+                                Button{model.fullscreenControlsVisible=true}label:{
+                                    Label("Controls",systemImage:"slider.horizontal.3")
+                                        .font(.subheadline.bold()).padding(12)
+                                        .background(.black.opacity(0.8)).cornerRadius(12)
+                                }.accessibilityIdentifier("player.fullscreen.showControls")
+                            }
                             closeButton
                         }
                         Spacer()
@@ -72,49 +74,60 @@ struct FullscreenSurfPlayer:View {
                 }
                 }
                 Spacer(minLength:4)
-                Button{model.fullscreenControlsVisible=false}label:{
-                    Image(systemName:"eye.slash").frame(width:44,height:44)
-                }.accessibilityLabel("Hide Surf controls")
-                    .accessibilityIdentifier("player.fullscreen.hideControls")
+                PatchableRegion("player.fullscreen.hideControls"){
+                    Button{model.fullscreenControlsVisible=false}label:{
+                        Image(systemName:"eye.slash").frame(width:44,height:44)
+                    }.accessibilityLabel("Hide Surf controls")
+                        .accessibilityIdentifier("player.fullscreen.hideControls")
+                }
                 closeButton
             }
             DynamicUISlotView(location:"player.fullscreen.top")
         }.padding(padding).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(corner)
     }
     private var closeButton:some View{
-        Button{model.fullscreenPresented=false}label:{
-            Image(systemName:"arrow.down.right.and.arrow.up.left")
-                .font(.headline).frame(width:44,height:44)
-                .background(Color.black.opacity(0.8)).cornerRadius(10)
-        }.accessibilityLabel("Exit fullscreen")
-            .accessibilityIdentifier("player.fullscreen.exit")
+        PatchableRegion("player.fullscreen.exit"){
+            Button{model.fullscreenPresented=false}label:{
+                Image(systemName:"arrow.down.right.and.arrow.up.left")
+                    .font(.headline).frame(width:44,height:44)
+                    .background(Color.black.opacity(0.8)).cornerRadius(10)
+            }.accessibilityLabel("Exit fullscreen")
+                .accessibilityIdentifier("player.fullscreen.exit")
+        }
     }
     private func footer(maxHeight:CGFloat)->some View{
         ScrollView(showsIndicators:false){
             VStack(alignment:.leading,spacing:spacing){
                 PatchableRegion("player.fullscreen.heading"){
                     HStack(spacing:8){
-                        Text(model.currentProgrammeTitle ?? model.current?.name ?? "Choose a channel")
-                            .font(.headline).lineLimit(1).truncationMode(.tail)
-                            .accessibilityIdentifier("player.fullscreen.programmeTitle")
+                        PatchableRegion("player.fullscreen.programmeTitle"){
+                            Text(model.currentProgrammeTitle ?? model.current?.name ?? "Choose a channel")
+                                .font(.headline).lineLimit(1).truncationMode(.tail)
+                                .accessibilityIdentifier("player.fullscreen.programmeTitle")
+                        }
                         Spacer(minLength:4)
-                        Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
-                            .font(.subheadline.monospacedDigit())
-                            .fixedSize(horizontal:true,vertical:false)
-                            .accessibilityLabel("Rotation countdown")
-                            .accessibilityValue(model.surfPaused ? "Paused, "+String(model.remaining)+" seconds remaining":String(model.remaining)+" seconds remaining")
-                            .accessibilityIdentifier("player.fullscreen.countdown")
+                        PatchableRegion("player.fullscreen.countdown"){
+                            Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
+                                .font(.subheadline.monospacedDigit())
+                                .fixedSize(horizontal:true,vertical:false)
+                                .accessibilityLabel("Rotation countdown")
+                                .accessibilityValue(model.surfPaused ? "Paused, "+String(model.remaining)+" seconds remaining":String(model.remaining)+" seconds remaining")
+                                .accessibilityIdentifier("player.fullscreen.countdown")
+                        }
                     }.foregroundColor(palette.secondary)
                 }
                 PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:spacing){
                     ForEach(presentation.resolvedFullscreenControlOrder,id:\.self){id in
-                        transportControl(id)
+                        PatchableRegion("player.fullscreen."+id){
+                            transportControl(id)
+                        }
                     }
                 }
                 }
                 PatchableRegion("player.fullscreen.surf"){
                 HStack(spacing:8){
+                    PatchableRegion("player.fullscreen.category"){
                     Menu{
                         ForEach(["All Channels","Favorites","Sports","Movies & Series"],id:\.self){category in
                             Button{
@@ -137,17 +150,24 @@ struct FullscreenSurfPlayer:View {
                             .overlay(RoundedRectangle(cornerRadius:9).strokeBorder(palette.border,lineWidth:1))
                     }.tint(palette.text)
                     .accessibilityIdentifier("player.fullscreen.category")
+                    }
+                    PatchableRegion("player.fullscreen.surfToggle"){
                     Button{
                         if model.surfing{model.stopSurf()}else{model.startSurf(category:model.settings.surfCategory)}
                     }label:{Text(model.surfing ? "Stop Surf":"Start Surf").font(.subheadline).frame(minHeight:44).padding(.horizontal,10)}
                         .buttonStyle(FullscreenControlButtonStyle(palette:palette))
                         .accessibilityIdentifier("player.fullscreen.surfToggle")
+                    }
                 }
-                brightnessControl
-                if model.currentFavoriteFailed{Text("Favorite update failed. Try again.").font(.caption2).foregroundColor(palette.secondary).accessibilityIdentifier("player.fullscreen.favoriteError")}
-                if model.usingSharedSurf{
-                    Text("Server manages source rotation. Reconnect refreshes the live stream.")
-                        .font(.caption).foregroundColor(.secondary)
+                PatchableRegion("player.fullscreen.brightness"){brightnessControl}
+                PatchableRegion("player.fullscreen.favoriteError"){
+                    if model.currentFavoriteFailed{Text("Favorite update failed. Try again.").font(.caption2).foregroundColor(palette.secondary).accessibilityIdentifier("player.fullscreen.favoriteError")}
+                }
+                PatchableRegion("player.fullscreen.sharedHint"){
+                    if model.usingSharedSurf{
+                        Text("Server manages source rotation. Reconnect refreshes the live stream.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
                 }
                 PatchableRegion("player.fullscreen.footer"){
