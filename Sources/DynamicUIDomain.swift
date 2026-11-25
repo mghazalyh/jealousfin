@@ -63,7 +63,15 @@ struct DynamicPresentation: Codable, Equatable {
     var fullscreenControlOrder:[String]?=nil
     var fullscreenControlTheme:String?=nil
     var resolvedFullscreenControlTheme:String{fullscreenControlTheme ?? "night"}
-    static let defaultControlOrder=["rotationToggle","playPause","next","stop","favorite"]
+    var fullscreenIconOnly:Bool?=nil
+    var fullscreenIconSize:Double?=nil
+    static let legacyControlOrder=["rotationToggle","playPause","next","stop","favorite"]
+    static let defaultControlOrder=["rotationToggle","previous","playPause","next","stop","favorite"]
+    var resolvedFullscreenControlOrder:[String]{
+        var order=fullscreenControlOrder ?? Self.defaultControlOrder
+        if !order.contains("previous"){order.insert("previous",at:order.firstIndex(of:"playPause") ?? order.startIndex)}
+        return order
+    }
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
               ["night","standard"].contains(resolvedFullscreenControlTheme),
@@ -74,7 +82,8 @@ struct DynamicPresentation: Codable, Equatable {
               (0...32).contains(fullscreenCornerRadius ?? 14),(44...80).contains(fullscreenButtonHeight ?? 44),
               (0.8...1.4).contains(fullscreenTextScale ?? 1),(0...600).contains(fullscreenAutoHideSeconds ?? 0),
               (0.20...0.80).contains(fullscreenPortraitMaxHeight ?? 0.25),
-              fullscreenControlOrder.map({$0.count==5 && Set($0)==Set(Self.defaultControlOrder)}) ?? true
+              (18...36).contains(fullscreenIconSize ?? 29),
+              fullscreenControlOrder.map({($0.count==6 && Set($0)==Set(Self.defaultControlOrder)) || ($0.count==5 && Set($0)==Set(Self.legacyControlOrder))}) ?? true
         else{throw AppError.message("Invalid presentation options")}
         return self
     }

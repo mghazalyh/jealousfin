@@ -108,7 +108,7 @@ struct FullscreenSurfPlayer:View {
                 }
                 PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:spacing){
-                    ForEach(presentation.fullscreenControlOrder ?? DynamicPresentation.defaultControlOrder,id:\.self){id in
+                    ForEach(presentation.resolvedFullscreenControlOrder,id:\.self){id in
                         transportControl(id)
                     }
                 }
@@ -165,8 +165,12 @@ struct FullscreenSurfPlayer:View {
         switch id{
         case "rotationToggle":
             if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:.rotation){model.toggleSurfPause()}}
+        case "previous":
+            control("Previous channel","backward.end.fill",id){model.previousFromUI()}
+                .disabled(!model.canGoPrevious)
         case "playPause":
             control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill",id){if model.playing{model.pause()}else{model.resume()}}
+                .disabled(model.current==nil)
         case "next":
             if model.surfing || model.currentSharedTransport{control(model.usingSharedSurf ? "Reconnect":"Next",model.usingSharedSurf ? "arrow.clockwise":"forward.end.fill",id){model.next()}}
         case "stop":
@@ -201,9 +205,11 @@ struct FullscreenSurfPlayer:View {
     private func control(_ title:String,_ image:String,_ id:String,role:FullscreenControlRole = .normal,action:@escaping()->Void)->some View{
         Button(action:action){
             VStack(spacing:4){
-                Image(systemName:image).font(.system(size:17*CGFloat(presentation.fullscreenTextScale ?? 1),weight:.semibold))
-                Text(title).font(.system(size:11*CGFloat(presentation.fullscreenTextScale ?? 1))).lineLimit(1).minimumScaleFactor(0.7)
-            }.frame(maxWidth:.infinity,minHeight:CGFloat(presentation.fullscreenButtonHeight ?? 44))
+                Image(systemName:image).font(.system(size:CGFloat(presentation.fullscreenIconSize ?? 29)*CGFloat(presentation.fullscreenTextScale ?? 1),weight:.semibold))
+                if presentation.fullscreenIconOnly==false{
+                    Text(title).font(.system(size:11*CGFloat(presentation.fullscreenTextScale ?? 1))).lineLimit(1).minimumScaleFactor(0.7)
+                }
+            }.frame(maxWidth:.infinity,minHeight:CGFloat(presentation.fullscreenButtonHeight ?? 48))
         }.buttonStyle(FullscreenControlButtonStyle(palette:palette,role:role))
             .accessibilityLabel(title)
             .accessibilityIdentifier("player.fullscreen."+id)

@@ -438,6 +438,11 @@ enum CommandQueue {
     }
 }
 enum SurfCommandSemantics {
+    // Previous is an explicit revisit, not a new automatic rotation cycle.
+    // Never select a removed, currently playing, or policy-excluded channel.
+    static func previousID(history:[String],eligible:Set<String>,current:String?)->String?{
+        history.first{$0 != current && eligible.contains($0)}
+    }
     static func rotationOwner(surfing:Bool,shared:Bool)->String {
         !surfing ? "none" : (shared ? "server" : "device")
     }
@@ -449,6 +454,11 @@ enum SurfCommandSemantics {
     }
 }
 enum SurfClock {
+    // A manual channel change gets a fresh dwell time. Reload/restore can
+    // explicitly supply the old remaining time, including a paused zero.
+    static func dwell(configured:Int,preserved:Int?=nil)->Int{
+        max(0,preserved ?? configured)
+    }
     static func remaining(deadline:Date?,now:Date)->Int {
         guard let deadline=deadline else{return 0}
         return max(0,Int(ceil(deadline.timeIntervalSince(now))))

@@ -40,6 +40,10 @@
       "fullscreen-clean-programme-20261125": {
         "disposition": "native",
         "evidence": "Fullscreen channel-only header and native programme heading; Program.title strips external schedule prefix and preserves server-enriched release year."
+      },
+      "fullscreen-icon-transport-20261125": {
+        "disposition": "native",
+        "evidence": "Six native icon-only controls default 29pt/48pt with accessible labels, previous preserves active rotation/category/eligible policy, native confirmed favorite and actual brightness; header and programme heading independently patchable."
       }
     },
     "jellyfinAPIRevision": {
