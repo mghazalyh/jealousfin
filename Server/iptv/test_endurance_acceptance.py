@@ -1,5 +1,5 @@
 import unittest
-from endurance_acceptance import evaluate,evaluate_rotation,evaluate_cycle_playback
+from endurance_acceptance import evaluate,evaluate_rotation,evaluate_cycle_playback,evaluate_campaign_coverage
 
 class EnduranceTests(unittest.TestCase):
     def test_pass_and_failure(self):
@@ -42,5 +42,22 @@ class EnduranceTests(unittest.TestCase):
         self.assertFalse(evaluate_cycle_playback(rows,sessions,[],180)["passed"])
         duplicate=list(rows);duplicate[1]=(*rows[1][:10],"a",1)
         self.assertFalse(evaluate_cycle_playback(duplicate,sessions,[2],180)["passed"])
+
+    def test_campaign_coverage_from_midcycle_observation(self):
+        # First rotation sample starts at attempt 2; earlier session evidence
+        # must be present and launch-matched by the caller's query.
+        rows=[(70,2,2,1,3,0,0,0,0,0,"b",1),(130,2,3,0,3,0,0,0,0,0,"c",1),(190,3,1,2,3,0,0,0,0,0,"a",1)]
+        sessions=[(cid,at,at+5,at+60,0,"sustained",4,10,55,0) for cid,at in (("a",0),("b",60),("c",120))]
+        ids=["a","b","c"]
+        self.assertTrue(evaluate_campaign_coverage(rows,sessions,ids,0,180)["passed"])
+        self.assertFalse(evaluate_campaign_coverage(rows[:-1],sessions,ids,0,180)["passed"])
+        self.assertFalse(evaluate_campaign_coverage(rows,sessions[1:],ids,0,180)["passed"])
+        self.assertFalse(evaluate_campaign_coverage(rows,sessions,["a","b","d"],0,180)["passed"])
+        duplicate=list(sessions);duplicate[0]=("b",*sessions[0][1:])
+        self.assertFalse(evaluate_campaign_coverage(rows,duplicate,ids,0,180)["passed"])
+        wrong=list(rows);wrong[0]=(*rows[0][:10],"a",1)
+        self.assertFalse(evaluate_campaign_coverage(wrong,sessions,ids,0,180)["passed"])
+        broken=list(sessions);broken[0]=("a",0,5,20,0,"inconclusive",1,10,10,0)
+        self.assertFalse(evaluate_campaign_coverage(rows,broken,ids,0,180)["passed"])
 
 if __name__=="__main__":unittest.main()
