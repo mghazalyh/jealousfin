@@ -20,6 +20,7 @@ def connect(path=DB):
     CREATE TABLE IF NOT EXISTS playback_quality(event_id TEXT PRIMARY KEY,at REAL NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT,build TEXT,position REAL,rate REAL,buffer_total REAL,buffer_ahead REAL,live_edge REAL,frame_age REAL,dropped INTEGER,stalls INTEGER,observed_bitrate REAL,indicated_bitrate REAL);
     CREATE INDEX IF NOT EXISTS playback_quality_at ON playback_quality(at);
     CREATE INDEX IF NOT EXISTS playback_quality_channel_at ON playback_quality(cid,at);
+    CREATE INDEX IF NOT EXISTS playback_quality_trace_at ON playback_quality(trace,at);
     """)
     for column in ("approved_at","last_success"):
         if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
@@ -94,6 +95,41 @@ def retain_quality(c,e,cid,trace,at,fields,status):
     c.execute("INSERT OR IGNORE INTO playback_quality VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (e['id'],at,cid,trace,fields.get('launchID'),fields.get('buildNumber'),*values))
 
+def credit_active_session(c,status,now=None):
+    """Credit sustained evidence while an already-open stream is still playing.
+    Never initiate a retry, forgive a newer failure, or reinstate a banned channel.
+    Use recorded samples plus live device state, not the playing flag alone."""
+    now=time.time() if now is None else now
+    cid=status.get('currentChannelID')
+    metrics=status.get('metrics',{})
+    if not cid or status.get('playing') is not True or metrics.get('displayReady') not in ('true',True):return False
+    rate=finite_number(metrics.get('rate'))
+    position=finite_number(metrics.get('position'))
+    if rate is None or rate<=0 or position is None or finite_number(metrics.get('stalls'))!=0:return False
+    # Do not use an older trace if the most recent attempt is still pending,
+    # failed, or has already been closed.
+    row=c.execute("""SELECT trace,opened,confirmed,closed,failed,outcome,sample_count,first_position,last_position,stalls
+                     FROM sessions WHERE cid=? ORDER BY opened DESC LIMIT 1""",(cid,)).fetchone()
+    if not row:return False
+    trace,opened,confirmed,closed,failed,outcome,count,first,last,stalls=row
+    if closed or failed or outcome!='pending' or not confirmed or confirmed<opened or count<2 or stalls:return False
+    policy=c.execute('SELECT banned,last_failure FROM channel WHERE id=?',(cid,)).fetchone()
+    if not policy or policy[0] or opened<policy[1] or confirmed<=policy[1]:return False
+    sample=c.execute("""SELECT at,position,rate,stalls FROM playback_quality
+                        WHERE trace=? AND cid=? ORDER BY at DESC LIMIT 1""",(trace,cid)).fetchone()
+    if not sample:return False
+    at,sample_position,sample_rate,sample_stalls=sample
+    if not 0<=now-at<=90 or sample_rate is None or sample_rate<=0 or sample_stalls!=0:return False
+    if any(finite_number(v) is None for v in (first,last,sample_position)):return False
+    # A healthy open stream must have progressed for at least one minute.
+    # A larger configured dwell does not require delaying recovery indefinitely.
+    if at-confirmed<60 or last-first<45 or abs(last-sample_position)>2 or not -2<=position-sample_position<=90:return False
+    updated=c.execute("""UPDATE channel SET sustained=sustained+1,failures=0,hiatus_until=0,last_success=max(last_success,?)
+                         WHERE id=? AND banned=0 AND last_failure<=? AND last_failure<?""",(at,cid,opened,confirmed))
+    if not updated.rowcount:return False
+    c.execute("UPDATE sessions SET outcome='sustained' WHERE trace=? AND failed=0 AND outcome='pending'",(trace,))
+    return True
+
 def ingest(c,events,status):
     rotation=int(status.get('rotationMinutes',1))*60
     for e in sorted(events,key=lambda v:v.get('timestamp','')):
@@ -107,7 +143,7 @@ def ingest(c,events,status):
         cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,code,cid,trace,str(fields.get('reason',''))[:300]))
         if not cur.rowcount:continue
         if code=='OPEN':
-            for old,oldcid,confirmed,count,first,last,stalls,outcome in c.execute("SELECT trace,cid,confirmed,sample_count,first_position,last_position,stalls,outcome FROM sessions WHERE closed=0 AND trace!=?",(trace,)).fetchall():
+            for old,oldcid,confirmed,count,first,last,stalls,outcome in c.execute("SELECT trace,cid,confirmed,sample_count,first_position,last_position,stalls,outcome FROM sessions WHERE closed=0 AND trace!=? AND opened<=?",(trace,at)).fetchall():
                 good=confirmed>0 and at-confirmed>=rotation-1 and count>=2 and first is not None and last is not None and last-first>=max(3,rotation*.45) and not stalls
                 c.execute("UPDATE sessions SET closed=?,outcome=CASE WHEN failed=1 THEN 'failed' ELSE ? END WHERE trace=?",(at,'sustained' if good or outcome=='sustained' else 'inconclusive',old))
                 if good and outcome!="sustained" and c.execute("SELECT failed FROM sessions WHERE trace=?",(old,)).fetchone()[0]==0:
@@ -135,6 +171,7 @@ def ingest(c,events,status):
             except (ValueError,KeyError,TypeError):pass
         elif code in ('STOP','PAUSE'):
             c.execute("UPDATE sessions SET closed=?,outcome=CASE WHEN failed=1 THEN 'failed' ELSE 'interrupted' END WHERE trace=? AND closed=0",(at,trace))
+    credit_active_session(c,status)
     cid=status.get('currentChannelID')
     # Blank startup snapshots cannot overwrite the last actual Surf channel.
     if cid and status.get('surfing') and c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():
