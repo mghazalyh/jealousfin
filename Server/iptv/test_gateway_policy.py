@@ -178,6 +178,7 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(g.programme_retry_delay(http(429),1,1000),("HTTP 429",120))
         self.assertEqual(g.programme_retry_delay(http(429,{"Retry-After":"180"}),1,1000),("HTTP 429",180))
         self.assertEqual(g.programme_retry_delay(http(403),1,1000),("HTTP 403",300))
+        self.assertLess(g.programme_retry_delay(http(429,{"Retry-After":"999999999999"}),1,1000)[1],threading.TIMEOUT_MAX)
         self.assertEqual(g.programme_retry_delay(TimeoutError(),1,1000),("TimeoutError",15))
         self.assertEqual(g.programme_retry_delay(ValueError("incomplete"),1,1000),("ValueError",60))
         self.assertEqual(g.programme_retry_delay(http(503,{"Retry-After":"Thu, 01 Jan 1970 00:18:20 GMT"}),1,1000),("HTTP 503",100))

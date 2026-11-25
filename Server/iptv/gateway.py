@@ -702,7 +702,9 @@ def programme_retry_delay(error,failures,now=None):
    try:
     retry_after=float(int(value)) if value.isdecimal() and len(value)<=12 else email.utils.parsedate_to_datetime(value).timestamp()-now
    except (ValueError,TypeError,OverflowError,AttributeError):retry_after=0.0
-  if retry_after>0:return reason,max(delay,retry_after)
+  # An absurdly large Retry-After must not overflow Event.wait and kill
+  # the worker. The platform maximum still defers effectively indefinitely.
+  if retry_after>0:return reason,min(threading.TIMEOUT_MAX-1,max(delay,retry_after))
  elif isinstance(error,(TimeoutError,ConnectionError)) or (isinstance(error,urllib.error.URLError) and isinstance(error.reason,(TimeoutError,ConnectionError))):
   reason=type(error).__name__;transient=True;delay=PROGRAMME_REFRESH
  else:
