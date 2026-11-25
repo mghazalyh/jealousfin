@@ -214,6 +214,39 @@ final class TorrioConflictFixture:URLProtocol {
         try BaselineInstaller.install(ReleaseBaseline(revision:"release-three",sources:PatchSourceSet()),disk:installDisk)
         try require(installDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active?.id=="local","real upgrade preserves independent local override")
 
+        // Release epochs reset only patch-owned files, before recovery.
+        let epochDisk=Disk(root:root.appendingPathComponent("release-epoch"))
+        let firstEpoch=PatchReleaseEpoch(version:"0.1.13",build:"1021")
+        let secondEpoch=PatchReleaseEpoch(version:"0.1.13",build:"1022")
+        let preserved=["settings.json","health.json","surf-rotation.json","device.json","channels.json","receipt-fixture.json","event-fixture.json","batch-fixture.json"]
+        let obsolete=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","hot-config-staged.json","hot-config-trial.json","patch-restore.json","last-patch-archive.json","application-trial.json","application-active.json","installed-baseline.json","module-checkpoint.json","native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json","patch-version-old.json","patch-archive-old.json","hot-config-version-old.json","hot-config-recovery-old.json","application-revision-old.json"]
+        for name in preserved+obsolete{
+            try require(epochDisk.save("fixture",name),"seed release fixture")
+        }
+        let recoveryFolder=epochDisk.root.appendingPathComponent("native-recovery-old",isDirectory:true)
+        try FileManager.default.createDirectory(at:recoveryFolder,withIntermediateDirectories:true)
+        let didReset=try PatchReleaseReset.prepare(firstEpoch,disk:epochDisk)
+        try require(didReset,"legacy installation starts a clean patch epoch")
+        try require(obsolete.allSatisfy{!FileManager.default.fileExists(atPath:epochDisk.root.appendingPathComponent($0).path)},"all legacy patch state removed")
+        try require(!FileManager.default.fileExists(atPath:recoveryFolder.path),"obsolete native recovery directory removed")
+        try require(preserved.allSatisfy{epochDisk.load(String.self,$0)=="fixture"},"settings, health, rotation and diagnostics retained")
+        try require(epochDisk.save("same-build-patch","patch-version-new.json"),"seed same build history")
+        let sameReset=try PatchReleaseReset.prepare(firstEpoch,disk:epochDisk)
+        try require(!sameReset && epochDisk.load(String.self,"patch-version-new.json")=="same-build-patch","ordinary relaunch preserves current epoch")
+        let upgradeReset=try PatchReleaseReset.prepare(secondEpoch,disk:epochDisk)
+        try require(upgradeReset && epochDisk.load(String.self,"patch-version-new.json")==nil,"new build clears previous patch history")
+        try require(preserved.allSatisfy{epochDisk.load(String.self,$0)=="fixture"},"upgrade preserves non-patch data")
+        try require(firstEpoch.archivePath(deviceID:"fixture",id:"old") != secondEpoch.archivePath(deviceID:"fixture",id:"old"),"remote archive path isolated by release")
+        let versionOnly=PatchReleaseEpoch(version:"0.1.14",build:"1022")
+        try require(versionOnly.namespace != secondEpoch.namespace,"marketing version also scopes archives")
+        let invalidEpoch=PatchReleaseEpoch(version:"",build:"1022")
+        var rejectedEpoch=false
+        do{_ = try PatchReleaseReset.prepare(invalidEpoch,disk:epochDisk)}catch{rejectedEpoch=true}
+        try require(rejectedEpoch && epochDisk.load(PatchReleaseEpoch.self,PatchReleaseReset.marker)==secondEpoch,"invalid metadata does not reset data")
+        try BaselineInstaller.install(ReleaseBaseline.empty,disk:epochDisk)
+        try require(epochDisk.load(RuntimePatchStore.self,"runtime-patch.json")?.active==nil && epochDisk.load(DynamicUIStore.self,"dynamic-ui.json")?.active==nil,"new IPA boots native baseline")
+        print("PASS: release-scoped patch reset, same-build retention, legacy migration and remote isolation")
+
         let versionDisk=Disk(root:root.appendingPathComponent("versions"))
         let oldVersion=PatchArchive(deviceID:"fixture",reason:"checkpoint",build:"1",sources:baseline.sources,label:"Working playback",knownGood:true)
         let newVersion=PatchArchive(deviceID:"fixture",reason:"runtime-activated",build:"1",sources:newer.sources,parentID:oldVersion.id)

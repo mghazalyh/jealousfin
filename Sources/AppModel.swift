@@ -53,6 +53,8 @@ import Network
     @Published private(set) var versionBusy=false
     private var promotionBusy=false
     private var versionRecoveryFailed=false
+    private let patchReleaseEpoch=PatchReleaseEpoch.current
+    private var patchReleaseResetApplied=false
     @Published private(set) var nativeSafeMode=false
     @Published private(set) var applicationTrial:ApplicationTrialJournal?
     @Published private(set) var applicationRevisionID:String?
@@ -179,9 +181,16 @@ import Network
         let storedDeviceID=disk.load(String.self,"device.json") ?? UUID().uuidString
         deviceID=storedDeviceID
         jelly=Jellyfin(deviceID:storedDeviceID)
-        nativeSafeMode=disk.load(Bool.self,"native-safe-mode.json") ?? false
-        let interruptedApplicationTrial=disk.load(ApplicationTrialJournal.self,ApplicationRevisionStore.journalName)?.pending==true
+        // Discard obsolete patch journals before any recovery.
+        do {patchReleaseResetApplied=try PatchReleaseReset.prepare(patchReleaseEpoch,disk:disk)}
+        catch{
+            versionRecoveryFailed=true
+            patchArchiveFault="Installed IPA patch reset failed; restart to retry"
+        }
+        nativeSafeMode = !versionRecoveryFailed && (disk.load(Bool.self,"native-safe-mode.json") ?? false)
+        let interruptedApplicationTrial = !versionRecoveryFailed && disk.load(ApplicationTrialJournal.self,ApplicationRevisionStore.journalName)?.pending==true
         do {
+            if versionRecoveryFailed{throw AppError.message("Release patch reset incomplete")}
             if nativeSafeMode{try ApplicationRevisionStore.completeSafeResetIfNeeded(disk:disk);automationSuspended=true}
             else{
                 applicationTrial=try ApplicationRevisionStore.recover(disk:disk)
@@ -192,7 +201,7 @@ import Network
             _ = try PatchVersionStore.recover(disk:disk)
         }catch{
             versionRecoveryFailed=true
-            patchArchiveFault="Interrupted patch restoration could not be recovered"
+            if patchArchiveFault==nil{patchArchiveFault="Interrupted patch restoration could not be recovered"}
         }
         if !versionRecoveryFailed,!nativeSafeMode{
             do {
@@ -201,17 +210,19 @@ import Network
                 bundledBaselineRevision=baseline.revision
             }catch{patchArchiveFault="Bundled baseline installation failed: "+String(describing:type(of:error))}
         }
-        if let last=disk.load(PatchArchive.self,"last-patch-archive.json"){
-            try? PatchVersionStore.retain(last,disk:disk)
+        if !versionRecoveryFailed{
+            if let last=disk.load(PatchArchive.self,"last-patch-archive.json"){
+                try? PatchVersionStore.retain(last,disk:disk)
+            }
+            patchVersions=PatchVersionStore.history(disk:disk)
+            patchArchiveID=disk.load(PatchArchive.self,"last-patch-archive.json")?.id
+            jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
+            campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
         }
-        patchVersions=PatchVersionStore.history(disk:disk)
-        patchArchiveID=disk.load(PatchArchive.self,"last-patch-archive.json")?.id
-        jellyfinAPIStore=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json") ?? JellyfinAdapterStore()
-        campaign=disk.load(DeviceTestCheckpoint.self,"device-campaign.json")
         if interruptedApplicationTrial,applicationTrial?.outcome=="recovered-on-launch",var cp=campaign,cp.canResume{
             cp.state="paused";campaign=cp;_ = disk.save(cp,"device-campaign.json")
         }
-        decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()
+        if !versionRecoveryFailed{decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()}
         if !nativeSafeMode,!versionRecoveryFailed,var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
             if let layout=stored.active,(try? layout.checked())==nil {
                 stored.active=nil;stored.values=[:]
@@ -222,7 +233,7 @@ import Network
             }else{stored.values=[:]}
             dynamicUI=stored
         }
-        moduleCheckpoint=disk.load(ModuleCheckpoint.self,"module-checkpoint.json")
+        if !versionRecoveryFailed{moduleCheckpoint=disk.load(ModuleCheckpoint.self,"module-checkpoint.json")}
         health=ledger.states()
         disk.save(deviceID,"device.json")
         channels=disk.load([Channel].self,"channels.json") ?? []
@@ -258,6 +269,7 @@ import Network
         guard !started else {return}; started=true
         telemetryActive=true
         do{
+            guard !versionRecoveryFailed else{throw AppError.message("Release patch reset incomplete")}
             let interruptedTrial=disk.load(HotConfigurationTrial.self,"hot-config-trial.json")?.pending==true
             configurationTrial=try disk.recoverConfigurationTrial()
             if interruptedTrial,campaign?.canResume==true{
@@ -1408,6 +1420,8 @@ import Network
     }
     func stateSnapshot()->[String:Any]{
         var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing || currentSharedTransport,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        snapshot["patchReleaseEpoch"]=patchReleaseEpoch.namespace
+        snapshot["patchReleaseResetApplied"]=patchReleaseResetApplied
         snapshot["configurationRevision"]=hotConfiguration.revision
         snapshot["nativeSafeMode"]=nativeSafeMode
         let accepted=applicationTrial?.outcome=="explicitly-confirmed" ? applicationTrial?.target : nil
@@ -2858,11 +2872,11 @@ extension AppModel {
         for url in disk.files(prefix:"patch-archive-").prefix(8){
             let data=try Data(contentsOf:url)
             let record=try JSONCodec.decoder().decode(PatchArchive.self,from:data)
-            guard record.deviceID==deviceID,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid patch archive")}
+            guard record.deviceID==deviceID,record.build==patchReleaseEpoch.build,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid or cross-build patch archive")}
             try dbArchiveCheck(record)
             try PatchVersionStore.retain(record,disk:disk)
             if !patchVersions.contains(where:{$0.id==record.id}){patchVersions=PatchVersionStore.history(disk:disk)}
-            try await db.immutable("engineering/"+deviceID+"/patches/"+record.id+".json",data:data)
+            try await db.immutable(patchReleaseEpoch.archivePath(deviceID:deviceID,id:record.id),data:data)
             disk.remove(url)
         }
     }
@@ -2877,12 +2891,12 @@ extension AppModel {
     private func fetchPatchVersion(_ id:String)async throws->PatchArchive{
         guard DynamicUILayout.validID(id) else{throw AppError.message("Invalid archive ID")}
         if let local=PatchVersionStore.load(id,disk:disk){
-            guard local.deviceID==deviceID else{throw AppError.message("Version belongs to another device")}
+            guard local.deviceID==deviceID,local.build==patchReleaseEpoch.build else{throw AppError.message("Version belongs to another device or IPA build")}
             return local
         }
-        guard let file=try await db.read("engineering/"+deviceID+"/patches/"+id+".json") else{throw AppError.message("Version not found locally or in JealousDB")}
+        guard let file=try await db.read(patchReleaseEpoch.archivePath(deviceID:deviceID,id:id)) else{throw AppError.message("Version not found locally or in JealousDB")}
         let record=try JSONCodec.decoder().decode(PatchArchive.self,from:file.data)
-        guard record.id==id,record.deviceID==deviceID else{throw AppError.message("Archive identity mismatch")}
+        guard record.id==id,record.deviceID==deviceID,record.build==patchReleaseEpoch.build else{throw AppError.message("Archive identity or IPA build mismatch")}
         try PatchVersionStore.retain(record,disk:disk)
         patchVersions=PatchVersionStore.history(disk:disk)
         return record
@@ -2985,10 +2999,10 @@ extension AppModel {
               let archive=disk.load(PatchArchive.self,"last-patch-archive.json"),archive.id==id,
               archive.sources==activePatchSources() else{throw AppError.message("Promotion requires the current archived source set and review evidence")}
         promotionBusy=true;defer{promotionBusy=false}
-        let archivePath="engineering/"+deviceID+"/patches/"+id+".json"
+        let archivePath=patchReleaseEpoch.archivePath(deviceID:deviceID,id:id)
         if let saved=try await db.read(archivePath){
             let decoded=try JSONCodec.decoder().decode(PatchArchive.self,from:saved.data)
-            guard decoded.id==id,decoded.sources==archive.sources,decoded.deviceID==deviceID else{throw AppError.message("Archive conflict")}
+            guard decoded.id==id,decoded.sources==archive.sources,decoded.deviceID==deviceID,decoded.build==patchReleaseEpoch.build else{throw AppError.message("Archive conflict")}
         }else{
             try await db.immutable(archivePath,data:JSONCodec.encoder().encode(archive))
         }

@@ -19,7 +19,7 @@ Run python3 test_policy_observer.py for isolated policy checks. The first succes
 
 ## Future iOS deployment
 
-Native defaults: strict hiatus, 10-second stall timeout, 5-second failure retry delay, advance on stall, user-configurable rotation interval. Rotation state is persisted by server, account and category and seeded once from available native ledger history. Existing settings, credentials, and active hot revisions remain intact. A hot configuration or runtime override can still control policy. Device-owned Surf tracks actual channels; shared server-owned Surf does not pretend to identify underlying channels. Keep the existing active adapter revision until the gateway and migration are verified; do not embed fixed channel IDs or expiry dates in an IPA.
+Native defaults: strict hiatus, 10-second stall timeout, 5-second failure retry delay, advance on stall, user-configurable rotation interval. Rotation state is persisted by server, account and category and seeded once from available native ledger history. Existing settings and credentials remain intact. Active hot revisions and local rollback history reset on a different IPA version/build. A hot configuration or runtime override can still control policy. Device-owned Surf tracks actual channels; shared server-owned Surf does not pretend to identify underlying channels. Before installing a new IPA, activate and verify the SQLite-aware gateway; the new release discards the previous static adapter override and its exclusion snapshot. Do not embed fixed channel IDs or expiry dates in an IPA.
 
 The PS3 profile is a separate JSON fixture for future development. Do not advertise a compatible PS3 endpoint until it has passed physical console testing.
 

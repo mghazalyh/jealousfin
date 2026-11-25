@@ -169,3 +169,45 @@ struct ApplicationTrialJournal:Codable{
         guard disk.save(true,"native-safe-reset-complete.json") else{throw AppError.message("Cannot finalize safe mode")}
     }
 }
+
+// Each installed IPA owns its own patch epoch. Reset before reading any
+// activation or rollback journal. The marker is written last, so a partial
+// cleanup is retried on the next launch rather than acknowledged as complete.
+struct PatchReleaseEpoch:Codable,Equatable{
+    let version:String
+    let build:String
+    static var current:Self{
+        let info=Bundle.main.infoDictionary ?? [:]
+        return Self(version:info["CFBundleShortVersionString"] as? String ?? "",
+                    build:info["CFBundleVersion"] as? String ?? "")
+    }
+    var valid:Bool{
+        [version,build].allSatisfy{!$0.isEmpty && $0.utf8.count<=80 && $0.range(of:"^[A-Za-z0-9_.-]+$",options:.regularExpression) != nil && $0 != "." && $0 != ".."}
+    }
+    // Length-prefixed components prevent ambiguous version/build combinations.
+    var namespace:String{"v"+String(version.utf8.count)+"-"+version+"-b"+String(build.utf8.count)+"-"+build}
+    func archivePath(deviceID:String,id:String)->String{
+        "engineering/"+deviceID+"/releases/"+namespace+"/patches/"+id+".json"
+    }
+}
+@MainActor enum PatchReleaseReset{
+    static let marker="patch-release-epoch.json"
+    static let exact:Set<String>=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json",
+        "hot-config-staged.json","hot-config-trial.json","patch-restore.json","last-patch-archive.json",
+        "application-trial.json","application-active.json","installed-baseline.json","module-checkpoint.json",
+        "native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json"]
+    static let prefixes=["patch-version-","patch-archive-","hot-config-version-","hot-config-recovery-","application-revision-","native-recovery-"]
+    @discardableResult static func prepare(_ epoch:PatchReleaseEpoch,disk:Disk)throws->Bool{
+        guard epoch.valid else{throw AppError.message("Missing or invalid installed IPA version/build")}
+        if disk.load(PatchReleaseEpoch.self,marker)==epoch{return false}
+        let entries=try FileManager.default.contentsOfDirectory(at:disk.root,includingPropertiesForKeys:nil)
+        for entry in entries{
+            let name=entry.lastPathComponent
+            if exact.contains(name) || prefixes.contains(where:{name.hasPrefix($0)}){
+                try FileManager.default.removeItem(at:entry)
+            }
+        }
+        guard disk.save(epoch,marker) else{throw AppError.message("Cannot record patch release epoch")}
+        return true
+    }
+}
