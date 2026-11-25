@@ -36,6 +36,7 @@ segment_cache=OrderedDict()
 segment_cache_bytes=0
 segment_flights={}
 quality=OrderedDict()
+manifest_quality=OrderedDict()
 CACHE_BYTES=64*1024*1024
 CACHE_TTL=45
 MAX_SEGMENT=8*1024*1024
@@ -199,11 +200,13 @@ def quality_summary():
   for cid,rows in quality.items():
    segments=[r for r in rows if r[0]=='segment']
    successful=[r for r in segments if not r[4]]
-   times=sorted(r[1] for r in successful)
+   times=sorted(r[1] for r in successful if not r[3])
    result[cid]={'segmentSamples':len(segments),'segmentErrors':sum(r[4] for r in segments),
-                'cacheHits':sum(r[3] for r in segments),'segmentP50Ms':times[len(times)//2] if times else None,
-                'segmentP95Ms':times[min(len(times)-1,int(.95*len(times)))] if times else None,
-                'segmentMaxMs':max(times) if times else None,'segmentBytes':sum(r[2] for r in successful)}
+                'cacheHits':sum(r[3] for r in segments),'upstreamSamples':len(times),
+                'upstreamP50Ms':times[len(times)//2] if times else None,
+                'upstreamP95Ms':times[min(len(times)-1,int(.95*len(times)))] if times else None,
+                'upstreamMaxMs':max(times) if times else None,'segmentBytes':sum(r[2] for r in successful)}
+   result[cid].update(manifest_quality.get(cid,{}))
   return result
 
 def evict_resources(now,required=0):
@@ -234,16 +237,22 @@ def rewrite(data,base,cid,correlation=None):
  text=data.decode('utf-8-sig')
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
  out=[];sequence=None;discontinuity=0;segment=False;byterange=False
+ durations=[];discontinuity_tags=0;first_sequence=None
  for line in text.splitlines():
   if line.startswith('#'):
    if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
-    try:sequence=int(line.split(':',1)[1])
+    try:sequence=int(line.split(':',1)[1]);first_sequence=sequence
     except ValueError:sequence=None
    elif line.startswith('#EXT-X-DISCONTINUITY-SEQUENCE:'):
     try:discontinuity=int(line.split(':',1)[1])
     except ValueError:discontinuity=0
-   elif line=='#EXT-X-DISCONTINUITY':discontinuity+=1
-   elif line.startswith('#EXTINF:'):segment=True
+   elif line=='#EXT-X-DISCONTINUITY':discontinuity+=1;discontinuity_tags+=1
+   elif line.startswith('#EXTINF:'):
+    segment=True
+    try:
+     duration=float(line.split(':',1)[1].split(',',1)[0])
+     if 0<duration<3600:durations.append(duration)
+    except ValueError:pass
    elif line.startswith('#EXT-X-BYTERANGE:'):byterange=True
    line=re.sub(r'URI="([^"]+)"',lambda m:'URI="'+register(urllib.parse.urljoin(base,m[1]),cid,correlation)+'"',line)
   elif line.strip():
@@ -253,6 +262,14 @@ def rewrite(data,base,cid,correlation=None):
    if segment and sequence is not None:sequence+=1
    segment=False;byterange=False
   out.append(line)
+ if durations:
+  with lock:
+   manifest_quality[cid]={'playlistMediaSequence':first_sequence,'playlistSegments':len(durations),
+                         'playlistDurationSeconds':round(sum(durations),3),
+                         'playlistMinSegmentSeconds':min(durations),'playlistMaxSegmentSeconds':max(durations),
+                         'playlistDiscontinuities':discontinuity_tags,'playlistObservedAt':time.time()}
+   manifest_quality.move_to_end(cid)
+   while len(manifest_quality)>300:manifest_quality.popitem(last=False)
  return ('\n'.join(out)+'\n').encode()
 def provider():
  base=os.environ['JEALOUSFIN_PROVIDER_URL'].rstrip('/')
@@ -283,8 +300,26 @@ channels={}
 sources={}
 preferred_hosts={s[0]:s[2] for s in SAMPLES}
 attempts={}
+catalogue_source='uninitialized'
+catalogue_fault=None
 def initialize_catalogue():
- raw=catalogue()
+ global catalogue_source,catalogue_fault
+ cache=ROOT/'catalogue-metadata.json'
+ prior=None
+ if cache.exists():
+  data=json.loads(cache.read_text())
+  if isinstance(data,dict) and len(data)>=100 and all(isinstance(k,str) and k.startswith('nltv:') and isinstance(v,dict) and isinstance(v.get('name'),str) for k,v in data.items()):
+   prior=data
+ try:
+  fresh=catalogue()
+  if prior and len(fresh)<len(prior)*.9:raise ValueError('Catalogue unexpectedly contracted')
+  # Only metadata is retained; no stream URLs or request credentials.
+  raw={k:{'name':v['name'],'genres':[x for x in v.get('genres',[]) if isinstance(x,str)] if isinstance(v.get('genres'),list) else []} for k,v in fresh.items()}
+  atomic_json(cache,raw);catalogue_source='provider';catalogue_fault=None
+ except Exception as error:
+  if prior is None:raise
+  raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
+  log('catalogue fallback '+catalogue_fault)
  for i,(source_id,row) in enumerate(raw.items(),1):
   cid=hashlib.md5(source_id.encode()).hexdigest()
   genres=row.get('genres',[])
@@ -410,7 +445,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})

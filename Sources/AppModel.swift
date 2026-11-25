@@ -861,6 +861,7 @@ import CryptoKit
             nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? effectivePolicy.rotationSeconds)
             pausedRotationSeconds=nil
         } else { emptyPoolRetry=Date() }
+        saveSurfCheckpoint(force:true)
         log("INFO","surf",surfPaused ? "PAUSED":"RESUMED")
     }
     var currentSharedTransport:Bool{
@@ -1458,14 +1459,33 @@ import CryptoKit
                     }
                 }
                 var values:[String:String]=["position":String(format:"%.2f",p),"rate":String(player.rate),"displayReady":String(ready),"thermal":String(ProcessInfo.processInfo.thermalState.rawValue),"battery":String(UIDevice.current.batteryLevel)]
-                let ranges=item.loadedTimeRanges.compactMap{$0.timeRangeValue.duration.seconds.isFinite ? $0.timeRangeValue.duration.seconds:nil}
-                values["bufferSeconds"]=String(format:"%.2f",ranges.reduce(0,+))
+                let ranges=item.loadedTimeRanges.map{$0.timeRangeValue}
+                let durations=ranges.map{$0.duration.seconds}.filter{$0.isFinite && $0>=0}
+                values["bufferSeconds"]=String(format:"%.2f",durations.reduce(0,+))
+                let ahead=PlaybackBufferEvidence.ahead(position:p,ranges:ranges.map{(start:$0.start.seconds,end:CMTimeRangeGetEnd($0).seconds)})
+                values["bufferAheadSeconds"]=String(format:"%.2f",ahead)
+                let seekable=item.seekableTimeRanges.map{$0.timeRangeValue}
+                if let first=seekable.map({$0.start.seconds}).filter({$0.isFinite}).min(),
+                   let last=seekable.map({CMTimeRangeGetEnd($0).seconds}).filter({$0.isFinite}).max(){
+                    values["seekableStart"]=String(format:"%.2f",first)
+                    values["seekableEnd"]=String(format:"%.2f",last)
+                    values["liveEdgeDistanceSeconds"]=String(format:"%.2f",last-p)
+                }
+                values["bufferEmpty"]=String(item.isPlaybackBufferEmpty)
+                values["likelyToKeepUp"]=String(item.isPlaybackLikelyToKeepUp)
+                values["waitingReason"]=player.reasonForWaitingToPlay?.rawValue ?? "none"
+                if let at=lastVideoFrameAt{values["videoSampleAgeSeconds"]=String(format:"%.2f",max(0,now.timeIntervalSince(at)))}
                 if let a=item.accessLog()?.events.last {
                     values["observedBitrate"]=String(format:"%.0f",a.observedBitrate)
                     values["indicatedBitrate"]=String(format:"%.0f",a.indicatedBitrate)
                     values["droppedFrames"]=String(a.numberOfDroppedVideoFrames)
                     values["stalls"]=String(a.numberOfStalls)
                     values["bytes"]=String(a.numberOfBytesTransferred)
+                }
+                if let access=item.accessLog()?.events{
+                    values["itemDroppedFramesTotal"]=String(access.reduce(0){$0+max(0,$1.numberOfDroppedVideoFrames)})
+                    values["itemStallsTotal"]=String(access.reduce(0){$0+max(0,$1.numberOfStalls)})
+                    values["accessLogEvents"]=String(access.count)
                 }
                 metrics=values;log("INFO","telemetry","PLAYBACK_SAMPLE",values)
             }
@@ -1849,7 +1869,13 @@ import CryptoKit
             guard let c=current,health[c.id]?.eligible(at:Date()) ?? true,jelly.connected,catalogueReady,policyReady,!apiChanging,!loginBusy,!patchBusy,!versionBusy else{throw AppError.message("No eligible current stream or engine busy")}
             let keep=surfing
             let paused=intentionallyPaused
+            let seconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())} ?? (pausedRotationSeconds ?? remaining)
             begin(c,keepSurf:keep)
+            if keep{
+                resumeRotationSeconds=seconds>0 ? seconds:nil
+                if surfPaused{remaining=seconds;pausedRotationSeconds=seconds}
+                saveSurfCheckpoint(force:true)
+            }
             if paused{pause()}
             return "Stream reload requested; decoded playback not yet verified"
         case "get_configuration_trial":
@@ -3226,6 +3252,7 @@ extension AppModel {
         let resumeLoop=surfing || settings.resumeSurf
         let category=settings.surfCategory
         let priorChannel=current?.id
+        saveSurfCheckpoint(force:true)
         let wasConnected=jelly.connected
         moduleTask?.cancel()
         await moduleTask?.value

@@ -376,7 +376,23 @@ struct SurfResumeCheckpoint:Codable,Equatable{
     let at:Double
     var valid:Bool{!channelID.isEmpty && channelID.utf8.count<=128 && !category.isEmpty && category.utf8.count<=128 && (0...86400).contains(remainingSeconds) && at.isFinite && at>=0}
     static func choose(local:Self?,gateway:Self?,category:String,eligible:Set<String>,now:Double)->Self?{
-        [local,gateway].compactMap{$0}.filter{$0.valid && $0.category==category && eligible.contains($0.channelID) && $0.at<=now+60}.max{$0.at<$1.at}
+        guard let latest=[local,gateway].compactMap({$0}).filter({$0.valid && $0.category==category && $0.at<=now+60}).max(by:{$0.at<$1.at}),
+              eligible.contains(latest.channelID) else{return nil}
+        return latest
+    }
+}
+// Total loaded media is not the same as uninterrupted playable buffer ahead.
+enum PlaybackBufferEvidence{
+    static func ahead(position:Double,ranges:[(start:Double,end:Double)])->Double{
+        guard position.isFinite else{return 0}
+        let valid=ranges.filter{$0.start.isFinite && $0.end.isFinite && $0.end>$0.start}.sorted{$0.start<$1.start}
+        var end=position
+        for range in valid{
+            if range.end<=end{continue}
+            if range.start>end+0.05{break}
+            end=max(end,range.end)
+        }
+        return max(0,end-position)
     }
 }
 struct SustainedPlaybackEvidence {
@@ -654,7 +670,7 @@ struct ChannelStartupProfile:Codable,Equatable{
     }
     func deadline(baseline:Int,validation:Int)->Int{
         guard count>=3,mean.isFinite,deviation.isFinite,(0.5...120).contains(mean),(0...120).contains(deviation) else{return baseline}
-        return min(120,baseline+15,max(validation+1,5,baseline-5,Int(ceil(mean+max(3,2*deviation)))))
+        return min(120,baseline+15,max(validation+1,5,baseline,Int(ceil(mean+max(3,2*deviation)))))
     }
 }
 struct ChannelStartupProfiles:Codable{

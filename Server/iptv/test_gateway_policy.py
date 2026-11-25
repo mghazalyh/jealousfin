@@ -130,6 +130,15 @@ class GatewayAcceptance(unittest.TestCase):
             db.execute("INSERT INTO meta VALUES('surf_resume',?)",(json.dumps({"channelID":self.c,"category":"All Channels","paused":True,"remainingSeconds":50,"at":time.time()}),))
         self.assertEqual(self.req("/Jealousfin/Policy")[1]["resume"]["channelID"],self.c)
 
+    def test_metadata_cache_on_provider_failure(self):
+        g=self.g
+        fresh={"nltv:"+str(i):{"name":"fixture "+str(i),"genres":["Drama"]} for i in range(100)}
+        with patch.object(g,"catalogue",return_value=fresh):g.initialize_catalogue()
+        self.assertEqual(g.catalogue_source,"provider")
+        with patch.object(g,"catalogue",side_effect=TimeoutError):g.initialize_catalogue()
+        self.assertEqual(g.catalogue_source,"cached")
+        self.assertEqual(g.catalogue_fault,"TimeoutError")
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2
