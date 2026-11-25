@@ -25,6 +25,8 @@ def connect(path=DB):
     CREATE TABLE IF NOT EXISTS programme_observations(at INTEGER NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,title TEXT NOT NULL,year INTEGER,source TEXT NOT NULL,observed_at REAL,state TEXT NOT NULL,PRIMARY KEY(trace,at));
     CREATE INDEX IF NOT EXISTS programme_observations_at ON programme_observations(at);
     CREATE INDEX IF NOT EXISTS programme_observations_channel_at ON programme_observations(cid,at);
+    CREATE TABLE IF NOT EXISTS rotation_observations(at INTEGER NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,cycle INTEGER NOT NULL,attempted INTEGER NOT NULL,remaining INTEGER NOT NULL,eligible INTEGER NOT NULL,catalogue INTEGER NOT NULL,hiatus INTEGER NOT NULL,banned INTEGER NOT NULL,cid TEXT NOT NULL,playing INTEGER NOT NULL,paused INTEGER NOT NULL,server_hiatus INTEGER NOT NULL,server_banned INTEGER NOT NULL,PRIMARY KEY(launch_id,at));
+    CREATE INDEX IF NOT EXISTS rotation_observations_at ON rotation_observations(at);
     """)
     for column in ("approved_at","last_success"):
         if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
@@ -221,6 +223,29 @@ def retain_programme(c,status,now=None):
     c.execute('INSERT OR IGNORE INTO programme_observations VALUES(?,?,?,?,?,?,?,?,?,?)',(now,cid,trace,launch,build,title,year,source,observed,state))
     return True
 
+def retain_rotation(c,status,now=None):
+    """Record observed device rotation boundaries and policy counts.
+    This is observational only: no playback commands or policy mutations."""
+    now=int(time.time() if now is None else now)
+    if status.get('surfing') is not True or status.get('rotationOwner')!='device':return False
+    launch=status.get('launchID')
+    build=status.get('systemMetrics',{}).get('buildNumber')
+    cid=status.get('currentChannelID')
+    if not all(isinstance(v,str) and 0<len(v)<=100 for v in (launch,build,cid)):return False
+    fields=('rotationCycle','rotationAttempted','rotationRemaining','eligible','channels','hiatus','banned')
+    vals=[status.get(k) for k in fields]
+    if not all(type(v) is int and 0<=v<=1000000000 for v in vals):return False
+    cycle,attempted,remaining,eligible,catalogue,hiatus,banned=vals
+    if cycle<1 or catalogue<1 or eligible>catalogue or hiatus+banned>catalogue:return False
+    if not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():return False
+    count,sh,sb=c.execute('SELECT count(*),coalesce(sum(banned=0 AND hiatus_until>?),0),coalesce(sum(banned=1),0) FROM channel',(now,)).fetchone()
+    if count!=catalogue:return False
+    values=(cycle,attempted,remaining,eligible,catalogue,hiatus,banned,cid,int(status.get('playing') is True),int(status.get('surfPaused') is True),sh,sb)
+    prior=c.execute('SELECT at,cycle,attempted,remaining,eligible,catalogue,hiatus,banned,cid,playing,paused,server_hiatus,server_banned FROM rotation_observations WHERE launch_id=? ORDER BY at DESC LIMIT 1',(launch,)).fetchone()
+    if prior and now-prior[0]<30 and tuple(prior[1:])==values:return False
+    cur=c.execute('INSERT OR IGNORE INTO rotation_observations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(now,launch,build,*values))
+    return cur.rowcount==1
+
 def cycle(c):
     status=http('/status')
     events=http('/logs')
@@ -230,11 +255,13 @@ def cycle(c):
         ingest(c,events,status)
         now=int(time.time());m=status.get('systemMetrics',{})
         retain_programme(c,status,now)
+        retain_rotation(c,status,now)
         if not c.execute('SELECT 1 FROM samples WHERE at>=?',(now-60,)).fetchone():
             c.execute('INSERT OR REPLACE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision) VALUES(?,?,?,?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel',''),status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision','')))
         c.execute('DELETE FROM observed WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM playback_quality WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM programme_observations WHERE at<?',(now-30*DAY,))
+        c.execute('DELETE FROM rotation_observations WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM samples WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM sessions WHERE closed>0 AND closed<?',(now-30*DAY,))
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(str(now),))
