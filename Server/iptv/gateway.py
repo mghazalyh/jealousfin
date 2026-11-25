@@ -307,8 +307,9 @@ programme_observed_at=0.0
 programme_fault=None
 PROGRAMME_REFRESH=60
 PROGRAMME_MAX_AGE=150
-# Explicit distributor IDs confirmed in the November 25 guide audit.
-# Channel name must match exactly, and two schedules must corroborate.
+# Explicit distributor IDs confirmed in the November 25–26 guide audits.
+# Exact provider identity, exact name, and two corroborating schedules are required.
+# Do not match similarly named channels across regional feeds.
 # These are schedule listings, not verified content fingerprints.
 GUIDE_CHANNELS={
  'OuterSphere':('6a1610bebdf296985fd95603-641496bf238e21f260e7844a','USBD1200007FE'),
@@ -326,6 +327,53 @@ GUIDE_CHANNELS={
  'FilmRise Western':('6a1610bebdf296985fd95603-6449369eb3ff17382cae57fd','USBB32000196O'),
  'Gravitas Movies':('6a1610bebdf296985fd95603-5efe1de7e0b3f5003f5d9f8e','USBD700011RE'),
  'Home.Made.Nation':('6a1610bebdf296985fd95603-5f74cf82ffbe690040689f47','USAJ3000006X5'),
+ "50 Cent Action":('6a1610bebdf296985fd95603-6827b9579beea89c38b6df55','US150000550'),
+ "All Weddings WE tv":('6a1610bebdf296985fd95603-60de0520281b17002cd1d4c4','USBD1200005XR'),
+ "At Home with Family Handyman":('6a1610bebdf296985fd95603-632270e3e67cf9cd9011fce1','USBD25000138Y'),
+ "Billiard TV":('6a1610bebdf296985fd95603-6334a8e48a7b2a349d903b8c','USBD12000183X'),
+ "Celebrity Name Game":('6a1610bebdf296985fd95603-640205c40e1daf16b299567e','US1900010IY'),
+ "Designated Survivor":('6a1610bebdf296985fd95603-66aa9b7fd8fc59729226073e','US1800019OC'),
+ "Dog Whisperer":('6a1610bebdf296985fd95603-652a8b001b5c74bc83cf727c','US3400001FX'),
+ "Fubo Sports Network":('6a1610bebdf296985fd95603-5fc705f68aba71002d8b7b37','USAJ2200023Z0'),
+ "MovieSphere":('6a1610bebdf296985fd95603-5fb84bc1b7ad2d002dcb735f','USBD17000117B'),
+ "NBC Sports NOW":('6a1610bebdf296985fd95603-5fc70600598c41002da3dd43','USBD420002446'),
+ "Nosey":('6a1610bebdf296985fd95603-5f0ff262d71dcb00449ec015','USAJ34000022E'),
+ "PBS Nature":('6a1610bebdf296985fd95603-63506e7747b2355a27e76e7f','US1300007KZ'),
+ "Scripps Sports Network":('6a1610bebdf296985fd95603-69b047eed42e70e462105dbb','US400221W2'),
+ "SportsGrid":('6a1610bebdf296985fd95603-5ef11485d33ab9004048a1ca','USBA300031OT'),
+ "Willow Sports":('6a1610bebdf296985fd95603-66fbf9cf128ab3f65b259bcb','US20000131M'),
+}
+GUIDE_PROVIDER_IDS={
+ "OuterSphere":'nltv:us:OuterSphere.us',
+ "Overtime":'nltv:us:Overtime.us',
+ "Racer Select":'nltv:us:RacerSelect.us',
+ "Stadium":'nltv:us:Stadium.us',
+ "The Bob Ross Channel":'nltv:us:TheBobRossChannel.us',
+ "This Old House":'nltv:us:ThisOldHouse.us',
+ "Tiny House Nation":'nltv:us:TinyHouseNation.us',
+ "NFL Channel":'nltv:us:NFLChannel.us',
+ "48 Hours":'nltv:us:48Hours.us',
+ "Dog the Bounty Hunter":'nltv:us:DogtheBountyHunter.us',
+ "Ebony TV by Lionsgate":'nltv:us:EbonyTVbyLionsgate.us',
+ "FilmRise Western":'nltv:us:FilmRiseWestern.us',
+ "Gravitas Movies":'nltv:us:GravitasMovies.us',
+ "Home.Made.Nation":'nltv:us:HomeMadeNation.us',
+ "50 Cent Action":'nltv:us:50CentAction.us',
+ "All Weddings WE tv":'nltv:us:AllWeddingsWEtv.us',
+ "At Home with Family Handyman":'nltv:us:AtHomewithFamilyHandyman.us',
+ "Billiard TV":'nltv:us:BilliardTV.us',
+ "Celebrity Name Game":'nltv:us:CelebrityNameGame.us',
+ "Designated Survivor":'nltv:us:DesignatedSurvivor.us',
+ "Dog Whisperer":'nltv:us:DogWhisperer.us',
+ "Fubo Sports Network":'nltv:us:FuboSportsNetwork.us',
+ "MovieSphere":'nltv:us:MovieSphere.us',
+ "NBC Sports NOW":'nltv:us:NBCSportsNOW.us',
+ "Nosey":'nltv:us:Nosey.us',
+ "PBS Nature":'nltv:us:PBSNature.us',
+ "Scripps Sports Network":'nltv:us:ScrippsSportsNetwork.us',
+ "SportsGrid":'nltv:us:SportsGrid.us',
+ "Willow Sports":'nltv:us:WillowSports.us',
+ 'FIFA+':'nltv:uk:FIFAPlus.uk', # Existing reviewed global replay feed.
 }
 GUIDE_URLS=('https://i.mjh.nz/Plex/us.xml.gz','https://i.mjh.nz/SamsungTVPlus/us.xml.gz')
 GUIDE_REFRESH=900
@@ -534,7 +582,7 @@ def guide_snapshot(now):
   observed=guide_observed_at
   if not 0<=now-observed<=GUIDE_MAX_AGE:return {}
   first,second=guide_rows
-  mapped=[(cid,GUIDE_CHANNELS[c['Name']]) for cid,c in channels.items() if c['Name'] in GUIDE_CHANNELS]
+  mapped=[(cid,GUIDE_CHANNELS[c['Name']]) for cid,c in channels.items() if c['Name'] in GUIDE_CHANNELS and sources.get(cid)==GUIDE_PROVIDER_IDS.get(c['Name'])]
  out={}
  for cid,(aid,bid) in mapped:
   a=[r for r in first.get(aid,[]) if r[0]<=now<r[1]]

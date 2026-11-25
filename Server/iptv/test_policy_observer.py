@@ -29,3 +29,60 @@ with tempfile.TemporaryDirectory() as d:
     assert c.execute('SELECT failures,banned,hiatus_until FROM channel WHERE id="a"').fetchone()==(8,1,0)
 print('PASS: deduplication, stall attribution, strict failure, progressive hiatus, sustained playback, permanent ban')
 
+
+# A replacement trace can start before a prior stall is ingested. A later
+# sustained active stream must be credited without closing or reopening it.
+with tempfile.TemporaryDirectory() as d:
+    c=p.connect(pathlib.Path(d)/'active.sqlite3')
+    c.executemany('INSERT INTO channel(id,name) VALUES(?,?)',[(x,x) for x in ('a','b','c','d','e')])
+    now=time.time()
+    def setup(cid,trace,opened,confirmed,at,first=10,last=80,failed=0,stalls=0,closed=0):
+        c.execute('INSERT INTO sessions(trace,cid,opened,confirmed,closed,failed,sample_count,first_position,last_position,stalls) VALUES(?,?,?,?,?,?,?,?,?,?)',(trace,cid,opened,confirmed,closed,failed,4,first,last,stalls))
+        p.retain_quality(c,{'id':trace+'-sample'},cid,trace,at,{'position':str(last),'rate':'1','stalls':str(stalls)}, {})
+    def status(cid,pos=80):
+        return {'currentChannelID':cid,'playing':True,'metrics':{'displayReady':'true','position':str(pos),'rate':'1','stalls':'0'}}
+    p.failure(c,'a',now-100,'previous trace stalled')
+    setup('a','a2',now-99,now-94,now-5)
+    assert p.credit_active_session(c,status('a'),now)
+    assert c.execute('SELECT failures,hiatus_until,sustained,last_failure,reason FROM channel WHERE id="a"').fetchone()==(0,0,1,now-100,'previous trace stalled')
+    assert c.execute('SELECT outcome,closed FROM sessions WHERE trace="a2"').fetchone()==('sustained',0)
+    assert not p.credit_active_session(c,status('a'),now)
+    p.failure(c,'a',now+1,'new actual stall','a2')
+    assert c.execute('SELECT failures,hiatus_until FROM channel WHERE id="a"').fetchone()==(1,now+1+3*p.DAY)
+    p.failure(c,'b',now-100,'newer failure')
+    setup('b','b1',now-120,now-110,now-5)
+    assert not p.credit_active_session(c,status('b'),now)
+    c.execute('UPDATE channel SET banned=1 WHERE id="c"')
+    setup('c','c1',now-100,now-94,now-5)
+    assert not p.credit_active_session(c,status('c'),now)
+    setup('d','d1',now-100,now-94,now-5,stalls=1)
+    assert not p.credit_active_session(c,status('d'),now)
+    setup('e','e1',now-300,now-290,now-120)
+    assert not p.credit_active_session(c,status('e'),now)
+    assert not p.credit_active_session(c,{'currentChannelID':'e','playing':True,'metrics':{}},now)
+print('PASS: active sustained evidence, idempotence, newer failure, permanent ban, stale evidence and stalled trace guards')
+
+# Programme telemetry is bounded, distinguishes missing and stale evidence,
+# and cannot create a channel success or failure.
+with tempfile.TemporaryDirectory() as d:
+    c=p.connect(pathlib.Path(d)/'programme.sqlite3')
+    c.execute('INSERT INTO channel(id,name) VALUES(?,?)',('a','A'))
+    now=int(time.time())
+    c.execute('INSERT INTO sessions(trace,cid,opened,confirmed) VALUES(?,?,?,?)',('a1','a',now-20,now-15))
+    status={'currentChannelID':'a','playing':True,'metrics':{'displayReady':'true','rate':'1'},'currentProgrammeTitle':'Example (2020)','currentProgrammeYear':2020,'programmeSource':'provider-catalogue','programmeObservedAt':now-10,'launchID':'launch','systemMetrics':{'buildNumber':'1031'}}
+    assert p.retain_programme(c,status,now)
+    assert not p.retain_programme(c,status,now+5)
+    assert p.retain_programme(c,status,now+30)
+    status['currentProgrammeTitle']=''
+    assert p.retain_programme(c,status,now+31)
+    status['currentProgrammeTitle']='Example'
+    assert p.retain_programme(c,status,now+200)
+    status['programmeObservedAt']=now+201
+    status['programmeSource']='corroborated-external-schedule'
+    assert p.retain_programme(c,status,now+202)
+    assert c.execute('SELECT state,year FROM programme_observations ORDER BY at').fetchall()==[('fresh',2020),('fresh',2020),('missing',None),('stale',2020),('fresh',2020)]
+    assert not p.retain_programme(c,dict(status,playing=False),now+250)
+    assert not p.retain_programme(c,dict(status,currentChannelID='unknown'),now+250)
+    assert not p.retain_programme(c,{k:v for k,v in status.items() if k!='currentProgrammeTitle'},now+250)
+    assert c.execute('SELECT failures,sustained FROM channel').fetchone()==(0,0)
+print('PASS: programme observation freshness, missing titles, deduplication and policy isolation')

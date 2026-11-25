@@ -62,6 +62,20 @@ struct DynamicPresentation: Codable, Equatable {
     var fullscreenPortraitMaxHeight:Double?=nil
     var fullscreenControlOrder:[String]?=nil
     var fullscreenControlTheme:String?=nil
+    // The range is hot-configurable; absolute rendering bounds remain native.
+    var videoBrightnessMinimum:Int?=nil
+    var videoBrightnessMaximum:Int?=nil
+    var resolvedVideoBrightnessRange:ClosedRange<Int>{
+        let low=min(0,max(-25,videoBrightnessMinimum ?? -20))
+        let high=max(0,min(20,videoBrightnessMaximum ?? 10))
+        return low...high
+    }
+    func clampedVideoBrightness(_ value:Int)->Int{
+        min(resolvedVideoBrightnessRange.upperBound,max(resolvedVideoBrightnessRange.lowerBound,value))
+    }
+    static func videoBrightnessOpacity(_ value:Int)->Double{
+        Double(abs(min(20,max(-25,value))))*0.035
+    }
     var resolvedFullscreenControlTheme:String{fullscreenControlTheme ?? "night"}
     var fullscreenIconOnly:Bool?=nil
     var fullscreenIconSize:Double?=nil
@@ -75,6 +89,8 @@ struct DynamicPresentation: Codable, Equatable {
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
               ["night","standard"].contains(resolvedFullscreenControlTheme),
+              (-25 ... -1).contains(videoBrightnessMinimum ?? -20),
+              (1 ... 20).contains(videoBrightnessMaximum ?? 10),
               (0.15...1).contains(fullscreenOpacity ?? 0.65),
               (0.20...0.80).contains(fullscreenMaxHeight ?? 0.25),
               (0.35...1).contains(fullscreenWidth ?? 1),

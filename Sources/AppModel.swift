@@ -1260,10 +1260,11 @@ import CryptoKit
         else if surfing {emptyPoolRetry=Date().addingTimeInterval(Double(policy.failureRetrySeconds))}
         requestSync();recalculateInsights()
     }
-    var videoBrightness:Int{min(10,max(-10,settings.videoBrightness ?? 0))}
+    var videoBrightnessRange:ClosedRange<Int>{presentationConfiguration.resolvedVideoBrightnessRange}
+    var videoBrightness:Int{presentationConfiguration.clampedVideoBrightness(settings.videoBrightness ?? 0)}
     func setVideoBrightness(_ value:Int){
-        let level=min(10,max(-10,value))
-        guard level != videoBrightness else{return}
+        let level=presentationConfiguration.clampedVideoBrightness(value)
+        guard level != (settings.videoBrightness ?? 0) else{return}
         settings.videoBrightness=level
         disk.save(settings,"settings.json")
     }
@@ -1768,6 +1769,8 @@ import CryptoKit
         snapshot["recentSurfChannelIDs"]=rotationState.recentIDs(scope:rotationScope)
         snapshot["recentSurfHistoryLimit"]=30
         snapshot["videoBrightness"]=videoBrightness
+        snapshot["videoBrightnessMinimum"]=videoBrightnessRange.lowerBound
+        snapshot["videoBrightnessMaximum"]=videoBrightnessRange.upperBound
         let favoriteState=currentFavoriteState
         snapshot["currentFavorite"]=favoriteState.favorite.map{$0 as Any} ?? NSNull()
         snapshot["favoriteUpdatePending"]=favoriteState.pending
@@ -2097,7 +2100,7 @@ import CryptoKit
             log("INFO","settings","PREFERENCES_PATCHED",["keys":args.keys.sorted().joined(separator:",")])
             return try json(PatchablePreferences.snapshot(settings))
         case "set_video_brightness":
-            guard args.count==1,let raw=args["level"],let level=Int(raw),(-10...10).contains(level) else{throw AppError.message("Brightness must be an integer from -10 to +10")}
+            guard args.count==1,let raw=args["level"],let level=Int(raw),videoBrightnessRange.contains(level) else{throw AppError.message("Brightness must be an integer in the configured range \(videoBrightnessRange.lowerBound)...\(videoBrightnessRange.upperBound)")}
             setVideoBrightness(level)
             return "Video brightness updated"
         case "set_player_audio":

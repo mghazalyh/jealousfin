@@ -31,7 +31,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
             let rect=vc.view.convert(vc.videoBounds,to:overlay).intersection(overlay.bounds)
             brightnessLayer.frame=rect.isNull ? .zero:rect
             brightnessLayer.backgroundColor=level<0 ? .black:.white
-            brightnessLayer.alpha=CGFloat(abs(level))*0.035
+            brightnessLayer.alpha=CGFloat(DynamicPresentation.videoBrightnessOpacity(level))
             brightnessLayer.isHidden=level==0 || !vc.isReadyForDisplay || rect.isEmpty
         }
         init(_ callback:@escaping(Bool)->Void){self.callback=callback}
@@ -47,7 +47,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
             let ready=vc.isReadyForDisplay
             DispatchQueue.main.async { coordinator?.callback(ready);coordinator?.applyBrightness(vc) }
         }
-        context.coordinator.level=min(10,max(-10,brightness))
+        context.coordinator.level=min(20,max(-25,brightness))
         context.coordinator.boundsObservation=c.observe(\.videoBounds,options:[.new]){[weak coordinator=context.coordinator] vc,_ in
             DispatchQueue.main.async{coordinator?.applyBrightness(vc)}
         }
@@ -61,7 +61,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
         uiViewController.videoGravity=videoGravity
         uiViewController.allowsPictureInPicturePlayback=allowsPiP
         uiViewController.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
-        context.coordinator.level=min(10,max(-10,brightness))
+        context.coordinator.level=min(20,max(-25,brightness))
         context.coordinator.applyBrightness(uiViewController)
     }
     static func dismantleUIViewController(_ uiViewController:AVPlayerViewController,coordinator:Coordinator){

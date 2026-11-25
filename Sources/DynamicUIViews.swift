@@ -167,7 +167,7 @@ struct DynamicUINodeView:View{
             let palette=FullscreenControlPalette(theme:model.presentationConfiguration.resolvedFullscreenControlTheme)
             return AnyView(HStack{
                 Label("Brightness",systemImage:"sun.max").font(.caption)
-                Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0.rounded()))}),in:-10...10,step:1).tint(palette.slider)
+                Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0.rounded()))}),in:Double(model.videoBrightnessRange.lowerBound)...Double(model.videoBrightnessRange.upperBound),step:1).tint(palette.slider)
                 Text(String(model.videoBrightness)).monospacedDigit()
                 Button{model.setVideoBrightness(0)}label:{Text("Reset").font(.caption).padding(.horizontal,9).frame(minHeight:32)}
                     .buttonStyle(FullscreenControlButtonStyle(palette:palette))

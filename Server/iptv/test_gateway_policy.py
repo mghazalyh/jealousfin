@@ -165,6 +165,7 @@ class GatewayAcceptance(unittest.TestCase):
         g=self.g
         now=1795620275
         g.channels[self.c]["Name"]="OuterSphere"
+        g.sources[self.c]=g.GUIDE_PROVIDER_IDS["OuterSphere"]
         a,b=g.GUIDE_CHANNELS["OuterSphere"]
         g.guide_rows=({a:[(now-60,now+600,"You're Next")]},{b:[(now-59,now+599,"You're Next")]})
         g.guide_observed_at=now
@@ -187,6 +188,26 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(g.parse_guide(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">'+raw,{"fixture"},now)["fixture"][0][2],"Fixture")
         with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv><tv/>',{"fixture"},now)
         with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv SYSTEM "other.dtd"><tv/>',{"fixture"},now)
+
+    def test_extended_guide_exact_provider_identity(self):
+        g=self.g
+        now=1795620275
+        self.assertEqual(set(g.GUIDE_CHANNELS),set(g.GUIDE_PROVIDER_IDS))
+        self.assertEqual(len(g.GUIDE_CHANNELS),30)
+        name="Designated Survivor"
+        g.channels[self.c]["Name"]=name
+        g.sources[self.c]=g.GUIDE_PROVIDER_IDS[name]
+        a,b=g.GUIDE_CHANNELS[name]
+        g.guide_rows=({a:[(now-60,now+600,name)]},{b:[(now-59,now+599,name)]})
+        g.guide_observed_at=now
+        self.assertEqual(g.guide_snapshot(now)[self.c]["title"],name)
+        g.sources[self.c]="nltv:uk:DesignatedSurvivor.uk"
+        self.assertNotIn(self.c,g.guide_snapshot(now))
+        g.sources[self.c]=g.GUIDE_PROVIDER_IDS[name]
+        g.guide_rows=({a:[(now-60,now+600,name)]},{b:[(now-59,now+599,"Different")]})
+        self.assertNotIn(self.c,g.guide_snapshot(now))
+        g.guide_rows=({a:[(now-60,now+600,name)]},{b:[(now-59,now+599,name)]})
+        self.assertNotIn(self.c,g.guide_snapshot(now+601))
 
     def test_programme_year_matching_and_display(self):
         g=self.g
