@@ -224,6 +224,30 @@ final class TorrioConflictFixture:URLProtocol {
         try require(URLComponents(url:shared.url,resolvingAgainstBaseURL:false)?.queryItems==[URLQueryItem(name:"ticket",value:"fixture-ticket")],"shared ticket stays native and excludes Jellyfin token")
         await gateway.close(shared,position:0)
         try require(gateway.inFlight==0,"shared close does not allocate or close Jellyfin live stream")
+        let eventModule=try PlatformModule.decode(Data("""
+        {"id":"telemetry","revision":"v1","hooks":["onTelemetrySample"],"source":"var hooks={onTelemetrySample:function(p){return {state:{count:String(Number(p.state.count||0)+1)},actions:[{action:'get_status'}]};}};","shadow":true}
+        """.utf8))
+        let input:[String:Any]=["hook":"onTelemetrySample","state":["count":"4"],"snapshot":[:],"event":[:],"data":[:]]
+        let moduleDecision=try await PlatformEvaluator.evaluate(eventModule,input:input,hostBudget:InterpreterBudget())
+        try require(moduleDecision.state?["count"]=="5" && moduleDecision.actions?.first?.action=="get_status","actual event hook evaluation")
+        var invalidModule=eventModule
+        invalidModule.source="var hooks={onTelemetrySample:function(p){api.command('get_status',{});return {};}};"
+        var platformRejected=false
+        do{_ = try await PlatformEvaluator.evaluate(invalidModule,input:input,hostBudget:InterpreterBudget())}catch{platformRejected=true}
+        try require(platformRejected,"event hook cannot execute commands directly")
+        let catalogueAdapter=try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:"catalogue-only",source:"var hooks={response:function(p){if(p.operation==='channels'){p.response.Items.reverse();}return p.response;},stream:function(p){return {path:'/changed',method:'Transcode'};}};",scope:"catalogue"),engine:engine)
+        let sorted=try await catalogueAdapter.response(operation:"channels",response:["Items":[["Id":"a"],["Id":"b"]],"JealousfinPolicyRevision":"sqlite-policy-v1"])
+        try require((sorted["Items"] as? [[String:String]])?.first?["Id"]=="b","scoped adapter transforms catalogue")
+        let unchanged=try await catalogueAdapter.stream(path:"/original",method:"DirectPlay",itemID:"a")
+        try require(unchanged.0=="/original" && unchanged.1=="DirectPlay","catalogue adapter cannot change active stream")
+        let policyAdapter=try await JellyfinAPIAdapter.load(JellyfinAdapterRevision(id:"policy-tamper",source:"var hooks={response:function(p){if(p.response.JealousfinPolicy){delete p.response.JealousfinPolicy;}return p.response;}};",scope:"catalogue"),engine:engine)
+        platformRejected=false
+        do{_ = try await policyAdapter.response(operation:"channels",response:["Items":[],"JealousfinPolicy":["revision":"sqlite-policy-v2"]])}catch{platformRejected=true}
+        try require(platformRejected,"catalogue adapter cannot suppress authoritative policy")
+        let selectorRuntime=EngineeringRuntime(disk:Disk(root:root.appendingPathComponent("selector")),engine:engine)
+        _ = try await selectorRuntime.install(id:"defer-selector",source:"var hooks={selectDecision:function(p){return {outcome:'defer',retrySeconds:12};}};",settings:settings)
+        let deferred=try await selectorRuntime.selection(candidates:[channel],currentID:nil)
+        try require(deferred.outcome=="defer" && deferred.retrySeconds==12,"explicit native selector defer")
         let layout=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data(contentsOf:URL(fileURLWithPath:"Examples/dynamic-ui.json"))).checked()
         let baseline=ReleaseBaseline(revision:"release-one",sources:PatchSourceSet(runtime:PatchSource(id:"one",source:first),jellyfinAPI:PatchSource(id:"api-test",source:source),ui:layout))
         let installDisk=Disk(root:root.appendingPathComponent("fresh"))
@@ -241,8 +265,8 @@ final class TorrioConflictFixture:URLProtocol {
         let epochDisk=Disk(root:root.appendingPathComponent("release-epoch"))
         let firstEpoch=PatchReleaseEpoch(version:"0.1.13",build:"1021")
         let secondEpoch=PatchReleaseEpoch(version:"0.1.13",build:"1022")
-        let preserved=["settings.json","health.json","surf-rotation.json","device.json","channels.json","receipt-fixture.json","event-fixture.json","batch-fixture.json"]
-        let obsolete=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","hot-config-staged.json","hot-config-trial.json","patch-restore.json","last-patch-archive.json","application-trial.json","application-active.json","installed-baseline.json","module-checkpoint.json","native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json","patch-version-old.json","patch-archive-old.json","hot-config-version-old.json","hot-config-recovery-old.json","application-revision-old.json"]
+        let preserved=["settings.json","health.json","surf-rotation.json","device.json","channels.json","receipt-fixture.json","event-fixture.json","batch-fixture.json","startup-profiles.json"]
+        let obsolete=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","hot-config-staged.json","hot-config-trial.json","patch-restore.json","last-patch-archive.json","application-trial.json","application-active.json","installed-baseline.json","module-checkpoint.json","native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json","patch-version-old.json","patch-archive-old.json","hot-config-version-old.json","hot-config-recovery-old.json","application-revision-old.json","platform-modules.json","platform-deferred-api.json"]
         for name in preserved+obsolete{
             try require(epochDisk.save("fixture",name),"seed release fixture")
         }

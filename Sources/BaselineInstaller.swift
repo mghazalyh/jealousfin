@@ -8,7 +8,7 @@ import Foundation
         let api=disk.load(JellyfinAdapterStore.self,"jellyfin-api.json")
         let ui=disk.load(DynamicUIStore.self,"dynamic-ui.json")
         let oldRuntime=runtime?.active.map{PatchSource(id:$0.id,source:$0.source)}
-        let oldAPI=api?.active.map{PatchSource(id:$0.id,source:$0.source)}
+        let oldAPI=api?.active.map{PatchSource(id:$0.id,source:$0.source,scope:$0.scope)}
         let selectedRuntime=BaselineMerge.select(local:oldRuntime,previous:prior?.sources.runtime,incoming:baseline.sources.runtime,hadLocal:runtime != nil,hadPrevious:prior != nil)
         let selectedAPI=BaselineMerge.select(local:oldAPI,previous:prior?.sources.jellyfinAPI,incoming:baseline.sources.jellyfinAPI,hadLocal:api != nil,hadPrevious:prior != nil)
         let selectedUI=BaselineMerge.select(local:ui?.active,previous:prior?.sources.ui,incoming:baseline.sources.ui,hadLocal:ui != nil,hadPrevious:prior != nil)
@@ -21,7 +21,7 @@ import Foundation
             guard disk.save(next,"runtime-patch.json") else{throw AppError.message("Cannot install bundled runtime")}
         }
         if api?.pending != true,selectedAPI != oldAPI || api==nil{
-            let next=JellyfinAdapterStore(active:selectedAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source)},previous:api?.active,pending:false)
+            let next=JellyfinAdapterStore(active:selectedAPI.map{JellyfinAdapterRevision(id:$0.id,source:$0.source,scope:$0.scope)},previous:api?.active,pending:false)
             guard disk.save(next,"jellyfin-api.json") else{throw AppError.message("Cannot install bundled API")}
         }
         if selectedUI != ui?.active || ui==nil{

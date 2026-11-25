@@ -21,6 +21,59 @@ resource_touched={}
 RESOURCE_TTL=900
 RESOURCE_LIMIT=10000
 active_channels={}
+CONFIG_FILE=ROOT/'gateway-runtime.json'
+CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeoutSeconds':10,
+                 'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
+                 'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{}}
+gateway_config=dict(CONFIG_DEFAULTS)
+config_fingerprint=None
+config_checked_at=0.0
+config_fault=None
+resource_correlation={}
+def validate_gateway_config(raw):
+ if not isinstance(raw,dict) or set(raw)-set(CONFIG_DEFAULTS):raise ValueError('Unknown gateway configuration fields')
+ result=dict(CONFIG_DEFAULTS,**raw)
+ if type(result['schemaVersion']) is not int or result['schemaVersion']!=1:raise ValueError('Unknown configuration schema')
+ if not isinstance(result['revision'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',result['revision']):raise ValueError('Invalid revision')
+ for key,lo,hi in [('upstreamTimeoutSeconds',2,30),('providerTimeoutSeconds',2,30),('upstreamRetries',0,2),('resourceTTLSeconds',120,3600),('resourceLimit',500,50000),('activeProtectionSeconds',30,300)]:
+  value=result[key]
+  if type(value) is not int or not lo<=value<=hi:raise ValueError('Invalid '+key)
+ if result['activeProtectionSeconds']>result['resourceTTLSeconds']:raise ValueError('Protection exceeds resource TTL')
+ if result['sourceSelection'] not in ('round-robin','preferred-first','first'):raise ValueError('Unknown selection strategy')
+ hosts=result['preferredHosts']
+ if not isinstance(hosts,dict) or len(hosts)>1000:raise ValueError('Invalid host preference map')
+ for cid,host in hosts.items():
+  if not re.fullmatch(r'[a-f0-9]{32}',cid) or not isinstance(host,str) or not re.fullmatch(r'[A-Za-z0-9.-]{1,253}',host):raise ValueError('Invalid preferred host')
+ return result
+def reload_gateway_config(force=False):
+ global config_checked_at,config_fingerprint,config_fault,gateway_config,RESOURCE_TTL,RESOURCE_LIMIT
+ with lock:
+  now=time.monotonic()
+  if not force and now-config_checked_at<2:return False
+  config_checked_at=now
+  try:
+   if not CONFIG_FILE.exists():
+    # Removal does not silently revert the running configuration.
+    return False
+   st=CONFIG_FILE.stat();fingerprint=(st.st_mtime_ns,st.st_size,st.st_ino)
+   if not force and fingerprint==config_fingerprint:return False
+   config_fingerprint=fingerprint
+   if st.st_size>65536:raise ValueError('Configuration too large')
+   candidate=validate_gateway_config(json.loads(CONFIG_FILE.read_text()))
+   if candidate==gateway_config:
+    config_fault=None;return False
+   if candidate['revision']==gateway_config['revision']:raise ValueError('Use a new revision')
+   gateway_config=candidate;RESOURCE_TTL=candidate['resourceTTLSeconds'];RESOURCE_LIMIT=candidate['resourceLimit']
+   config_fault=None
+   evict_resources(now)
+   log('gateway configuration activated '+candidate['revision'])
+   return True
+  except (ValueError,OSError,TypeError) as error:
+   config_fault=type(error).__name__
+   log('gateway configuration rejected '+config_fault)
+   return False
+def request_correlation(value):
+ return value if isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}',value) else uuid.uuid4().hex
 counts={}
 favorites=set()
 def log(msg):
@@ -41,21 +94,29 @@ def fetch(url,limit,range_header=None):
  validate(url)
  headers={'User-Agent':'Jealousfin-IPTV-Trial/1.0','Accept':'*/*','Accept-Encoding':'identity'}
  if range_header:headers['Range']=range_header
- with opener.open(urllib.request.Request(url,headers=headers),timeout=10) as f:
-  data=f.read(limit+1)
-  if len(data)>limit:raise ValueError('Response too large')
-  return data,f.headers,f.status,f.geturl()
+ config=gateway_config
+ for attempt in range(config['upstreamRetries']+1):
+  try:
+   with opener.open(urllib.request.Request(url,headers=headers),timeout=config['upstreamTimeoutSeconds']) as f:
+    data=f.read(limit+1)
+    if len(data)>limit:raise ValueError('Response too large')
+    return data,f.headers,f.status,f.geturl()
+  except urllib.error.HTTPError as error:
+   if attempt>=config['upstreamRetries'] or error.code not in (408,429,500,502,503,504):raise
+   error.close()
+  except (urllib.error.URLError,TimeoutError):
+   if attempt>=config['upstreamRetries']:raise
 def evict_resources(now,required=0):
  # Idle expiry plus LRU under pressure. Protect active-channel media touched
  # recently; if all slots are protected, reject growth rather than corrupt playback.
  for rid,(cid,url) in list(resources.items()):
   age=now-resource_touched.get(rid,0)
-  active=active_channels.get(cid,0)>now and age<120
+  active=active_channels.get(cid,0)>now and age<gateway_config['activeProtectionSeconds']
   if not active and (age>RESOURCE_TTL or len(resources)+required>RESOURCE_LIMIT):
-   resources.pop(rid,None);resource_touched.pop(rid,None);reverse.pop((cid,url),None)
+   resources.pop(rid,None);resource_touched.pop(rid,None);resource_correlation.pop(rid,None);reverse.pop((cid,url),None)
  for cid,until in list(active_channels.items()):
   if until<=now:active_channels.pop(cid,None)
-def register(url,cid):
+def register(url,cid,correlation=None):
  validate(url)
  with lock:
   key=(cid,url);now=time.monotonic()
@@ -66,15 +127,16 @@ def register(url,cid):
    if len(resources)>=RESOURCE_LIMIT:raise RuntimeError("Resource registry saturated")
    rid=secrets.token_hex(16);resources[rid]=key;reverse[key]=rid
   resource_touched[rid]=now
+  if correlation:resource_correlation[rid]=correlation
  return '/media/'+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
-def rewrite(data,base,cid):
+def rewrite(data,base,cid,correlation=None):
  text=data.decode('utf-8-sig')
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
  out=[]
  for line in text.splitlines():
   if line.startswith('#'):
-   line=re.sub(r'URI="([^"]+)"',lambda m:'URI="'+register(urllib.parse.urljoin(base,m[1]),cid)+'"',line)
-  elif line.strip():line=register(urllib.parse.urljoin(base,line.strip()),cid)
+   line=re.sub(r'URI="([^"]+)"',lambda m:'URI="'+register(urllib.parse.urljoin(base,m[1]),cid,correlation)+'"',line)
+  elif line.strip():line=register(urllib.parse.urljoin(base,line.strip()),cid,correlation)
   out.append(line)
  return ('\n'.join(out)+'\n').encode()
 def provider():
@@ -86,7 +148,7 @@ def provider_json(path):
  if PROVIDER is None:raise RuntimeError('Provider is not initialized')
  url=validate(PROVIDER+path)
  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'Jealousfin-Catalogue-Diagnostics/1.0'})
- with opener.open(req,timeout=8) as f:
+ with opener.open(req,timeout=gateway_config['providerTimeoutSeconds']) as f:
   data=f.read(MAX_PLAYLIST+1)
   if len(data)>MAX_PLAYLIST:raise ValueError('Provider response too large')
   return json.loads(data)
@@ -129,10 +191,11 @@ def resolve(cid):
   except Exception:continue
   candidates.append(url)
  if not candidates:raise ValueError('No usable stream source')
- prefer=preferred_hosts.get(source_id)
- if prefer:candidates.sort(key=lambda u:urllib.parse.urlsplit(u).hostname!=prefer)
+ config=gateway_config
+ prefer=config['preferredHosts'].get(cid) or preferred_hosts.get(source_id)
+ if prefer and config['sourceSelection']!='first':candidates.sort(key=lambda u:urllib.parse.urlsplit(u).hostname!=prefer)
  with lock:
-  idx=attempts.get(cid,0)%len(candidates)
+  idx=attempts.get(cid,0)%len(candidates) if config['sourceSelection']=='round-robin' else 0
   attempts[cid]=idx+1
  return candidates[idx]
 ROTATION_FILE=ROOT/'rotation-history.json'
@@ -192,10 +255,10 @@ def policy_event(cid,trace,action,reason):
   elif action=="approve":
    db.execute("UPDATE channel SET banned=0,failures=0,hiatus_until=0,approved_at=? WHERE id=? AND banned=1",(now,cid))
   else:raise ValueError("Unknown policy action")
-def record_source_error(cid,url,phase,error):
+def record_source_error(cid,url,phase,error,correlation=None):
  # Never persist stream URLs, query parameters, headers or credentials.
  host=urllib.parse.urlsplit(url).hostname if url else None
- entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error}
+ entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation}
  with lock:
   p=ROOT/'source-errors.jsonl'
   if p.exists() and p.stat().st_size>4*1024*1024:
@@ -221,13 +284,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
   h=self.headers.get('Authorization','')+' '+self.headers.get('X-Emby-Authorization','')
   return hmac.compare_digest(q.get('api_key',[''])[0],TOKEN) or hmac.compare_digest(self.headers.get('X-Emby-Token',''),TOKEN) or ('Token="'+TOKEN+'"') in h
  def handle_request(self):
+  reload_gateway_config()
+  correlation=request_correlation(self.headers.get('X-Jealousfin-Request-ID'))
   p=urllib.parse.urlsplit(self.path);path=p.path;q=urllib.parse.parse_qs(p.query)
   with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
   if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial','Version':'10.10.0','Id':USER_ID})
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot)})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -243,9 +308,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     if entry:
      now=time.monotonic()
      if now-resource_touched.get(rid,0)>RESOURCE_TTL:
-      resources.pop(rid,None);reverse.pop(entry,None);resource_touched.pop(rid,None);entry=None
+      resources.pop(rid,None);reverse.pop(entry,None);resource_touched.pop(rid,None);resource_correlation.pop(rid,None);entry=None
      else:
-      resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+120
+      resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+gateway_config['activeProtectionSeconds']
+      correlation=resource_correlation.get(rid,correlation)
    if not entry:return self.reply(404,{})
    cid,url=entry
    try:
@@ -254,13 +320,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     data,headers,status,final=fetch(url,MAX_BODY,rg)
     if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
      if len(data)>MAX_PLAYLIST:return self.reply(502,{})
-     return self.reply(200,rewrite(data,final,cid),'application/vnd.apple.mpegurl')
+     return self.reply(200,rewrite(data,final,cid,correlation),'application/vnd.apple.mpegurl')
     extra={k:headers[k] for k in ('Content-Range','Accept-Ranges') if headers.get(k)}
     return self.reply(status,data,headers.get('Content-Type','application/octet-stream'),extra)
    except urllib.error.HTTPError as e:
-    record_source_error(cid,url,'media','HTTP '+str(e.code));log('upstream HTTP '+str(e.code));return self.reply(502,{})
+    record_source_error(cid,url,'media','HTTP '+str(e.code),correlation);log('upstream HTTP '+str(e.code));return self.reply(502,{})
    except Exception as e:
-    record_source_error(cid,url,'media',type(e).__name__);log('upstream failure '+type(e).__name__);return self.reply(502,{})
+    record_source_error(cid,url,'media',type(e).__name__,correlation);log('upstream failure '+type(e).__name__);return self.reply(502,{})
   if not self.authorized(q):return self.reply(401,{})
   if path in ('/LiveTv/Channels','/Jealousfin/Policy'):
    try:snapshot=policy_rows()
@@ -294,10 +360,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    record_attempt(cid)
    with lock:
-    now=time.monotonic();active_channels[cid]=now+120;evict_resources(now)
-   try:url=register(resolve(cid),cid);url=url.rsplit('.',1)[0]+'.m3u8'
+    now=time.monotonic();active_channels[cid]=now+gateway_config['activeProtectionSeconds'];evict_resources(now)
+   try:url=register(resolve(cid),cid,correlation);url=url.rsplit('.',1)[0]+'.m3u8'
    except Exception as e:
-    record_source_error(cid,None,'resolve',type(e).__name__);return self.reply(502,{})
+    record_source_error(cid,None,'resolve',type(e).__name__,correlation);return self.reply(502,{})
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
@@ -326,6 +392,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
  global PROVIDER
  PROVIDER=provider()
+ reload_gateway_config(force=True)
  initialize_catalogue()
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))

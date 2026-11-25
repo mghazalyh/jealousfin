@@ -4,8 +4,9 @@ import Foundation
 struct PatchSource: Codable, Equatable {
     var id:String
     var source:String
+    var scope:String?=nil
     func checked()throws->Self{
-        guard DynamicUILayout.validID(id),!source.isEmpty,source.utf8.count<=192*1024 else{
+        guard DynamicUILayout.validID(id),!source.isEmpty,source.utf8.count<=192*1024,scope==nil || scope=="catalogue" else{
             throw AppError.message("Invalid patch source")
         }
         return self
@@ -16,7 +17,7 @@ struct PatchSourceSet: Codable, Equatable {
     var jellyfinAPI:PatchSource?
     var ui:DynamicUILayout?
     func checked()throws->Self{
-        if let runtime=runtime{_ = try runtime.checked()}
+        if let runtime=runtime{_ = try runtime.checked();guard runtime.scope==nil else{throw AppError.message("Runtime source cannot declare API scope")}}
         if let jellyfinAPI=jellyfinAPI{_ = try jellyfinAPI.checked()}
         if let ui=ui{_ = try ui.checked()}
         guard try JSONCodec.encoder().encode(self).count<=700*1024 else{throw AppError.message("Patch set too large")}
@@ -110,6 +111,15 @@ struct ApplicationRevision:Codable,Equatable{
 enum ApplicationCapabilitySchema{
     static let commands:[String:[String:String]]=[
         "get_application_revision":[:],
+        "get_capability_registry":[:],"query_native_data":["query":"NativeDataQuery JSON"],
+        "get_effective_configuration":[:],"list_event_modules":[:],
+        "validate_event_module":["module":"PlatformModule JSON"],
+        "install_event_module":["module":"PlatformModule JSON","expectedRevision":"none or active revision","preserveState":"true|false"],
+        "rollback_event_module":["id":"module ID","expectedRevision":"active revision"],
+        "remove_event_module":["id":"module ID","expectedRevision":"active revision"],
+        "stage_api_activation":["id":"API revision","source":"JavaScript source","scope":"catalogue or omitted","expectedRevision":"active API revision","mode":"when-idle|next-channel|next-cycle"],
+        "get_staged_api_activation":[:],"cancel_staged_api_activation":["id":"staged revision"],
+        "install_jellyfin_api":["id":"API revision","source":"JavaScript source","scope":"catalogue or omitted","activation":"immediate|reconnect"],
         "validate_patch_bundle":["manifest":"ApplicationRevision JSON"],
         "begin_application_trial":["manifest":"ApplicationRevision JSON","expected":"identity JSON from get_application_revision","seconds":"30...3600"],
         "restore_application_revision":["id":"archived application revision","expected":"identity JSON","seconds":"30...3600"],
@@ -131,7 +141,7 @@ enum ApplicationCapabilitySchema{
     ]
     static let configuration:[String:[String:String]]=[
         "root":["schemaVersion":"1","revision":"unique ID, 1...80 characters","runtime":"RuntimePolicy; optional","playbackRules":"ordered rules, max 64","operations":"OperationalConfiguration; optional","interpreter":"InterpreterBudget; optional","presentation":"DynamicPresentation; optional","gateway":"GatewayConfiguration; optional"],
-        "runtime":["startupTimeout":"5...120","retries":"1...5","qualityMbps":"1...50","stallSeconds":"5...300","rotationSeconds":"5...86400","validationSeconds":"3...60, less than startupTimeout","minimumFrames":"3...120","forwardBufferSeconds":"0...120","automaticallyWaits":"boolean","recoveryMode":"reopen|advance_surf|pause","failureRetrySeconds":"0...600","interAttemptDelaySeconds":"0...30","terminalAdvanceDelaySeconds":"0...60","adaptiveStartupExtraSeconds":"0...60","healthPenalty":"{baseDays:1...30,banAfter:2...20}; gateway policy takes precedence","strictChannelHiatus":"boolean; default true"],
+        "runtime":["startupTimeout":"5...120","retries":"1...5","qualityMbps":"1...50","stallSeconds":"5...300","rotationSeconds":"5...86400","validationSeconds":"3...60, less than startupTimeout","minimumFrames":"3...120","forwardBufferSeconds":"0...120","automaticallyWaits":"boolean","recoveryMode":"reopen|advance_surf|pause","failureRetrySeconds":"0...600","interAttemptDelaySeconds":"0...30","terminalAdvanceDelaySeconds":"0...60","adaptiveStartupExtraSeconds":"0...60","adaptiveChannelStartup":"boolean; learns bounded deadline from confirmed attempts","healthPenalty":"{baseDays:1...30,banAfter:2...20}; gateway policy takes precedence","strictChannelHiatus":"boolean; default true"],
         "interpreter":["timeoutMs":"100...10000","memoryMiB":"8...64","maxCommands":"1...100"],
         "gateway":["lanServerPort":"1...65535, default 8096","lanGatewayPort":"1...65535, default 8097","routePrefix":"validated absolute path, default /api/surf","ticketField":"JSON key, default url","timeoutSeconds":"5...90, default 20"],
         "operations":["systemSampleSeconds":"5...300","playbackSampleSeconds":"5...120","heartbeatSeconds":"15...600","syncSeconds":"15...600","catalogueRefreshSeconds":"60...3600","gatewayPolicyPollSeconds":"2...120","reconnectSeconds":"15...600","eventRetentionCount":"500...20000","eventRetentionMiB":"4...128","resourceWarningMiB":"64...2048","memoryGrowthWarningMiB":"16...1024","suspendAutomationOnPressure":"boolean","playerEventDiagnostics":"boolean","playerEventSampleSeconds":"1...60","surfTransport":"auto|device"],

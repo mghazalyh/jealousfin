@@ -19,19 +19,22 @@ import Foundation
         return dictionary
     }
     static func load(_ revision:JellyfinAdapterRevision,engine:ScriptEngine)async throws->JellyfinAPIAdapter{
-        guard DynamicUILayout.validID(revision.id),!revision.source.isEmpty,revision.source.utf8.count<=192*1024 else{throw AppError.message("Invalid Jellyfin API revision")}
+        guard DynamicUILayout.validID(revision.id),!revision.source.isEmpty,revision.source.utf8.count<=192*1024,revision.scope==nil || revision.catalogueOnly else{throw AppError.message("Invalid Jellyfin API revision")}
         let baseline=JellyfinAdapterSpec()
         let data=try JSONCodec.encoder().encode(baseline)
         guard let input=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{throw AppError.message("Invalid native adapter defaults")}
         let configured=try await evaluate(revision,engine:engine,hook:"configure",input:input) ?? input
         let spec=try JSONCodec.decoder().decode(JellyfinAdapterSpec.self,from:JSONSerialization.data(withJSONObject:configured)).checked()
+        guard !revision.catalogueOnly || spec==baseline else{throw AppError.message("Catalogue-only adapter cannot alter native transport or authentication")}
         let adapter=JellyfinAPIAdapter(revision:revision,spec:spec,engine:engine)
         // Exercise the same request/response interfaces on deterministic data.
         _ = try await adapter.request(operation:"health",path:"System/Info/Public",method:"GET",query:[:],body:nil)
         _ = try await adapter.response(operation:"health",response:["ServerName":"Fixture","Version":"10.11.0"])
+        if revision.catalogueOnly{_ = try await adapter.response(operation:"channels",response:["Items":[["Id":"fixture","Name":"Fixture"]]])}
         return adapter
     }
     func request(operation:String,path:String,method:String,query:[String:String],body:[String:Any]?) async throws -> (path:String,method:String,query:[String:String],body:[String:Any]?){
+        if revision.catalogueOnly{return(path,method,query,body)}
         let login=operation=="authenticate"
         let input:[String:Any]=["operation":operation,"path":path,"method":method,"query":query,"body":login ? NSNull() as Any : (body.map{$0 as Any} ?? NSNull())]
         let output=try await Self.evaluate(revision,engine:engine,hook:"request",input:input) ?? input
@@ -48,10 +51,21 @@ import Foundation
     func response(operation:String,response:[String:Any])async throws->[String:Any]{
         // Authentication responses are extracted natively via configurable
         // field paths. Credentials are not passed into the interpreter.
-        if operation=="authenticate"{return response}
-        return try await Self.evaluate(revision,engine:engine,hook:"response",input:["operation":operation,"response":response]) ?? response
+        if operation=="authenticate" || (revision.catalogueOnly && !["channels","programs"].contains(operation)){return response}
+        let result=try await Self.evaluate(revision,engine:engine,hook:"response",input:["operation":operation,"response":response]) ?? response
+        if revision.catalogueOnly{
+            // A display adapter may reorder or format catalogue rows, but never
+            // forge or suppress the authoritative gateway policy contract.
+            for key in ["JealousfinPolicy","JealousfinPolicyRevision"]{
+                let a=try JSONSerialization.data(withJSONObject:response[key] ?? NSNull(),options:[.sortedKeys,.fragmentsAllowed])
+                let b=try JSONSerialization.data(withJSONObject:result[key] ?? NSNull(),options:[.sortedKeys,.fragmentsAllowed])
+                guard a==b else{throw AppError.message("Catalogue adapter changed protected policy metadata")}
+            }
+        }
+        return result
     }
     func stream(path:String,method:String,itemID:String)async throws->(String,String){
+        if revision.catalogueOnly{return(path,method)}
         let result=try await Self.evaluate(revision,engine:engine,hook:"stream",input:["path":path,"method":method,"itemID":itemID])
         guard let result=result else{return(path,method)}
         guard let p=result["path"] as? String,!p.isEmpty,p.utf8.count<=16384,

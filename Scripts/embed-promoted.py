@@ -30,7 +30,7 @@ def checked(raw):
     for k in ("runtime","jellyfinAPI"):
         p=sources.get(k)
         if p is not None:
-            if not isinstance(p,dict) or set(p)!={"id","source"} or not ident(p["id"]) or not isinstance(p["source"],str) or not 0<len(p["source"].encode())<=192*1024:
+            if not isinstance(p,dict) or not {"id","source"}.issubset(p) or set(p)-{"id","source","scope"} or ("scope" in p and (k!="jellyfinAPI" or p["scope"]!="catalogue")) or not ident(p["id"]) or not isinstance(p["source"],str) or not 0<len(p["source"].encode())<=192*1024:
                 raise ValueError("Invalid "+k)
     ui=sources.get("ui")
     if ui is not None and (not isinstance(ui,dict) or ui.get("schemaVersion")!=1 or not ident(ui.get("revision"))):

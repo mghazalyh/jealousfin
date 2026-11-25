@@ -25,6 +25,19 @@ struct JellyfinAdapterRevision:Codable,Equatable{
     var id:String
     var source:String
     var installedAt=Date()
+    var scope:String?=nil
+    var catalogueOnly:Bool{scope=="catalogue"}
+}
+struct DeferredAPIActivation:Codable{
+    let candidate:JellyfinAdapterRevision
+    let expectedRevision:String
+    let mode:String
+    func checked()throws->Self{
+        guard ["when-idle","next-channel","next-cycle"].contains(mode),DynamicUILayout.validID(candidate.id),
+              DynamicUILayout.validID(expectedRevision),candidate.id != expectedRevision,!candidate.source.isEmpty,
+              candidate.source.utf8.count<=192*1024,candidate.scope==nil || candidate.catalogueOnly else{throw AppError.message("Invalid deferred adapter")}
+        return self
+    }
 }
 struct JellyfinAdapterStore:Codable{
     var active:JellyfinAdapterRevision?

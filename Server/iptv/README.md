@@ -30,3 +30,7 @@ Use `python3 make_policy_snapshot.py /private/policy.sqlite3 /private/new-adapte
 ## Policy v2 and acceptance
 
 The new gateway requires an initialized complete SQLite catalogue, fails closed when policy is unavailable, returns the complete catalogue plus health only to opt-in clients, and rejects excluded PlaybackInfo before source resolution. Older clients still receive a filtered catalogue. The authenticated policy event endpoint deduplicates native failure and sustained-success reports; explicit approval is required for reinstatement. The default remains 3 days per failure, ban at 8. Gateway policy takes precedence over native settings. Idle resource entries expire; recently accessed active-channel entries are protected under pressure. See docs/native-release-acceptance.md for the mandatory live migration and physical/endurance checks.
+
+## Runtime configuration reload
+
+After deploying the reviewed gateway, place a validated `gateway-runtime.json` in its existing state directory using atomic replacement and a new revision. The gateway retains the last accepted configuration on invalid input and reports the active revision and fault via /trial-status. See [the ABI 3 contract](../../docs/hotpatch-platform-abi3.md#gateway) for allowed fields, bounds, and deployment limitations.

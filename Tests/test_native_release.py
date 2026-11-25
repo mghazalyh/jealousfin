@@ -23,3 +23,10 @@ class NativeReleaseTests(unittest.TestCase):
     def test_old_bundle_rejected(self):
         self.baseline["sources"]={"ui":{"revision":"old"}}
         self.assertTrue(module.audit(self.baseline,self.review))
+
+    def test_event_modules_and_deferred_api_block_upgrade(self):
+        self.status["eventModuleRevisions"]={"recovery":"v1"}
+        self.assertTrue(module.audit(self.baseline,self.review,self.status))
+        self.status["eventModuleRevisions"]={}
+        self.status["stagedAPIRevision"]="candidate"
+        self.assertTrue(module.audit(self.baseline,self.review,self.status))

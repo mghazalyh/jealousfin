@@ -76,16 +76,29 @@ struct DynamicPresentation: Codable, Equatable {
         return self
     }
 }
+struct DynamicTab:Codable,Equatable,Identifiable{
+    let id:Int
+    let title:String
+    let symbol:String
+    var visible:Bool=true
+    static let defaults=[DynamicTab(id:0,title:"Guide",symbol:"tv"),DynamicTab(id:1,title:"Player",symbol:"play.rectangle"),DynamicTab(id:2,title:"Health",symbol:"waveform.path.ecg"),DynamicTab(id:3,title:"Insights",symbol:"lightbulb"),DynamicTab(id:4,title:"More",symbol:"ellipsis.circle")]
+    static func checked(_ tabs:[Self])throws{
+        guard tabs.count==5,Set(tabs.map(\.id))==Set(0...4),
+              tabs.allSatisfy({!$0.title.isEmpty && $0.title.utf8.count<=60 && !$0.symbol.isEmpty && $0.symbol.utf8.count<=100}),
+              tabs.first(where:{$0.id==4})?.visible==true else{throw AppError.message("Tab layout must retain the native recovery tab")}
+    }
+}
 struct DynamicUILayout: Codable, Equatable {
     var schemaVersion:Int
     var revision:String
     var slots:[DynamicUISlot]
     var pages:[DynamicUIPage]
     var presentation:DynamicPresentation? = nil
+    var tabs:[DynamicTab]?=nil
     static let replacementLocations=["guide.body","health.body","insights.body","more.body","player.transport","player.surf","player.history","player.fullscreen.header","player.fullscreen.transport","player.fullscreen.surf","player.fullscreen.footer"]
     static let locations=replacementLocations+["guide.top","guide.bottom","player.top","player.controls","player.bottom","player.fullscreen.top","player.fullscreen.controls","player.fullscreen.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
-    static let kinds=["text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
-    static let commands:Set<String>=["get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","get_native_capabilities","get_preferences","set_preferences","set_player_audio","set_video_brightness","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
+    static let kinds=["segmented","menu","disclosure","scroll","searchList","table","barChart","banner","liveBrightness","text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
+    static let commands:Set<String>=["query_native_data","get_effective_configuration","get_capability_registry","list_event_modules","get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","get_native_capabilities","get_preferences","set_preferences","set_player_audio","set_video_brightness","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
     static func validID(_ value:String)->Bool {
         value.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil
     }
@@ -99,6 +112,7 @@ struct DynamicUILayout: Codable, Equatable {
             pages.allSatisfy({Self.validID($0.id) && !$0.title.isEmpty && $0.title.count<=100})
         else{throw AppError.message("Invalid UI layout header, slots or pages")}
         _ = try presentation?.checked()
+        if let tabs=tabs{try DynamicTab.checked(tabs)}
         var seen=Set<String>();var fields=Set<String>();var count=0
         let pageIDs=Set(pages.map(\.id))
         func walk(_ nodes:[DynamicUINode],depth:Int)throws{
@@ -113,13 +127,13 @@ struct DynamicUILayout: Codable, Equatable {
                 for binding in [n.valueKey,n.visibleWhen,n.enabledWhen].compactMap({$0}){
                     guard Self.validBinding(binding) else{throw AppError.message("Invalid UI binding \(binding)")}
                 }
-                let editable=["input","toggle","picker","slider"].contains(n.kind)
+                let editable=["input","toggle","picker","slider","segmented","menu"].contains(n.kind)
                 if editable {
                     guard let key=n.valueKey,key.hasPrefix("form."),key.split(separator:".").count==2 else{throw AppError.message("Editable controls require a form key")}
                     guard fields.insert(key).inserted else{throw AppError.message("Duplicate editable form field")}
                     guard fields.count<=64 else{throw AppError.message("Too many form fields")}
                 }
-                if n.kind=="picker" {
+                if ["picker","segmented","menu"].contains(n.kind) {
                     let values=n.options ?? []
                     guard !values.isEmpty,values.count<=40,Set(values.map(\.value)).count==values.count,
                         values.allSatisfy({$0.value.utf8.count<=512 && !$0.title.isEmpty && $0.title.count<=100}),
@@ -130,6 +144,11 @@ struct DynamicUILayout: Codable, Equatable {
                     let lo=n.minimum ?? 0,hi=n.maximum ?? 100,step=n.step ?? 1
                     guard lo.isFinite,hi.isFinite,step.isFinite,hi>lo,hi-lo<=1e9,step>0,step<=hi-lo,
                         abs(lo)<=1e9,abs(hi)<=1e9 else{throw AppError.message("Invalid numeric range")}
+                }
+                if n.kind=="liveBrightness"{
+                    guard n.action==nil,n.valueKey==nil,n.children==nil,n.minimum==nil,n.maximum==nil,n.step==nil,
+                          !fields.contains("native.brightness") else{throw AppError.message("Only one fixed native brightness control is allowed")}
+                    fields.insert("native.brightness")
                 }
                 if n.kind=="web" {
                     guard let html=n.html,!html.isEmpty,html.utf8.count<=65536,
@@ -147,13 +166,17 @@ struct DynamicUILayout: Codable, Equatable {
                 }
                 if n.kind=="button",n.action==nil {throw AppError.message("Button requires an action")}
                 if let children=n.children,!children.isEmpty{
-                    guard ["card","vstack","hstack"].contains(n.kind) else{throw AppError.message("Only containers may have children")}
+                    guard ["card","vstack","hstack","disclosure","scroll","searchList","table","barChart"].contains(n.kind) else{throw AppError.message("Only containers may have children")}
                     try walk(children,depth:depth+1)
                 }
             }
         }
-        for slot in slots{try walk(slot.nodes,depth:0)}
-        for page in pages{try walk(page.nodes,depth:0)}
+        func containsBrightness(_ nodes:[DynamicUINode])->Bool{nodes.contains{$0.kind=="liveBrightness" || containsBrightness($0.children ?? [])}}
+        for slot in slots{
+            guard !containsBrightness(slot.nodes) || slot.location=="player.fullscreen.surf" else{throw AppError.message("Native brightness belongs in the fullscreen Surf control replacement")}
+            try walk(slot.nodes,depth:0)
+        }
+        for page in pages{guard !containsBrightness(page.nodes) else{throw AppError.message("Brightness is fullscreen-only")};try walk(page.nodes,depth:0)}
         return self
     }
     func node(_ id:String)->DynamicUINode?{
@@ -173,7 +196,7 @@ struct DynamicUILayout: Codable, Equatable {
         switch node.kind {
         case "toggle":
             guard ["true","false"].contains(value) else{throw AppError.message("Toggle value must be true or false")}
-        case "picker":
+        case "picker","segmented","menu":
             guard (node.options ?? []).contains(where:{$0.value==value}) else{throw AppError.message("Unknown picker option")}
         case "slider":
             guard let number=Double(value),number.isFinite,number>=(node.minimum ?? 0),number<=(node.maximum ?? 100) else{throw AppError.message("Slider value outside supported range")}
@@ -184,7 +207,7 @@ struct DynamicUILayout: Codable, Equatable {
     func formNode(_ field:String)->DynamicUINode?{
         func find(_ nodes:[DynamicUINode])->DynamicUINode?{
             for n in nodes {
-                if n.valueKey=="form."+field,["input","toggle","picker","slider"].contains(n.kind){return n}
+                if n.valueKey=="form."+field,["input","toggle","picker","slider","segmented","menu"].contains(n.kind){return n}
                 if let child=find(n.children ?? []){return child}
             }
             return nil
@@ -204,8 +227,8 @@ struct DynamicUILayout: Codable, Equatable {
         var result:[String:String]=[:]
         func visit(_ nodes:[DynamicUINode]){
             for n in nodes{
-                if ["input","toggle","picker","slider"].contains(n.kind),let key=n.valueKey {
-                    result[String(key.dropFirst(5))]=n.defaultValue ?? (n.kind=="toggle" ? "false":n.kind=="picker" ? n.options?.first?.value ?? "":n.kind=="slider" ? String(n.minimum ?? 0):"")
+                if ["input","toggle","picker","slider","segmented","menu"].contains(n.kind),let key=n.valueKey {
+                    result[String(key.dropFirst(5))]=n.defaultValue ?? (n.kind=="toggle" ? "false":["picker","segmented","menu"].contains(n.kind) ? n.options?.first?.value ?? "":n.kind=="slider" ? String(n.minimum ?? 0):"")
                 }
                 visit(n.children ?? [])
             }

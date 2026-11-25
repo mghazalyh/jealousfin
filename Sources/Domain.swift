@@ -621,3 +621,32 @@ enum PlaybackFailureCategory:String{
     }
     var definitive:Bool{self == .policy || self == .provider}
 }
+
+// Learned deadlines use only successful per-attempt validation durations.
+// Never learn from a failed attempt, intentional pause or shared gateway stream.
+struct ChannelStartupProfile:Codable,Equatable{
+    var count=0
+    var mean=0.0
+    var deviation=0.0
+    var updatedAt=Date.distantPast
+    mutating func observe(seconds:Double,at:Date){
+        guard seconds.isFinite,(0.5...120).contains(seconds) else{return}
+        if count==0{mean=seconds;deviation=0}
+        else{let difference=abs(seconds-mean);mean=0.75*mean+0.25*seconds;deviation=0.75*deviation+0.25*difference}
+        count=min(10000,count+1);updatedAt=at
+    }
+    func deadline(baseline:Int,validation:Int)->Int{
+        guard count>=3,mean.isFinite,deviation.isFinite,(0.5...120).contains(mean),(0...120).contains(deviation) else{return baseline}
+        return min(120,baseline+15,max(validation+1,5,baseline-5,Int(ceil(mean+max(3,2*deviation)))))
+    }
+}
+struct ChannelStartupProfiles:Codable{
+    var entries:[String:ChannelStartupProfile]=[:]
+    mutating func record(key:String,seconds:Double,at:Date){
+        var row=entries[key] ?? ChannelStartupProfile()
+        row.observe(seconds:seconds,at:at)
+        guard row.count>0 else{return}
+        entries[key]=row
+        if entries.count>2048,let oldest=entries.min(by:{$0.value.updatedAt<$1.value.updatedAt})?.key{entries.removeValue(forKey:oldest)}
+    }
+}

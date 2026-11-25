@@ -529,3 +529,42 @@ check(PlaybackFailureCategory.classify("Network player error -1008") == .network
 check(PlaybackFailureCategory.classify("Video frames stalled after startup") == .videoFrozen,"video freeze classification")
 check(PlaybackFailureCategory.classify("Stream HTTP 403") == .manifestOrSegment,"media HTTP failure classification")
 print("PASS: \(checks) assertions including gateway policy, adaptive recovery and presentation controls")
+
+// Native platform contracts, capability discovery and bounded state.
+let module=try PlatformModule.decode(Data("""
+{"id":"recovery","revision":"v1","hooks":["onPlaybackFailure"],"shadow":true,"rules":[{"id":"failure","hook":"onPlaybackFailure","equals":{"state.surfing":"true"},"actions":[{"action":"get_status"}]}]}
+""".utf8))
+check(module.requiredABI==3 && module.shadow,"event module defaults and ABI")
+check(module.rules?.first?.matches(hook:"onPlaybackFailure",state:["surfing":true])==true,"declarative event condition")
+check(module.rules?.first?.matches(hook:"onPlaybackFailure",state:["surfing":false])==false,"condition rejects nonmatching state")
+var firstStore=try PlatformStore().replacing(module,expected:"none",preserveState:false,cursor:nil)
+firstStore.modules[0].state=["count":"1"]
+var replacement=module;replacement=PlatformModule(id:module.id,revision:"v2",hooks:module.hooks,rules:module.rules,shadow:true)
+let secondStore=try firstStore.replacing(replacement,expected:"v1",preserveState:true,cursor:"fixture")
+check(secondStore.modules.first?.state["count"]=="1" && secondStore.modules.first?.previous?.revision=="v1","independent module CAS and state migration")
+check((try? secondStore.replacing(replacement,expected:"v1",preserveState:false,cursor:nil))==nil,"stale module CAS rejected")
+check((try? HotPatchPlatform.validateActions([ModuleAction(action:"approve_reinstatement",arguments:nil)]))==nil,"event module cannot reinstate banned channels")
+check((try? HotPatchPlatform.validateActions([ModuleAction(action:"script",arguments:nil)]))==nil,"event module cannot dispatch arbitrary scripts")
+check((try? PlatformSelection(outcome:"defer",retrySeconds:20).checked(ids:["a"])) != nil,"explicit defer selection")
+check((try? PlatformSelection(outcome:"select",channelID:"excluded").checked(ids:["a"]))==nil,"selector cannot choose outside eligible pool")
+let nativeQuery=try NativeDataQuery.decode(Data("{\"provider\":\"catalogue\"}".utf8))
+check(nativeQuery.limit==50 && nativeQuery.offset==0,"native data provider query defaults")
+check((try? NativeDataQuery(provider:"catalogue",limit:1000).checked())==nil,"native data query size bounded")
+let registry=HotPatchPlatform.registry(actions:["get_status","set_video_brightness","approve_reinstatement"],ui:DynamicUILayout.commands)
+check(registry["set_video_brightness"]?["eventModule"] as? Bool==true && registry["approve_reinstatement"]?["eventModule"] as? Bool==false,"registry permission consistency")
+var profile=ChannelStartupProfile()
+profile.observe(seconds:4,at:Date());profile.observe(seconds:4,at:Date())
+check(profile.deadline(baseline:15,validation:3)==15,"startup profile waits for evidence")
+profile.observe(seconds:4,at:Date())
+check(profile.deadline(baseline:15,validation:3)==10,"fast channel learned bounded deadline")
+var slow=ChannelStartupProfile()
+for _ in 0..<3{slow.observe(seconds:25,at:Date())}
+check(slow.deadline(baseline:15,validation:3)==28,"slow channel learned bounded extension")
+var tabs=DynamicTab.defaults;tabs[4].visible=false
+check((try? DynamicTab.checked(tabs))==nil,"recovery tab cannot be hidden")
+let newUI=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"platform-ui","slots":[{"location":"player.fullscreen.surf","nodes":[{"id":"brightness","kind":"liveBrightness"},{"id":"group","kind":"disclosure","title":"Options","children":[{"id":"seg","kind":"segmented","valueKey":"form.mode","options":[{"value":"a","title":"A"},{"value":"b","title":"B"}]}]}]}],"pages":[]}
+""".utf8)).checked()
+check(newUI.formDefaults()["mode"]=="a","segmented native form defaults")
+check(HotPatchPlatform.hook(component:"validator",code:"CHANNEL_FAILED")=="onPlaybackFailure","event mapping")
+print("PASS: \(checks) assertions including ABI 3 event modules, typed data, native UI and adaptive profiles")

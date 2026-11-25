@@ -94,6 +94,11 @@ import Foundation
         for attempt in [1,2] {
             _ = try await playbackAttempt(patch:patch,channel:fixture,attempt:attempt,previousFailure:attempt==1 ? "" : "Startup timeout",defaults:result.playback ?? PlaybackAttemptPolicy())
         }
+        let selectionInput:[String:Any]=["candidates":[["id":"abi-fixture","name":"Fixture","favorite":false]],"currentID":""]
+        if let id=try await evaluate(patch,hook:"select",input:selectionInput,as:String?.self),id != "abi-fixture"{throw AppError.message("Invalid selection in preflight")}
+        if let choice=try await evaluate(patch,hook:"selectDecision",input:selectionInput,as:PlatformSelection?.self){_ = try choice.checked(ids:["abi-fixture"])}
+        // Tick preflight uses the real snapshot shape in the event-module host;
+        // legacy tick may depend on arbitrary existing checkpoint state.
         return result
     }
     func playbackAttempt(channel:Channel,attempt:Int,previousFailure:String,defaults:PlaybackAttemptPolicy)async throws->PlaybackAttemptPolicy {
@@ -115,10 +120,43 @@ import Foundation
         guard candidates.contains(where:{$0.id==id}) else{throw AppError.message("Module selected an ineligible channel")}
         return id
     }
+    func selection(candidates:[Channel],currentID:String?)async throws->PlatformSelection{
+        guard let patch=store.active,!loading else{return PlatformSelection(outcome:"fallback")}
+        let input:[String:Any]=["candidates":candidates.map{["id":$0.id,"name":$0.name,"favorite":$0.favorite] as [String:Any]},"currentID":currentID ?? ""]
+        if let choice=try await evaluate(patch,hook:"selectDecision",input:input,as:PlatformSelection?.self){
+            return try choice.checked(ids:Set(candidates.map(\.id)))
+        }
+        if let id=try await select(candidates:candidates,currentID:currentID){return PlatformSelection(outcome:"select",channelID:id)}
+        return PlatformSelection(outcome:"fallback")
+    }
     func decision(snapshot:[String:Any],state:[String:String],events:[[String:Any]],receipts:[String]) async throws -> ModuleDecision? {
         guard let patch=store.active,!loading else{return nil}
         let input:[String:Any]=["snapshot":snapshot,"state":state,"events":events,"receipts":receipts]
         let value=try await evaluate(patch,hook:"tick",input:input,as:ModuleDecision?.self)
         return try value?.checked()
+    }
+}
+
+@MainActor enum PlatformEvaluator{
+    static func evaluate(_ module:PlatformModule,input:[String:Any],hostBudget:InterpreterBudget)async throws->ModuleDecision{
+        _ = try module.checked()
+        guard let hook=input["hook"] as? String,module.hooks.contains(hook) else{throw AppError.message("Unknown module hook")}
+        var result=ModuleDecision()
+        if let source=module.source{
+            let engine=ScriptEngine()
+            let requested=module.budget ?? InterpreterBudget()
+            engine.budget=InterpreterBudget(timeoutMs:min(requested.timeoutMs ?? 1000,hostBudget.timeoutMs ?? 5000),
+                memoryMiB:min(requested.memoryMiB ?? 16,hostBudget.memoryMiB ?? 32),maxCommands:1)
+            let wrapper="(function(){\n"+source+"\nconst h=api.state.hook; const f=typeof hooks==='object' && (hooks[h] || hooks.onEvent); return JSON.stringify(typeof f==='function' ? (f(api.state)||null):null);})()"
+            let (text,commands)=try await engine.evaluateAsync(wrapper,snapshot:input)
+            guard commands.isEmpty,text.utf8.count<=131072 else{throw AppError.message("Event hooks return decisions, never execute commands")}
+            result=try JSONCodec.decoder().decode(ModuleDecision?.self,from:Data(text.utf8)) ?? ModuleDecision()
+        }
+        let state=input["snapshot"] as? [String:Any] ?? [:]
+        let rules=(module.rules ?? []).filter{$0.matches(hook:hook,state:state)}.flatMap(\.actions)
+        result.actions=(result.actions ?? [])+rules
+        _ = try result.checked()
+        try HotPatchPlatform.validateActions(result.actions ?? [])
+        return result
     }
 }

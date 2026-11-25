@@ -154,7 +154,7 @@ struct ApplicationTrialJournal:Codable{
     static func safeReset(disk:Disk)throws{
         let folder=disk.root.appendingPathComponent("native-recovery-"+UUID().uuidString,isDirectory:true)
         try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
-        let names=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","patch-restore.json","hot-config-trial.json","application-trial.json","hot-config-staged.json","device-campaign.json","decision-journal.json"]
+        let names=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json","patch-restore.json","hot-config-trial.json","application-trial.json","hot-config-staged.json","device-campaign.json","decision-journal.json","platform-modules.json","platform-deferred-api.json"]
         for name in names{
             let path=disk.root.appendingPathComponent(name)
             if FileManager.default.fileExists(atPath:path.path){try FileManager.default.copyItem(at:path,to:folder.appendingPathComponent(name))}
@@ -195,7 +195,7 @@ struct PatchReleaseEpoch:Codable,Equatable{
     static let exact:Set<String>=["runtime-patch.json","jellyfin-api.json","dynamic-ui.json","hot-config.json",
         "hot-config-staged.json","hot-config-trial.json","patch-restore.json","last-patch-archive.json",
         "application-trial.json","application-active.json","installed-baseline.json","module-checkpoint.json",
-        "native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json"]
+        "native-safe-mode.json","native-safe-reset-complete.json","device-campaign.json","decision-journal.json","platform-modules.json","platform-deferred-api.json"]
     static let prefixes=["patch-version-","patch-archive-","hot-config-version-","hot-config-recovery-","application-revision-","native-recovery-"]
     @discardableResult static func prepare(_ epoch:PatchReleaseEpoch,disk:Disk)throws->Bool{
         guard epoch.valid else{throw AppError.message("Missing or invalid installed IPA version/build")}

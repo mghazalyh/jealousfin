@@ -62,6 +62,7 @@ struct DynamicUIPageView:View{
 struct DynamicUINodeView:View{
     @EnvironmentObject var model:AppModel
     let node:DynamicUINode
+    @State private var search=""
     private var title:String{node.title ?? ""}
     private var value:String{model.dynamicValue(node.valueKey) ?? node.defaultValue ?? ""}
     private var lower:Double{node.minimum ?? 0}
@@ -128,6 +129,46 @@ struct DynamicUINodeView:View{
         case "picker":
             return AnyView(Picker(title,selection:form){
                 ForEach(node.options ?? []){option in Text(option.title).tag(option.value)}
+            })
+        case "segmented":
+            return AnyView(Picker(title,selection:form){ForEach(node.options ?? []){option in Text(option.title).tag(option.value)}}.pickerStyle(.segmented))
+        case "menu":
+            return AnyView(Picker(title,selection:form){ForEach(node.options ?? []){option in Text(option.title).tag(option.value)}}.pickerStyle(.menu))
+        case "disclosure":
+            return AnyView(DisclosureGroup(title){DynamicUINodes(nodes:node.children ?? [])})
+        case "scroll":
+            return AnyView(ScrollView{DynamicUINodes(nodes:node.children ?? [])}.frame(maxHeight:320))
+        case "searchList":
+            return AnyView(VStack(alignment:.leading){
+                TextField(title.isEmpty ? "Search":title,text:$search).textFieldStyle(.roundedBorder)
+                ScrollView{DynamicUINodes(nodes:(node.children ?? []).filter{search.isEmpty || ($0.title ?? "").localizedCaseInsensitiveContains(search) || ($0.detail ?? "").localizedCaseInsensitiveContains(search)})}.frame(maxHeight:320)
+            })
+        case "table":
+            return AnyView(VStack(alignment:.leading,spacing:6){
+                if !title.isEmpty{Text(title).font(.headline)}
+                ForEach(node.children ?? []){child in DynamicUINodeView(node:child);Divider()}
+            })
+        case "barChart":
+            return AnyView(VStack(alignment:.leading,spacing:8){
+                if !title.isEmpty{Text(title).font(.headline)}
+                ForEach(node.children ?? []){child in
+                    let raw=Double(model.dynamicValue(child.valueKey) ?? child.defaultValue ?? "") ?? 0
+                    let hi=max(1,child.maximum ?? 100)
+                    let fraction=raw.isFinite ? min(1,max(0,raw/hi)):0
+                    VStack(alignment:.leading,spacing:4){
+                        HStack{Text(child.title ?? "");Spacer();Text(raw.isFinite ? String(format:"%.1f",raw):"Unavailable").monospacedDigit()}
+                        GeometryReader{g in ZStack(alignment:.leading){Capsule().fill(Color.secondary.opacity(0.2));Capsule().fill(Color.accentColor).frame(width:g.size.width*CGFloat(fraction))}}.frame(height:8)
+                    }.font(.caption)
+                }
+            })
+        case "banner":
+            return AnyView(Panel{VStack(alignment:.leading){label.font(.headline);if let detail=node.detail{Text(detail).font(.caption)};if !value.isEmpty{Text(value).font(.caption)}}})
+        case "liveBrightness":
+            return AnyView(HStack{
+                Label("Brightness",systemImage:"sun.max").font(.caption)
+                Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0.rounded()))}),in:-10...10,step:1)
+                Text(String(model.videoBrightness)).monospacedDigit()
+                Button("Reset"){model.setVideoBrightness(0)}.buttonStyle(.bordered)
             })
         case "slider":
             return AnyView(VStack(alignment:.leading,spacing:6){

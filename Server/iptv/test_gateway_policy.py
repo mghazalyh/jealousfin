@@ -85,6 +85,22 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(self.req("/LiveTv/Channels")[0],503)
         self.assertEqual(self.req("/Items/"+self.c+"/PlaybackInfo",{})[0],503)
 
+    def test_validated_runtime_reload(self):
+        g=self.g
+        g.CONFIG_FILE.write_text(json.dumps({"revision":"fixture-v2","resourceLimit":600,"resourceTTLSeconds":300,"activeProtectionSeconds":60,"upstreamTimeoutSeconds":5,"sourceSelection":"first"}))
+        self.assertTrue(g.reload_gateway_config(force=True))
+        self.assertEqual(g.RESOURCE_LIMIT,600)
+        self.assertEqual(g.gateway_config["upstreamTimeoutSeconds"],5)
+        self.assertEqual(self.req("/trial-status")[1]["configurationRevision"],"fixture-v2")
+        g.CONFIG_FILE.write_text(json.dumps({"revision":"invalid","upstreamTimeoutSeconds":1}))
+        self.assertFalse(g.reload_gateway_config(force=True))
+        self.assertEqual(g.gateway_config["revision"],"fixture-v2")
+        self.assertIsNotNone(g.config_fault)
+        g.CONFIG_FILE.write_text(json.dumps({"revision":"fixture-v3","resourceLimit":700}))
+        self.assertTrue(g.reload_gateway_config(force=True))
+        self.assertEqual(g.RESOURCE_LIMIT,700)
+        self.assertIsNone(g.config_fault)
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

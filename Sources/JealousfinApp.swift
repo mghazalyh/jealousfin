@@ -17,14 +17,30 @@ private let subdued = Color(red:0.62,green:0.64,blue:0.73)
 }
 struct RootView:View {
     @EnvironmentObject var model:AppModel
+    private var tabs:[DynamicTab]{model.dynamicUI.active?.tabs ?? DynamicTab.defaults}
+    private var visibleTabs:[DynamicTab]{tabs.filter(\.visible)}
+    @ViewBuilder private func content(_ id:Int)->some View{
+        switch id{
+        case 0:PatchableTab("guide.body"){GuideView()}
+        case 1:PlaybackView()
+        case 2:PatchableTab("health.body"){HealthView()}
+        case 3:PatchableTab("insights.body"){InsightsView()}
+        default:EngineeringView()
+        }
+    }
+    private func ensureVisibleTab(){
+        if !visibleTabs.contains(where:{$0.id==model.tab}){model.tab=visibleTabs.first?.id ?? 4}
+    }
     var body:some View{
         TabView(selection:$model.tab){
-            NavigationView{PatchableTab("guide.body"){GuideView()}}.navigationViewStyle(.stack).tabItem{Label("Guide",systemImage:"tv")}.tag(0)
-            NavigationView{PlaybackView()}.navigationViewStyle(.stack).tabItem{Label("Player",systemImage:"play.rectangle")}.tag(1)
-            NavigationView{PatchableTab("health.body"){HealthView()}}.navigationViewStyle(.stack).tabItem{Label("Health",systemImage:"waveform.path.ecg")}.tag(2)
-            NavigationView{PatchableTab("insights.body"){InsightsView()}}.navigationViewStyle(.stack).tabItem{Label("Insights",systemImage:"lightbulb")}.tag(3)
-            NavigationView{EngineeringView()}.navigationViewStyle(.stack).tabItem{Label("More",systemImage:"ellipsis.circle")}.tag(4)
+            ForEach(visibleTabs){tab in
+                NavigationView{content(tab.id)}.navigationViewStyle(.stack)
+                    .tabItem{Label(tab.title,systemImage:tab.symbol)}.tag(tab.id)
+            }
         }
+        .onChange(of:tabs){_ in ensureVisibleTab()}
+        .onChange(of:model.tab){_ in ensureVisibleTab()}
+        .onAppear{ensureVisibleTab()}
         .accentColor(accent)
         .overlay{if model.dynamicPage==nil{DecisionOverlay().environmentObject(model)}}
         .sheet(item:$model.dynamicPage){page in DynamicUIPageView(page:page).environmentObject(model)}

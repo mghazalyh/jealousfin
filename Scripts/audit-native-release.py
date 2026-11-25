@@ -28,6 +28,10 @@ def audit(baseline,review,status=None,gateway=None):
                 errors.append("Unreviewed active revision: "+key+"/"+revision);continue
             if entry.get("disposition")=="gateway" and not (gateway and gateway.get("policyRevision")=="sqlite-policy-v2" and gateway.get("policyReady") is True and gateway.get("policyChannels",0)>0):
                 errors.append("Gateway replacement must be deployed and policy-ready before upgrade: "+revision)
+        modules=status.get("eventModuleRevisions",{})
+        if not isinstance(modules,dict):errors.append("Invalid event module inventory")
+        elif modules:errors.append("Active event modules must be promoted or explicitly retired before installation: "+", ".join(sorted(modules)))
+        if status.get("stagedAPIRevision"):errors.append("Deferred API activation must be resolved before installation")
     return errors
 
 def main():
