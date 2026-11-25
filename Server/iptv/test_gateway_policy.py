@@ -161,6 +161,27 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: Show","releaseInfo":"Now · Different"}))
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: https://fixture.invalid"}))
 
+    def test_catalogue_partial_last_page_and_refresh_retry(self):
+        g=self.g
+        def page(start,count):
+            return {"metas":[{"id":"nltv:"+str(i),"name":"Channel "+str(i)} for i in range(start,start+count)]}
+        with patch.object(g,"provider_json",side_effect=[page(0,100),page(100,100),page(200,99)]) as request:
+            self.assertEqual(len(g.catalogue()),299)
+            self.assertEqual(request.call_count,3)
+        with patch.object(g,"provider_json",return_value={"metas":"invalid"}):
+            with self.assertRaises(ValueError):g.catalogue()
+        def http(code,headers=None):
+            return urllib.error.HTTPError("https://fixture.invalid",code,"fixture",headers or {},None)
+        self.assertEqual(g.programme_retry_delay(http(503),1,1000),("HTTP 503",15))
+        self.assertEqual(g.programme_retry_delay(http(503),2,1000),("HTTP 503",30))
+        self.assertEqual(g.programme_retry_delay(http(503),3,1000),("HTTP 503",60))
+        self.assertEqual(g.programme_retry_delay(http(429),1,1000),("HTTP 429",120))
+        self.assertEqual(g.programme_retry_delay(http(429,{"Retry-After":"180"}),1,1000),("HTTP 429",180))
+        self.assertEqual(g.programme_retry_delay(http(403),1,1000),("HTTP 403",300))
+        self.assertEqual(g.programme_retry_delay(TimeoutError(),1,1000),("TimeoutError",15))
+        self.assertEqual(g.programme_retry_delay(ValueError("incomplete"),1,1000),("ValueError",60))
+        self.assertEqual(g.programme_retry_delay(http(503,{"Retry-After":"Thu, 01 Jan 1970 00:18:20 GMT"}),1,1000),("HTTP 503",100))
+
     def test_dedicated_series_title_requires_explicit_schedule(self):
         g=self.g
         raw={"name":"Rawhide","description":"Now: Rawhide (until 05:00)\nNext: Rawhide at 05:00","releaseInfo":"Now · Rawhide"}

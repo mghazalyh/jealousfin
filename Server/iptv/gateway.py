@@ -1,4 +1,4 @@
-import datetime, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
@@ -288,12 +288,16 @@ def catalogue():
  found={}
  for skip in range(0,10000,100):
   path='/catalog/tv/nltv_channels'+('/skip='+str(skip) if skip else '')+'.json'
-  rows=provider_json(path).get('metas',[])
+  response=provider_json(path)
+  rows=response.get('metas') if isinstance(response,dict) else None
+  if not isinstance(rows,list):raise ValueError('Invalid provider catalogue page')
   if not rows:break
   prior=len(found)
   for row in rows:
-   if isinstance(row.get('id'),str) and row['id'].startswith('nltv:') and isinstance(row.get('name'),str):found[row['id']]=row
-  if len(found)==prior:break
+   if isinstance(row,dict) and isinstance(row.get('id'),str) and row['id'].startswith('nltv:') and isinstance(row.get('name'),str):found[row['id']]=row
+  # The provider catalogue is paginated in groups of 100. A partial final
+  # page is complete; do not make an unnecessary request beyond its end.
+  if len(found)==prior or len(rows)<100:break
  if len(found)<100:raise ValueError('Incomplete channel catalogue')
  return found
 channels={}
@@ -305,6 +309,9 @@ catalogue_fault=None
 programme_rows={}
 programme_observed_at=0.0
 programme_fault=None
+programme_refresh_failures=0
+programme_last_attempt=0.0
+programme_next_attempt=0.0
 PROGRAMME_REFRESH=60
 PROGRAMME_MAX_AGE=150
 # Explicit distributor IDs confirmed in the November 25–26 guide audits.
@@ -680,16 +687,50 @@ def programme_item(cid,row):
   item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
  return item
 
+def programme_retry_delay(error,failures,now=None):
+ # Recover from transient refresh failures while the existing evidence is
+ # still fresh. Rate limits and authorization failures never get fast retries.
+ now=time.time() if now is None else now
+ transient=False
+ retry_after=0.0
+ if isinstance(error,urllib.error.HTTPError):
+  reason='HTTP '+str(error.code)
+  transient=error.code in (408,500,502,503,504)
+  delay=300 if error.code in (401,403) else 120 if error.code==429 else PROGRAMME_REFRESH
+  value=error.headers.get('Retry-After') if error.headers else None
+  if isinstance(value,str):
+   try:
+    retry_after=float(int(value)) if value.isdecimal() and len(value)<=12 else email.utils.parsedate_to_datetime(value).timestamp()-now
+   except (ValueError,TypeError,OverflowError,AttributeError):retry_after=0.0
+  if retry_after>0:return reason,max(delay,retry_after)
+ elif isinstance(error,(TimeoutError,ConnectionError)) or (isinstance(error,urllib.error.URLError) and isinstance(error.reason,(TimeoutError,ConnectionError))):
+  reason=type(error).__name__;transient=True;delay=PROGRAMME_REFRESH
+ else:
+  reason=type(error).__name__;delay=PROGRAMME_REFRESH
+ if transient:delay=min(PROGRAMME_REFRESH,15*2**min(2,max(0,failures-1)))
+ return reason,delay
+
 def programme_worker(stop):
- global programme_fault
- while not stop.wait(PROGRAMME_REFRESH):
+ global programme_fault,programme_refresh_failures,programme_last_attempt,programme_next_attempt
+ delay=PROGRAMME_REFRESH
+ failures=0
+ while True:
+  with lock:programme_next_attempt=time.time()+delay
+  if stop.wait(delay):return
+  with lock:programme_last_attempt=time.time()
   try:
    raw=catalogue()
    if len(raw)<len(sources)*.9:raise ValueError('Incomplete programme refresh')
    update_programmes(raw)
+   failures=0;delay=PROGRAMME_REFRESH
+   with lock:programme_refresh_failures=0
   except Exception as error:
-   with lock:programme_fault=type(error).__name__
-   log('programme refresh failed '+type(error).__name__)
+   failures+=1
+   reason,delay=programme_retry_delay(error,failures)
+   with lock:
+    programme_fault=reason
+    programme_refresh_failures=failures
+   log('programme refresh failed '+reason+'; retry in '+str(round(delay))+'s')
 
 def initialize_catalogue():
  global catalogue_source,catalogue_fault
@@ -836,7 +877,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
