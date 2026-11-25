@@ -1036,9 +1036,9 @@ import CryptoKit
         if !keepSurf{surfPaused=false}
         current=channel;ready=false;playing=false;validated=false;healthSuccessRecorded=false;sustainedEvidence=SustainedPlaybackEvidence();evidencePosition=nil;evidenceTime=nil;intentionallyPaused=false;startedSession=false
         nextRotation=nil;remaining=0;lastAdvance=nil;lastPosition=0
-        if keepSurf && surfPaused && !channel.isSurf{
+        if keepSurf && !channel.isSurf{
             remaining=SurfClock.dwell(configured:effectivePolicy.rotationSeconds)
-            pausedRotationSeconds=remaining
+            if surfPaused{pausedRotationSeconds=remaining}
         }
         trace=UUID().uuidString;startUptime=ProcessInfo.processInfo.systemUptime
         status="Opening \(channel.name)"

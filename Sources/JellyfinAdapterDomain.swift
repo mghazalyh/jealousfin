@@ -33,8 +33,8 @@ struct DeferredAPIActivation:Codable{
     let expectedRevision:String
     let mode:String
     func checked()throws->Self{
-        guard ["when-idle","next-channel","next-cycle"].contains(mode),DynamicUILayout.validID(candidate.id),
-              DynamicUILayout.validID(expectedRevision),candidate.id != expectedRevision,!candidate.source.isEmpty,
+        guard ["when-idle","next-channel","next-cycle"].contains(mode),JellyfinAdapterRules.validRevisionID(candidate.id),
+              JellyfinAdapterRules.validRevisionID(expectedRevision),candidate.id != expectedRevision,!candidate.source.isEmpty,
               candidate.source.utf8.count<=192*1024,candidate.scope==nil || candidate.catalogueOnly else{throw AppError.message("Invalid deferred adapter")}
         return self
     }
@@ -45,6 +45,11 @@ struct JellyfinAdapterStore:Codable{
     var pending=false
 }
 enum JellyfinAdapterRules{
+    // Keep the adapter policy independent of SwiftUI domain types so the
+    // standalone HLS readiness test compiles with only the network domain.
+    static func validRevisionID(_ value:String)->Bool{
+        value.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil
+    }
     static let operations=["authenticate","channels","programs","favorite","playback_info","session_start","session_progress","session_stop","close_stream","health","record","recordings","other"]
     static func operation(_ path:String)->String{
         if path=="Users/AuthenticateByName"{return "authenticate"}

@@ -628,3 +628,9 @@ check((try? DynamicPresentation(fullscreenIconSize:100).checked())==nil,"reject 
 let scheduledYear=Program(id:"p",name:"Scheduled: You're Next (2011)",start:nil,end:nil,channelID:"channel")
 check(scheduledYear.title=="You're Next (2011)","native title strips schedule prefix and preserves year")
 print("PASS: \(checks) assertions including previous rotation, timer and native icon promotion")
+
+check(JellyfinAdapterRules.validRevisionID("fixture-123") && !JellyfinAdapterRules.validRevisionID("../fixture"),"standalone adapter revision identity validation")
+let iconConfig=try HotConfiguration.decode(Data("""
+{"schemaVersion":1,"revision":"icons","presentation":{"fullscreenIconOnly":true,"fullscreenIconSize":29,"fullscreenControlOrder":["rotationToggle","previous","playPause","next","stop","favorite"]}}
+""".utf8))
+check(iconConfig.presentation?.fullscreenIconSize==29 && iconConfig.presentation?.resolvedFullscreenControlOrder==DynamicPresentation.defaultControlOrder,"hot configuration admits icon presentation fields")
