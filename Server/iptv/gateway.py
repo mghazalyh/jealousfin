@@ -396,6 +396,58 @@ GUIDE_MAX_AGE=1800
 guide_rows=({}, {})
 guide_observed_at=0.0
 guide_fault=None
+# Explicitly reviewed distributor channel IDs and exact provider identities.
+# Never infer identity from a fuzzy channel name or use a guide to replace a
+# conflicting primary programme. The single-distributor schedule is evidence,
+# not independent proof of decoded video identity.
+EPISODE_GUIDE_URL='https://i.mjh.nz/PlutoTV/us.xml.gz'
+EPISODE_CHANNELS={
+ 'nltv:us:BeverlyHills90210.us':('Beverly Hills 90210','5f4d83e0a382c00007bc02e7'),
+ 'nltv:us:Andromeda.us':('Andromeda','66c638726838ee00085ac20d'),
+ 'nltv:us:BarRescue.us':('Bar Rescue','60a3d889a5b3690008dc7fe8'),
+ 'nltv:us:BattlestarGalactica.us':('Battlestar Galactica','69d7ebff029c431826bd328e'),
+ 'nltv:us:BlueBloods.us':('Blue Bloods','61b3b8c645b45d0007a9bb8d'),
+ 'nltv:us:Bonanza.us':('Bonanza','68e9913c4a666b9054849832'),
+ 'nltv:us:Cheers.us':('Cheers','6a28827ef4a627f3b07df1ea'),
+ 'nltv:us:CSI.us':('CSI','5efbd29e4aa26700076c0d06'),
+ 'nltv:us:CSIMiami.us':('CSI: Miami','62f54c11b3af68000702c304'),
+ 'nltv:us:CSINY.us':('CSI: NY','62f54c6439183b000769fb8f'),
+ 'nltv:us:DiagnosisMurder.us':('Diagnosis Murder','6a2b0eab9465b98649cd0d2f'),
+ 'nltv:us:Dynasty.us':('Dynasty','64d1606b4c5ed80008e3b8b9'),
+ 'nltv:us:FamilyTies.us':('Family Ties','5f77939a630f530007dde654'),
+ 'nltv:us:FeelGoodDrama.us':('Feel Good Drama','65775af3b3801200084a3aa4'),
+ 'nltv:us:Gunsmoke.us':('Gunsmoke','60f75771dfc72a00071fd0e0'),
+ 'nltv:us:HappyDays.us':('Happy Days','5f7794162a4559000781fc12'),
+ 'nltv:us:Matlock.us':('Matlock','60f754f98185580007eb0754'),
+ 'nltv:us:MidsomerMurders.us':('Midsomer Murders','5cbf6a868a1bce4a3d52a5e9'),
+ 'nltv:us:MissionImpossible.us':('Mission Impossible','5f77977bd924d80007eee60c'),
+ 'nltv:us:Mythbusters.us':('Mythbusters','66e0b4866ad04d0008fff4d8'),
+ 'nltv:us:PerryMason.us':('Perry Mason','6197086891ddd4000739941a'),
+ 'nltv:us:PlutoTVAdventure.us':('Pluto TV Adventure','69d7ebb726eeec84158e28cb'),
+ 'nltv:us:PlutoTVCrimeDrama.us':('Pluto TV Crime Drama','5f31fd1b4c510e00071c3103'),
+ 'nltv:us:PlutoTVHometownDrama.us':('Pluto TV Hometown Drama','69d6c7befde57cd5ba0160c3'),
+ 'nltv:us:PlutoTVSciFi.us':('Pluto TV Sci-Fi','5b4fc274694c027be6ed3eea'),
+ 'nltv:us:Rawhide.us':('Rawhide','634f307c7a068e00072c9982'),
+ 'nltv:us:StarTrekDeepSpaceNine.us':('Star Trek: Deep Space Nine','65c69bbfd77d450008c7ffee'),
+ 'nltv:us:StarTrekTheNextGeneration.us':('Star Trek: The Next Generation','695c32e61ca20bb8ca802eb9'),
+ 'nltv:us:StarTrekVoyager.us':('Star Trek: Voyager','634dacf51d90320007fcd5fa'),
+ 'nltv:us:SupernaturalDrama.us':('Supernatural Drama','5f24662bebe0f0000767de32'),
+ 'nltv:us:TheAddamsFamily.us':('The Addams Family','5d81607ab737153ea3c1c80e'),
+ 'nltv:us:TheRifleman.us':('The Rifleman','5e825550e758c700077b0aef'),
+ 'nltv:us:TheWildWildWest.us':('The Wild Wild West','664e640a0120f40008be4582'),
+ 'nltv:us:ThreesCompany.us':("Three's Company",'5ef3977e5d773400077de284'),
+ 'nltv:us:TVLandDrama.us':('TV Land Drama','5d40bebc5e3d2750a2239d7e'),
+}
+EPISODE_SERIES_IDS={'beverlyhills90210':'tt0098749'}
+EPISODE_CACHE_FILE=ROOT/'programme-episodes.json'
+EPISODE_CACHE_LIMIT=2048
+episode_rows={}
+episode_observed_at=0.0
+episode_fault=None
+episode_lookup_fault=None
+episode_lookup_errors=0
+episode_cache=OrderedDict()
+episode_series_cache=OrderedDict()
 regional_programme=None
 regional_fault=None
 regional_observed_at=0.0
@@ -577,7 +629,10 @@ def parse_guide(data,ids,now):
   if not title or start is None or end is None or not 0<end-start<=86400 or end<=now-60 or start>now+86400:continue
   rows=out.setdefault(key,[])
   if len(rows)>=256:raise ValueError('Guide channel limit exceeded')
-  rows.append((start,end,title,programme_text((p.findtext('desc') or '')[:300]),programme_text(p.findtext('sub-title'))))
+  code=next((x.text for x in p.findall('episode-num') if x.get('system')=='onscreen'),'')
+  match=re.fullmatch(r'S(\d{1,2})E(\d{1,4})',code or '',re.I)
+  numbers=(int(match[1]),int(match[2])) if match and 0<int(match[1])<=99 and 0<int(match[2])<=9999 else None
+  rows.append((start,end,title,programme_text((p.findtext('desc') or '')[:300]),programme_text(p.findtext('sub-title')),numbers))
  return out
 def fetch_guide(url,ids,now):
  req=urllib.request.Request(validate(url),headers={'User-Agent':'Jealousfin-EPG/1.0'})
@@ -614,6 +669,167 @@ def guide_snapshot(now):
   episodes=[r[4] for r in (a[0],b[0]) if len(r)>4 and r[4]]
   out[cid]={'title':ta,'source':'corroborated-external-schedule','observedAt':observed,'start':max(sa,sb),'end':min(ea,eb),'guideSynopsis':' '.join(dict.fromkeys(synopses))[:600],'guideEpisode':episodes[0] if episodes else ''}
  return out
+
+def episode_key(row):
+ return hashlib.sha256(json.dumps([guide_norm(row['title']),guide_norm(row['episodeTitle']),row['guideSeasonNumber'],row['guideEpisodeNumber']],separators=(',',':')).encode()).hexdigest()
+
+def checked_episode(value):
+ if not isinstance(value,dict):return {}
+ season=value.get('seasonNumber');number=value.get('episodeNumber')
+ if type(season) is not int or not 1<=season<=99 or type(number) is not int or not 1<=number<=9999:return {}
+ result={'seasonNumber':season,'episodeNumber':number}
+ year=release_year(value.get('seasonYear'))
+ if year:result['seasonYear']=year
+ return result
+
+def load_episode_cache():
+ try:
+  if not EPISODE_CACHE_FILE.exists():return
+  if EPISODE_CACHE_FILE.stat().st_size>1024*1024:raise ValueError('Episode cache too large')
+  raw=json.loads(EPISODE_CACHE_FILE.read_text())
+  if not isinstance(raw,dict):raise ValueError('Invalid episode cache')
+  now=time.time()
+  with lock:
+   for key,entry in list(raw.items())[-EPISODE_CACHE_LIMIT:]:
+    if isinstance(key,str) and re.fullmatch(r'[a-f0-9]{64}',key) and isinstance(entry,dict) and type(entry.get('expires')) in (int,float) and now<entry['expires']<=now+YEAR_POSITIVE_TTL:
+     episode_cache[key]={'expires':entry['expires'],'value':checked_episode(entry.get('value'))}
+ except (OSError,ValueError,TypeError):log('episode cache ignored')
+
+def episode_snapshot(now,programmes):
+ with lock:
+  observed=episode_observed_at
+  if not 0<=now-observed<=GUIDE_MAX_AGE:return {}
+  mapped=[(cid,EPISODE_CHANNELS[sources[cid]][1]) for cid,c in channels.items() if sources.get(cid) in EPISODE_CHANNELS and c['Name']==EPISODE_CHANNELS[sources[cid]][0]]
+  out={}
+  for cid,gid in mapped:
+   primary=programmes.get(cid)
+   # No title-only guess from a channel name, or substitution for another show.
+   if not primary or primary.get('source')!='provider-catalogue':continue
+   active=[r for r in episode_rows.get(gid,[]) if r[0]<=now<r[1]]
+   if len(active)!=1:continue
+   row=active[0];start,end,title=row[:3]
+   if guide_norm(title_year(primary['title'])[0])!=guide_norm(title_year(title)[0]):continue
+   if len(row)<6 or not row[4] or not row[5]:continue
+   season,number=row[5]
+   item={'episodeTitle':row[4],'guideSeasonNumber':season,'guideEpisodeNumber':number,'episodeSource':'pluto-xmltv','episodeObservedAt':observed,'start':start,'end':end}
+   key=episode_key(dict(primary,**item))
+   entry=episode_cache.get(key)
+   if entry and now<entry['expires']:item.update(checked_episode(entry['value']))
+   out[cid]=item
+  return out
+
+def episode_guide_worker(stop):
+ global episode_rows,episode_observed_at,episode_fault
+ while not stop.is_set():
+  delay=GUIDE_REFRESH
+  try:
+   now=time.time()
+   rows=fetch_guide(EPISODE_GUIDE_URL,{x[1] for x in EPISODE_CHANNELS.values()},now)
+   if not rows:raise ValueError('Empty episode guide')
+   with lock:episode_rows=rows;episode_observed_at=now;episode_fault=None
+  except Exception as error:
+   reason,delay=programme_retry_delay(error,1)
+   delay=max(delay,GUIDE_REFRESH)
+   with lock:episode_fault=reason
+   log('episode guide refresh failed '+reason)
+  if stop.wait(delay):return
+
+def fetch_episode_series(mid):
+ # The entire episode catalogue is bounded, with a larger limit than ordinary
+ # movie detail metadata. Keep only titles, numbers and dates in memory.
+ now=time.time()
+ cached=episode_series_cache.get(mid)
+ if cached and now<cached[0]:
+  episode_series_cache.move_to_end(mid);return cached[1]
+ url=validate(YEAR_API+'/meta/series/'+mid+'.json')
+ req=urllib.request.Request(url,headers={'User-Agent':'Jealousfin-Programme-Metadata/1.0','Accept':'application/json'})
+ with opener.open(req,timeout=8) as f:data=f.read(4*1024*1024+1)
+ if len(data)>4*1024*1024:raise ValueError('Episode metadata response too large')
+ obj=json.loads(data)
+ meta=obj.get('meta') if isinstance(obj,dict) else None
+ if not isinstance(meta,dict) or not isinstance(meta.get('videos'),list):raise ValueError('Invalid series metadata')
+ if len(meta['videos'])>5000:raise ValueError('Episode metadata limit')
+ name=programme_text(meta.get('name'))
+ videos=[]
+ for v in meta['videos']:
+  if not isinstance(v,dict):continue
+  season=v.get('season');number=v.get('episode');title=programme_text(v.get('title') or v.get('name'))
+  if type(season) is not int or not 1<=season<=99 or type(number) is not int or not 1<=number<=9999:continue
+  date=v.get('released')
+  year=None
+  if isinstance(date,str):
+   try:year=release_year(datetime.datetime.fromisoformat(date.replace('Z','+00:00')).year)
+   except ValueError:pass
+  videos.append((season,number,title,year))
+ value=(name,videos)
+ episode_series_cache[mid]=(now+86400,value)
+ episode_series_cache.move_to_end(mid)
+ while len(episode_series_cache)>16:episode_series_cache.popitem(last=False)
+ return value
+
+def resolve_episode(row):
+ series=title_year(row['title'])[0];norm=guide_norm(series)
+ episode=guide_norm(row['episodeTitle'])
+ if len(episode)<4 or re.fullmatch(r'(?:episode|ep|e)\d+',episode):return {}
+ known=EPISODE_SERIES_IDS.get(norm)
+ if known:ids=[known]
+ else:
+  result=lookup_json('/catalog/series/top/search='+urllib.parse.quote(series,safe='')+'.json')
+  metas=result.get('metas')
+  if not isinstance(metas,list):raise ValueError('Invalid series search')
+  ids=list(dict.fromkeys(m['id'] for m in metas if isinstance(m,dict) and isinstance(m.get('id'),str) and re.fullmatch(r'tt\d{5,12}',m['id']) and isinstance(m.get('name'),str) and guide_norm(m['name'])==norm))
+ if not 1<=len(ids)<=4:return {}
+ exact=[];named=[]
+ for mid in ids:
+  name,videos=fetch_episode_series(mid)
+  if guide_norm(name)!=norm:continue
+  for s,e,t,y in videos:
+   if guide_norm(t)!=episode:continue
+   first={v[3] for v in videos if v[0]==s and v[1]==1 and v[3]}
+   result={'seasonNumber':s,'episodeNumber':e}
+   if len(first)==1:result['seasonYear']=next(iter(first))
+   named.append(result)
+   if (s,e)==(row['guideSeasonNumber'],row['guideEpisodeNumber']):exact.append(result)
+ # If distributor numbering differs, correct only a unique canonical title
+ # match across all exact series candidates. Never pick a remake by ranking.
+ if len(exact)==1:return exact[0]
+ if not exact and len(named)==1:return named[0]
+ return {}
+
+def episode_worker(stop):
+ global episode_lookup_fault,episode_lookup_errors
+ load_episode_cache()
+ while not stop.is_set():
+  selected=None
+  try:
+   now=time.time()
+   rows=programme_snapshot(now)
+   with lock:
+    recent=dict(active_channels)
+    for cid,row in sorted(rows.items(),key=lambda item:recent.get(item[0],0),reverse=True):
+     if not row.get('episodeTitle'):continue
+     key=episode_key(row);entry=episode_cache.get(key)
+     if entry and now<entry['expires']:continue
+     selected=(key,row);break
+   if selected:
+    key,row=selected
+    try:
+     value=checked_episode(resolve_episode(row));ttl=YEAR_POSITIVE_TTL if value else YEAR_NEGATIVE_TTL
+     with lock:episode_lookup_fault=None
+    except Exception as error:
+     value={};ttl=YEAR_RETRY_SECONDS
+     with lock:episode_lookup_errors+=1;episode_lookup_fault=year_error_code(error)
+     log('episode lookup deferred '+year_error_code(error))
+    with lock:
+     episode_cache[key]={'expires':time.time()+ttl,'value':value};episode_cache.move_to_end(key)
+     while len(episode_cache)>EPISODE_CACHE_LIMIT:episode_cache.popitem(last=False)
+     snapshot=dict(episode_cache)
+    atomic_json(EPISODE_CACHE_FILE,snapshot)
+   if stop.wait(3 if selected else 15):return
+  except Exception as error:
+   with lock:episode_lookup_fault=year_error_code(error)
+   log('episode worker failed '+year_error_code(error))
+   if stop.wait(60):return
 
 def regional_snapshot(now):
  with lock:
@@ -792,6 +1008,7 @@ def programme_snapshot(now=None):
      for key in ('guideSynopsis','guideEpisode'):
       if evidence.get(key):primary[key]=evidence[key]
     result[cid]=primary
+ for cid,episode in episode_snapshot(now,result).items():result[cid].update(episode)
  return result
 
 def programme_item(cid,row):
@@ -800,14 +1017,22 @@ def programme_item(cid,row):
  title=row['title']
  year=cached_year(row)
  display=title if not year or title_year(title)[1] else title+' ('+str(year)+')'
- evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode')}
+ evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber')}
+ episode=programme_text(row.get('episodeTitle'))
+ if episode:
+  prefix='' if guide_norm(channels.get(cid,{}).get('Name',''))==guide_norm(title_year(title)[0]) else title_year(title)[0]+' — '
+  season=row.get('seasonNumber');number=row.get('episodeNumber')
+  code=f'S{season:02d}E{number:02d}: ' if type(season) is int and type(number) is int else ''
+  season_year=release_year(row.get('seasonYear'))
+  display=prefix+code+episode+(f' ({season_year})' if season_year else '')
  if year:evidence['year']=year
- item={'Id':hashlib.sha256((cid+'\0'+title).encode()).hexdigest()[:32],
+ identity=title if not episode else title+'\0'+episode+'\0'+str(row.get('start',''))
+ item={'Id':hashlib.sha256((cid+'\0'+identity).encode()).hexdigest()[:32],
        'Name':display,'ChannelId':cid,'Type':'Program',
        'JealousfinProgramme':evidence}
  if year:item['ProductionYear']=year
- if row.get('source')=='corroborated-external-schedule':
-  item['Name']='Scheduled: '+display
+ if row.get('source')=='corroborated-external-schedule' or episode:
+  if row.get('source')=='corroborated-external-schedule':item['Name']='Scheduled: '+display
   item['StartDate']=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
   item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
  return item
@@ -1004,7 +1229,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1123,6 +1348,8 @@ def main():
  stop=threading.Event()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
+ epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()
+ episodes=threading.Thread(target=episode_worker,args=(stop,),name='episode-metadata-refresh',daemon=True);episodes.start()
  regional=threading.Thread(target=regional_worker,args=(stop,),name='regional-guide-refresh',daemon=True);regional.start()
  research=threading.Thread(target=discovery_worker,args=(stop,),name='programme-research',daemon=True);research.start()
  years=threading.Thread(target=year_worker,args=(stop,),name='programme-year-refresh',daemon=True);years.start()

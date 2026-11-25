@@ -830,7 +830,9 @@ import CryptoKit
         return p
     }
     var currentProgrammeTitle:String?{
-        guard let title=currentProgramme?.title.trimmingCharacters(in:.whitespacesAndNewlines),!title.isEmpty else{return nil}
+        guard let programme=currentProgramme,let channel=current else{return nil}
+        let title=programme.displayTitle(channelName:channel.name).trimmingCharacters(in:.whitespacesAndNewlines)
+        guard !title.isEmpty else{return nil}
         return title
     }
     var currentFavoriteState:FullscreenFavoriteState{
@@ -1758,7 +1760,11 @@ import CryptoKit
         snapshot["eventModuleCount"]=platformStore.modules.count
         snapshot["eventModuleRevisions"]=Dictionary(uniqueKeysWithValues:platformStore.modules.map{($0.module.id,$0.module.revision)})
         let programme=currentProgramme
-        snapshot["currentProgrammeTitle"]=programme?.title ?? ""
+        snapshot["currentProgrammeTitle"]=currentProgrammeTitle ?? ""
+        snapshot["currentEpisodeTitle"]=programme?.evidence?.episodeTitle ?? ""
+        snapshot["currentSeasonNumber"]=(programme?.evidence?.seasonNumber).map{$0 as Any} ?? NSNull()
+        snapshot["currentEpisodeNumber"]=(programme?.evidence?.episodeNumber).map{$0 as Any} ?? NSNull()
+        snapshot["currentSeasonYear"]=(programme?.evidence?.seasonYear).map{$0 as Any} ?? NSNull()
         snapshot["currentProgrammeYear"]=(programme?.productionYear).map{$0 as Any} ?? NSNull()
         snapshot["nextProgrammeTitle"]=programme?.evidence?.nextTitle ?? ""
         snapshot["programmeSource"]=programme?.evidence?.source ?? ""

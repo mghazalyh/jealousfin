@@ -11,6 +11,15 @@ struct ProgrammeEvidence: Codable, Equatable {
     var providerEndClock:String?
     var providerNextClock:String?
     var year:Int?
+    var episodeTitle:String?=nil
+    var seasonNumber:Int?=nil
+    var episodeNumber:Int?=nil
+    var seasonYear:Int?=nil
+    var episodeSource:String?=nil
+    var episodeObservedAt:Double?=nil
+    static func normalizedTitle(_ value:String)->String{
+        value.lowercased().replacingOccurrences(of:"[^a-z0-9]",with:"",options:.regularExpression)
+    }
     static func clean(_ value:String?,maximum:Int=300)->String?{
         guard let value=value?.trimmingCharacters(in:.whitespacesAndNewlines),!value.isEmpty,
               value.count<=maximum,
@@ -31,6 +40,13 @@ struct ProgrammeEvidence: Codable, Equatable {
         result.providerEndClock=Self.clean(providerEndClock,maximum:16)
         result.providerNextClock=Self.clean(providerNextClock,maximum:16)
         result.year=Self.validYear(year)
+        result.episodeTitle=Self.clean(episodeTitle,maximum:300)
+        if episodeSource != "pluto-xmltv" || result.episodeTitle==nil || episodeObservedAt.map({$0.isFinite && $0>0}) != true{
+            result.episodeTitle=nil;result.episodeSource=nil;result.episodeObservedAt=nil
+        }
+        if result.episodeTitle==nil || !(seasonNumber.map{(1...99).contains($0)} ?? false) || !(episodeNumber.map{(1...9999).contains($0)} ?? false){
+            result.seasonNumber=nil;result.episodeNumber=nil;result.seasonYear=nil
+        }else{result.seasonYear=Self.validYear(seasonYear)}
         return result
     }
     func isFresh(at date:Date)->Bool{
@@ -57,6 +73,17 @@ struct Program: Codable, Identifiable, Equatable {
         let title=p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
         if title.hasPrefix("Scheduled: "){return String(title.dropFirst("Scheduled: ".count))}
         return title
+    }
+    func displayTitle(channelName:String,at now:Date=Date())->String{
+        guard let metadata=evidence?.checked(),let episode=metadata.episodeTitle,
+              let observed=metadata.episodeObservedAt,now.timeIntervalSince1970-observed>=(-30),
+              now.timeIntervalSince1970-observed<=1800,isCurrent(at:now) else{return title}
+        let series=metadata.title.replacingOccurrences(of:" \\(\\d{4}\\)$",with:"",options:.regularExpression)
+        let prefix=ProgrammeEvidence.normalizedTitle(series)==ProgrammeEvidence.normalizedTitle(channelName) ? "" : series+" — "
+        let code:String
+        if let season=metadata.seasonNumber,let number=metadata.episodeNumber{code=String(format:"S%02dE%02d: ",season,number)}
+        else{code=""}
+        return prefix+code+episode+(metadata.seasonYear.map{" ("+String($0)+")"} ?? "")
     }
     var progress: Double? {
         guard let a = start, let b = end, b > a else { return nil }

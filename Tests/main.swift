@@ -714,3 +714,12 @@ check(expandedBrightness.presentation?.clampedVideoBrightness(-50) == -25,"absol
 check((try? DynamicPresentation(videoBrightnessMinimum:-26).checked()) == nil,"invalid brightness minimum rejected")
 check((try? DynamicPresentation(videoBrightnessMaximum:21).checked()) == nil,"invalid brightness maximum rejected")
 print("PASS: \(checks) assertions including configurable brightness range and rendering opacity")
+
+var epEvidence=ProgrammeEvidence(title:"Beverly Hills, 90210",source:"provider-catalogue",observedAt:programmeNow.timeIntervalSince1970,year:1990)
+epEvidence.episodeTitle="Slipping Away";epEvidence.seasonNumber=9;epEvidence.episodeNumber=17;epEvidence.seasonYear=1998;epEvidence.episodeSource="pluto-xmltv";epEvidence.episodeObservedAt=programmeNow.timeIntervalSince1970
+let epProgramme=Program(id:"episode",name:"S09E17: Slipping Away (1998)",start:programmeNow.addingTimeInterval(-60),end:programmeNow.addingTimeInterval(60),channelID:"beverly",productionYear:1990,evidence:epEvidence)
+check(epProgramme.displayTitle(channelName:"Beverly Hills 90210",at:programmeNow)=="S09E17: Slipping Away (1998)","dedicated series omits duplicate name and uses season premiere year")
+check(epProgramme.displayTitle(channelName:"TV Land Drama",at:programmeNow)=="Beverly Hills, 90210 — S09E17: Slipping Away (1998)","mixed channels retain series identity")
+check(!epProgramme.isCurrent(at:programmeNow.addingTimeInterval(61)),"episode expires at broadcast boundary")
+check(try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(epProgramme))==epProgramme,"episode metadata round trip")
+print("PASS: \(checks) assertions including native episode formatting")

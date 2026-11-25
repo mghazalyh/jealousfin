@@ -315,6 +315,31 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertIn(g.year_key({"title":"Broken"}),g.year_retry)
         self.assertIsNone(g.year_fault)
 
+    def test_permanent_episode_matching_and_display(self):
+        g=self.g;now=time.time()
+        sid='nltv:us:BeverlyHills90210.us';name,gid=g.EPISODE_CHANNELS[sid]
+        g.sources[self.c]=sid;g.channels[self.c]['Name']=name
+        g.programme_rows={self.c:{'title':'Beverly Hills, 90210'}}
+        g.programme_observed_at=now
+        g.episode_rows={gid:[(now-30,now+300,'Beverly Hills, 90210','','Slipping Away',(9,17))]}
+        g.episode_observed_at=now
+        row=g.programme_snapshot(now)[self.c]
+        self.assertEqual(row['episodeTitle'],'Slipping Away')
+        self.assertEqual(g.programme_item(self.c,row)['Name'],'Slipping Away')
+        with patch.object(g,'fetch_episode_series',return_value=('Beverly Hills, 90210',[(9,1,'The Morning After',1998),(9,17,'Slipping Away',1999)])):
+            value=g.resolve_episode(row)
+        self.assertEqual(value,{'seasonNumber':9,'episodeNumber':17,'seasonYear':1998})
+        key=g.episode_key(row)
+        g.episode_cache[key]={'expires':now+60,'value':value}
+        row=g.programme_snapshot(now)[self.c]
+        item=g.programme_item(self.c,row)
+        self.assertEqual(item['Name'],'S09E17: Slipping Away (1998)')
+        self.assertEqual(item['JealousfinProgramme']['seasonYear'],1998)
+        self.assertIn('EndDate',item)
+        self.assertNotIn('episodeTitle',g.programme_snapshot(now+301).get(self.c,{}))
+        g.programme_rows[self.c]['title']='Other series'
+        self.assertNotIn('episodeTitle',g.programme_snapshot(now)[self.c])
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

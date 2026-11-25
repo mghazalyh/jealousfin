@@ -82,3 +82,7 @@ Validate on the physical iPad: reload while paused, repeated resume, duration
 change while paused, restart across a previous-channel revisit, single-channel
 automatic dwell expiry, genuine single-channel playback failure, and preserved
 rotation scope and history across release installation.
+
+### Episode metadata promotion
+
+The temporary Beverly Hills catalogue adapter is superseded by permanent reviewed Pluto schedule matching and typed episode evidence. Native displayTitle(channelName:at:) uses season premiere year, canonical episode number and title on one line; omit duplicate series title only on normalized exact channel match. Verify current episode, next boundary, mixed channel prefix, stale/conflicting guide fallback and unchanged playback, rotation and hiatus. Unknown years are omitted. No new IPA required for the gateway's standard Name field; typed native fields take effect in a future build.

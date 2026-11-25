@@ -50,6 +50,14 @@
       "iptv-hiatus-snapshot-1795612090": {
         "disposition": "gateway",
         "evidence": "SQLite policy v2 gateway final eligibility and native snapshot contract; deploy and verify before install"
+      },
+      "beverly-episode-inline-20261126": {
+        "disposition": "gateway",
+        "evidence": "Persistent Pluto XMLTV worker, reviewed explicit source IDs and primary-title agreement; verified Cinemeta episode metadata/season premiere, structured native ProgrammeEvidence and displayTitle, no expiring adapter."
+      },
+      "beverly-season-year-compact-20261126": {
+        "disposition": "gateway",
+        "evidence": "Persistent Pluto XMLTV worker, reviewed explicit source IDs and primary-title agreement; verified Cinemeta episode metadata/season premiere, structured native ProgrammeEvidence and displayTitle, no expiring adapter."
       }
     }
   }
