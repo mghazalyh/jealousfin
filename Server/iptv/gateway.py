@@ -28,7 +28,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
-                 'metadataResearchDailyBudget':12,'metadataResearchTimeoutSeconds':45}
+                 'metadataResearchDailyBudget':12,'metadataResearchTimeoutSeconds':75}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -727,19 +727,35 @@ def discovery_worker(stop):
     known=programme_snapshot(now)
     active={cid for cid,until in active_channels.items() if until>time.monotonic()}
     missing={cid for cid in channels if cid not in known and sources.get(cid)}
-    cid=discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
+    recheck=discovery.choose_recheck(missing,active,now)
+    cid=recheck or discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
     if not cid:continue
     channel=channels[cid]['Name'];provider_id=sources[cid]
     model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
     if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
-    discovery.calls.append(now)
-    discovery.records[cid]={'at':now,'outcome':'started','candidate':opencode_discovery.normalize_result({})}
-    discovery.save(atomic_json);discovery.in_flight=True
+    if recheck:
+     discovery.rechecked[cid]=now
+     previous=dict(discovery.records[cid]['candidate'])
+    else:
+     discovery.calls.append(now)
+     discovery.records[cid]={'at':now,'outcome':'started','candidate':opencode_discovery.normalize_result({})}
+     discovery.save(atomic_json)
+    discovery.in_flight=True
    try:
-    raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout)
-    candidate=opencode_discovery.normalize_result(raw)
+    if recheck:
+     candidate=previous
+    else:
+     raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout)
+     candidate=opencode_discovery.normalize_result(raw)
     checked_at=time.time()
-    row=opencode_discovery.verify_candidate(candidate,channel,provider_id,checked_at,fetch_discovery_page)
+    row=opencode_discovery.verify_candidate(candidate,channel,provider_id,checked_at,fetch_discovery_page,match_title=not recheck)
+    if recheck and not row:
+     # Source pages may be date-specific; return to budgeted research.
+     with lock:
+      discovery.records[cid]['outcome']='unverified'
+      discovery.save(atomic_json)
+     continue
+    if row:candidate=dict(candidate,title=row['title'],year=None)
     with lock:
      discovery.records[cid]={'at':now,'outcome':'verified' if row else 'unverified' if candidate['title'] else 'missing','candidate':candidate}
      if row and gateway_config['metadataResearchEnabled']:discovery.verified[cid]=row
@@ -757,6 +773,9 @@ def discovery_worker(stop):
   except Exception as error:
    with lock:discovery.in_flight=False;discovery.last_fault=type(error).__name__
    log('programme research worker '+type(error).__name__)
+
+def discovery_status():
+ with lock:return dict(discovery.status(time.time(),gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'])
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
@@ -985,7 +1004,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':dict(discovery.status(time.time(),gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled']),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
