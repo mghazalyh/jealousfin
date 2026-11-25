@@ -61,3 +61,28 @@ with tempfile.TemporaryDirectory() as d:
     assert not p.credit_active_session(c,status('e'),now)
     assert not p.credit_active_session(c,{'currentChannelID':'e','playing':True,'metrics':{}},now)
 print('PASS: active sustained evidence, idempotence, newer failure, permanent ban, stale evidence and stalled trace guards')
+
+# Programme telemetry is bounded, distinguishes missing and stale evidence,
+# and cannot create a channel success or failure.
+with tempfile.TemporaryDirectory() as d:
+    c=p.connect(pathlib.Path(d)/'programme.sqlite3')
+    c.execute('INSERT INTO channel(id,name) VALUES(?,?)',('a','A'))
+    now=int(time.time())
+    c.execute('INSERT INTO sessions(trace,cid,opened,confirmed) VALUES(?,?,?,?)',('a1','a',now-20,now-15))
+    status={'currentChannelID':'a','playing':True,'metrics':{'displayReady':'true','rate':'1'},'currentProgrammeTitle':'Example (2020)','currentProgrammeYear':2020,'programmeSource':'provider-catalogue','programmeObservedAt':now-10,'launchID':'launch','systemMetrics':{'buildNumber':'1031'}}
+    assert p.retain_programme(c,status,now)
+    assert not p.retain_programme(c,status,now+5)
+    assert p.retain_programme(c,status,now+30)
+    status['currentProgrammeTitle']=''
+    assert p.retain_programme(c,status,now+31)
+    status['currentProgrammeTitle']='Example'
+    assert p.retain_programme(c,status,now+200)
+    status['programmeObservedAt']=now+201
+    status['programmeSource']='corroborated-external-schedule'
+    assert p.retain_programme(c,status,now+202)
+    assert c.execute('SELECT state,year FROM programme_observations ORDER BY at').fetchall()==[('fresh',2020),('fresh',2020),('missing',None),('stale',2020),('fresh',2020)]
+    assert not p.retain_programme(c,dict(status,playing=False),now+250)
+    assert not p.retain_programme(c,dict(status,currentChannelID='unknown'),now+250)
+    assert not p.retain_programme(c,{k:v for k,v in status.items() if k!='currentProgrammeTitle'},now+250)
+    assert c.execute('SELECT failures,sustained FROM channel').fetchone()==(0,0)
+print('PASS: programme observation freshness, missing titles, deduplication and policy isolation')

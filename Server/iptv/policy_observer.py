@@ -1,6 +1,6 @@
 """Observe Jealousfin events, persist rotation and strict channel health.
 Never controls playback, changes credentials, or contacts an upstream media source."""
-import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys
+import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys, re
 ROOT=pathlib.Path(os.environ.get('JEALOUSFIN_STATE_DIR',str(pathlib.Path(__file__).resolve().parent))).expanduser().resolve()
 DB=ROOT/'policy.sqlite3'
 BASE=os.environ.get('JEALOUSFIN_DEVICE_URL','http://127.0.0.1:8765').rstrip('/')
@@ -21,6 +21,10 @@ def connect(path=DB):
     CREATE INDEX IF NOT EXISTS playback_quality_at ON playback_quality(at);
     CREATE INDEX IF NOT EXISTS playback_quality_channel_at ON playback_quality(cid,at);
     CREATE INDEX IF NOT EXISTS playback_quality_trace_at ON playback_quality(trace,at);
+    CREATE INDEX IF NOT EXISTS sessions_channel_opened ON sessions(cid,opened);
+    CREATE TABLE IF NOT EXISTS programme_observations(at INTEGER NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,title TEXT NOT NULL,year INTEGER,source TEXT NOT NULL,observed_at REAL,state TEXT NOT NULL,PRIMARY KEY(trace,at));
+    CREATE INDEX IF NOT EXISTS programme_observations_at ON programme_observations(at);
+    CREATE INDEX IF NOT EXISTS programme_observations_channel_at ON programme_observations(cid,at);
     """)
     for column in ("approved_at","last_success"):
         if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
@@ -181,6 +185,42 @@ def ingest(c,events,status):
                 'paused':bool(status.get('surfPaused')),'remainingSeconds':max(0,min(86400,int(status.get('remainingSeconds',0)))),
                 'at':time.time()}
         c.execute("INSERT OR REPLACE INTO meta VALUES('surf_resume',?)",(json.dumps(resume,separators=(',',':')),))
+def retain_programme(c,status,now=None):
+    """Record the client-visible programme evidence, not inferred content.
+    Sample once per confirmed session and on changes, otherwise every 30s."""
+    now=int(time.time() if now is None else now)
+    # Legacy clients cannot expose trustworthy typed programme state.
+    if 'currentProgrammeTitle' not in status:return False
+    cid=status.get('currentChannelID')
+    metrics=status.get('metrics',{})
+    if not cid or status.get('playing') is not True or metrics.get('displayReady') not in (True,'true'):return False
+    rate=finite_number(metrics.get('rate'))
+    if rate is None or rate<=0:return False
+    row=c.execute('SELECT trace,confirmed,closed,failed FROM sessions WHERE cid=? ORDER BY opened DESC LIMIT 1',(cid,)).fetchone()
+    if not row or not row[1] or row[1]>now+1 or row[2] or row[3]:return False
+    trace=row[0]
+    def safe_text(value,limit):
+        if not isinstance(value,str) or len(value)>limit or re.search(r'(?i)https?://|api_key=|token=',value):return ''
+        return ' '.join(value.split())
+    title=safe_text(status.get('currentProgrammeTitle'),300)
+    raw_year=status.get('currentProgrammeYear')
+    year=raw_year if type(raw_year) is int and 1888<=raw_year<=dt.datetime.now(dt.timezone.utc).year+1 else None
+    source=safe_text(status.get('programmeSource'),80)
+    observed=finite_number(status.get('programmeObservedAt'))
+    ttl={'provider-catalogue':150,'corroborated-external-schedule':1800}.get(source)
+    # The client may use a standard Jellyfin EPG without typed evidence;
+    # distinguish that from a verified gateway schedule.
+    if not title:state='missing';year=None
+    elif ttl is None or observed is None:state='unverified'
+    elif -5<=now-observed<=ttl:state='fresh'
+    else:state='stale'
+    launch=safe_text(status.get('launchID'),80)
+    build=safe_text(status.get('systemMetrics',{}).get('buildNumber'),32)
+    prior=c.execute('SELECT at,title,year,source,state FROM programme_observations WHERE trace=? ORDER BY at DESC LIMIT 1',(trace,)).fetchone()
+    if prior and now-prior[0]<30 and tuple(prior[1:])==(title,year,source,state):return False
+    c.execute('INSERT OR IGNORE INTO programme_observations VALUES(?,?,?,?,?,?,?,?,?,?)',(now,cid,trace,launch,build,title,year,source,observed,state))
+    return True
+
 def cycle(c):
     status=http('/status')
     events=http('/logs')
@@ -189,10 +229,12 @@ def cycle(c):
             seed(c,json.loads((ROOT/'trial-info.json').read_text()),health())
         ingest(c,events,status)
         now=int(time.time());m=status.get('systemMetrics',{})
+        retain_programme(c,status,now)
         if not c.execute('SELECT 1 FROM samples WHERE at>=?',(now-60,)).fetchone():
             c.execute('INSERT OR REPLACE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision) VALUES(?,?,?,?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel',''),status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision','')))
         c.execute('DELETE FROM observed WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM playback_quality WHERE at<?',(now-30*DAY,))
+        c.execute('DELETE FROM programme_observations WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM samples WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM sessions WHERE closed>0 AND closed<?',(now-30*DAY,))
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(str(now),))
