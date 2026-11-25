@@ -341,6 +341,18 @@ YEAR_NEGATIVE_TTL=6*3600
 YEAR_API='https://v3-cinemeta.strem.io'
 year_fault=None
 year_last_lookup=0.0
+year_errors=0
+year_last_error=None
+year_retry=OrderedDict()
+YEAR_RETRY_SECONDS=900
+
+def year_error_code(error):
+ if isinstance(error,urllib.error.HTTPError):return 'HTTP '+str(error.code)
+ if isinstance(error,json.JSONDecodeError):return 'invalid JSON'
+ if isinstance(error,ValueError):
+  reason=str(error)
+  if reason in ('Metadata response too large','Invalid metadata search','Invalid metadata response','Unsupported upstream URL','Non-public upstream address'):return reason
+ return type(error).__name__
 
 def release_year(value):
  if type(value) is int:year=value
@@ -377,7 +389,9 @@ def lookup_json(path):
  req=urllib.request.Request(validate(YEAR_API+path),headers={'User-Agent':'Jealousfin-Programme-Metadata/1.0','Accept':'application/json'})
  with opener.open(req,timeout=5) as f:data=f.read(512*1024+1)
  if len(data)>512*1024:raise ValueError('Metadata response too large')
- return json.loads(data)
+ result=json.loads(data)
+ if not isinstance(result,dict):raise ValueError('Invalid metadata response')
+ return result
 def evidence_words(value):
  return re.findall(r"[a-z0-9]+",value.casefold()) if isinstance(value,str) else []
 def synopsis_match(synopsis,meta):
@@ -409,16 +423,26 @@ def lookup_year(row):
  synopsis=row.get('guideSynopsis','')
  if not synopsis or not 1<len(candidates)<=6:return None
  positive=[]
+ incomplete=False
  for mid,(kind,year) in candidates.items():
   if not year:continue
   try:
    meta=lookup_json('/meta/'+kind+'/'+mid+'.json').get('meta',{})
    if isinstance(meta,dict) and synopsis_match(synopsis,meta):positive.append(year)
   except urllib.error.HTTPError as error:
-   if error.code!=404:raise
- return positive[0] if len(positive)==1 else None
+   # Do not retry or circumvent denied or missing detail records.
+   # A distinctive matching synopsis/cast is positive identity evidence;
+   # inaccessible alternatives are not evidence of a conflicting match.
+   if error.code not in (403,404,410):raise
+   incomplete=True
+  except ValueError as error:
+   if str(error)!='Metadata response too large':raise
+   incomplete=True
+ if len(positive)==1:return positive[0]
+ if not positive and incomplete:raise ValueError('Incomplete candidate details')
+ return None
 def year_worker(stop):
- global year_fault,year_last_lookup
+ global year_fault,year_last_lookup,year_errors,year_last_error
  load_year_cache()
  while not stop.is_set():
   try:
@@ -430,13 +454,28 @@ def year_worker(stop):
    for cid,row in ordered:
     if cached_year(row,now):continue
     key=year_key(row)
-    with lock:entry=year_cache.get(key)
-    if entry and now<entry['expires']:continue
+    with lock:
+     entry=year_cache.get(key)
+     deferred=year_retry.get(key,0)
+    if (entry and now<entry['expires']) or now<deferred:continue
     selected=(key,row);break
    if selected:
     key,row=selected
-    year=lookup_year(row)
+    try:year=lookup_year(row)
+    except Exception as error:
+     reason=year_error_code(error)
+     if isinstance(error,ValueError) and str(error)=='Incomplete candidate details':reason='Incomplete candidate details'
+     with lock:
+      year_errors+=1;year_last_error={'at':time.time(),'key':key[:12],'reason':reason}
+      year_retry[key]=time.time()+YEAR_RETRY_SECONDS
+      year_retry.move_to_end(key)
+      while len(year_retry)>YEAR_CACHE_LIMIT:year_retry.popitem(last=False)
+      year_last_lookup=time.time();year_fault=None
+     log('programme year deferred '+reason)
+     if stop.wait(3):return
+     continue
     with lock:
+     year_retry.pop(key,None)
      year_cache[key]={'year':year,'expires':now+(YEAR_POSITIVE_TTL if year else YEAR_NEGATIVE_TTL)}
      year_cache.move_to_end(key)
      while len(year_cache)>YEAR_CACHE_LIMIT:year_cache.popitem(last=False)
@@ -444,8 +483,8 @@ def year_worker(stop):
     atomic_json(YEAR_CACHE_FILE,snapshot)
    if stop.wait(3 if selected else 15):return
   except Exception as error:
-   with lock:year_fault=type(error).__name__
-   log('programme year lookup failed '+type(error).__name__)
+   with lock:year_fault=year_error_code(error)
+   log('programme year worker failed '+year_fault)
    if stop.wait(60):return
 
 def guide_norm(value):
@@ -745,7 +784,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})

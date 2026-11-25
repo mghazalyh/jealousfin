@@ -206,6 +206,25 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertIsNone(g.release_year("20261125"))
         self.assertNotIn("guideSynopsis",g.programme_item(self.c,row)["JealousfinProgramme"])
 
+    def test_year_lookup_denied_alternative_and_queue_isolation(self):
+        g=self.g
+        row={"title":"Example","guideSynopsis":"A mysterious family harbors a secret talent for fighting back"}
+        denied=urllib.error.HTTPError("https://fixture.invalid",403,"Forbidden",{},None)
+        results=[{"metas":[{"name":"Example","id":"tt1234567","releaseInfo":"2011"},{"name":"Example","id":"tt7654321","releaseInfo":"2023"}]},{"metas":[]},{"meta":{"description":"The family harbors a secret talent for fighting back."}},denied]
+        with patch.object(g,"lookup_json",side_effect=results):self.assertEqual(g.lookup_year(row),2011)
+        self.assertEqual(g.year_error_code(denied),"HTTP 403")
+        stop=threading.Event()
+        def wait(seconds):
+            if g.year_last_lookup and len(g.year_cache)>=1:return True
+            return False
+        with patch.object(g,"programme_snapshot",return_value={self.a:{"title":"Broken"},self.c:{"title":"Working"}}),patch.object(g,"lookup_year",side_effect=[ValueError("Metadata response too large"),2022]),patch.object(stop,"wait",side_effect=wait):
+            g.year_worker(stop)
+        self.assertEqual(g.cached_year({"title":"Working"}),2022)
+        self.assertEqual(g.year_errors,1)
+        self.assertEqual(g.year_last_error["reason"],"Metadata response too large")
+        self.assertIn(g.year_key({"title":"Broken"}),g.year_retry)
+        self.assertIsNone(g.year_fault)
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2
