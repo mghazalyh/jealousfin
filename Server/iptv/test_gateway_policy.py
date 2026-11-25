@@ -188,6 +188,24 @@ class GatewayAcceptance(unittest.TestCase):
         with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv><tv/>',{"fixture"},now)
         with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv SYSTEM "other.dtd"><tv/>',{"fixture"},now)
 
+    def test_programme_year_matching_and_display(self):
+        g=self.g
+        row={"title":"Example"}
+        with patch.object(g,"lookup_json",side_effect=[{"metas":[{"name":"Example","id":"tt1234567","releaseInfo":"2022"}]},{"metas":[]}]):
+            self.assertEqual(g.lookup_year(row),2022)
+        with patch.object(g,"lookup_json",side_effect=[{"metas":[{"name":"Example","id":"tt1234567","releaseInfo":"2022"},{"name":"Example","id":"tt7654321","releaseInfo":"1995"}]},{"metas":[]}]):
+            self.assertIsNone(g.lookup_year(row))
+        row={"title":"Example","guideSynopsis":"A mysterious family harbors a secret talent for fighting back"}
+        search=[{"metas":[{"name":"Example","id":"tt1234567","releaseInfo":"2011"},{"name":"Example","id":"tt7654321","releaseInfo":"2023"}]},{"metas":[]},{"meta":{"description":"The family harbors a secret talent for fighting back."}},{"meta":{"description":"An unrelated story."}}]
+        with patch.object(g,"lookup_json",side_effect=search):self.assertEqual(g.lookup_year(row),2011)
+        g.year_cache[g.year_key(row)]={"year":2011,"expires":time.time()+60}
+        self.assertEqual(g.programme_item(self.c,row)["Name"],"Example (2011)")
+        self.assertEqual(g.programme_item(self.c,row)["ProductionYear"],2011)
+        self.assertEqual(g.programme_item(self.c,{"title":"Example (2022)"})["Name"],"Example (2022)")
+        self.assertEqual(g.programme_item(self.c,{"title":"Unknown title"})["Name"],"Unknown title")
+        self.assertIsNone(g.release_year("20261125"))
+        self.assertNotIn("guideSynopsis",g.programme_item(self.c,row)["JealousfinProgramme"])
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

@@ -32,6 +32,14 @@
       "fullscreen-now-playing-20261125": {
         "disposition": "native",
         "evidence": "CurrentProgram gateway feed and native fullscreen programme heading use refreshed catalogue with channel fallback; native favorite, rotation, brightness and night controls retained. Upcoming programme title remains a separate enhancement."
+      },
+      "fullscreen-channel-only-20261125": {
+        "disposition": "native",
+        "evidence": "Fullscreen channel-only header and native programme heading; Program.title strips external schedule prefix and preserves server-enriched release year."
+      },
+      "fullscreen-clean-programme-20261125": {
+        "disposition": "native",
+        "evidence": "Fullscreen channel-only header and native programme heading; Program.title strips external schedule prefix and preserves server-enriched release year."
       }
     },
     "jellyfinAPIRevision": {

@@ -8,7 +8,9 @@ struct Program: Codable, Identifiable, Equatable {
     var channelID: String?
     var title: String {
         let p = name.components(separatedBy: " · ")
-        return p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
+        let title=p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
+        if title.hasPrefix("Scheduled: "){return String(title.dropFirst("Scheduled: ".count))}
+        return title
     }
     var progress: Double? {
         guard let a = start, let b = end, b > a else { return nil }
