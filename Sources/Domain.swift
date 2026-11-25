@@ -1,11 +1,57 @@
 import Foundation
 
+// Gateway evidence is optional and backwards-compatible with ordinary Jellyfin
+// and previously persisted catalogue entries. Unknown or stale metadata must
+// never be used as a title, a playback verdict or a rotation decision.
+struct ProgrammeEvidence: Codable, Equatable {
+    var title:String
+    var source:String
+    var observedAt:Double
+    var nextTitle:String?
+    var providerEndClock:String?
+    var providerNextClock:String?
+    var year:Int?
+    static func clean(_ value:String?,maximum:Int=300)->String?{
+        guard let value=value?.trimmingCharacters(in:.whitespacesAndNewlines),!value.isEmpty,
+              value.count<=maximum,
+              value.range(of:"https?://|api_key=|token=",options:[.regularExpression,.caseInsensitive])==nil else{return nil}
+        return value
+    }
+    static func validYear(_ value:Int?)->Int?{
+        guard let value=value,(1870...2100).contains(value) else{return nil}
+        return value
+    }
+    func checked()->Self?{
+        guard let title=Self.clean(title),
+              ["provider-catalogue","corroborated-external-schedule"].contains(source),
+              observedAt.isFinite,observedAt>0 else{return nil}
+        var result=self
+        result.title=title
+        result.nextTitle=source=="provider-catalogue" ? Self.clean(nextTitle):nil
+        result.providerEndClock=Self.clean(providerEndClock,maximum:16)
+        result.providerNextClock=Self.clean(providerNextClock,maximum:16)
+        result.year=Self.validYear(year)
+        return result
+    }
+    func isFresh(at date:Date)->Bool{
+        guard checked() != nil else{return false}
+        let age=date.timeIntervalSince1970-observedAt
+        let maximum:Double=source=="provider-catalogue" ? 150:1800
+        return age>=(-30) && age<=maximum
+    }
+}
+
 struct Program: Codable, Identifiable, Equatable {
     var id: String
     var name: String
     var start: Date?
     var end: Date?
     var channelID: String?
+    var productionYear:Int?=nil
+    var evidence:ProgrammeEvidence?=nil
+    func isCurrent(at now:Date)->Bool{
+        (start.map{$0<=now} ?? true) && (end.map{$0>now} ?? true) && (evidence?.isFresh(at:now) ?? true)
+    }
     var title: String {
         let p = name.components(separatedBy: " · ")
         let title=p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
@@ -345,6 +391,19 @@ struct SurfRotationState: Codable, Equatable {
     // Optional for decoding rotation state from previous IPAs.
     var cycles:[String:Int]?=nil
     var checkpoints:[String:SurfResumeCheckpoint]?=nil
+    // Unlike the visited set, this bounded recency list survives launches
+    // and preserves last-channel navigation without changing cycle membership.
+    var recentHistory:[String:[String]]?=nil
+    mutating func remember(scope:String,id:String){
+        guard !id.isEmpty,id.utf8.count<=128 else{return}
+        var next=recentHistory ?? [:]
+        var history=next[scope] ?? []
+        history.removeAll{$0==id}
+        history.insert(id,at:0)
+        next[scope]=Array(history.prefix(30))
+        recentHistory=next
+    }
+    func recentIDs(scope:String)->[String]{Array((recentHistory?[scope] ?? []).prefix(30))}
     mutating func checkpoint(scope:String,value:SurfResumeCheckpoint){
         var next=checkpoints ?? [:];next[scope]=value;checkpoints=next
     }
@@ -442,6 +501,9 @@ enum SurfCommandSemantics {
     // Never select a removed, currently playing, or policy-excluded channel.
     static func previousID(history:[String],eligible:Set<String>,current:String?)->String?{
         history.first{$0 != current && eligible.contains($0)}
+    }
+    static func retainOnlyChannel(reason:String,eligible:[String],current:String?,healthy:Bool)->Bool{
+        reason=="rotation-deadline" && healthy && eligible.count==1 && eligible.first==current
     }
     static func rotationOwner(surfing:Bool,shared:Bool)->String {
         !surfing ? "none" : (shared ? "server" : "device")

@@ -628,3 +628,75 @@ check((try? DynamicPresentation(fullscreenIconSize:100).checked())==nil,"reject 
 let scheduledYear=Program(id:"p",name:"Scheduled: You're Next (2011)",start:nil,end:nil,channelID:"channel")
 check(scheduledYear.title=="You're Next (2011)","native title strips schedule prefix and preserves year")
 print("PASS: \(checks) assertions including previous rotation, timer and native icon promotion")
+
+check(JellyfinAdapterRules.validRevisionID("fixture-123") && !JellyfinAdapterRules.validRevisionID("../fixture"),"standalone adapter revision identity validation")
+let iconConfig=try HotConfiguration.decode(Data("""
+{"schemaVersion":1,"revision":"icons","presentation":{"fullscreenIconOnly":true,"fullscreenIconSize":29,"fullscreenControlOrder":["rotationToggle","previous","playPause","next","stop","favorite"]}}
+""".utf8))
+check(iconConfig.presentation?.fullscreenIconSize==29 && iconConfig.presentation?.resolvedFullscreenControlOrder==DynamicPresentation.defaultControlOrder,"hot configuration admits icon presentation fields")
+
+ 
+// Fine-grained fullscreen slots coexist with legacy whole-row replacements.
+let componentSlots = DynamicUILayout.fullscreenComponentLocations
+check(componentSlots.count == 16 && Set(componentSlots).count == 16,"all independent fullscreen component slots are unique")
+let componentLayout = DynamicUILayout(schemaVersion:1,revision:"fullscreen-component-fixture",slots:componentSlots.map{DynamicUISlot(location:$0,nodes:[])},pages:[])
+check((try? componentLayout.checked()) != nil,"all fullscreen component locations accepted together")
+let brightnessSlotFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"brightness-slot","slots":[{"location":"player.fullscreen.brightness","nodes":[{"id":"brightness-native","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? brightnessSlotFixture.checked()) != nil,"standalone native brightness accepted")
+let duplicateBrightnessFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"duplicate-brightness","slots":[{"location":"player.fullscreen.brightness","nodes":[{"id":"brightness-child","kind":"liveBrightness"}]},{"location":"player.fullscreen.surf","nodes":[{"id":"brightness-parent","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? duplicateBrightnessFixture.checked()) == nil,"duplicate native brightness rejected across old and new slots")
+let misplacedBrightnessFixture = try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
+{"schemaVersion":1,"revision":"misplaced-brightness","slots":[{"location":"player.fullscreen.countdown","nodes":[{"id":"brightness-wrong","kind":"liveBrightness"}]}],"pages":[]}
+""".utf8))
+check((try? misplacedBrightnessFixture.checked()) == nil,"brightness rejected outside supported slots")
+print("PASS: \(checks) assertions including independent fullscreen components")
+
+let programmeNow=Date(timeIntervalSince1970:1_795_620_000)
+let programmeEvidence=ProgrammeEvidence(title:"  Example film  ",source:"provider-catalogue",observedAt:programmeNow.timeIntervalSince1970-100,nextTitle:"Next film",providerEndClock:"23:16",providerNextClock:nil,year:2011)
+check(programmeEvidence.checked()?.title=="Example film","gateway evidence normalizes title")
+check(programmeEvidence.isFresh(at:programmeNow),"fresh primary programme metadata")
+check(!programmeEvidence.isFresh(at:programmeNow.addingTimeInterval(51)),"primary metadata expires without refresh")
+var externalEvidence=programmeEvidence
+externalEvidence.source="corroborated-external-schedule"
+check(externalEvidence.checked()?.nextTitle==nil,"external current-only schedule cannot invent an upcoming programme")
+check(externalEvidence.isFresh(at:programmeNow.addingTimeInterval(1600)),"external corroborated metadata has its own TTL")
+check(!externalEvidence.isFresh(at:programmeNow.addingTimeInterval(1701)),"external schedule expiry")
+var invalidEvidence=programmeEvidence
+invalidEvidence.title="https://example.invalid/token=secret"
+check(invalidEvidence.checked()==nil,"metadata rejects URL or credential-like title")
+check(ProgrammeEvidence.validYear(42)==nil,"invalid release year rejected")
+let legacyProgramme=try JSONCodec.decoder().decode(Program.self,from:Data("""
+{"id":"legacy","name":"Legacy programme"}
+""".utf8))
+check(legacyProgramme.evidence==nil && legacyProgramme.productionYear==nil && legacyProgramme.isCurrent(at:programmeNow),"previous programme serialization remains compatible")
+let typedProgramme=Program(id:"typed",name:"Scheduled: Example film (2011)",start:nil,end:nil,channelID:nil,productionYear:2011,evidence:programmeEvidence.checked())
+check(typedProgramme.title=="Example film (2011)" && typedProgramme.isCurrent(at:programmeNow),"typed metadata preserves server display title")
+check(!typedProgramme.isCurrent(at:programmeNow.addingTimeInterval(51)),"stale evidence cannot resurrect programme")
+let decodedProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(typedProgramme))
+check(decodedProgramme==typedProgramme,"typed programme evidence round trip")
+print("PASS: \(checks) assertions including programme evidence freshness")
+
+var durableHistory=SurfRotationState()
+durableHistory.record(scope:"server-a",id:"visited")
+for i in 0..<35{durableHistory.remember(scope:"server-a",id:"channel-\(i)")}
+check(durableHistory.recentIDs(scope:"server-a").count==30,"recency history capped")
+durableHistory.remember(scope:"server-a",id:"channel-20")
+check(durableHistory.recentIDs(scope:"server-a").first=="channel-20","explicit revisit moves channel to front")
+check(durableHistory.recentIDs(scope:"server-b").isEmpty,"history isolated by server/account/category")
+check(durableHistory.visited["server-a"]==Set(["visited"]),"navigation history independent of cycle ledger")
+let restoredHistory=try JSONCodec.decoder().decode(SurfRotationState.self,from:JSONCodec.encoder().encode(durableHistory))
+check(restoredHistory==durableHistory,"recent channel history survives release and restart serialization")
+let legacyRotationHistory=try JSONCodec.decoder().decode(SurfRotationState.self,from:Data("""
+{"visited":{"server-a":["visited"]}}
+""".utf8))
+check(legacyRotationHistory.recentIDs(scope:"server-a").isEmpty && legacyRotationHistory.visited["server-a"]==Set(["visited"]),"old unordered visited set preserved without inventing recent order")
+check(SurfCommandSemantics.previousID(history:restoredHistory.recentIDs(scope:"server-a"),eligible:["channel-34","channel-20"],current:"channel-20")=="channel-34","restored Previous skips excluded or current channels")
+check(SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a"],current:"a",healthy:true),"healthy sole eligible channel does not reconnect at dwell expiry")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"manual-next",eligible:["a"],current:"a",healthy:true),"explicit next is not silently swallowed")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a"],current:"a",healthy:false),"unhealthy channel remains subject to failure recovery")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a","b"],current:"a",healthy:true),"normal rotation with alternatives remains intact")
+print("PASS: \(checks) assertions including durable recent history and sole-channel retention")

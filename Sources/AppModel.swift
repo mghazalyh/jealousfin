@@ -821,16 +821,17 @@ import CryptoKit
     func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
     // Prefer the refreshed catalogue over the playback-start copy. An absent
     // programme in a refreshed row must not resurrect the old programme.
-    var currentProgrammeTitle:String?{
+    private var currentProgramme:Program?{
         guard let c=current else{return nil}
         let now=Date()
         let refreshed=channels.first(where:{$0.id==c.id})
         if jelly.gatewayHealth != nil && (refreshed==nil || now.timeIntervalSince(lastRefresh)>180){return nil}
-        guard let p=(refreshed ?? c).program,
-              p.start.map({$0<=now}) ?? true,
-              p.end.map({$0>now}) ?? true else{return nil}
-        let title=p.title.trimmingCharacters(in:.whitespacesAndNewlines)
-        return title.isEmpty ? nil:title
+        guard let p=(refreshed ?? c).program,p.isCurrent(at:now) else{return nil}
+        return p
+    }
+    var currentProgrammeTitle:String?{
+        guard let title=currentProgramme?.title.trimmingCharacters(in:.whitespacesAndNewlines),!title.isEmpty else{return nil}
+        return title
     }
     var currentFavoriteState:FullscreenFavoriteState{
         guard let c=current,!c.isSurf,!currentSharedTransport else{return FullscreenFavoriteState(favorite:nil,pending:false)}
@@ -903,7 +904,8 @@ import CryptoKit
     private var previousEligibleChannel:Channel?{
         guard !usingSharedSurf,!currentSharedTransport,!engineeringOwnsPlayback,jelly.connected,catalogueReady,policyReady,!apiChanging,!loginBusy else{return nil}
         let eligible=surfing ? pool():eligibleChannels
-        guard let id=SurfCommandSemantics.previousID(history:previous.map(\.id),eligible:Set(eligible.map(\.id)),current:current?.id) else{return nil}
+        let history=surfing ? rotationState.recentIDs(scope:rotationScope):previous.map(\.id)
+        guard let id=SurfCommandSemantics.previousID(history:history,eligible:Set(eligible.map(\.id)),current:current?.id) else{return nil}
         return eligible.first{$0.id==id}
     }
     var canGoPrevious:Bool{previousEligibleChannel != nil}
@@ -940,6 +942,19 @@ import CryptoKit
             log("WARN","surf","EMPTY_POOL",["category":settings.surfCategory]);return
         }
         emptyPoolRetry=nil
+        // Do not tear down a healthy stream merely because it is the sole
+        // eligible channel. Manual Next/reconnect and genuine failure recovery
+        // retain their existing behaviour.
+        let healthy=validated && playing && !intentionallyPaused && player.timeControlStatus == .playing &&
+            lastVideoFrameAt.map{Date().timeIntervalSince($0)<=Double(effectivePolicy.stallSeconds)}==true
+        if surfing && !surfPaused && !engineeringOwnsPlayback &&
+            SurfCommandSemantics.retainOnlyChannel(reason:reason,eligible:candidates.map(\.id),current:current?.id,healthy:healthy){
+            remaining=effectivePolicy.rotationSeconds
+            nextRotation=SurfClock.resumed(now:Date(),remaining:remaining)
+            saveSurfCheckpoint(force:true)
+            log("INFO","surf","SOLE_ELIGIBLE_RETAINED",["channelID":current?.id ?? ""])
+            return
+        }
         var cycle=rotationState
         let eligibleIDs=Set(cycle.candidates(scope:rotationScope,ids:candidates.map(\.id),current:current?.id))
         if surfing && !engineeringOwnsPlayback {
@@ -1036,9 +1051,10 @@ import CryptoKit
         if !keepSurf{surfPaused=false}
         current=channel;ready=false;playing=false;validated=false;healthSuccessRecorded=false;sustainedEvidence=SustainedPlaybackEvidence();evidencePosition=nil;evidenceTime=nil;intentionallyPaused=false;startedSession=false
         nextRotation=nil;remaining=0;lastAdvance=nil;lastPosition=0
-        if keepSurf && surfPaused && !channel.isSurf{
+        if keepSurf && !channel.isSurf{
             remaining=SurfClock.dwell(configured:effectivePolicy.rotationSeconds)
-            pausedRotationSeconds=remaining
+            if surfPaused{pausedRotationSeconds=remaining}
+            if !engineeringOwnsPlayback{rotationState.remember(scope:rotationScope,id:channel.id)}
         }
         trace=UUID().uuidString;startUptime=ProcessInfo.processInfo.systemUptime
         status="Opening \(channel.name)"
@@ -1264,7 +1280,14 @@ import CryptoKit
         player.pause();playing=false;saveSurfCheckpoint(force:true);log("INFO","player","PAUSE")
     }
     func resume(){
+        let wasPaused=intentionallyPaused
         intentionallyPaused=false
+        // Repeated play/resume commands must not extend the active dwell or
+        // continually reset the stall evidence clock.
+        if !wasPaused && !retryCurrentAfterResume{
+            if session != nil && player.timeControlStatus == .paused{player.play()}
+            return
+        }
         lastAdvance=Date();lastVideoFrameAt=Date();lastPosition=position
         if retryCurrentAfterResume,let c=current {
             let seconds=pausedRotationSeconds ?? resumeRotationSeconds
@@ -1275,7 +1298,7 @@ import CryptoKit
             }
         } else if session != nil {
             player.play()
-            if surfing && !surfPaused && validated && !usingSharedSurf {
+            if surfing && !surfPaused && validated && !usingSharedSurf && nextRotation==nil && !rotationSelectionPending {
                 nextRotation=SurfClock.resumed(now:Date(),remaining:pausedRotationSeconds ?? effectivePolicy.rotationSeconds)
                 pausedRotationSeconds=nil
             }
@@ -1733,8 +1756,17 @@ import CryptoKit
         snapshot["startupProfileCount"]=startupProfiles.entries.count
         snapshot["eventModuleCount"]=platformStore.modules.count
         snapshot["eventModuleRevisions"]=Dictionary(uniqueKeysWithValues:platformStore.modules.map{($0.module.id,$0.module.revision)})
-        snapshot["currentProgrammeTitle"]=currentProgrammeTitle ?? ""
+        let programme=currentProgramme
+        snapshot["currentProgrammeTitle"]=programme?.title ?? ""
+        snapshot["currentProgrammeYear"]=(programme?.productionYear).map{$0 as Any} ?? NSNull()
+        snapshot["nextProgrammeTitle"]=programme?.evidence?.nextTitle ?? ""
+        snapshot["programmeSource"]=programme?.evidence?.source ?? ""
+        snapshot["programmeObservedAt"]=(programme?.evidence?.observedAt).map{$0 as Any} ?? NSNull()
+        snapshot["programmeProviderEndClock"]=programme?.evidence?.providerEndClock ?? ""
+        snapshot["programmeProviderNextClock"]=programme?.evidence?.providerNextClock ?? ""
         snapshot["previousChannelAvailable"]=canGoPrevious
+        snapshot["recentSurfChannelIDs"]=rotationState.recentIDs(scope:rotationScope)
+        snapshot["recentSurfHistoryLimit"]=30
         snapshot["videoBrightness"]=videoBrightness
         let favoriteState=currentFavoriteState
         snapshot["currentFavorite"]=favoriteState.favorite.map{$0 as Any} ?? NSNull()
@@ -2054,8 +2086,10 @@ import CryptoKit
             guard !surfing || candidate.surfCategory==previous.surfCategory else{throw AppError.message("Use start_surf to change an active category")}
             guard disk.save(candidate,"settings.json") else{throw AppError.message("Cannot persist preferences")}
             settings=candidate
-            if surfing,!surfPaused,!usingSharedSurf,validated,previous.rotationMinutes != settings.rotationMinutes{
+            if surfing,!surfPaused,!intentionallyPaused,!usingSharedSurf,validated,!rotationSelectionPending,previous.rotationMinutes != settings.rotationMinutes{
                 nextRotation=Date().addingTimeInterval(Double(effectivePolicy.rotationSeconds))
+                remaining=effectivePolicy.rotationSeconds
+                saveSurfCheckpoint(force:true)
             }
             if activePatchID=="native-baseline"{
                 player.currentItem?.preferredPeakBitRate=Double(settings.qualityMbps)*1_000_000
@@ -2206,7 +2240,13 @@ import CryptoKit
             if surfPaused{toggleSurfPause()}
         case "set_rotation_minutes":
             guard let n=args["minutes"].flatMap(Int.init),(1...1440).contains(n) else{throw AppError.message("Minutes must be 1–1440")}
-            settings.rotationMinutes=n;saveSettings();if surfing && !surfPaused && validated && !usingSharedSurf{nextRotation=Date().addingTimeInterval(Double(n*60))}
+            let changed=settings.rotationMinutes != n
+            settings.rotationMinutes=n;saveSettings()
+            if changed && surfing && !surfPaused && !intentionallyPaused && validated && !usingSharedSurf && !rotationSelectionPending{
+                remaining=effectivePolicy.rotationSeconds
+                nextRotation=Date().addingTimeInterval(Double(remaining))
+                saveSurfCheckpoint(force:true)
+            }
         case "favorite_current":guard let c=current,!c.isSurf else{throw AppError.message("No underlying channel selected")};try await favorite(c)
         case "favorite_previous":
             guard let id=args["id"],let c=previous.first(where:{$0.id==id}) else{throw AppError.message("Specify an immutable previous channel ID")};try await favorite(c)
@@ -3483,8 +3523,23 @@ extension AppModel {
         case "playback":
             rows=[["id":current?.id ?? "","name":current?.name ?? "","playing":playing,"validated":validated,
                    "position":position.isFinite ? position:0,"metrics":metrics,"brightness":videoBrightness]]
+            if let programme=currentProgramme{rows[0]["programme"]=try platformObject(programme)}
             if let c=current,let profile=startupProfiles.entries[startupProfileKey(c)]{rows[0]["startupProfile"]=try platformObject(profile)}
         case "telemetry":
+            // The common unsorted diagnostic query only needs to serialize its
+            // requested page, not thousands of historical event dictionaries.
+            if q.sort==nil || q.sort=="native"{
+                let term=q.search ?? ""
+                let matching=events.reversed().lazy.filter{e in
+                    guard ["telemetry","validator","recovery"].contains(e.component) else{return false}
+                    return term.isEmpty || [e.id,e.code,e.component].contains{$0.localizedCaseInsensitiveContains(term)}
+                }
+                let total=matching.count
+                let offset=min(q.offset,total)
+                let page=try matching.dropFirst(offset).prefix(q.limit).map{try platformObject($0)}
+                return ["provider":q.provider,"total":total,"offset":offset,"limit":q.limit,
+                        "nextOffset":offset+page.count<total ? offset+page.count:NSNull() as Any,"rows":page]
+            }
             rows=try events.filter{$0.component=="telemetry" || $0.component=="validator" || $0.component=="recovery"}.reversed().map{try platformObject($0)}
         case "gateway":
             if let snapshot=jelly.gatewayHealth{
