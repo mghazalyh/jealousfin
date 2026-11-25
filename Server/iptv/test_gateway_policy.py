@@ -161,6 +161,24 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: Show","releaseInfo":"Now · Different"}))
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: https://fixture.invalid"}))
 
+    def test_dedicated_series_title_requires_explicit_schedule(self):
+        g=self.g
+        raw={"name":"Rawhide","description":"Now: Rawhide (until 05:00)\nNext: Rawhide at 05:00","releaseInfo":"Now · Rawhide"}
+        item=g.parse_programme(raw)
+        self.assertEqual(item,{"title":"Rawhide","nextTitle":"Rawhide","providerEndClock":"05:00","providerNextClock":"05:00"})
+        for row in (
+            {"name":"Rawhide"},
+            {"name":"Rawhide","releaseInfo":"Now · Rawhide"},
+            {"name":"Rawhide","description":"Now: Rawhide"},
+            dict(raw,releaseInfo="Now · Another programme"),
+            dict(raw,description="Now: Rawhide (until 05:00)\nNext: Rawhide at 06:00"),
+            dict(raw,description="Now: Rawhide (until 05:00)"),
+            dict(raw,releaseInfo=""),
+        ):
+            self.assertIsNone(g.parse_programme(row),row)
+        self.assertEqual(g.parse_programme(dict(raw,name="Another channel"))["title"],"Rawhide")
+        self.assertIsNone(g.parse_programme({"name":"Unknown","description":"Now: Unknown (until 05:00)\nNext: Unknown at 05:00","releaseInfo":"Now · Unknown"}))
+
     def test_external_schedule_corroboration_and_precedence(self):
         g=self.g
         now=1795620275
