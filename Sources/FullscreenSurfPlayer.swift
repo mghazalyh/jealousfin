@@ -210,11 +210,11 @@ struct FullscreenSurfPlayer:View {
     private var brightnessControl:some View{
         HStack(spacing:8){
             Label("Brightness",systemImage:"sun.max").font(.caption)
-            Text("−10").font(.caption2)
-            Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0));lastInteraction=Date()}),in:-10...10,step:1)
+            Text(String(model.videoBrightnessRange.lowerBound)).font(.caption2)
+            Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0));lastInteraction=Date()}),in:Double(model.videoBrightnessRange.lowerBound)...Double(model.videoBrightnessRange.upperBound),step:1)
                 .tint(palette.slider)
                 .accessibilityLabel("Video brightness")
-            Text("+10").font(.caption2)
+            Text("+"+String(model.videoBrightnessRange.upperBound)).font(.caption2)
             Text(model.videoBrightness > 0 ? "+"+String(model.videoBrightness):String(model.videoBrightness))
                 .font(.caption.monospacedDigit()).frame(minWidth:25)
             Button{model.setVideoBrightness(0)}label:{Text("Reset").font(.caption).padding(.horizontal,9).frame(minHeight:32)}

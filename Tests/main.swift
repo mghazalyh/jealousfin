@@ -700,3 +700,17 @@ check(!SurfCommandSemantics.retainOnlyChannel(reason:"manual-next",eligible:["a"
 check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a"],current:"a",healthy:false),"unhealthy channel remains subject to failure recovery")
 check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a","b"],current:"a",healthy:true),"normal rotation with alternatives remains intact")
 print("PASS: \(checks) assertions including durable recent history and sole-channel retention")
+
+let brightnessDefaults=DynamicPresentation()
+check(brightnessDefaults.resolvedVideoBrightnessRange == -20...10,"expanded native brightness default")
+check(brightnessDefaults.clampedVideoBrightness(-30) == -20,"default negative brightness clamp")
+check(abs(DynamicPresentation.videoBrightnessOpacity(-20)-0.7)<0.0001,"negative twenty applies real seventy percent black overlay")
+check(abs(DynamicPresentation.videoBrightnessOpacity(-10)-0.35)<0.0001,"legacy brightness scale preserved")
+let expandedBrightness=try HotConfiguration.decode(Data("""
+{"schemaVersion":1,"revision":"brightness-range-fixture","presentation":{"videoBrightnessMinimum":-25,"videoBrightnessMaximum":15}}
+""".utf8))
+check(expandedBrightness.presentation?.resolvedVideoBrightnessRange == -25...15,"brightness range hot configurable")
+check(expandedBrightness.presentation?.clampedVideoBrightness(-50) == -25,"absolute brightness safety clamp")
+check((try? DynamicPresentation(videoBrightnessMinimum:-26).checked()) == nil,"invalid brightness minimum rejected")
+check((try? DynamicPresentation(videoBrightnessMaximum:21).checked()) == nil,"invalid brightness maximum rejected")
+print("PASS: \(checks) assertions including configurable brightness range and rendering opacity")
