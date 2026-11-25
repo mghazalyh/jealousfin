@@ -183,6 +183,35 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(g.programme_retry_delay(ValueError("incomplete"),1,1000),("ValueError",60))
         self.assertEqual(g.programme_retry_delay(http(503,{"Retry-After":"Thu, 01 Jan 1970 00:18:20 GMT"}),1,1000),("HTTP 503",100))
 
+    def test_regional_axn_crime_guide(self):
+        import regional_guide as r
+        import datetime as dt
+        day=dt.date(2026,11,25)
+        first=[(r.epoch(day,"22:00"),"Országúti bosszú","Országúti bosszú",2014),(r.epoch(day+dt.timedelta(days=1),"00:20"),"Next","Next",None)]
+        second=[(r.epoch(day,"22:00"),"Országúti bosszú","The Rover",2014),(r.epoch(day+dt.timedelta(days=1),"02:05"),"Later","Later",None)]
+        now=r.epoch(day,"23:18")
+        row=r.corroborate(first,second,now)
+        self.assertEqual(row["title"],"The Rover (2014)")
+        self.assertEqual(row["end"],first[1][0])
+        self.assertIsNone(r.corroborate(first,second,first[1][0]))
+        self.assertIsNone(r.corroborate(first,[(second[0][0],"Different","Different",2014),second[1]],now))
+        document={"name":"AXN Crime","broadcastDisplayName":"AXN Crime","hasBroadcastEvent":[{"@type":"BroadcastEvent","name":"Országúti bosszú","startDate":"2026-11-25T22:00:00","description":"(2014.) fixture"}]}
+        page="currentDateStr: '2026-11-25', <script type=\"application/ld+json\">"+json.dumps(document)+"</script>"
+        for clock,title in (("22:00","Országúti bosszú"),("00:20","Next")):
+            page+=f"<div onclick=\"loadDetailsVertical(this, 'viasat_film', 1, '{clock}')\"><div class=\"v-time\">{clock}</div><div class=\"v-title\">{title}</div></div>"
+        self.assertEqual(r.mustra(page,day),first)
+        with self.assertRaises(ValueError):r.mustra(page,day+dt.timedelta(days=1))
+        film="<TITLE>TV műsor (AXN Crime - 2026. november 25., szerda)</TITLE><TR><TD VALIGN='TOP'>21:05</TD><TD VALIGN=TOP><B>Before</B></TD></TR><TR><TD VALIGN='TOP'>22:00</TD><TD VALIGN=TOP><B><a href='/fixture'>Országúti bosszú</a></B><BR>(The Rover, 2014)<BR></TD></TR>"
+        self.assertEqual(r.filmkatalogus(film,day)[-1],second[0])
+        g=self.g
+        g.channels[self.c]["Name"]="AXN Crime";g.sources[self.c]=r.PROVIDER_ID
+        g.regional_programme=row
+        self.assertEqual(g.programme_snapshot(now)[self.c]["title"],"The Rover (2014)")
+        g.sources[self.c]="nltv:other:AXNCrime"
+        self.assertNotIn(self.c,g.programme_snapshot(now))
+        g.sources[self.c]=r.PROVIDER_ID
+        self.assertNotIn(self.c,g.programme_snapshot(now+1801))
+
     def test_dedicated_series_title_requires_explicit_schedule(self):
         g=self.g
         raw={"name":"Rawhide","description":"Now: Rawhide (until 05:00)\nNext: Rawhide at 05:00","releaseInfo":"Now · Rawhide"}

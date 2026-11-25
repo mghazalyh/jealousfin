@@ -1,6 +1,7 @@
 import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
+import regional_guide
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -388,6 +389,9 @@ GUIDE_MAX_AGE=1800
 guide_rows=({}, {})
 guide_observed_at=0.0
 guide_fault=None
+regional_programme=None
+regional_fault=None
+regional_observed_at=0.0
 year_cache=OrderedDict()
 YEAR_CACHE_FILE=ROOT/'programme-years.json'
 YEAR_CACHE_LIMIT=2048
@@ -603,6 +607,36 @@ def guide_snapshot(now):
   out[cid]={'title':ta,'source':'corroborated-external-schedule','observedAt':observed,'start':max(sa,sb),'end':min(ea,eb),'guideSynopsis':' '.join(dict.fromkeys(synopses))[:600],'guideEpisode':episodes[0] if episodes else ''}
  return out
 
+def regional_snapshot(now):
+ with lock:
+  row=regional_programme
+  if not row or not 0<=now-row['observedAt']<=regional_guide.MAX_AGE or not row['start']<=now<row['end']:return {}
+  return {cid:dict(row) for cid,c in channels.items() if c['Name']==regional_guide.CHANNEL and sources.get(cid)==regional_guide.PROVIDER_ID}
+
+def fetch_regional_page(url):
+ req=urllib.request.Request(validate(url),headers={'User-Agent':'Jealousfin-EPG/1.0','Accept':'text/html'})
+ with opener.open(req,timeout=8) as f:
+  raw=f.read(2*1024*1024+1)
+  encoding=f.headers.get_content_charset() or 'utf-8'
+ if len(raw)>2*1024*1024:raise ValueError('Regional guide too large')
+ return raw.decode(encoding,errors='strict')
+
+def regional_worker(stop):
+ global regional_programme,regional_fault,regional_observed_at
+ while not stop.is_set():
+  delay=regional_guide.REFRESH
+  try:
+   now=time.time()
+   row=regional_guide.fetch_current(fetch_regional_page,now)
+   with lock:regional_programme=row;regional_observed_at=now;regional_fault=None
+  except Exception as error:
+   reason,delay=programme_retry_delay(error,1)
+   # Use a slow cadence; a rejected public guide is never retried rapidly.
+   delay=max(delay,regional_guide.REFRESH)
+   with lock:regional_fault=reason
+   log('regional programme refresh failed '+reason)
+  if stop.wait(delay):return
+
 def programme_text(value):
  if not isinstance(value,str):return ''
  value=' '.join(value.split())
@@ -658,6 +692,7 @@ def update_programmes(raw,observed=None):
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
  result=guide_snapshot(now)
+ result.update(regional_snapshot(now))
  with lock:
   if 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:
    for cid,row in programme_rows.items():
@@ -879,7 +914,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -998,6 +1033,7 @@ def main():
  stop=threading.Event()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
+ regional=threading.Thread(target=regional_worker,args=(stop,),name='regional-guide-refresh',daemon=True);regional.start()
  years=threading.Thread(target=year_worker,args=(stop,),name='programme-year-refresh',daemon=True);years.start()
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
