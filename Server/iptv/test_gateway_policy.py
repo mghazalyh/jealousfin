@@ -161,6 +161,31 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: Show","releaseInfo":"Now · Different"}))
         self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: https://fixture.invalid"}))
 
+    def test_external_schedule_corroboration_and_precedence(self):
+        g=self.g
+        now=1795620275
+        g.channels[self.c]["Name"]="OuterSphere"
+        a,b=g.GUIDE_CHANNELS["OuterSphere"]
+        g.guide_rows=({a:[(now-60,now+600,"You're Next")]},{b:[(now-59,now+599,"You're Next")]})
+        g.guide_observed_at=now
+        rows=g.programme_snapshot(now)
+        self.assertEqual(rows[self.c]["title"],"You're Next")
+        item=g.programme_item(self.c,rows[self.c])
+        self.assertEqual(item["Name"],"Scheduled: You're Next")
+        self.assertIn("EndDate",item)
+        g.programme_rows={self.c:{"title":"Provider actual"}}
+        g.programme_observed_at=now
+        self.assertEqual(g.programme_snapshot(now)[self.c]["title"],"Provider actual")
+        g.programme_rows={}
+        g.guide_rows=({a:[(now-60,now+600,"You're Next")]},{b:[(now-59,now+599,"Different")]})
+        self.assertNotIn(self.c,g.programme_snapshot(now))
+        g.guide_rows=({a:[(now-60,now+600,"You're Next")]},{b:[(now-59,now+599,"You're Next")]})
+        self.assertNotIn(self.c,g.programme_snapshot(now+601))
+        self.assertNotIn(self.c,g.programme_snapshot(now+1801))
+        raw=b'<tv><programme channel="fixture" start="20261125140000 +0000" stop="20261125160000 +0000"><title>Fixture</title></programme></tv>'
+        self.assertEqual(g.parse_guide(raw,{"fixture"},now)["fixture"][0][2],"Fixture")
+        with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv><tv/>',{"fixture"},now)
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

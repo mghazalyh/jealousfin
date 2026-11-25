@@ -1,4 +1,4 @@
-import datetime, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import datetime, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
@@ -307,6 +307,85 @@ programme_observed_at=0.0
 programme_fault=None
 PROGRAMME_REFRESH=60
 PROGRAMME_MAX_AGE=150
+# Explicit distributor IDs confirmed in the November 25 guide audit.
+# Channel name must match exactly, and two schedules must corroborate.
+# These are schedule listings, not verified content fingerprints.
+GUIDE_CHANNELS={
+ 'OuterSphere':('6a1610bebdf296985fd95603-641496bf238e21f260e7844a','USBD1200007FE'),
+ 'Overtime':('6a1610bebdf296985fd95603-62a388865440744efae8e243','US33000154M'),
+ 'Racer Select':('6a1610bebdf296985fd95603-5f0641d0e8ffda004033aff4','USBD1700019RN'),
+ 'Stadium':('6a1610bebdf296985fd95603-5f6142d2fc6ce20041ec3c92','USAJ3504705A'),
+ 'The Bob Ross Channel':('6a1610bebdf296985fd95603-5efe1de6e0b3f5003f5d9f88','USBD700012OA'),
+ 'This Old House':('6a1610bebdf296985fd95603-62e3232ca105dea9c400e9fe','USBC13000065U'),
+ 'Tiny House Nation':('6a1610bebdf296985fd95603-63c1e176f0f132afc3afbab0','USAJ3400020KC'),
+ 'FIFA+':('6a1610bebdf296985fd95603-66628d4a8dfc36b8c8a399c4','USBD12000255B'),
+ 'NFL Channel':('6a1610bebdf296985fd95603-61e805952502a7a6fa84d70f','US2600007WJ'),
+ '48 Hours':('6a1610bebdf296985fd95603-668561babc1490a2f408f30d','US1000005GY'),
+ 'Dog the Bounty Hunter':('6a1610bebdf296985fd95603-66428faa5116d565e63ae32a','US900002IH'),
+ 'Ebony TV by Lionsgate':('6a1610bebdf296985fd95603-6533de63bd43e1c8b1865152','USBD2500012DH'),
+ 'FilmRise Western':('6a1610bebdf296985fd95603-6449369eb3ff17382cae57fd','USBB32000196O'),
+ 'Gravitas Movies':('6a1610bebdf296985fd95603-5efe1de7e0b3f5003f5d9f8e','USBD700011RE'),
+ 'Home.Made.Nation':('6a1610bebdf296985fd95603-5f74cf82ffbe690040689f47','USAJ3000006X5'),
+}
+GUIDE_URLS=('https://i.mjh.nz/Plex/us.xml.gz','https://i.mjh.nz/SamsungTVPlus/us.xml.gz')
+GUIDE_REFRESH=900
+GUIDE_MAX_AGE=1800
+guide_rows=({}, {})
+guide_observed_at=0.0
+guide_fault=None
+def guide_norm(value):
+ return re.sub(r'[^a-z0-9]','',value.casefold())
+def guide_time(value):
+ try:return datetime.datetime.strptime(value,'%Y%m%d%H%M%S %z').timestamp()
+ except (TypeError,ValueError,OverflowError):return None
+def parse_guide(data,ids,now):
+ if len(data)>40*1024*1024 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():raise ValueError('Unsupported guide document')
+ root=ET.fromstring(data)
+ if root.tag!='tv':raise ValueError('Invalid guide root')
+ out={}
+ for p in root.findall('programme'):
+  key=p.get('channel')
+  if key not in ids:continue
+  start=guide_time(p.get('start'));end=guide_time(p.get('stop'))
+  title=programme_text(p.findtext('title'))
+  if not title or start is None or end is None or not 0<end-start<=86400 or end<=now-60 or start>now+86400:continue
+  rows=out.setdefault(key,[])
+  if len(rows)>=256:raise ValueError('Guide channel limit exceeded')
+  rows.append((start,end,title))
+ return out
+def fetch_guide(url,ids,now):
+ req=urllib.request.Request(validate(url),headers={'User-Agent':'Jealousfin-EPG/1.0'})
+ with opener.open(req,timeout=10) as f:raw=f.read(8*1024*1024+1)
+ if len(raw)>8*1024*1024:raise ValueError('Compressed guide too large')
+ with gzip.GzipFile(fileobj=io.BytesIO(raw)) as f:data=f.read(40*1024*1024+1)
+ return parse_guide(data,ids,now)
+def guide_worker(stop):
+ global guide_rows,guide_observed_at,guide_fault
+ while not stop.is_set():
+  try:
+   now=time.time()
+   parsed=tuple(fetch_guide(url,{ids[i] for ids in GUIDE_CHANNELS.values()},now) for i,url in enumerate(GUIDE_URLS))
+   with lock:guide_rows=parsed;guide_observed_at=now;guide_fault=None
+  except Exception as error:
+   with lock:guide_fault=type(error).__name__
+   log('external programme refresh failed '+type(error).__name__)
+  if stop.wait(GUIDE_REFRESH):return
+def guide_snapshot(now):
+ with lock:
+  observed=guide_observed_at
+  if not 0<=now-observed<=GUIDE_MAX_AGE:return {}
+  first,second=guide_rows
+  mapped=[(cid,GUIDE_CHANNELS[c['Name']]) for cid,c in channels.items() if c['Name'] in GUIDE_CHANNELS]
+ out={}
+ for cid,(aid,bid) in mapped:
+  a=[r for r in first.get(aid,[]) if r[0]<=now<r[1]]
+  b=[r for r in second.get(bid,[]) if r[0]<=now<r[1]]
+  if len(a)!=1 or len(b)!=1:continue
+  sa,ea,ta=a[0];sb,eb,tb=b[0]
+  if guide_norm(ta)!=guide_norm(tb) or abs(sa-sb)>60 or abs(ea-eb)>60:continue
+  if not guide_norm(ta):continue
+  out[cid]={'title':ta,'source':'corroborated-external-schedule','observedAt':observed,'start':max(sa,sb),'end':min(ea,eb)}
+ return out
 
 def programme_text(value):
  if not isinstance(value,str):return ''
@@ -358,17 +437,24 @@ def update_programmes(raw,observed=None):
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
+ result=guide_snapshot(now)
  with lock:
-  if not 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:return {}
-  return {cid:dict(row) for cid,row in programme_rows.items()}
+  if 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:
+   result.update({cid:dict(row,source='provider-catalogue',observedAt=programme_observed_at) for cid,row in programme_rows.items()})
+ return result
 
 def programme_item(cid,row):
  # The provider supplies a title and an unzoned end clock, not a reliable
  # UTC schedule. Keep the standard programme dates absent and expose evidence.
  title=row['title']
- return {'Id':hashlib.sha256((cid+'\0'+title).encode()).hexdigest()[:32],
-         'Name':title,'ChannelId':cid,'Type':'Program',
-         'JealousfinProgramme':dict(row,source='provider-catalogue',observedAt=programme_observed_at)}
+ item={'Id':hashlib.sha256((cid+'\0'+title).encode()).hexdigest()[:32],
+       'Name':title,'ChannelId':cid,'Type':'Program',
+       'JealousfinProgramme':dict(row)}
+ if row.get('source')=='corroborated-external-schedule':
+  item['Name']='Scheduled: '+title
+  item['StartDate']=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
+  item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
+ return item
 
 def programme_worker(stop):
  global programme_fault
@@ -526,7 +612,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -644,6 +730,7 @@ def main():
  (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  stop=threading.Event()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
+ guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
  finally:
