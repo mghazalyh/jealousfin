@@ -28,6 +28,7 @@ def connect(path=DB):
             try:c.execute("ALTER TABLE samples ADD COLUMN "+column+" TEXT DEFAULT ''")
             except sqlite3.OperationalError:
                 if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:raise
+    c.execute('UPDATE channel SET last_attempt=max(last_attempt,last_failure) WHERE last_attempt<last_failure')
     c.commit()
     return c
 def http(path):
@@ -112,7 +113,14 @@ def ingest(c,events,status):
         elif code in ('STOP','PAUSE'):
             c.execute("UPDATE sessions SET closed=?,outcome=CASE WHEN failed=1 THEN 'failed' ELSE 'interrupted' END WHERE trace=? AND closed=0",(at,trace))
     cid=status.get('currentChannelID')
-    if cid and status.get('surfing') and status.get('playing'):c.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(time.time(),cid))
+    # Blank startup snapshots cannot overwrite the last actual Surf channel.
+    if cid and status.get('surfing') and c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():
+        if status.get('playing'):
+            c.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(time.time(),cid))
+        resume={'channelID':cid,'category':status.get('preferences',{}).get('surfCategory','All Channels'),
+                'paused':bool(status.get('surfPaused')),'remainingSeconds':max(0,min(86400,int(status.get('remainingSeconds',0)))),
+                'at':time.time()}
+        c.execute("INSERT OR REPLACE INTO meta VALUES('surf_resume',?)",(json.dumps(resume,separators=(',',':')),))
 def cycle(c):
     status=http('/status')
     events=http('/logs')

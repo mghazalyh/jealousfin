@@ -101,6 +101,35 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(g.RESOURCE_LIMIT,700)
         self.assertIsNone(g.config_fault)
 
+    def test_favorites_persist(self):
+        g=self.g
+        g.set_favorite(self.c,True)
+        g.favorites.clear();g.load_favorites()
+        self.assertIn(self.c,g.favorites)
+        g.set_favorite(self.c,False)
+        g.favorites.clear();g.load_favorites()
+        self.assertNotIn(self.c,g.favorites)
+
+    def test_sequence_segment_cache(self):
+        g=self.g
+        playlist=b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:5,\nsegment.ts\n"
+        with patch.object(g,"validate",side_effect=lambda u:u):
+            first=g.rewrite(playlist,"https://fixture.invalid/live.m3u8",self.c)
+            second=g.rewrite(playlist.replace(b":100",b":101"),"https://fixture.invalid/live.m3u8",self.c)
+            self.assertNotEqual(first,second)
+        rid=next(iter(g.segment_resources))
+        with patch.object(g,"fetch",return_value=(b"fixture",{},200,"https://fixture.invalid/segment.ts")) as fetch:
+            self.assertFalse(g.fetch_media(rid,"https://fixture.invalid/segment.ts",None)[1])
+            self.assertTrue(g.fetch_media(rid,"https://fixture.invalid/segment.ts",None)[1])
+            self.assertEqual(fetch.call_count,1)
+            self.assertFalse(g.fetch_media(rid,"https://fixture.invalid/segment.ts","bytes=0-2")[1])
+        self.assertLessEqual(g.segment_cache_bytes,g.CACHE_BYTES)
+
+    def test_resume_policy(self):
+        with self.g.policy_connect(self.db) as db:
+            db.execute("INSERT INTO meta VALUES('surf_resume',?)",(json.dumps({"channelID":self.c,"category":"All Channels","paused":True,"remainingSeconds":50,"at":time.time()}),))
+        self.assertEqual(self.req("/Jealousfin/Policy")[1]["resume"]["channelID"],self.c)
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

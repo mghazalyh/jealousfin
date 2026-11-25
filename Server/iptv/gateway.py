@@ -1,5 +1,5 @@
-import sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
-from collections import OrderedDict
+import http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+from collections import OrderedDict, deque
 from pathlib import Path
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
@@ -30,6 +30,15 @@ config_fingerprint=None
 config_checked_at=0.0
 config_fault=None
 resource_correlation={}
+resource_keys={}
+segment_resources=set()
+segment_cache=OrderedDict()
+segment_cache_bytes=0
+segment_flights={}
+quality=OrderedDict()
+CACHE_BYTES=64*1024*1024
+CACHE_TTL=45
+MAX_SEGMENT=8*1024*1024
 def validate_gateway_config(raw):
  if not isinstance(raw,dict) or set(raw)-set(CONFIG_DEFAULTS):raise ValueError('Unknown gateway configuration fields')
  result=dict(CONFIG_DEFAULTS,**raw)
@@ -76,6 +85,31 @@ def request_correlation(value):
  return value if isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}',value) else uuid.uuid4().hex
 counts={}
 favorites=set()
+FAVORITES_FILE=ROOT/'favorites.json'
+
+def atomic_json(path,value):
+ temp=path.with_name(path.name+'.tmp-'+uuid.uuid4().hex)
+ try:
+  with os.fdopen(os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as f:
+   json.dump(value,f,separators=(',',':'));f.flush();os.fsync(f.fileno())
+  os.replace(temp,path)
+ finally:
+  if temp.exists():temp.unlink()
+
+def load_favorites():
+ if not FAVORITES_FILE.exists():return
+ data=json.loads(FAVORITES_FILE.read_text())
+ if not isinstance(data,list) or any(not isinstance(x,str) or not re.fullmatch(r'[a-f0-9]{32}',x) for x in data):raise ValueError('Invalid favorites state')
+ favorites.clear();favorites.update(data)
+
+def set_favorite(cid,value):
+ with lock:
+  updated=set(favorites)
+  if value:updated.add(cid)
+  else:updated.discard(cid)
+  atomic_json(FAVORITES_FILE,sorted(updated))
+  favorites.clear();favorites.update(updated)
+
 def log(msg):
  print(time.strftime('%Y-%m-%dT%H:%M:%S'),msg,flush=True)
 def validate(url):
@@ -104,8 +138,74 @@ def fetch(url,limit,range_header=None):
   except urllib.error.HTTPError as error:
    if attempt>=config['upstreamRetries'] or error.code not in (408,429,500,502,503,504):raise
    error.close()
-  except (urllib.error.URLError,TimeoutError):
+  except (urllib.error.URLError,TimeoutError,http.client.IncompleteRead,ConnectionError):
    if attempt>=config['upstreamRetries']:raise
+def remove_resource(rid):
+ global segment_cache_bytes
+ entry=resources.pop(rid,None)
+ if entry:reverse.pop(resource_keys.pop(rid,entry),None)
+ resource_touched.pop(rid,None);resource_correlation.pop(rid,None);segment_resources.discard(rid)
+ cached=segment_cache.pop(rid,None)
+ if cached:segment_cache_bytes-=len(cached[1][0])
+
+def expire_cache(now):
+ global segment_cache_bytes
+ for rid,(expires,result) in list(segment_cache.items()):
+  if expires<=now or segment_cache_bytes>CACHE_BYTES:
+   segment_cache.pop(rid);segment_cache_bytes-=len(result[0])
+
+def fetch_media(rid,url,rg):
+ # Cache only explicitly sequenced complete media segments, not keys or playlists.
+ global segment_cache_bytes
+ if rg:return fetch(url,MAX_BODY,rg),False
+ with lock:
+  eligible=rid in segment_resources
+  if eligible:
+   expire_cache(time.monotonic())
+   cached=segment_cache.get(rid)
+   if cached:segment_cache.move_to_end(rid);return cached[1],True
+   flight=segment_flights.get(rid)
+   leader=flight is None
+   if leader:flight=threading.Event();segment_flights[rid]=flight
+ if not eligible:return fetch(url,MAX_BODY,rg),False
+ if not leader:
+  flight.wait(timeout=min(30,gateway_config['upstreamTimeoutSeconds']*(1+gateway_config['upstreamRetries'])+1))
+  with lock:
+   cached=segment_cache.get(rid)
+   if cached and cached[0]>time.monotonic():return cached[1],True
+  return fetch(url,MAX_BODY,rg),False
+ try:
+  result=fetch(url,MAX_BODY,rg)
+  data,headers,status,final=result
+  if status==200 and 0<len(data)<=MAX_SEGMENT and not data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
+   with lock:
+    if rid in segment_resources and rid not in segment_cache:
+     segment_cache[rid]=(time.monotonic()+CACHE_TTL,result);segment_cache_bytes+=len(data);expire_cache(time.monotonic())
+  return result,False
+ finally:
+  with lock:
+   segment_flights.pop(rid,None);flight.set()
+
+def record_delivery(cid,kind,elapsed,size,cache_hit=False,error=False):
+ with lock:
+  if cid not in quality:quality[cid]=deque(maxlen=128)
+  quality.move_to_end(cid)
+  quality[cid].append((kind,round(elapsed*1000,1),size,bool(cache_hit),bool(error)))
+  while len(quality)>300:quality.popitem(last=False)
+
+def quality_summary():
+ with lock:
+  result={}
+  for cid,rows in quality.items():
+   segments=[r for r in rows if r[0]=='segment']
+   successful=[r for r in segments if not r[4]]
+   times=sorted(r[1] for r in successful)
+   result[cid]={'segmentSamples':len(segments),'segmentErrors':sum(r[4] for r in segments),
+                'cacheHits':sum(r[3] for r in segments),'segmentP50Ms':times[len(times)//2] if times else None,
+                'segmentP95Ms':times[min(len(times)-1,int(.95*len(times)))] if times else None,
+                'segmentMaxMs':max(times) if times else None,'segmentBytes':sum(r[2] for r in successful)}
+  return result
+
 def evict_resources(now,required=0):
  # Idle expiry plus LRU under pressure. Protect active-channel media touched
  # recently; if all slots are protected, reject growth rather than corrupt playback.
@@ -113,30 +213,45 @@ def evict_resources(now,required=0):
   age=now-resource_touched.get(rid,0)
   active=active_channels.get(cid,0)>now and age<gateway_config['activeProtectionSeconds']
   if not active and (age>RESOURCE_TTL or len(resources)+required>RESOURCE_LIMIT):
-   resources.pop(rid,None);resource_touched.pop(rid,None);resource_correlation.pop(rid,None);reverse.pop((cid,url),None)
+   remove_resource(rid)
  for cid,until in list(active_channels.items()):
   if until<=now:active_channels.pop(cid,None)
-def register(url,cid,correlation=None):
+def register(url,cid,correlation=None,identity=None):
  validate(url)
  with lock:
-  key=(cid,url);now=time.monotonic()
+  key=(cid,url) if identity is None else (cid,url,identity);now=time.monotonic()
   if key in reverse and reverse[key] in resources:
    rid=reverse[key];resources.move_to_end(rid)
   else:
    if len(resources)>=RESOURCE_LIMIT:evict_resources(now,1)
    if len(resources)>=RESOURCE_LIMIT:raise RuntimeError("Resource registry saturated")
-   rid=secrets.token_hex(16);resources[rid]=key;reverse[key]=rid
+   rid=secrets.token_hex(16);resources[rid]=(cid,url);reverse[key]=rid;resource_keys[rid]=key
+   if identity is not None:segment_resources.add(rid)
   resource_touched[rid]=now
   if correlation:resource_correlation[rid]=correlation
  return '/media/'+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
 def rewrite(data,base,cid,correlation=None):
  text=data.decode('utf-8-sig')
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
- out=[]
+ out=[];sequence=None;discontinuity=0;segment=False;byterange=False
  for line in text.splitlines():
   if line.startswith('#'):
+   if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+    try:sequence=int(line.split(':',1)[1])
+    except ValueError:sequence=None
+   elif line.startswith('#EXT-X-DISCONTINUITY-SEQUENCE:'):
+    try:discontinuity=int(line.split(':',1)[1])
+    except ValueError:discontinuity=0
+   elif line=='#EXT-X-DISCONTINUITY':discontinuity+=1
+   elif line.startswith('#EXTINF:'):segment=True
+   elif line.startswith('#EXT-X-BYTERANGE:'):byterange=True
    line=re.sub(r'URI="([^"]+)"',lambda m:'URI="'+register(urllib.parse.urljoin(base,m[1]),cid,correlation)+'"',line)
-  elif line.strip():line=register(urllib.parse.urljoin(base,line.strip()),cid,correlation)
+  elif line.strip():
+   absolute=urllib.parse.urljoin(base,line.strip())
+   identity=(base,discontinuity,sequence) if segment and sequence is not None and not byterange else None
+   line=register(absolute,cid,correlation,identity)
+   if segment and sequence is not None:sequence+=1
+   segment=False;byterange=False
   out.append(line)
  return ('\n'.join(out)+'\n').encode()
 def provider():
@@ -205,10 +320,10 @@ def record_attempt(cid):
  with lock:
   updated={'schemaVersion':1,'sequence':rotation['sequence']+1,'attemptOrder':dict(rotation['attemptOrder'])}
   updated['attemptOrder'][cid]=updated['sequence']
-  temp=ROTATION_FILE.with_suffix('.tmp')
-  temp.write_text(json.dumps(updated,separators=(',',':')))
-  os.replace(temp,ROTATION_FILE)
+  atomic_json(ROTATION_FILE,updated)
   rotation.update(updated)
+ with policy_connect(ROOT/'policy.sqlite3') as db:
+  db.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(time.time(),cid))
 def policy_rows():
  # No false readiness marker or silent fail-open when policy storage fails.
  with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
@@ -218,7 +333,7 @@ def policy_rows():
   approval="approved_at" if "approved_at" in columns else "0"
   success="last_success" if "last_success" in columns else "0"
   rows=db.execute("SELECT id,last_attempt,hiatus_until,banned,failures,last_failure,reason,sustained,"+approval+","+success+" FROM channel").fetchall()
- result={r[0]:dict(lastAttempt=r[1],hiatusUntil=r[2],banned=bool(r[3]),failures=r[4],lastFailure=r[5],reason=r[6],successes=r[7],approvedAt=r[8],lastSuccess=r[9]) for r in rows if r[0] in channels}
+ result={r[0]:dict(lastAttempt=max(r[1],r[5]),hiatusUntil=r[2],banned=bool(r[3]),failures=r[4],lastFailure=r[5],reason=r[6],successes=r[7],approvedAt=r[8],lastSuccess=r[9]) for r in rows if r[0] in channels}
  if not set(channels).issubset(result):raise RuntimeError("Policy catalogue incomplete")
  return result
 def policy_eligible(row,now):
@@ -229,7 +344,10 @@ def ordered_catalogue(snapshot,include_excluded=False):
 def policy_payload(snapshot):
  with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
   days,ban=policy_penalty(db)
- return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban}}
+  row=db.execute("SELECT value FROM meta WHERE key='surf_resume'").fetchone()
+  resume=json.loads(row[0]) if row else None
+  if not isinstance(resume,dict) or resume.get('channelID') not in snapshot:resume=None
+ return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
 def policy_event(cid,trace,action,reason):
  with policy_connect(ROOT/'policy.sqlite3') as db:
   if not db.execute("SELECT 1 FROM channel WHERE id=?",(cid,)).fetchone():raise ValueError("Unknown policy channel")
@@ -292,7 +410,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -308,25 +426,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
     if entry:
      now=time.monotonic()
      if now-resource_touched.get(rid,0)>RESOURCE_TTL:
-      resources.pop(rid,None);reverse.pop(entry,None);resource_touched.pop(rid,None);resource_correlation.pop(rid,None);entry=None
+      remove_resource(rid);entry=None
      else:
       resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+gateway_config['activeProtectionSeconds']
       correlation=resource_correlation.get(rid,correlation)
    if not entry:return self.reply(404,{})
    cid,url=entry
+   started=time.monotonic();kind='segment' if rid in segment_resources else 'other'
    try:
     rg=self.headers.get('Range')
     if rg and not re.fullmatch(r'bytes=\d*-\d*',rg):return self.reply(416,{})
-    data,headers,status,final=fetch(url,MAX_BODY,rg)
+    (data,headers,status,final),cache_hit=fetch_media(rid,url,rg)
+    record_delivery(cid,kind,time.monotonic()-started,len(data),cache_hit)
     if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
      if len(data)>MAX_PLAYLIST:return self.reply(502,{})
      return self.reply(200,rewrite(data,final,cid,correlation),'application/vnd.apple.mpegurl')
     extra={k:headers[k] for k in ('Content-Range','Accept-Ranges') if headers.get(k)}
     return self.reply(status,data,headers.get('Content-Type','application/octet-stream'),extra)
    except urllib.error.HTTPError as e:
-    record_source_error(cid,url,'media','HTTP '+str(e.code),correlation);log('upstream HTTP '+str(e.code));return self.reply(502,{})
+    record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'media','HTTP '+str(e.code),correlation);log('upstream HTTP '+str(e.code));return self.reply(502,{})
    except Exception as e:
-    record_source_error(cid,url,'media',type(e).__name__,correlation);log('upstream failure '+type(e).__name__);return self.reply(502,{})
+    record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'media',type(e).__name__,correlation);log('upstream failure '+type(e).__name__);return self.reply(502,{})
   if not self.authorized(q):return self.reply(401,{})
   if path in ('/LiveTv/Channels','/Jealousfin/Policy'):
    try:snapshot=policy_rows()
@@ -375,9 +495,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
    return self.reply(200,{})
   m=re.fullmatch(r'/Users/[^/]+/FavoriteItems/([a-f0-9]{32})',path)
   if m and m[1] in channels:
-   with lock:
-    if self.command=='DELETE':favorites.discard(m[1])
-    else:favorites.add(m[1])
+   if self.command not in ('POST','DELETE'):return self.reply(405,{})
+   set_favorite(m[1],self.command=='POST')
    return self.reply(200,{})
   return self.reply(404,{})
  def do_GET(self):
@@ -394,6 +513,7 @@ def main():
  PROVIDER=provider()
  reload_gateway_config(force=True)
  initialize_catalogue()
+ load_favorites()
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  log('READY channels='+str(len(channels)))

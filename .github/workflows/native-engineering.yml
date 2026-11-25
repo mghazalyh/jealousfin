@@ -18,6 +18,17 @@ concurrency:
   group: native-engineering-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated gateway acceptance
+        run: |
+          python3 Server/iptv/test_policy_observer.py
+          python3 Server/iptv/test_policy_snapshot.py
+          python3 Server/iptv/test_gateway_policy.py
+          python3 Server/iptv/test_endurance_acceptance.py
   native:
     runs-on: macos-15
     timeout-minutes: 25

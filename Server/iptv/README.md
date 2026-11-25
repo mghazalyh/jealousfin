@@ -15,7 +15,7 @@ Run gateway.py and policy_observer.py as separate managed processes. Do not expo
 
 An optional local hiatus-seed.json in the state directory may contain an array of objects with id, at (ISO 8601), reason. Never commit deployment-specific data or secrets. The native app's record_channel_failure command requires explicit approval. Gateway filtering is independent of native health accounting; the client's hiatus screen only shows native ledger entries. Native and gateway exclusions may overlap.
 
-Run python3 test_policy_observer.py for isolated policy checks. The first successful startup does not prove sustained playback. The observer can miss old events that have already rotated out of the device log window. It uses observed terminal failures, not individual retry errors, to avoid penalizing an otherwise successful session. A policy database outage leaves the last loaded catalogue policy active in the gateway.
+Run python3 test_policy_observer.py for isolated policy checks. The first successful startup does not prove sustained playback. The observer can miss old events that have already rotated out of the device log window. It uses observed terminal failures, not individual retry errors, to avoid penalizing an otherwise successful session. A policy database outage fails closed; do not install a new IPA until policy readiness is verified.
 
 ## Future iOS deployment
 
@@ -34,3 +34,9 @@ The new gateway requires an initialized complete SQLite catalogue, fails closed 
 ## Runtime configuration reload
 
 After deploying the reviewed gateway, place a validated `gateway-runtime.json` in its existing state directory using atomic replacement and a new revision. The gateway retains the last accepted configuration on invalid input and reports the active revision and fault via /trial-status. See [the ABI 3 contract](../../docs/hotpatch-platform-abi3.md#gateway) for allowed fields, bounds, and deployment limitations.
+
+## Restart-safe quality and rotation
+
+Gateway favorites are persisted atomically in private `favorites.json`; migration from a legacy gateway must export the full authenticated favorites catalogue before stopping it, and retain the original token, account/server ID and login credentials. Keep a consistent SQLite backup and checkpoint the current channel/category/pause/countdown. Existing attempt history is preserved. A legacy client requires a same-channel reload after a controlled gateway restart; opaque media handles are not portable across processes.
+
+Explicitly sequenced complete HLS segments can be coalesced and cached for 45 seconds, with a 64 MiB global cap and 8 MiB item cap. Manifests, keys, byte ranges and unsequenced resources bypass caching. Private status exposes bounded per-channel delivery latency samples, errors and cache hits. This is delivery telemetry, not decoded frame cadence measurement, and does not transcode the stream.
