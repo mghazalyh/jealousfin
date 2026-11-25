@@ -75,9 +75,11 @@ struct Program: Codable, Identifiable, Equatable {
         return title
     }
     func displayTitle(channelName:String,at now:Date=Date())->String{
-        guard let metadata=evidence?.checked(),let episode=metadata.episodeTitle,
-              let observed=metadata.episodeObservedAt,now.timeIntervalSince1970-observed>=(-30),
-              now.timeIntervalSince1970-observed<=1800,isCurrent(at:now) else{return title}
+        guard let metadata=evidence?.checked(),let episode=metadata.episodeTitle else{return title}
+        guard let observed=metadata.episodeObservedAt,now.timeIntervalSince1970-observed>=(-30),
+              now.timeIntervalSince1970-observed<=1800,isCurrent(at:now) else{
+            return metadata.title+(metadata.year.map{metadata.title.hasSuffix(" ("+String($0)+")") ? "" : " ("+String($0)+")"} ?? "")
+        }
         let series=metadata.title.replacingOccurrences(of:" \\(\\d{4}\\)$",with:"",options:.regularExpression)
         let prefix=ProgrammeEvidence.normalizedTitle(series)==ProgrammeEvidence.normalizedTitle(channelName) ? "" : series+" — "
         let code:String

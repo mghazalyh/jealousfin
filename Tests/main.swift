@@ -721,5 +721,6 @@ let epProgramme=Program(id:"episode",name:"S09E17: Slipping Away (1998)",start:p
 check(epProgramme.displayTitle(channelName:"Beverly Hills 90210",at:programmeNow)=="S09E17: Slipping Away (1998)","dedicated series omits duplicate name and uses season premiere year")
 check(epProgramme.displayTitle(channelName:"TV Land Drama",at:programmeNow)=="Beverly Hills, 90210 — S09E17: Slipping Away (1998)","mixed channels retain series identity")
 check(!epProgramme.isCurrent(at:programmeNow.addingTimeInterval(61)),"episode expires at broadcast boundary")
-check(try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(epProgramme))==epProgramme,"episode metadata round trip")
+let decodedEpisodeProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(epProgramme))
+check(decodedEpisodeProgramme==epProgramme,"episode metadata round trip")
 print("PASS: \(checks) assertions including native episode formatting")

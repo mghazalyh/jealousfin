@@ -336,7 +336,9 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(item['Name'],'S09E17: Slipping Away (1998)')
         self.assertEqual(item['JealousfinProgramme']['seasonYear'],1998)
         self.assertIn('EndDate',item)
+        g.programme_observed_at=now+301
         self.assertNotIn('episodeTitle',g.programme_snapshot(now+301).get(self.c,{}))
+        g.programme_observed_at=now
         g.programme_rows[self.c]['title']='Other series'
         self.assertNotIn('episodeTitle',g.programme_snapshot(now)[self.c])
 
