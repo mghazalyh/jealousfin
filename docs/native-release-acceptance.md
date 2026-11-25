@@ -52,3 +52,33 @@ acceptance must confirm that recovery, exit and reveal remain accessible
 under the chosen configuration. Engineering CI also executes the exact
 standalone HLS compilation and test command from the IPA workflow, without
 producing an IPA.
+
+
+### Durable history, programme evidence and countdown acceptance
+
+Surf retains a bounded, scope-specific recency history independently of the
+unordered cycle ledger. Previous deliberately behaves as a television
+last-channel toggle, not a browser history cursor; the target is resolved
+from the refreshed eligible pool. A legacy unordered visited set is preserved
+but cannot reconstruct a historical ordering. A healthy validated stream that
+is the sole eligible channel remains connected at automatic dwell expiry.
+Manual Next and actual failures still take their normal paths.
+
+Repeated playback resume must not reset the active deadline or stall clock.
+Changing rotation preferences while playback or rotation is paused preserves
+the saved dwell; a deliberate duration change while running updates the
+deadline using effective runtime policy and saves a checkpoint.
+
+Typed gateway programme evidence retains source, observed timestamp, release
+year, optional upcoming title and unzoned provider clock text. Primary
+evidence expires at 150 seconds, corroborated external evidence at 1800 seconds;
+standard programme start/end boundaries still apply. The server owns the
+display title and year; no new title is guessed. Next-programme information
+is exposed in diagnostics without adding a default fullscreen row. Unsorted
+telemetry queries serialize only the requested page. Sorted queries retain
+their existing behavior pending further profiling.
+
+Validate on the physical iPad: reload while paused, repeated resume, duration
+change while paused, restart across a previous-channel revisit, single-channel
+automatic dwell expiry, genuine single-channel playback failure, and preserved
+rotation scope and history across release installation.

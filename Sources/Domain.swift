@@ -391,6 +391,19 @@ struct SurfRotationState: Codable, Equatable {
     // Optional for decoding rotation state from previous IPAs.
     var cycles:[String:Int]?=nil
     var checkpoints:[String:SurfResumeCheckpoint]?=nil
+    // Unlike the visited set, this bounded recency list survives launches
+    // and preserves last-channel navigation without changing cycle membership.
+    var recentHistory:[String:[String]]?=nil
+    mutating func remember(scope:String,id:String){
+        guard !id.isEmpty,id.utf8.count<=128 else{return}
+        var next=recentHistory ?? [:]
+        var history=next[scope] ?? []
+        history.removeAll{$0==id}
+        history.insert(id,at:0)
+        next[scope]=Array(history.prefix(30))
+        recentHistory=next
+    }
+    func recentIDs(scope:String)->[String]{Array((recentHistory?[scope] ?? []).prefix(30))}
     mutating func checkpoint(scope:String,value:SurfResumeCheckpoint){
         var next=checkpoints ?? [:];next[scope]=value;checkpoints=next
     }
@@ -488,6 +501,9 @@ enum SurfCommandSemantics {
     // Never select a removed, currently playing, or policy-excluded channel.
     static func previousID(history:[String],eligible:Set<String>,current:String?)->String?{
         history.first{$0 != current && eligible.contains($0)}
+    }
+    static func retainOnlyChannel(reason:String,eligible:[String],current:String?,healthy:Bool)->Bool{
+        reason=="rotation-deadline" && healthy && eligible.count==1 && eligible.first==current
     }
     static func rotationOwner(surfing:Bool,shared:Bool)->String {
         !surfing ? "none" : (shared ? "server" : "device")

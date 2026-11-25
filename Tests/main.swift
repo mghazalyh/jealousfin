@@ -679,3 +679,24 @@ check(!typedProgramme.isCurrent(at:programmeNow.addingTimeInterval(51)),"stale e
 let decodedProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(typedProgramme))
 check(decodedProgramme==typedProgramme,"typed programme evidence round trip")
 print("PASS: \(checks) assertions including programme evidence freshness")
+
+var durableHistory=SurfRotationState()
+durableHistory.record(scope:"server-a",id:"visited")
+for i in 0..<35{durableHistory.remember(scope:"server-a",id:"channel-\(i)")}
+check(durableHistory.recentIDs(scope:"server-a").count==30,"recency history capped")
+durableHistory.remember(scope:"server-a",id:"channel-20")
+check(durableHistory.recentIDs(scope:"server-a").first=="channel-20","explicit revisit moves channel to front")
+check(durableHistory.recentIDs(scope:"server-b").isEmpty,"history isolated by server/account/category")
+check(durableHistory.visited["server-a"]==Set(["visited"]),"navigation history independent of cycle ledger")
+let restoredHistory=try JSONCodec.decoder().decode(SurfRotationState.self,from:JSONCodec.encoder().encode(durableHistory))
+check(restoredHistory==durableHistory,"recent channel history survives release and restart serialization")
+let legacyRotationHistory=try JSONCodec.decoder().decode(SurfRotationState.self,from:Data("""
+{"visited":{"server-a":["visited"]}}
+""".utf8))
+check(legacyRotationHistory.recentIDs(scope:"server-a").isEmpty && legacyRotationHistory.visited["server-a"]==Set(["visited"]),"old unordered visited set preserved without inventing recent order")
+check(SurfCommandSemantics.previousID(history:restoredHistory.recentIDs(scope:"server-a"),eligible:["channel-34","channel-20"],current:"channel-20")=="channel-34","restored Previous skips excluded or current channels")
+check(SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a"],current:"a",healthy:true),"healthy sole eligible channel does not reconnect at dwell expiry")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"manual-next",eligible:["a"],current:"a",healthy:true),"explicit next is not silently swallowed")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a"],current:"a",healthy:false),"unhealthy channel remains subject to failure recovery")
+check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a","b"],current:"a",healthy:true),"normal rotation with alternatives remains intact")
+print("PASS: \(checks) assertions including durable recent history and sole-channel retention")

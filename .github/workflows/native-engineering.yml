@@ -1,7 +1,7 @@
 name: Native engineering validation
 on:
   push:
-    branches: [engineering/hotpatch-abi2-20261125, engineering/hotpatch-abi2-20261126]
+    branches: ['engineering/hotpatch-abi2-*']
     paths:
       - 'Sources/**'
       - 'Tests/**'

@@ -904,7 +904,8 @@ import CryptoKit
     private var previousEligibleChannel:Channel?{
         guard !usingSharedSurf,!currentSharedTransport,!engineeringOwnsPlayback,jelly.connected,catalogueReady,policyReady,!apiChanging,!loginBusy else{return nil}
         let eligible=surfing ? pool():eligibleChannels
-        guard let id=SurfCommandSemantics.previousID(history:previous.map(\.id),eligible:Set(eligible.map(\.id)),current:current?.id) else{return nil}
+        let history=surfing ? rotationState.recentIDs(scope:rotationScope):previous.map(\.id)
+        guard let id=SurfCommandSemantics.previousID(history:history,eligible:Set(eligible.map(\.id)),current:current?.id) else{return nil}
         return eligible.first{$0.id==id}
     }
     var canGoPrevious:Bool{previousEligibleChannel != nil}
@@ -941,6 +942,19 @@ import CryptoKit
             log("WARN","surf","EMPTY_POOL",["category":settings.surfCategory]);return
         }
         emptyPoolRetry=nil
+        // Do not tear down a healthy stream merely because it is the sole
+        // eligible channel. Manual Next/reconnect and genuine failure recovery
+        // retain their existing behaviour.
+        let healthy=validated && playing && !intentionallyPaused && player.timeControlStatus == .playing &&
+            lastVideoFrameAt.map{Date().timeIntervalSince($0)<=Double(effectivePolicy.stallSeconds)}==true
+        if surfing && !surfPaused && !engineeringOwnsPlayback &&
+            SurfCommandSemantics.retainOnlyChannel(reason:reason,eligible:candidates.map(\.id),current:current?.id,healthy:healthy){
+            remaining=effectivePolicy.rotationSeconds
+            nextRotation=SurfClock.resumed(now:Date(),remaining:remaining)
+            saveSurfCheckpoint(force:true)
+            log("INFO","surf","SOLE_ELIGIBLE_RETAINED",["channelID":current?.id ?? ""])
+            return
+        }
         var cycle=rotationState
         let eligibleIDs=Set(cycle.candidates(scope:rotationScope,ids:candidates.map(\.id),current:current?.id))
         if surfing && !engineeringOwnsPlayback {
@@ -1040,6 +1054,7 @@ import CryptoKit
         if keepSurf && !channel.isSurf{
             remaining=SurfClock.dwell(configured:effectivePolicy.rotationSeconds)
             if surfPaused{pausedRotationSeconds=remaining}
+            if !engineeringOwnsPlayback{rotationState.remember(scope:rotationScope,id:channel.id)}
         }
         trace=UUID().uuidString;startUptime=ProcessInfo.processInfo.systemUptime
         status="Opening \(channel.name)"
@@ -1750,6 +1765,8 @@ import CryptoKit
         snapshot["programmeProviderEndClock"]=programme?.evidence?.providerEndClock ?? ""
         snapshot["programmeProviderNextClock"]=programme?.evidence?.providerNextClock ?? ""
         snapshot["previousChannelAvailable"]=canGoPrevious
+        snapshot["recentSurfChannelIDs"]=rotationState.recentIDs(scope:rotationScope)
+        snapshot["recentSurfHistoryLimit"]=30
         snapshot["videoBrightness"]=videoBrightness
         let favoriteState=currentFavoriteState
         snapshot["currentFavorite"]=favoriteState.favorite.map{$0 as Any} ?? NSNull()
