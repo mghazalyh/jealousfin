@@ -1,0 +1,28 @@
+{
+  "pages": [],
+  "revision": "fullscreen-brightness-preview-20261125",
+  "schemaVersion": 1,
+  "slots": [
+    {
+      "location": "player.fullscreen.transport",
+      "nodes": [
+        {
+          "height": 148,
+          "html": "<style>\nbody{overflow:hidden} .row{display:flex;gap:6px;align-items:center;margin:0 0 5px} button,select{min-height:44px;border:1px solid #ffffff30;border-radius:8px;background:#ffffff16;color:#fff;padding:4px 8px;touch-action:manipulation;white-space:normal;font-size:13px;line-height:1.1} button{flex:1;min-width:0} button:disabled{opacity:.4} select{flex:2;min-width:0} .rotation{flex:1.65} .accent{background:#ffffff26} #feedback{font-size:11px;color:#ffc9a0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:12px}\n</style><div class=\"row\"><button class=\"rotation accent\" id=\"rot\" disabled>Pause rotation</button><button id=\"play\" disabled>Pause</button><button id=\"next\" disabled>Next</button><button id=\"stop\" disabled>Stop</button><button id=\"fav\" disabled>Favorite</button></div>\n<div class=\"row\"><select id=\"cat\" aria-label=\"Surf category\" disabled><option>All Channels</option><option>Favorites</option><option>Sports</option><option>Movies &amp; Series</option></select><button id=\"surf\" disabled>Stop Surf</button></div><style>.brightness-row{display:flex;align-items:center;gap:8px;min-height:32px;font-size:13px;color:#fff}.brightness-row input{flex:1;min-width:0;accent-color:#d1d5db;margin:0}.brightness-row output{min-width:25px;text-align:right;font-variant-numeric:tabular-nums}.brightness-row button{flex:0 0 auto;min-height:32px;padding:4px 9px}.brightness-caption{font-size:10px;color:#ccc;white-space:nowrap}</style><div class=\"brightness-row\"><label for=\"brightness\">Brightness <span class=\"brightness-caption\">(preview)</span></label><span>−10</span><input type=\"range\" id=\"brightness\" min=\"-10\" max=\"10\" step=\"1\" value=\"0\" aria-label=\"Brightness preview, not connected to video\"><span>+10</span><output id=\"brightness-value\" for=\"brightness\">0</output><button id=\"brightness-reset\" aria-label=\"Reset brightness preview\">Reset</button></div><script>(function(){const slider=document.getElementById('brightness'),out=document.getElementById('brightness-value');function render(){const v=Number(slider.value);out.textContent=(v>0?'+':'')+v;}slider.addEventListener('input',render);document.getElementById('brightness-reset').addEventListener('click',()=>{slider.value='0';render()});render();})();</script><div id=\"feedback\" role=\"status\"></div>\n<script>\n(function(){\nconst $=id=>document.getElementById(id);let state={},pending=false,seq=0;\nfunction sync(s){state=s||{};const ready=!!state.launchID, shared=state.rotationOwner==='server'||state.currentSharedTransport===true;\n$('rot').textContent=state.surfPaused?'Resume rotation':'Pause rotation';\n$('play').textContent=state.playing?'Pause':'Play';\n$('next').textContent=shared?'Reconnect':'Next';\n$('surf').textContent=state.surfing?'Stop Surf':'Start Surf';\n$('rot').disabled=!ready||pending||!state.surfRotationControllable;\n$('play').disabled=!ready||pending||!state.currentChannelID;\n$('next').disabled=!ready||pending||!(state.surfing||shared);\n$('stop').disabled=!ready||pending||!state.currentChannelID;\n$('fav').disabled=!ready||pending||!state.currentChannelID||shared;\n$('cat').disabled=!ready||pending;$('surf').disabled=!ready||pending;\nif(state.preferences&&state.preferences.surfCategory)$('cat').value=state.preferences.surfCategory;\n}\nfunction send(command,args){if(pending)return;pending=true;$('feedback').textContent='';sync(state);try{window.jealousfin.command(command,args||{},'compact-'+(++seq));}catch(e){pending=false;$('feedback').textContent='Command unavailable';sync(state)}}\n$('rot').onclick=()=>send(state.surfPaused?'resume_surf':'pause_surf');\n$('play').onclick=()=>send(state.playing?'pause':'resume');\n$('next').onclick=()=>send('next_channel');\n$('stop').onclick=()=>send('stop');\n$('fav').onclick=()=>send('favorite_current');\n$('surf').onclick=()=>state.surfing?send('stop_surf'):send('start_surf',{category:$('cat').value});\n$('cat').onchange=()=>{const category=$('cat').value;send(state.surfing?'start_surf':'set_preferences',state.surfing?{category:category}:{surfCategory:category})};\nwindow.addEventListener('jealousfin-state',e=>sync(e.detail));\nwindow.addEventListener('jealousfin-receipt',e=>{pending=false;const d=e.detail||{};if(d.status!=='succeeded')$('feedback').textContent=d.result||'Command failed';sync(window.jealousfinState||state)});\nsync(window.jealousfinState||{});\n})();\n</script>",
+          "id": "compact-transport",
+          "kind": "web"
+        }
+      ]
+    },
+    {
+      "location": "player.fullscreen.surf",
+      "nodes": [
+        {
+          "children": [],
+          "id": "surf-controls-relocated",
+          "kind": "vstack"
+        }
+      ]
+    }
+  ]
+}

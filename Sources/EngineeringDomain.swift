@@ -16,8 +16,8 @@ struct RuntimePolicy: Codable, Equatable {
     var strictChannelHiatus:Bool? = nil
     static func baseline(_ settings: Settings) -> RuntimePolicy {
         RuntimePolicy(startupTimeout: settings.startupTimeout, retries: settings.retries,
-            qualityMbps: settings.qualityMbps, stallSeconds: 15, rotationSeconds: settings.rotationMinutes * 60,
-            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true, recoveryMode:"advance_surf", failureRetrySeconds:30, strictChannelHiatus:true)
+            qualityMbps: settings.qualityMbps, stallSeconds: 10, rotationSeconds: settings.rotationMinutes * 60,
+            validationSeconds: 3, minimumFrames: 3, forwardBufferSeconds: 0, automaticallyWaits: true, recoveryMode:"advance_surf", failureRetrySeconds:5, strictChannelHiatus:true)
     }
     func checked() throws -> RuntimePolicy {
         guard (5...120).contains(startupTimeout), (1...5).contains(retries), (1...50).contains(qualityMbps),

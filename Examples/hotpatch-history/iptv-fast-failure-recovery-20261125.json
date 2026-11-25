@@ -1,0 +1,17 @@
+{
+  "revision": "iptv-fast-failure-recovery-20261125",
+  "runtime": {
+    "automaticallyWaits": true,
+    "failureRetrySeconds": 5,
+    "forwardBufferSeconds": 0,
+    "minimumFrames": 3,
+    "qualityMbps": 10,
+    "recoveryMode": "advance_surf",
+    "retries": 2,
+    "rotationSeconds": 60,
+    "stallSeconds": 10,
+    "startupTimeout": 15,
+    "validationSeconds": 3
+  },
+  "schemaVersion": 1
+}

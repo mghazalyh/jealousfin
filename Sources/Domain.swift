@@ -232,7 +232,7 @@ struct Settings: Codable {
     }
     var rotationMinutes = 5
     var retries = 2
-    var startupTimeout = 25
+    var startupTimeout = 15
     var validation = true
     var random = false
     var unattended = true

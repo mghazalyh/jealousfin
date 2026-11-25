@@ -5,6 +5,7 @@ import AVKit
 // changes. Native buttons remain available if a dynamic UI revision is rejected.
 struct FullscreenSurfPlayer:View {
     @EnvironmentObject var model:AppModel
+    @State private var brightnessPreview:Double=0
     private var presentation:DynamicPresentation{model.presentationConfiguration}
     var body:some View {
         GeometryReader{geometry in
@@ -17,7 +18,7 @@ struct FullscreenSurfPlayer:View {
                     VStack(spacing:0){
                         header
                         Spacer(minLength:8)
-                        footer(maxHeight:max(100,geometry.size.height*CGFloat(presentation.fullscreenMaxHeight ?? 0.48)))
+                        footer(maxHeight:max(100,geometry.size.height*CGFloat(presentation.fullscreenMaxHeight ?? 0.25)))
                     }.padding(.horizontal,12).padding(.vertical,8)
                 }else{
                     VStack{
@@ -54,7 +55,7 @@ struct FullscreenSurfPlayer:View {
                 closeButton
             }
             DynamicUISlotView(location:"player.fullscreen.top")
-        }.padding(10).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.78)).cornerRadius(14)
+        }.padding(10).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(14)
     }
     private var closeButton:some View{
         Button{model.fullscreenPresented=false}label:{
@@ -75,6 +76,11 @@ struct FullscreenSurfPlayer:View {
                 }
                 PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:8){
+                    if model.surfing && !model.usingSharedSurf {
+                        control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle","rotationToggle"){
+                            model.toggleSurfPause()
+                        }
+                    }
                     control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill","playPause"){
                         if model.playing{model.pause()}else{model.resume()}
                     }
@@ -107,11 +113,7 @@ struct FullscreenSurfPlayer:View {
                     }.buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("player.fullscreen.surfToggle")
                 }
-                if model.surfing && !model.usingSharedSurf{
-                    Button(model.surfPaused ? "Resume rotation":"Pause rotation"){model.toggleSurfPause()}
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("player.fullscreen.rotationToggle")
-                }
+                brightnessControl
                 if model.usingSharedSurf{
                     Text("Server manages source rotation. Reconnect refreshes the live stream.")
                         .font(.caption).foregroundColor(.secondary)
@@ -122,7 +124,23 @@ struct FullscreenSurfPlayer:View {
                     DynamicUISlotView(location:"player.fullscreen.bottom")
                 }
             }.padding(12)
-        }.frame(maxHeight:maxHeight).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.82)).cornerRadius(14)
+        }.frame(maxHeight:maxHeight).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(14)
+    }
+    // Preview only. The native video and screen brightness remain unchanged.
+    private var brightnessControl:some View{
+        HStack(spacing:8){
+            Label("Brightness",systemImage:"sun.max").font(.caption)
+            Text("(preview)").font(.caption2).foregroundColor(.secondary)
+            Text("−10").font(.caption2)
+            Slider(value:$brightnessPreview,in:-10...10,step:1)
+                .accessibilityLabel("Brightness preview")
+                .accessibilityHint("Changes the preview value only; video is unaffected")
+            Text("+10").font(.caption2)
+            Text(brightnessPreview > 0 ? "+"+String(Int(brightnessPreview)):String(Int(brightnessPreview)))
+                .font(.caption.monospacedDigit()).frame(minWidth:25)
+            Button("Reset"){brightnessPreview=0}.buttonStyle(.bordered)
+                .accessibilityLabel("Reset brightness preview")
+        }.accessibilityIdentifier("player.fullscreen.brightnessPreview")
     }
     private func control(_ title:String,_ image:String,_ id:String,action:@escaping()->Void)->some View{
         Button(action:action){

@@ -52,8 +52,8 @@ struct DynamicPresentation: Codable, Equatable {
     var automaticPictureInPicture:Bool? = nil
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
-              (0.15...1).contains(fullscreenOpacity ?? 0.82),
-              (0.20...0.80).contains(fullscreenMaxHeight ?? 0.48)
+              (0.15...1).contains(fullscreenOpacity ?? 0.65),
+              (0.20...0.80).contains(fullscreenMaxHeight ?? 0.25)
         else{throw AppError.message("Invalid presentation options")}
         return self
     }

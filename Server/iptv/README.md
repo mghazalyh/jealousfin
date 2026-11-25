@@ -19,6 +19,10 @@ Run python3 test_policy_observer.py for isolated policy checks. The first succes
 
 ## Future iOS deployment
 
-Native defaults: strict hiatus, 15-second stall timeout, advance on stall, user-configurable rotation interval. Rotation state is persisted by server, account and category and seeded once from available native ledger history. Existing settings, credentials, and active hot revisions remain intact. A hot configuration or runtime override can still control policy. Device-owned Surf tracks actual channels; shared server-owned Surf does not pretend to identify underlying channels. Keep the existing active adapter revision until the gateway and migration are verified; do not embed fixed channel IDs or expiry dates in an IPA.
+Native defaults: strict hiatus, 10-second stall timeout, 5-second failure retry delay, advance on stall, user-configurable rotation interval. Rotation state is persisted by server, account and category and seeded once from available native ledger history. Existing settings, credentials, and active hot revisions remain intact. A hot configuration or runtime override can still control policy. Device-owned Surf tracks actual channels; shared server-owned Surf does not pretend to identify underlying channels. Keep the existing active adapter revision until the gateway and migration are verified; do not embed fixed channel IDs or expiry dates in an IPA.
 
 The PS3 profile is a separate JSON fixture for future development. Do not advertise a compatible PS3 endpoint until it has passed physical console testing.
+
+## Offline compatibility snapshot
+
+Use `python3 make_policy_snapshot.py /private/policy.sqlite3 /private/new-adapter.js` to generate an ABI-1 catalogue filter for older clients. This read-only generator is not an installer or continuous synchronization service. Keep the output private. Each activation can reconnect an older client. The gateway marker delegates ordering and exclusions to the SQLite-aware gateway. Run `python3 test_policy_snapshot.py` for regression checks.
