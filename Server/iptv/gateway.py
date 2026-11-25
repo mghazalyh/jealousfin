@@ -1,4 +1,4 @@
-import http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import datetime, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
@@ -302,10 +302,90 @@ preferred_hosts={s[0]:s[2] for s in SAMPLES}
 attempts={}
 catalogue_source='uninitialized'
 catalogue_fault=None
+programme_rows={}
+programme_observed_at=0.0
+programme_fault=None
+PROGRAMME_REFRESH=60
+PROGRAMME_MAX_AGE=150
+
+def programme_text(value):
+ if not isinstance(value,str):return ''
+ value=' '.join(value.split())
+ if not value or len(value)>300 or re.search(r'(?i)https?://|api_key=|token=',value):return ''
+ return value
+
+def parse_programme(row):
+ # Provider clock strings are unzoned. Do not manufacture start/end dates.
+ description=row.get('description')
+ if not isinstance(description,str) or len(description)>8192:description=''
+ release=row.get('releaseInfo')
+ if not isinstance(release,str):release=''
+ current=''
+ next_title=''
+ end_clock=''
+ next_clock=''
+ for line in description.splitlines():
+  if line.startswith('Now: '):
+   value=line[5:].strip()
+   match=re.fullmatch(r'(.+?) \(until ((?:[01]\d|2[0-3]):[0-5]\d)\)',value)
+   current=programme_text(match[1] if match else value)
+   if match:end_clock=match[2]
+  elif line.startswith('Next: '):
+   value=line[6:].strip()
+   match=re.fullmatch(r'(.+?) at ((?:[01]\d|2[0-3]):[0-5]\d)',value)
+   next_title=programme_text(match[1] if match else value)
+   if match:next_clock=match[2]
+ release_title=programme_text(release[6:]) if release.startswith('Now · ') else ''
+ if not current:current=release_title
+ if not current or (release_title and current!=release_title):return None
+ if current.casefold() in ('unknown','no information','no programme information','no program information','n/a','live tv','tba','to be announced'):return None
+ if current.casefold()==str(row.get('name','')).strip().casefold():return None
+ return {'title':current,'nextTitle':next_title,'providerEndClock':end_clock,'providerNextClock':next_clock}
+
+def update_programmes(raw,observed=None):
+ global programme_rows,programme_observed_at,programme_fault
+ now=time.time() if observed is None else observed
+ # Metadata refresh is independent from catalogue identity, policy and playback.
+ valid={}
+ for source_id,row in raw.items():
+  if not isinstance(row,dict):continue
+  cid=hashlib.md5(source_id.encode()).hexdigest()
+  if cid not in sources:continue
+  parsed=parse_programme(row)
+  if parsed:valid[cid]=parsed
+ with lock:
+  programme_rows=valid;programme_observed_at=now;programme_fault=None
+
+def programme_snapshot(now=None):
+ now=time.time() if now is None else now
+ with lock:
+  if not 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:return {}
+  return {cid:dict(row) for cid,row in programme_rows.items()}
+
+def programme_item(cid,row):
+ # The provider supplies a title and an unzoned end clock, not a reliable
+ # UTC schedule. Keep the standard programme dates absent and expose evidence.
+ title=row['title']
+ return {'Id':hashlib.sha256((cid+'\0'+title).encode()).hexdigest()[:32],
+         'Name':title,'ChannelId':cid,'Type':'Program',
+         'JealousfinProgramme':dict(row,source='provider-catalogue',observedAt=programme_observed_at)}
+
+def programme_worker(stop):
+ global programme_fault
+ while not stop.wait(PROGRAMME_REFRESH):
+  try:
+   raw=catalogue()
+   if len(raw)<len(sources)*.9:raise ValueError('Incomplete programme refresh')
+   update_programmes(raw)
+  except Exception as error:
+   with lock:programme_fault=type(error).__name__
+   log('programme refresh failed '+type(error).__name__)
+
 def initialize_catalogue():
  global catalogue_source,catalogue_fault
  cache=ROOT/'catalogue-metadata.json'
  prior=None
+ fresh=None
  if cache.exists():
   data=json.loads(cache.read_text())
   if isinstance(data,dict) and len(data)>=100 and all(isinstance(k,str) and k.startswith('nltv:') and isinstance(v,dict) and isinstance(v.get('name'),str) for k,v in data.items()):
@@ -318,7 +398,7 @@ def initialize_catalogue():
   atomic_json(cache,raw);catalogue_source='provider';catalogue_fault=None
  except Exception as error:
   if prior is None:raise
-  raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
+  fresh=None;raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
   log('catalogue fallback '+catalogue_fault)
  for i,(source_id,row) in enumerate(raw.items(),1):
   cid=hashlib.md5(source_id.encode()).hexdigest()
@@ -326,6 +406,7 @@ def initialize_catalogue():
   if not isinstance(genres,list):genres=[]
   channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
   sources[cid]=source_id
+ if fresh is not None:update_programmes(fresh)
  # A pre-existing initialized database may acquire new channels. Preserve every
  # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
  with policy_connect(ROOT/'policy.sqlite3') as db:
@@ -445,7 +526,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -489,6 +570,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if path=='/Jealousfin/Policy':return self.reply(200,policy_payload(snapshot))
    include=q.get('JealousfinIncludePolicy',['false'])[0]=='true'
    with lock:out=[dict(c,UserData={'IsFavorite':cid in favorites}) for cid,c in ordered_catalogue(snapshot,include)]
+   programmes=programme_snapshot()
+   for item in out:
+    row=programmes.get(item['Id'])
+    if row:item['CurrentProgram']=programme_item(item['Id'],row)
    result={'Items':out,'TotalRecordCount':len(out),'JealousfinPolicyRevision':'sqlite-policy-v1'}
    if include:result['JealousfinPolicy']=policy_payload(snapshot)
    return self.reply(200,result)
@@ -503,7 +588,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     return self.reply(200,policy_payload(policy_rows()))
    except (KeyError,ValueError,TypeError):return self.reply(400,{})
    except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-  if path in ('/LiveTv/Programs','/LiveTv/Recordings'):return self.reply(200,{'Items':[],'TotalRecordCount':0})
+  if path=='/LiveTv/Programs':
+   # The current-title feed is not a full EPG. For queries needing a real
+   # time range, do not invent times; the client can use CurrentProgram.
+   selected=set(','.join(q.get('ChannelIds',[])).split(','))-{''}
+   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if not selected or cid in selected]
+   return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinCurrentOnly':True})
+  if path=='/LiveTv/Recordings':return self.reply(200,{'Items':[],'TotalRecordCount':0})
   m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)
   if m and m[1] in sources:
    n=int(self.headers.get('Content-Length','0'))
@@ -551,10 +642,12 @@ def main():
  load_favorites()
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
+ stop=threading.Event()
+ worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
  finally:
-  server.server_close()
+  stop.set();server.server_close()
   try:(ROOT/'trial-info.json').unlink()
   except FileNotFoundError:pass
 if __name__=='__main__':main()

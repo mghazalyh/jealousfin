@@ -139,6 +139,28 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(g.catalogue_source,"cached")
         self.assertEqual(g.catalogue_fault,"TimeoutError")
 
+    def test_current_programme(self):
+        g=self.g
+        g.sources[self.c]="nltv:movie"
+        cid=__import__("hashlib").md5(b"nltv:movie").hexdigest()
+        g.channels[cid]=g.channels.pop(self.c)
+        g.channels[cid]["Id"]=cid
+        del g.sources[self.c];g.sources[cid]="nltv:movie"
+        with g.policy_connect(self.db) as db:db.execute("UPDATE channel SET id=? WHERE id=?",(cid,self.c))
+        raw={"nltv:movie":{"name":"MovieSphere Gold","description":"Now: Love the Coopers (until 23:16)\nNext: Killers at 23:16","releaseInfo":"Now · Love the Coopers"}}
+        g.update_programmes(raw)
+        items=self.req("/LiveTv/Channels")[1]["Items"]
+        self.assertEqual(items[0]["CurrentProgram"]["Name"],"Love the Coopers")
+        self.assertEqual(items[0]["CurrentProgram"]["JealousfinProgramme"]["nextTitle"],"Killers")
+        self.assertNotIn("EndDate",items[0]["CurrentProgram"])
+        self.assertEqual(self.req("/LiveTv/Programs?ChannelIds="+cid)[1]["Items"][0]["Name"],"Love the Coopers")
+        self.assertEqual(self.req("/LiveTv/Programs",auth=False)[0],401)
+        self.assertEqual(g.programme_snapshot(g.programme_observed_at+151),{})
+        g.update_programmes({"nltv:movie":{"name":"MovieSphere Gold"}})
+        self.assertNotIn("CurrentProgram",self.req("/LiveTv/Channels")[1]["Items"][0])
+        self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: Show","releaseInfo":"Now · Different"}))
+        self.assertIsNone(g.parse_programme({"name":"Example","description":"Now: https://fixture.invalid"}))
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2
