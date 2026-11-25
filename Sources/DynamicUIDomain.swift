@@ -61,9 +61,12 @@ struct DynamicPresentation: Codable, Equatable {
     var fullscreenFitContent:Bool?=nil
     var fullscreenPortraitMaxHeight:Double?=nil
     var fullscreenControlOrder:[String]?=nil
+    var fullscreenControlTheme:String?=nil
+    var resolvedFullscreenControlTheme:String{fullscreenControlTheme ?? "night"}
     static let defaultControlOrder=["rotationToggle","playPause","next","stop","favorite"]
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
+              ["night","standard"].contains(resolvedFullscreenControlTheme),
               (0.15...1).contains(fullscreenOpacity ?? 0.65),
               (0.20...0.80).contains(fullscreenMaxHeight ?? 0.25),
               (0.35...1).contains(fullscreenWidth ?? 1),
@@ -75,6 +78,20 @@ struct DynamicPresentation: Codable, Equatable {
         else{throw AppError.message("Invalid presentation options")}
         return self
     }
+}
+// The state is derived from the last confirmed native catalogue value, not
+// optimistically inverted by a tap. It is also available to web and runtime UI.
+struct FullscreenFavoriteState:Equatable{
+    let favorite:Bool?
+    let pending:Bool
+    var title:String{
+        if pending{return "Saving…"}
+        guard let favorite=favorite else{return "Favorite unavailable"}
+        return favorite ? "Unfavorite":"Favorite"
+    }
+    var symbol:String{favorite==true ? "heart.fill":"heart"}
+    var enabled:Bool{favorite != nil && !pending}
+    var selected:Bool{favorite==true}
 }
 struct DynamicTab:Codable,Equatable,Identifiable{
     let id:Int

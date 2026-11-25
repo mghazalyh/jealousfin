@@ -11,6 +11,7 @@ struct FullscreenSurfPlayer:View {
     private var spacing:CGFloat{CGFloat(presentation.fullscreenSpacing ?? 6)}
     private var corner:CGFloat{CGFloat(presentation.fullscreenCornerRadius ?? 14)}
     private var presentation:DynamicPresentation{model.presentationConfiguration}
+    private var palette:FullscreenControlPalette{FullscreenControlPalette(theme:presentation.resolvedFullscreenControlTheme)}
     var body:some View {
         GeometryReader{geometry in
             ZStack {
@@ -93,11 +94,11 @@ struct FullscreenSurfPlayer:View {
         ScrollView(showsIndicators:false){
             VStack(alignment:.leading,spacing:spacing){
                 HStack{
-                    Label(model.surfing ? "Surf active":"Surf stopped",systemImage:"shuffle").font(.headline)
+                    Label(model.surfing ? (model.surfPaused ? "Surf paused":"Surf active"):"Surf stopped",systemImage:"shuffle").font(.headline)
                     Spacer()
                     Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
                         .font(.subheadline.monospacedDigit())
-                }
+                }.foregroundColor(palette.secondary)
                 PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:spacing){
                     ForEach(presentation.fullscreenControlOrder ?? DynamicPresentation.defaultControlOrder,id:\.self){id in
@@ -117,15 +118,26 @@ struct FullscreenSurfPlayer:View {
                                 else{Text(category)}
                             }
                         }
-                    }label:{Label(model.settings.surfCategory,systemImage:"list.bullet").lineLimit(1)}
+                    }label:{
+                        HStack{
+                            Label(model.settings.surfCategory,systemImage:"list.bullet").lineLimit(1)
+                            Spacer(minLength:4)
+                            Image(systemName:"chevron.down").font(.caption2)
+                        }.font(.subheadline).padding(.horizontal,8)
+                            .frame(maxWidth:.infinity,minHeight:44)
+                            .foregroundColor(palette.text)
+                            .background(palette.button).cornerRadius(9)
+                            .overlay(RoundedRectangle(cornerRadius:9).strokeBorder(palette.border,lineWidth:1))
+                    }.tint(palette.text)
                     .accessibilityIdentifier("player.fullscreen.category")
-                    Spacer(minLength:0)
-                    Button(model.surfing ? "Stop Surf":"Start Surf"){
+                    Button{
                         if model.surfing{model.stopSurf()}else{model.startSurf(category:model.settings.surfCategory)}
-                    }.buttonStyle(.borderedProminent)
+                    }label:{Text(model.surfing ? "Stop Surf":"Start Surf").font(.subheadline).frame(minHeight:44).padding(.horizontal,10)}
+                        .buttonStyle(FullscreenControlButtonStyle(palette:palette))
                         .accessibilityIdentifier("player.fullscreen.surfToggle")
                 }
                 brightnessControl
+                if model.currentFavoriteFailed{Text("Favorite update failed. Try again.").font(.caption2).foregroundColor(palette.secondary).accessibilityIdentifier("player.fullscreen.favoriteError")}
                 if model.usingSharedSurf{
                     Text("Server manages source rotation. Reconnect refreshes the live stream.")
                         .font(.caption).foregroundColor(.secondary)
@@ -145,7 +157,7 @@ struct FullscreenSurfPlayer:View {
     @ViewBuilder private func transportControl(_ id:String)->some View{
         switch id{
         case "rotationToggle":
-            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id){model.toggleSurfPause()}}
+            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:.rotation){model.toggleSurfPause()}}
         case "playPause":
             control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill",id){if model.playing{model.pause()}else{model.resume()}}
         case "next":
@@ -153,7 +165,13 @@ struct FullscreenSurfPlayer:View {
         case "stop":
             control("Stop","stop.fill",id){model.stop()}
         case "favorite":
-            if let c=model.current,!c.isSurf{control("Favorite",c.favorite ? "heart.fill":"heart",id){model.favoriteFromUI(c)}}
+            if let c=model.current,!c.isSurf,!model.currentSharedTransport{
+                let state=model.currentFavoriteState
+                control(state.title,state.symbol,id,role:state.selected ? .favorite:.normal){model.favoriteFromUI(c)}
+                    .disabled(!state.enabled)
+                    .accessibilityValue(state.selected ? "In Favorites":"Not in Favorites")
+                    .accessibilityAddTraits(state.selected ? .isSelected:[])
+            }
         default:EmptyView()
         }
     }
@@ -163,21 +181,23 @@ struct FullscreenSurfPlayer:View {
             Label("Brightness",systemImage:"sun.max").font(.caption)
             Text("−10").font(.caption2)
             Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0));lastInteraction=Date()}),in:-10...10,step:1)
+                .tint(palette.slider)
                 .accessibilityLabel("Video brightness")
             Text("+10").font(.caption2)
             Text(model.videoBrightness > 0 ? "+"+String(model.videoBrightness):String(model.videoBrightness))
                 .font(.caption.monospacedDigit()).frame(minWidth:25)
-            Button("Reset"){model.setVideoBrightness(0)}.buttonStyle(.bordered)
+            Button{model.setVideoBrightness(0)}label:{Text("Reset").font(.caption).padding(.horizontal,9).frame(minHeight:32)}
+                .buttonStyle(FullscreenControlButtonStyle(palette:palette))
                 .accessibilityLabel("Reset brightness")
-        }.accessibilityIdentifier("player.fullscreen.brightness")
+        }.foregroundColor(palette.text).accessibilityIdentifier("player.fullscreen.brightness")
     }
-    private func control(_ title:String,_ image:String,_ id:String,action:@escaping()->Void)->some View{
+    private func control(_ title:String,_ image:String,_ id:String,role:FullscreenControlRole = .normal,action:@escaping()->Void)->some View{
         Button(action:action){
             VStack(spacing:4){
                 Image(systemName:image).font(.system(size:17*CGFloat(presentation.fullscreenTextScale ?? 1),weight:.semibold))
                 Text(title).font(.system(size:11*CGFloat(presentation.fullscreenTextScale ?? 1))).lineLimit(1).minimumScaleFactor(0.7)
             }.frame(maxWidth:.infinity,minHeight:CGFloat(presentation.fullscreenButtonHeight ?? 44))
-        }.buttonStyle(.bordered)
+        }.buttonStyle(FullscreenControlButtonStyle(palette:palette,role:role))
             .accessibilityLabel(title)
             .accessibilityIdentifier("player.fullscreen."+id)
     }
@@ -186,4 +206,55 @@ struct FullscreenSurfPlayer:View {
 private struct FullscreenContentHeight:PreferenceKey{
     static var defaultValue:CGFloat=0
     static func reduce(value:inout CGFloat,nextValue:()->CGFloat){value=max(value,nextValue())}
+}
+
+// Native colors mirror the physically accepted night hot patch. The standard
+// variant is opt-in and remains subdued; neither changes video brightness.
+enum FullscreenControlRole{case normal,rotation,favorite}
+struct FullscreenControlPalette{
+    let theme:String
+    private var night:Bool{theme != "standard"}
+    private func rgb(_ value:UInt32)->Color{
+        Color(red:Double((value >> 16) & 255)/255,green:Double((value >> 8) & 255)/255,blue:Double(value & 255)/255)
+    }
+    var text:Color{rgb(night ? 0xb9bec7:0xeceff4)}
+    var secondary:Color{rgb(night ? 0x9da6b2:0xaeb6c2)}
+    var button:Color{rgb(night ? 0x171a20:0x282d36).opacity(0.91)}
+    var border:Color{Color.white.opacity(night ? 0.09:0.18)}
+    var slider:Color{rgb(night ? 0x8495ab:0x8ea4c3)}
+    func foreground(_ role:FullscreenControlRole)->Color{
+        switch role{
+        case .normal:return text
+        case .rotation:return rgb(night ? 0xb5c1d0:0xd5e3f6)
+        case .favorite:return rgb(night ? 0xc4aab6:0xe0c3ce)
+        }
+    }
+    func background(_ role:FullscreenControlRole)->Color{
+        switch role{
+        case .normal:return button
+        case .rotation:return rgb(night ? 0x26313f:0x34465b).opacity(0.91)
+        case .favorite:return rgb(night ? 0x352a31:0x493641).opacity(0.91)
+        }
+    }
+    func outline(_ role:FullscreenControlRole)->Color{
+        switch role{
+        case .normal:return border
+        case .rotation:return rgb(0x8193ad).opacity(night ? 0.20:0.35)
+        case .favorite:return rgb(0x8b6e79).opacity(night ? 0.24:0.40)
+        }
+    }
+}
+struct FullscreenControlButtonStyle:ButtonStyle{
+    @Environment(\.isEnabled) private var enabled
+    let palette:FullscreenControlPalette
+    var role:FullscreenControlRole = .normal
+    func makeBody(configuration:Configuration)->some View{
+        configuration.label
+            .foregroundColor(palette.foreground(role))
+            .background(palette.background(role))
+            .cornerRadius(9)
+            .overlay(RoundedRectangle(cornerRadius:9).strokeBorder(palette.outline(role),lineWidth:1))
+            .opacity(enabled ? (configuration.isPressed ? 0.75:1):0.45)
+            .contentShape(Rectangle())
+    }
 }

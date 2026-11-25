@@ -170,7 +170,8 @@ import CryptoKit
     private var emptyPoolRetry:Date?
     private var retryCurrentAfterResume=false
     private var catalogueBusy=false
-    private var favoriteInFlight=Set<String>()
+    @Published private var favoriteInFlight=Set<String>()
+    @Published private var favoriteFailureChannelID:String?
     private var lastProgressReport:Task<Void,Never>?
     private var progressReportBusy=false
     private var cleanupTask:Task<Void,Never>?
@@ -813,12 +814,23 @@ import CryptoKit
         recalculateInsights()
     }
     func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
+    var currentFavoriteState:FullscreenFavoriteState{
+        guard let c=current,!c.isSurf,!currentSharedTransport else{return FullscreenFavoriteState(favorite:nil,pending:false)}
+        let value=channels.first(where:{$0.id==c.id})?.favorite ?? c.favorite
+        return FullscreenFavoriteState(favorite:value,pending:favoriteInFlight.contains(c.id))
+    }
+    var currentFavoriteFailed:Bool{
+        guard let id=current?.id else{return false}
+        return favoriteFailureChannelID==id
+    }
     func favorite(_ channel:Channel) async throws {
         guard !apiChanging,jelly.connected,!loginBusy else{throw AppError.message("Jellyfin unavailable")}
         guard favoriteInFlight.insert(channel.id).inserted else{throw AppError.message("Favorite update already in progress")}
         defer{favoriteInFlight.remove(channel.id)}
         let value = !(channels.first(where:{$0.id==channel.id})?.favorite ?? channel.favorite)
-        try await jelly.favorite(channel.id,value:value)
+        favoriteFailureChannelID=nil
+        do{try await jelly.favorite(channel.id,value:value)}
+        catch{favoriteFailureChannelID=channel.id;throw error}
         if let i=channels.firstIndex(where:{$0.id==channel.id}){channels[i].favorite=value}
         if current?.id==channel.id {current?.favorite=value}
         if let i=previous.firstIndex(where:{$0.id==channel.id}){previous[i].favorite=value}
@@ -1587,6 +1599,11 @@ import CryptoKit
         snapshot["eventModuleCount"]=platformStore.modules.count
         snapshot["eventModuleRevisions"]=Dictionary(uniqueKeysWithValues:platformStore.modules.map{($0.module.id,$0.module.revision)})
         snapshot["videoBrightness"]=videoBrightness
+        let favoriteState=currentFavoriteState
+        snapshot["currentFavorite"]=favoriteState.favorite.map{$0 as Any} ?? NSNull()
+        snapshot["favoriteUpdatePending"]=favoriteState.pending
+        snapshot["favoriteUpdateFailed"]=currentFavoriteFailed
+        snapshot["fullscreenControlTheme"]=presentationConfiguration.resolvedFullscreenControlTheme
         snapshot["hiatusBaseDays"]=healthPenalty.baseDays
         snapshot["hiatusBanAfter"]=healthPenalty.banAfter
         snapshot["gatewayPolicyRevision"]=jelly.gatewayHealth?.revision ?? ""
@@ -1957,7 +1974,7 @@ import CryptoKit
             contract["uiReplacementLocations"]=DynamicUILayout.replacementLocations.filter{$0 != "more.body"}
             contract["uiPrimitives"]=DynamicUILayout.kinds
             contract["uiCommands"]=DynamicUILayout.commands.sorted()
-            contract["presentationFields"]=["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture","fullscreenWidth","fullscreenPadding","fullscreenSpacing","fullscreenCornerRadius","fullscreenButtonHeight","fullscreenTextScale","fullscreenAutoHideSeconds","fullscreenTapToReveal","fullscreenFitContent","fullscreenPortraitMaxHeight","fullscreenControlOrder"]
+            contract["presentationFields"]=["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture","fullscreenWidth","fullscreenPadding","fullscreenSpacing","fullscreenCornerRadius","fullscreenButtonHeight","fullscreenTextScale","fullscreenAutoHideSeconds","fullscreenTapToReveal","fullscreenFitContent","fullscreenPortraitMaxHeight","fullscreenControlOrder","fullscreenControlTheme"]
             contract["preferences"]=PatchablePreferences.keys
             contract["configurationRegistry"]=ApplicationCapabilitySchema.configuration
             contract["commandRegistry"]=ApplicationCapabilitySchema.commands

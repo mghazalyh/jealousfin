@@ -20,6 +20,14 @@
       "fullscreen-brightness-preview-20261125": {
         "disposition": "native",
         "evidence": "Native fullscreen brightness slider and local video-plane adjustment"
+      },
+      "fullscreen-favorite-toggle-20261125": {
+        "disposition": "native",
+        "evidence": "Native confirmed favorite toggle and pending/error state, currentFavorite state snapshot"
+      },
+      "fullscreen-night-controls-20261125": {
+        "disposition": "native",
+        "evidence": "FullscreenControlPalette default night, native control styling, single brightness slider and favorite toggle"
       }
     },
     "jellyfinAPIRevision": {

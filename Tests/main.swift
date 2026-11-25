@@ -568,3 +568,18 @@ let newUI=try JSONCodec.decoder().decode(DynamicUILayout.self,from:Data("""
 check(newUI.formDefaults()["mode"]=="a","segmented native form defaults")
 check(HotPatchPlatform.hook(component:"validator",code:"CHANNEL_FAILED")=="onPlaybackFailure","event mapping")
 print("PASS: \(checks) assertions including ABI 3 event modules, typed data, native UI and adaptive profiles")
+
+let favoriteOn=FullscreenFavoriteState(favorite:true,pending:false)
+let favoriteOff=FullscreenFavoriteState(favorite:false,pending:false)
+let favoriteSaving=FullscreenFavoriteState(favorite:true,pending:true)
+check(favoriteOn.title=="Unfavorite" && favoriteOn.symbol=="heart.fill" && favoriteOn.selected && favoriteOn.enabled,"confirmed favorite displays selected toggle")
+check(favoriteOff.title=="Favorite" && favoriteOff.symbol=="heart" && !favoriteOff.selected && favoriteOff.enabled,"unfavorited channel displays add action")
+check(favoriteSaving.title=="Saving…" && !favoriteSaving.enabled && favoriteSaving.selected,"pending favorite keeps confirmed state and blocks repeated tap")
+check(!FullscreenFavoriteState(favorite:nil,pending:false).enabled,"unavailable favorite disabled")
+check(DynamicPresentation().resolvedFullscreenControlTheme=="night","native night theme default")
+let standardTheme=try HotConfiguration.decode(Data("""
+{"schemaVersion":1,"revision":"theme-fixture","presentation":{"fullscreenControlTheme":"standard"}}
+""".utf8))
+check(standardTheme.presentation?.resolvedFullscreenControlTheme=="standard","theme hot configuration supported")
+check((try? DynamicPresentation(fullscreenControlTheme:"unknown").checked())==nil,"invalid native theme rejected")
+print("PASS: \(checks) assertions including native night mode and confirmed favorite toggle")

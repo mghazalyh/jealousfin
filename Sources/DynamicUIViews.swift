@@ -164,12 +164,14 @@ struct DynamicUINodeView:View{
         case "banner":
             return AnyView(Panel{VStack(alignment:.leading){label.font(.headline);if let detail=node.detail{Text(detail).font(.caption)};if !value.isEmpty{Text(value).font(.caption)}}})
         case "liveBrightness":
+            let palette=FullscreenControlPalette(theme:model.presentationConfiguration.resolvedFullscreenControlTheme)
             return AnyView(HStack{
                 Label("Brightness",systemImage:"sun.max").font(.caption)
-                Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0.rounded()))}),in:-10...10,step:1)
+                Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0.rounded()))}),in:-10...10,step:1).tint(palette.slider)
                 Text(String(model.videoBrightness)).monospacedDigit()
-                Button("Reset"){model.setVideoBrightness(0)}.buttonStyle(.bordered)
-            })
+                Button{model.setVideoBrightness(0)}label:{Text("Reset").font(.caption).padding(.horizontal,9).frame(minHeight:32)}
+                    .buttonStyle(FullscreenControlButtonStyle(palette:palette))
+            }.foregroundColor(palette.text))
         case "slider":
             return AnyView(VStack(alignment:.leading,spacing:6){
                 HStack{Text(title);Spacer();Text(String(format:"%.2f",number)).monospacedDigit()}

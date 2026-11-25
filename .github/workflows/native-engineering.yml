@@ -1,0 +1,51 @@
+name: Native engineering validation
+on:
+  push:
+    branches: [engineering/hotpatch-abi2-20261125]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Scripts/**'
+      - 'Server/**'
+      - 'Native/**'
+      - 'Promoted/**'
+      - 'project.yml'
+      - '.github/workflows/native-engineering.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-engineering-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit and test policies
+        run: |
+          set -euo pipefail
+          python3 Scripts/audit-native-release.py
+          python3 Scripts/embed-promoted.py Promoted/baseline.json Sources/PromotedBaseline.generated.swift
+          mkdir -p build
+          swiftc Sources/Domain.swift Sources/EngineeringDomain.swift Sources/DynamicUIDomain.swift Sources/DecisionDomain.swift Sources/JellyfinAdapterDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Tests/main.swift -o build/policy-tests
+          build/policy-tests
+          python3 -m unittest discover -s Tests -p 'test_*.py' -v
+          python3 Server/iptv/test_policy_observer.py
+          python3 Server/iptv/test_policy_snapshot.py
+          python3 Server/iptv/test_gateway_policy.py
+          python3 Server/iptv/test_endurance_acceptance.py
+      - name: Runtime and iOS compile only
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          bash Scripts/fetch-runtime.sh
+          mkdir -p build/quickjs
+          for f in Native/RuntimeBridge.c Vendor/QuickJS/{cutils,libregexp,libunicode,quickjs,xsum}.c; do
+            clang -std=gnu11 -O2 -D_GNU_SOURCE -I Vendor/QuickJS -c "$f" -o "build/quickjs/$(basename "$f" .c).o"
+          done
+          swiftc -parse-as-library -import-objc-header Native/RuntimeBridge.h Sources/Domain.swift Sources/Runtime.swift Sources/RuntimeWorker.swift Sources/DynamicUIDomain.swift Sources/JellyfinAdapterDomain.swift Sources/JellyfinAdapterRuntime.swift Sources/EngineeringDomain.swift Sources/PatchPromotionDomain.swift Sources/PromotedBaseline.generated.swift Sources/Persistence.swift Sources/EngineeringRuntime.swift Sources/Jellyfin.swift Sources/HLSReadiness.swift Sources/BaselineInstaller.swift Sources/PatchVersionStore.swift Tests/HotPatchIntegration.swift Tests/RuntimeSmoke.swift build/quickjs/*.o -o build/runtime-tests
+          build/runtime-tests
+          xcodegen generate
+          xcodebuild -project Jealousfin.xcodeproj -scheme Jealousfin -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO IPHONEOS_DEPLOYMENT_TARGET=15.0 build
