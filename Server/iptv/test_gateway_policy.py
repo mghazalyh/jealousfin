@@ -184,7 +184,9 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertNotIn(self.c,g.programme_snapshot(now+1801))
         raw=b'<tv><programme channel="fixture" start="20261125140000 +0000" stop="20261125160000 +0000"><title>Fixture</title></programme></tv>'
         self.assertEqual(g.parse_guide(raw,{"fixture"},now)["fixture"][0][2],"Fixture")
+        self.assertEqual(g.parse_guide(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">'+raw,{"fixture"},now)["fixture"][0][2],"Fixture")
         with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv><tv/>',{"fixture"},now)
+        with self.assertRaises(ValueError):g.parse_guide(b'<!DOCTYPE tv SYSTEM "other.dtd"><tv/>',{"fixture"},now)
 
     def test_active_resource_protection(self):
         g=self.g

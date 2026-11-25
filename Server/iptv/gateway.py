@@ -339,7 +339,12 @@ def guide_time(value):
  try:return datetime.datetime.strptime(value,'%Y%m%d%H%M%S %z').timestamp()
  except (TypeError,ValueError,OverflowError):return None
 def parse_guide(data,ids,now):
- if len(data)>40*1024*1024 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():raise ValueError('Unsupported guide document')
+ if len(data)>40*1024*1024:raise ValueError('Guide too large')
+ # The two reviewed XMLTV feeds contain exactly this harmless declaration.
+ # Strip it before parsing; never fetch the external DTD.
+ data=data.replace(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">',b'',1)
+ upper=data.upper()
+ if b'<!DOCTYPE' in upper or b'<!ENTITY' in upper:raise ValueError('Unsupported guide document')
  root=ET.fromstring(data)
  if root.tag!='tv':raise ValueError('Invalid guide root')
  out={}
