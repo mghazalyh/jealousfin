@@ -654,3 +654,28 @@ let misplacedBrightnessFixture = try JSONCodec.decoder().decode(DynamicUILayout.
 """.utf8))
 check((try? misplacedBrightnessFixture.checked()) == nil,"brightness rejected outside supported slots")
 print("PASS: \(checks) assertions including independent fullscreen components")
+
+let programmeNow=Date(timeIntervalSince1970:1_795_620_000)
+let programmeEvidence=ProgrammeEvidence(title:"  Example film  ",source:"provider-catalogue",observedAt:programmeNow.timeIntervalSince1970-100,nextTitle:"Next film",providerEndClock:"23:16",providerNextClock:nil,year:2011)
+check(programmeEvidence.checked()?.title=="Example film","gateway evidence normalizes title")
+check(programmeEvidence.isFresh(at:programmeNow),"fresh primary programme metadata")
+check(!programmeEvidence.isFresh(at:programmeNow.addingTimeInterval(51)),"primary metadata expires without refresh")
+var externalEvidence=programmeEvidence
+externalEvidence.source="corroborated-external-schedule"
+check(externalEvidence.checked()?.nextTitle==nil,"external current-only schedule cannot invent an upcoming programme")
+check(externalEvidence.isFresh(at:programmeNow.addingTimeInterval(1600)),"external corroborated metadata has its own TTL")
+check(!externalEvidence.isFresh(at:programmeNow.addingTimeInterval(1701)),"external schedule expiry")
+var invalidEvidence=programmeEvidence
+invalidEvidence.title="https://example.invalid/token=secret"
+check(invalidEvidence.checked()==nil,"metadata rejects URL or credential-like title")
+check(ProgrammeEvidence.validYear(42)==nil,"invalid release year rejected")
+let legacyProgramme=try JSONCodec.decoder().decode(Program.self,from:Data("""
+{"id":"legacy","name":"Legacy programme"}
+""".utf8))
+check(legacyProgramme.evidence==nil && legacyProgramme.productionYear==nil && legacyProgramme.isCurrent(at:programmeNow),"previous programme serialization remains compatible")
+let typedProgramme=Program(id:"typed",name:"Scheduled: Example film (2011)",start:nil,end:nil,channelID:nil,productionYear:2011,evidence:programmeEvidence.checked())
+check(typedProgramme.title=="Example film (2011)" && typedProgramme.isCurrent(at:programmeNow),"typed metadata preserves server display title")
+check(!typedProgramme.isCurrent(at:programmeNow.addingTimeInterval(51)),"stale evidence cannot resurrect programme")
+let decodedProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(typedProgramme))
+check(decodedProgramme==typedProgramme,"typed programme evidence round trip")
+print("PASS: \(checks) assertions including programme evidence freshness")

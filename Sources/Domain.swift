@@ -1,11 +1,57 @@
 import Foundation
 
+// Gateway evidence is optional and backwards-compatible with ordinary Jellyfin
+// and previously persisted catalogue entries. Unknown or stale metadata must
+// never be used as a title, a playback verdict or a rotation decision.
+struct ProgrammeEvidence: Codable, Equatable {
+    var title:String
+    var source:String
+    var observedAt:Double
+    var nextTitle:String?
+    var providerEndClock:String?
+    var providerNextClock:String?
+    var year:Int?
+    static func clean(_ value:String?,maximum:Int=300)->String?{
+        guard let value=value?.trimmingCharacters(in:.whitespacesAndNewlines),!value.isEmpty,
+              value.count<=maximum,
+              value.range(of:"https?://|api_key=|token=",options:[.regularExpression,.caseInsensitive])==nil else{return nil}
+        return value
+    }
+    static func validYear(_ value:Int?)->Int?{
+        guard let value=value,(1870...2100).contains(value) else{return nil}
+        return value
+    }
+    func checked()->Self?{
+        guard let title=Self.clean(title),
+              ["provider-catalogue","corroborated-external-schedule"].contains(source),
+              observedAt.isFinite,observedAt>0 else{return nil}
+        var result=self
+        result.title=title
+        result.nextTitle=source=="provider-catalogue" ? Self.clean(nextTitle):nil
+        result.providerEndClock=Self.clean(providerEndClock,maximum:16)
+        result.providerNextClock=Self.clean(providerNextClock,maximum:16)
+        result.year=Self.validYear(year)
+        return result
+    }
+    func isFresh(at date:Date)->Bool{
+        guard checked() != nil else{return false}
+        let age=date.timeIntervalSince1970-observedAt
+        let maximum:Double=source=="provider-catalogue" ? 150:1800
+        return age>=(-30) && age<=maximum
+    }
+}
+
 struct Program: Codable, Identifiable, Equatable {
     var id: String
     var name: String
     var start: Date?
     var end: Date?
     var channelID: String?
+    var productionYear:Int?=nil
+    var evidence:ProgrammeEvidence?=nil
+    func isCurrent(at now:Date)->Bool{
+        (start.map{$0<=now} ?? true) && (end.map{$0>now} ?? true) && (evidence?.isFresh(at:now) ?? true)
+    }
     var title: String {
         let p = name.components(separatedBy: " · ")
         let title=p.count > 1 ? p.dropFirst().joined(separator: " · ") : name
