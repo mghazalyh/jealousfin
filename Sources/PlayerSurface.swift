@@ -9,6 +9,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
     var gravity:String = "fit"
     var allowsPiP:Bool = true
     var automaticPiP:Bool = false
+    var brightness:Int = 0
     private var videoGravity:AVLayerVideoGravity {
         switch gravity{case "fill":return .resizeAspectFill;case "stretch":return .resize;default:return .resizeAspect}
     }
@@ -16,6 +17,23 @@ struct PlayerSurface: UIViewControllerRepresentable {
     final class Coordinator {
         var callback:(Bool)->Void
         var observation:NSKeyValueObservation?
+        var boundsObservation:NSKeyValueObservation?
+        let brightnessLayer=UIView()
+        var level=0
+        @MainActor func applyBrightness(_ vc:AVPlayerViewController){
+            guard let overlay=vc.contentOverlayView else{return}
+            if brightnessLayer.superview !== overlay{
+                brightnessLayer.removeFromSuperview()
+                brightnessLayer.isUserInteractionEnabled=false
+                brightnessLayer.isAccessibilityElement=false
+                overlay.addSubview(brightnessLayer)
+            }
+            let rect=vc.view.convert(vc.videoBounds,to:overlay).intersection(overlay.bounds)
+            brightnessLayer.frame=rect.isNull ? .zero:rect
+            brightnessLayer.backgroundColor=level<0 ? .black:.white
+            brightnessLayer.alpha=CGFloat(abs(level))*0.035
+            brightnessLayer.isHidden=level==0 || !vc.isReadyForDisplay || rect.isEmpty
+        }
         init(_ callback:@escaping(Bool)->Void){self.callback=callback}
     }
     func makeUIViewController(context:Context)->AVPlayerViewController {
@@ -27,8 +45,13 @@ struct PlayerSurface: UIViewControllerRepresentable {
         c.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
         context.coordinator.observation=c.observe(\.isReadyForDisplay,options:[.initial,.new]){ [weak coordinator=context.coordinator] vc,_ in
             let ready=vc.isReadyForDisplay
-            DispatchQueue.main.async { coordinator?.callback(ready) }
+            DispatchQueue.main.async { coordinator?.callback(ready);coordinator?.applyBrightness(vc) }
         }
+        context.coordinator.level=min(10,max(-10,brightness))
+        context.coordinator.boundsObservation=c.observe(\.videoBounds,options:[.new]){[weak coordinator=context.coordinator] vc,_ in
+            DispatchQueue.main.async{coordinator?.applyBrightness(vc)}
+        }
+        context.coordinator.applyBrightness(c)
         return c
     }
     func updateUIViewController(_ uiViewController:AVPlayerViewController,context:Context) {
@@ -38,10 +61,15 @@ struct PlayerSurface: UIViewControllerRepresentable {
         uiViewController.videoGravity=videoGravity
         uiViewController.allowsPictureInPicturePlayback=allowsPiP
         uiViewController.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
+        context.coordinator.level=min(10,max(-10,brightness))
+        context.coordinator.applyBrightness(uiViewController)
     }
     static func dismantleUIViewController(_ uiViewController:AVPlayerViewController,coordinator:Coordinator){
         coordinator.observation?.invalidate()
         coordinator.observation=nil
+        coordinator.boundsObservation?.invalidate()
+        coordinator.boundsObservation=nil
+        coordinator.brightnessLayer.removeFromSuperview()
         // Do not pause the shared AVPlayer when switching surfaces.
         uiViewController.player=nil
     }

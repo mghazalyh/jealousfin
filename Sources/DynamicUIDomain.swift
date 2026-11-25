@@ -50,10 +50,28 @@ struct DynamicPresentation: Codable, Equatable {
     var nativePlaybackControls:Bool? = nil
     var pictureInPictureAllowed:Bool? = nil
     var automaticPictureInPicture:Bool? = nil
+    var fullscreenWidth:Double?=nil
+    var fullscreenPadding:Double?=nil
+    var fullscreenSpacing:Double?=nil
+    var fullscreenCornerRadius:Double?=nil
+    var fullscreenButtonHeight:Double?=nil
+    var fullscreenTextScale:Double?=nil
+    var fullscreenAutoHideSeconds:Int?=nil
+    var fullscreenTapToReveal:Bool?=nil
+    var fullscreenFitContent:Bool?=nil
+    var fullscreenPortraitMaxHeight:Double?=nil
+    var fullscreenControlOrder:[String]?=nil
+    static let defaultControlOrder=["rotationToggle","playPause","next","stop","favorite"]
     func checked()throws->Self{
         guard ["fit","fill","stretch"].contains(videoGravity ?? "fit"),
               (0.15...1).contains(fullscreenOpacity ?? 0.65),
-              (0.20...0.80).contains(fullscreenMaxHeight ?? 0.25)
+              (0.20...0.80).contains(fullscreenMaxHeight ?? 0.25),
+              (0.35...1).contains(fullscreenWidth ?? 1),
+              (0...32).contains(fullscreenPadding ?? 8),(0...24).contains(fullscreenSpacing ?? 6),
+              (0...32).contains(fullscreenCornerRadius ?? 14),(44...80).contains(fullscreenButtonHeight ?? 44),
+              (0.8...1.4).contains(fullscreenTextScale ?? 1),(0...600).contains(fullscreenAutoHideSeconds ?? 0),
+              (0.20...0.80).contains(fullscreenPortraitMaxHeight ?? 0.25),
+              fullscreenControlOrder.map({$0.count==5 && Set($0)==Set(Self.defaultControlOrder)}) ?? true
         else{throw AppError.message("Invalid presentation options")}
         return self
     }
@@ -67,7 +85,7 @@ struct DynamicUILayout: Codable, Equatable {
     static let replacementLocations=["guide.body","health.body","insights.body","more.body","player.transport","player.surf","player.history","player.fullscreen.header","player.fullscreen.transport","player.fullscreen.surf","player.fullscreen.footer"]
     static let locations=replacementLocations+["guide.top","guide.bottom","player.top","player.controls","player.bottom","player.fullscreen.top","player.fullscreen.controls","player.fullscreen.bottom","health.top","health.bottom","insights.top","insights.bottom","more.top","more.bottom","settings.top","settings.bottom","telemetry.top","telemetry.bottom","runtime.top","runtime.bottom","tests.top","tests.bottom","logs.top","logs.bottom","epg.top","epg.bottom"]
     static let kinds=["text","metric","button","input","toggle","picker","slider","progress","card","vstack","hstack","divider","link","spacer","web"]
-    static let commands:Set<String>=["get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","get_native_capabilities","get_preferences","set_preferences","set_player_audio","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
+    static let commands:Set<String>=["get_media_tracks","select_media_track","seek_live","seek_relative","reload_current_stream","get_hot_configuration","get_native_capabilities","get_preferences","set_preferences","set_player_audio","set_video_brightness","navigate","refresh_catalogue","probe_active_hls","set_fullscreen","set_fullscreen_controls","get_player_snapshot","get_status","get_telemetry","get_insights","get_logs","get_version","get_capabilities","list_channels","get_channel_health","list_banned","list_hiatus","open_channel","open_server_surf","play","pause","resume","stop","next_channel","previous_channel","start_surf","stop_surf","pause_surf","resume_surf","set_rotation_minutes","favorite_current","favorite_previous","sync_now","reconnect","start_device_tests","pause_device_tests","resume_device_tests","stop_device_tests","get_device_tests","get_runtime_module","script"]
     static func validID(_ value:String)->Bool {
         value.range(of:"^[A-Za-z0-9_-]{1,80}$",options:.regularExpression) != nil
     }

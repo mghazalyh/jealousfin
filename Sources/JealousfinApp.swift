@@ -123,7 +123,7 @@ struct PlaybackView:View{
                 if model.fullscreenPresented {
                     Color.black.aspectRatio(16/9,contentMode:.fit)
                 }else{
-                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:model.presentationConfiguration.nativePlaybackControls ?? false,gravity:model.presentationConfiguration.videoGravity ?? "fit",allowsPiP:model.presentationConfiguration.pictureInPictureAllowed ?? true,automaticPiP:model.presentationConfiguration.automaticPictureInPicture ?? false)
+                    PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:model.presentationConfiguration.nativePlaybackControls ?? false,gravity:model.presentationConfiguration.videoGravity ?? "fit",allowsPiP:model.presentationConfiguration.pictureInPictureAllowed ?? true,automaticPiP:model.presentationConfiguration.automaticPictureInPicture ?? false,brightness:model.videoBrightness)
                         .aspectRatio(16/9,contentMode:.fit)
                 }
                 Button{
@@ -197,7 +197,7 @@ struct HealthView:View{
             Panel{
                 VStack(alignment:.leading,spacing:8){
                     Text("Validation policy").font(.headline)
-                    Text("3 → 6 → 9 → 12 → 15 → 18 → 21 days").font(.subheadline.monospaced()).foregroundColor(accent)
+                    Text((1..<model.healthPenalty.banAfter).map{String($0*model.healthPenalty.baseDays)}.joined(separator:" → ")+" days").font(.subheadline.monospaced()).foregroundColor(accent)
                     Text("After the final hiatus, another confirmed failure permanently excludes the channel until explicit reinstatement.").font(.caption).foregroundColor(subdued)
                     Text("\(model.validatedCount) channels with recorded observations").font(.caption)
                 }
@@ -221,7 +221,7 @@ struct HealthView:View{
             DynamicUISlotView(location:"health.bottom")
         }.navigationBarHidden(true)
         .confirmationDialog("Explicitly reinstate \(approval?.name ?? "channel")?",isPresented:Binding(get:{approval != nil},set:{if !$0{approval=nil}}),titleVisibility:.visible){
-            Button("Approve reinstatement"){if let c=approval{model.approve(c)};approval=nil}
+            Button("Approve reinstatement"){if let c=approval{model.approveFromUI(c)};approval=nil}
             Button("Cancel",role:.cancel){approval=nil}
         }
     }

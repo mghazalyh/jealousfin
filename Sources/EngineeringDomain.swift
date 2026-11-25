@@ -14,6 +14,10 @@ struct RuntimePolicy: Codable, Equatable {
     var failureRetrySeconds: Int
     var playback:PlaybackAttemptPolicy? = nil
     var strictChannelHiatus:Bool? = nil
+    var healthPenalty:HealthPenaltyPolicy?=nil
+    var interAttemptDelaySeconds:Int?=nil
+    var terminalAdvanceDelaySeconds:Int?=nil
+    var adaptiveStartupExtraSeconds:Int?=nil
     static func baseline(_ settings: Settings) -> RuntimePolicy {
         RuntimePolicy(startupTimeout: settings.startupTimeout, retries: settings.retries,
             qualityMbps: settings.qualityMbps, stallSeconds: 10, rotationSeconds: settings.rotationMinutes * 60,
@@ -24,9 +28,12 @@ struct RuntimePolicy: Codable, Equatable {
             (5...300).contains(stallSeconds), (5...86400).contains(rotationSeconds),
             (3...60).contains(validationSeconds), (3...120).contains(minimumFrames),
             (0...120).contains(forwardBufferSeconds), startupTimeout > validationSeconds,
-            ["reopen","advance_surf","pause"].contains(recoveryMode),(5...600).contains(failureRetrySeconds)
+            ["reopen","advance_surf","pause"].contains(recoveryMode),(0...600).contains(failureRetrySeconds),
+            (0...30).contains(interAttemptDelaySeconds ?? 1),(0...60).contains(terminalAdvanceDelaySeconds ?? 2),
+            (0...60).contains(adaptiveStartupExtraSeconds ?? 5)
         else { throw AppError.message("Runtime policy is outside supported native limits") }
         _ = try playback?.checked()
+        _ = try healthPenalty?.checked()
         return self
     }
 }
@@ -235,18 +242,19 @@ struct HotConfiguration:Codable,Equatable {
         try keys(root,["schemaVersion","revision","runtime","playbackRules","operations","interpreter","presentation","gateway"])
         let playbackKeys:Set<String>=["segmentContainer","forceEncode","segmentSeconds","minimumSegments","maxWidth","maxHeight","videoBitrate","audioBitrate","peakMbps","forwardBufferSeconds","automaticallyWaits","startupSeconds","diagnosticSeconds","preferDirect","preferredMaximumWidth","preferredMaximumHeight","networkWhilePaused"]
         if let runtime=root["runtime"] as? [String:Any]{
-            try keys(runtime,["startupTimeout","retries","qualityMbps","stallSeconds","rotationSeconds","validationSeconds","minimumFrames","forwardBufferSeconds","automaticallyWaits","recoveryMode","failureRetrySeconds","playback","strictChannelHiatus"])
+            try keys(runtime,["startupTimeout","retries","qualityMbps","stallSeconds","rotationSeconds","validationSeconds","minimumFrames","forwardBufferSeconds","automaticallyWaits","recoveryMode","failureRetrySeconds","playback","strictChannelHiatus","interAttemptDelaySeconds","terminalAdvanceDelaySeconds","adaptiveStartupExtraSeconds","healthPenalty"])
             if let p=runtime["playback"] as? [String:Any]{try keys(p,playbackKeys)}
+            if let h=runtime["healthPenalty"] as? [String:Any]{try keys(h,["baseDays","banAfter"])}
         }
         for rule in root["playbackRules"] as? [[String:Any]] ?? [] {
             try keys(rule,["channelID","attempt","policy"])
             if let p=rule["policy"] as? [String:Any]{try keys(p,playbackKeys)}
         }
         if let op=root["operations"] as? [String:Any]{
-            try keys(op,["systemSampleSeconds","playbackSampleSeconds","heartbeatSeconds","syncSeconds","catalogueRefreshSeconds","reconnectSeconds","eventRetentionCount","eventRetentionMiB","resourceWarningMiB","suspendAutomationOnPressure","playerEventDiagnostics","playerEventSampleSeconds","surfTransport"])
+            try keys(op,["systemSampleSeconds","playbackSampleSeconds","heartbeatSeconds","syncSeconds","catalogueRefreshSeconds","gatewayPolicyPollSeconds","reconnectSeconds","eventRetentionCount","eventRetentionMiB","resourceWarningMiB","memoryGrowthWarningMiB","suspendAutomationOnPressure","playerEventDiagnostics","playerEventSampleSeconds","surfTransport"])
         }
         if let budget=root["interpreter"] as? [String:Any]{try keys(budget,["timeoutMs","memoryMiB","maxCommands"])}
-        if let ui=root["presentation"] as? [String:Any]{try keys(ui,["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture"])}
+        if let ui=root["presentation"] as? [String:Any]{try keys(ui,["videoGravity","fullscreenOpacity","fullscreenMaxHeight","fullscreenInitiallyVisible","nativePlaybackControls","pictureInPictureAllowed","automaticPictureInPicture","fullscreenWidth","fullscreenPadding","fullscreenSpacing","fullscreenCornerRadius","fullscreenButtonHeight","fullscreenTextScale","fullscreenAutoHideSeconds","fullscreenTapToReveal","fullscreenFitContent","fullscreenPortraitMaxHeight","fullscreenControlOrder"])}
         if let gateway=root["gateway"] as? [String:Any]{try keys(gateway,["lanServerPort","lanGatewayPort","routePrefix","ticketField","timeoutSeconds"])}
         var normalized=root
         if let runtime=root["runtime"] as? [String:Any]{
@@ -277,10 +285,12 @@ struct OperationalConfiguration:Codable,Equatable{
     var heartbeatSeconds:Int?=nil
     var syncSeconds:Int?=nil
     var catalogueRefreshSeconds:Int?=nil
+    var gatewayPolicyPollSeconds:Int?=nil
     var reconnectSeconds:Int?=nil
     var eventRetentionCount:Int?=nil
     var eventRetentionMiB:Int?=nil
     var resourceWarningMiB:Int?=nil
+    var memoryGrowthWarningMiB:Int?=nil
     var suspendAutomationOnPressure:Bool?=nil
     var playerEventDiagnostics:Bool?=nil
     var playerEventSampleSeconds:Int?=nil
@@ -291,10 +301,12 @@ struct OperationalConfiguration:Codable,Equatable{
               (15...600).contains(heartbeatSeconds ?? 30),
               (15...600).contains(syncSeconds ?? 30),
               (60...3600).contains(catalogueRefreshSeconds ?? 180),
+              (2...120).contains(gatewayPolicyPollSeconds ?? 5),
               (15...600).contains(reconnectSeconds ?? 60),
               (500...20000).contains(eventRetentionCount ?? 5000),
               (4...128).contains(eventRetentionMiB ?? 32),
               (64...2048).contains(resourceWarningMiB ?? 512),
+              (16...1024).contains(memoryGrowthWarningMiB ?? 128),
               (1...60).contains(playerEventSampleSeconds ?? 5),
               ["auto","device"].contains(surfTransport ?? "auto")
         else{throw AppError.message("Operational configuration outside supported bounds")}

@@ -18,25 +18,43 @@ def connect(path=DB):
     CREATE TABLE IF NOT EXISTS samples(at INTEGER PRIMARY KEY,footprint INTEGER,cpu REAL,thermal TEXT,queued INTEGER,resources INTEGER,channel TEXT);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
     """)
+    for column in ("approved_at","last_success"):
+        if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
+            try:c.execute("ALTER TABLE channel ADD COLUMN "+column+" REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:raise
+    for column in ("launch_id","build","policy_revision"):
+        if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:
+            try:c.execute("ALTER TABLE samples ADD COLUMN "+column+" TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:raise
+    c.commit()
     return c
 def http(path):
     req=urllib.request.Request(BASE+path,headers={'Authorization':'Bearer '+AUTH} if AUTH else {})
     with urllib.request.urlopen(req,timeout=5) as f:return json.load(f)
 def health():
-    req=urllib.request.Request(BASE+'/command',data=json.dumps({'schemaVersion':1,'id':str(uuid.uuid4()),'action':'get_channel_health','arguments':{}}).encode(),headers=dict({'Content-Type':'application/json'},**({'Authorization':'Bearer '+AUTH} if AUTH else {})))
-    with urllib.request.urlopen(req,timeout=6) as f:r=json.load(f)
-    if r.get('status')!='succeeded':raise RuntimeError('Health query unsuccessful')
-    return json.loads(r['result'])
+    for action in ('get_native_channel_health','get_channel_health'):
+        req=urllib.request.Request(BASE+'/command',data=json.dumps({'schemaVersion':1,'id':str(uuid.uuid4()),'action':action,'arguments':{}}).encode(),headers=dict({'Content-Type':'application/json'},**({'Authorization':'Bearer '+AUTH} if AUTH else {})))
+        with urllib.request.urlopen(req,timeout=6) as f:r=json.load(f)
+        if r.get('status')=='succeeded':return json.loads(r['result'])
+    raise RuntimeError('Health query unsuccessful')
+def penalty(c):
+    values=dict(c.execute("SELECT key,value FROM meta WHERE key IN ('hiatus_base_days','hiatus_ban_after')"))
+    days=int(values.get('hiatus_base_days','3'));ban=int(values.get('hiatus_ban_after','8'))
+    if not 1<=days<=30 or not 2<=ban<=20:raise ValueError('Invalid progressive hiatus policy')
+    return days,ban
 def failure(c,cid,at,reason,trace=None):
     if trace:
         cur=c.execute("UPDATE sessions SET failed=1,outcome='failed' WHERE trace=? AND failed=0",(trace,))
         if not cur.rowcount:return
-    row=c.execute('SELECT failures,hiatus_until,banned,last_failure FROM channel WHERE id=?',(cid,)).fetchone()
+    row=c.execute('SELECT failures,hiatus_until,banned,last_failure,approved_at,last_success FROM channel WHERE id=?',(cid,)).fetchone()
     if not row:return
-    n,until,banned,last=row
-    if banned or at<until or at<=last:return
+    n,until,banned,last,approved,success=row
+    if banned or at<until or at<=max(last,approved or 0,success or 0):return
     n+=1
-    c.execute('UPDATE channel SET failures=?,hiatus_until=?,banned=?,last_failure=?,reason=? WHERE id=?',(n,0 if n>=8 else at+n*3*DAY,int(n>=8),at,reason[:300],cid))
+    days,ban=penalty(c)
+    c.execute('UPDATE channel SET failures=?,hiatus_until=?,banned=?,last_failure=?,reason=? WHERE id=?',(n,0 if n>=ban else at+n*days*DAY,int(n>=ban),at,reason[:300],cid))
 def seed(c,info,h):
     for ch in info['channels']:
         c.execute('INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)',(ch['id'],ch['name']))
@@ -66,17 +84,18 @@ def ingest(c,events,status):
         cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,code,cid,trace,str(fields.get('reason',''))[:300]))
         if not cur.rowcount:continue
         if code=='OPEN':
-            for old,oldcid,confirmed,count,first,last,stalls in c.execute("SELECT trace,cid,confirmed,sample_count,first_position,last_position,stalls FROM sessions WHERE closed=0 AND trace!=?",(trace,)).fetchall():
+            for old,oldcid,confirmed,count,first,last,stalls,outcome in c.execute("SELECT trace,cid,confirmed,sample_count,first_position,last_position,stalls,outcome FROM sessions WHERE closed=0 AND trace!=?",(trace,)).fetchall():
                 good=confirmed>0 and at-confirmed>=rotation-1 and count>=2 and first is not None and last is not None and last-first>=max(3,rotation*.45) and not stalls
-                c.execute("UPDATE sessions SET closed=?,outcome=CASE WHEN failed=1 THEN 'failed' ELSE ? END WHERE trace=?",(at,'sustained' if good else 'inconclusive',old))
-                if good and c.execute("SELECT failed FROM sessions WHERE trace=?",(old,)).fetchone()[0]==0:
-                    c.execute('UPDATE channel SET sustained=sustained+1,failures=0,hiatus_until=0 WHERE id=? AND banned=0 AND last_failure<?',(oldcid,confirmed))
+                c.execute("UPDATE sessions SET closed=?,outcome=CASE WHEN failed=1 THEN 'failed' ELSE ? END WHERE trace=?",(at,'sustained' if good or outcome=='sustained' else 'inconclusive',old))
+                if good and outcome!="sustained" and c.execute("SELECT failed FROM sessions WHERE trace=?",(old,)).fetchone()[0]==0:
+                    c.execute('UPDATE channel SET sustained=sustained+1,failures=0,hiatus_until=0,last_success=max(last_success,?) WHERE id=? AND banned=0 AND last_failure<?',(at,oldcid,confirmed))
             c.execute('INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)',(trace,cid,at))
             c.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(at,cid))
         elif code=='PLAYBACK_CONFIRMED':
             cur=c.execute('UPDATE sessions SET confirmed=? WHERE trace=? AND confirmed=0',(at,trace))
             if cur.rowcount and at>float((c.execute("SELECT value FROM meta WHERE key='seed_time'").fetchone() or ('0',))[0]):c.execute('UPDATE channel SET startups=startups+1 WHERE id=?',(cid,))
         elif code in ('PLAYBACK_STALLED','FAILURE_UNCONFIRMED','CHANNEL_FAILED'):
+            if fields.get('terminal') in ('false',False):continue
             # A terminal failure may occur before the observer saw OPEN.
             c.execute('INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)',(trace,cid,at))
             failure(c,cid,at,fields.get('reason',code),trace)
@@ -103,7 +122,7 @@ def cycle(c):
         ingest(c,events,status)
         now=int(time.time());m=status.get('systemMetrics',{})
         if not c.execute('SELECT 1 FROM samples WHERE at>=?',(now-60,)).fetchone():
-            c.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel','')))
+            c.execute('INSERT OR REPLACE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision) VALUES(?,?,?,?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel',''),status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision','')))
         c.execute('DELETE FROM observed WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM samples WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM sessions WHERE closed>0 AND closed<?',(now-30*DAY,))

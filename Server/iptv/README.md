@@ -26,3 +26,7 @@ The PS3 profile is a separate JSON fixture for future development. Do not advert
 ## Offline compatibility snapshot
 
 Use `python3 make_policy_snapshot.py /private/policy.sqlite3 /private/new-adapter.js` to generate an ABI-1 catalogue filter for older clients. This read-only generator is not an installer or continuous synchronization service. Keep the output private. Each activation can reconnect an older client. The gateway marker delegates ordering and exclusions to the SQLite-aware gateway. Run `python3 test_policy_snapshot.py` for regression checks.
+
+## Policy v2 and acceptance
+
+The new gateway requires an initialized complete SQLite catalogue, fails closed when policy is unavailable, returns the complete catalogue plus health only to opt-in clients, and rejects excluded PlaybackInfo before source resolution. Older clients still receive a filtered catalogue. The authenticated policy event endpoint deduplicates native failure and sustained-success reports; explicit approval is required for reinstatement. The default remains 3 days per failure, ban at 8. Gateway policy takes precedence over native settings. Idle resource entries expire; recently accessed active-channel entries are protected under pressure. See docs/native-release-acceptance.md for the mandatory live migration and physical/endurance checks.

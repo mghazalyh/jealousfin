@@ -5,21 +5,36 @@ import AVKit
 // changes. Native buttons remain available if a dynamic UI revision is rejected.
 struct FullscreenSurfPlayer:View {
     @EnvironmentObject var model:AppModel
-    @State private var brightnessPreview:Double=0
+    @State private var contentHeight:CGFloat=0
+    @State private var lastInteraction=Date()
+    private var padding:CGFloat{CGFloat(presentation.fullscreenPadding ?? 8)}
+    private var spacing:CGFloat{CGFloat(presentation.fullscreenSpacing ?? 6)}
+    private var corner:CGFloat{CGFloat(presentation.fullscreenCornerRadius ?? 14)}
     private var presentation:DynamicPresentation{model.presentationConfiguration}
     var body:some View {
         GeometryReader{geometry in
             ZStack {
                 Color.black.ignoresSafeArea()
-                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:presentation.nativePlaybackControls ?? false,gravity:presentation.videoGravity ?? "fit",allowsPiP:presentation.pictureInPictureAllowed ?? true,automaticPiP:presentation.automaticPictureInPicture ?? false)
+                PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:presentation.nativePlaybackControls ?? false,gravity:presentation.videoGravity ?? "fit",allowsPiP:presentation.pictureInPictureAllowed ?? true,automaticPiP:presentation.automaticPictureInPicture ?? false,brightness:model.videoBrightness)
                     .ignoresSafeArea()
                     .accessibilityLabel("Fullscreen video")
+                    .overlay{
+                        if !model.fullscreenControlsVisible && presentation.fullscreenTapToReveal != false{
+                            Color.clear.contentShape(Rectangle()).onTapGesture{lastInteraction=Date();model.fullscreenControlsVisible=true}
+                        }
+                    }
                 if model.fullscreenControlsVisible {
                     VStack(spacing:0){
                         header
                         Spacer(minLength:8)
-                        footer(maxHeight:max(100,geometry.size.height*CGFloat(presentation.fullscreenMaxHeight ?? 0.25)))
-                    }.padding(.horizontal,12).padding(.vertical,8)
+                        let portrait=geometry.size.height>geometry.size.width
+                        let fraction=portrait ? (presentation.fullscreenPortraitMaxHeight ?? presentation.fullscreenMaxHeight ?? 0.25):(presentation.fullscreenMaxHeight ?? 0.25)
+                        footer(maxHeight:max(100,geometry.size.height*CGFloat(fraction)))
+                    }
+                    .frame(maxWidth:geometry.size.width*CGFloat(presentation.fullscreenWidth ?? 1))
+                    .padding(.horizontal,padding).padding(.vertical,padding)
+                    .simultaneousGesture(TapGesture().onEnded{lastInteraction=Date()})
+                    .simultaneousGesture(DragGesture(minimumDistance:1).onChanged{_ in lastInteraction=Date()})
                 }else{
                     VStack{
                         HStack{
@@ -36,11 +51,20 @@ struct FullscreenSurfPlayer:View {
                 }
             }
         }.preferredColorScheme(.dark)
+            .onChange(of:model.fullscreenControlsVisible){visible in if visible{lastInteraction=Date()}}
+            .task(id:presentation.fullscreenAutoHideSeconds){
+                guard let seconds=presentation.fullscreenAutoHideSeconds,seconds>0 else{return}
+                while !Task.isCancelled{
+                    try? await Task.sleep(nanoseconds:1_000_000_000)
+                    guard !Task.isCancelled else{return}
+                    if model.fullscreenControlsVisible,Date().timeIntervalSince(lastInteraction)>=Double(seconds){model.fullscreenControlsVisible=false}
+                }
+            }
             .overlay{DecisionOverlay().environmentObject(model)}
     }
     private var header:some View{
-        VStack(alignment:.leading,spacing:8){
-            HStack(spacing:10){
+        VStack(alignment:.leading,spacing:spacing){
+            HStack(spacing:spacing){
                 PatchableRegion("player.fullscreen.header"){
                 VStack(alignment:.leading,spacing:3){
                     Text(model.current?.name ?? "Choose a channel").font(.headline).lineLimit(1)
@@ -55,7 +79,7 @@ struct FullscreenSurfPlayer:View {
                 closeButton
             }
             DynamicUISlotView(location:"player.fullscreen.top")
-        }.padding(10).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(14)
+        }.padding(padding).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(corner)
     }
     private var closeButton:some View{
         Button{model.fullscreenPresented=false}label:{
@@ -67,7 +91,7 @@ struct FullscreenSurfPlayer:View {
     }
     private func footer(maxHeight:CGFloat)->some View{
         ScrollView(showsIndicators:false){
-            VStack(alignment:.leading,spacing:10){
+            VStack(alignment:.leading,spacing:spacing){
                 HStack{
                     Label(model.surfing ? "Surf active":"Surf stopped",systemImage:"shuffle").font(.headline)
                     Spacer()
@@ -75,21 +99,9 @@ struct FullscreenSurfPlayer:View {
                         .font(.subheadline.monospacedDigit())
                 }
                 PatchableRegion("player.fullscreen.transport"){
-                HStack(spacing:8){
-                    if model.surfing && !model.usingSharedSurf {
-                        control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle","rotationToggle"){
-                            model.toggleSurfPause()
-                        }
-                    }
-                    control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill","playPause"){
-                        if model.playing{model.pause()}else{model.resume()}
-                    }
-                    if model.surfing || model.currentSharedTransport{
-                        control(model.usingSharedSurf ? "Reconnect":"Next",model.usingSharedSurf ? "arrow.clockwise":"forward.end.fill","next"){model.next()}
-                    }
-                    control("Stop","stop.fill","stop"){model.stop()}
-                    if let c=model.current,!c.isSurf{
-                        control("Favorite",c.favorite ? "heart.fill":"heart","favorite"){model.favoriteFromUI(c)}
+                HStack(spacing:spacing){
+                    ForEach(presentation.fullscreenControlOrder ?? DynamicPresentation.defaultControlOrder,id:\.self){id in
+                        transportControl(id)
                     }
                 }
                 }
@@ -123,33 +135,55 @@ struct FullscreenSurfPlayer:View {
                     DynamicUISlotView(location:"player.fullscreen.controls")
                     DynamicUISlotView(location:"player.fullscreen.bottom")
                 }
-            }.padding(12)
-        }.frame(maxHeight:maxHeight).background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(14)
+            }.padding(padding)
+                .background(GeometryReader{proxy in Color.clear.preference(key:FullscreenContentHeight.self,value:proxy.size.height)})
+        }
+        .onPreferenceChange(FullscreenContentHeight.self){height in if height>0,abs(height-contentHeight)>1{contentHeight=height}}
+        .frame(height:presentation.fullscreenFitContent != false && contentHeight>0 ? min(maxHeight,contentHeight):maxHeight)
+        .background(Color.black.opacity(presentation.fullscreenOpacity ?? 0.65)).cornerRadius(corner)
     }
-    // Preview only. The native video and screen brightness remain unchanged.
+    @ViewBuilder private func transportControl(_ id:String)->some View{
+        switch id{
+        case "rotationToggle":
+            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id){model.toggleSurfPause()}}
+        case "playPause":
+            control(model.playing ? "Pause":"Play",model.playing ? "pause.fill":"play.fill",id){if model.playing{model.pause()}else{model.resume()}}
+        case "next":
+            if model.surfing || model.currentSharedTransport{control(model.usingSharedSurf ? "Reconnect":"Next",model.usingSharedSurf ? "arrow.clockwise":"forward.end.fill",id){model.next()}}
+        case "stop":
+            control("Stop","stop.fill",id){model.stop()}
+        case "favorite":
+            if let c=model.current,!c.isSurf{control("Favorite",c.favorite ? "heart.fill":"heart",id){model.favoriteFromUI(c)}}
+        default:EmptyView()
+        }
+    }
+    // Local video-plane luminance overlay; no transcoding or stream reopening.
     private var brightnessControl:some View{
         HStack(spacing:8){
             Label("Brightness",systemImage:"sun.max").font(.caption)
-            Text("(preview)").font(.caption2).foregroundColor(.secondary)
             Text("−10").font(.caption2)
-            Slider(value:$brightnessPreview,in:-10...10,step:1)
-                .accessibilityLabel("Brightness preview")
-                .accessibilityHint("Changes the preview value only; video is unaffected")
+            Slider(value:Binding(get:{Double(model.videoBrightness)},set:{model.setVideoBrightness(Int($0));lastInteraction=Date()}),in:-10...10,step:1)
+                .accessibilityLabel("Video brightness")
             Text("+10").font(.caption2)
-            Text(brightnessPreview > 0 ? "+"+String(Int(brightnessPreview)):String(Int(brightnessPreview)))
+            Text(model.videoBrightness > 0 ? "+"+String(model.videoBrightness):String(model.videoBrightness))
                 .font(.caption.monospacedDigit()).frame(minWidth:25)
-            Button("Reset"){brightnessPreview=0}.buttonStyle(.bordered)
-                .accessibilityLabel("Reset brightness preview")
-        }.accessibilityIdentifier("player.fullscreen.brightnessPreview")
+            Button("Reset"){model.setVideoBrightness(0)}.buttonStyle(.bordered)
+                .accessibilityLabel("Reset brightness")
+        }.accessibilityIdentifier("player.fullscreen.brightness")
     }
     private func control(_ title:String,_ image:String,_ id:String,action:@escaping()->Void)->some View{
         Button(action:action){
             VStack(spacing:4){
-                Image(systemName:image).font(.headline)
-                Text(title).font(.caption2).lineLimit(1).minimumScaleFactor(0.7)
-            }.frame(maxWidth:.infinity,minHeight:44)
+                Image(systemName:image).font(.system(size:17*CGFloat(presentation.fullscreenTextScale ?? 1),weight:.semibold))
+                Text(title).font(.system(size:11*CGFloat(presentation.fullscreenTextScale ?? 1))).lineLimit(1).minimumScaleFactor(0.7)
+            }.frame(maxWidth:.infinity,minHeight:CGFloat(presentation.fullscreenButtonHeight ?? 44))
         }.buttonStyle(.bordered)
             .accessibilityLabel(title)
             .accessibilityIdentifier("player.fullscreen."+id)
     }
+}
+
+private struct FullscreenContentHeight:PreferenceKey{
+    static var defaultValue:CGFloat=0
+    static func reduce(value:inout CGFloat,nextValue:()->CGFloat){value=max(value,nextValue())}
 }

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "revisions": {
+    "runtimePatch": {},
+    "configurationRevision": {
+      "iptv-fast-failure-recovery-20261125": {
+        "disposition": "native",
+        "evidence": "RuntimePolicy.baseline and startup preference defaults"
+      },
+      "iptv-compact-fullscreen-20261125": {
+        "disposition": "native",
+        "evidence": "DynamicPresentation defaults and FullscreenSurfPlayer native layout"
+      }
+    },
+    "uiRevision": {
+      "fullscreen-rotation-first-20261125": {
+        "disposition": "native",
+        "evidence": "Native rotation-first toolbar"
+      },
+      "fullscreen-brightness-preview-20261125": {
+        "disposition": "native",
+        "evidence": "Native fullscreen brightness slider and local video-plane adjustment"
+      }
+    },
+    "jellyfinAPIRevision": {
+      "iptv-hiatus-snapshot-1795612090": {
+        "disposition": "gateway",
+        "evidence": "SQLite policy v2 gateway final eligibility and native snapshot contract; deploy and verify before install"
+      }
+    }
+  }
+}

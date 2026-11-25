@@ -1,6 +1,7 @@
 import sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict
 from pathlib import Path
+from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
 PORT=int(os.environ.get('JEALOUSFIN_PORT','18796'))
@@ -16,6 +17,10 @@ SAMPLES=[]
 lock=threading.RLock()
 resources=OrderedDict()
 reverse={}
+resource_touched={}
+RESOURCE_TTL=900
+RESOURCE_LIMIT=10000
+active_channels={}
 counts={}
 favorites=set()
 def log(msg):
@@ -40,16 +45,27 @@ def fetch(url,limit,range_header=None):
   data=f.read(limit+1)
   if len(data)>limit:raise ValueError('Response too large')
   return data,f.headers,f.status,f.geturl()
+def evict_resources(now,required=0):
+ # Idle expiry plus LRU under pressure. Protect active-channel media touched
+ # recently; if all slots are protected, reject growth rather than corrupt playback.
+ for rid,(cid,url) in list(resources.items()):
+  age=now-resource_touched.get(rid,0)
+  active=active_channels.get(cid,0)>now and age<120
+  if not active and (age>RESOURCE_TTL or len(resources)+required>RESOURCE_LIMIT):
+   resources.pop(rid,None);resource_touched.pop(rid,None);reverse.pop((cid,url),None)
+ for cid,until in list(active_channels.items()):
+  if until<=now:active_channels.pop(cid,None)
 def register(url,cid):
  validate(url)
  with lock:
-  key=(cid,url)
+  key=(cid,url);now=time.monotonic()
   if key in reverse and reverse[key] in resources:
    rid=reverse[key];resources.move_to_end(rid)
   else:
+   if len(resources)>=RESOURCE_LIMIT:evict_resources(now,1)
+   if len(resources)>=RESOURCE_LIMIT:raise RuntimeError("Resource registry saturated")
    rid=secrets.token_hex(16);resources[rid]=key;reverse[key]=rid
-   while len(resources)>10000:
-    old,u=resources.popitem(last=False);reverse.pop(u,None)
+  resource_touched[rid]=now
  return '/media/'+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
 def rewrite(data,base,cid):
  text=data.decode('utf-8-sig')
@@ -65,8 +81,9 @@ def provider():
  base=os.environ['JEALOUSFIN_PROVIDER_URL'].rstrip('/')
  if base.endswith('/manifest.json'):base=base[:-14].rstrip('/')
  return validate(base)
-PROVIDER=provider()
+PROVIDER=None
 def provider_json(path):
+ if PROVIDER is None:raise RuntimeError('Provider is not initialized')
  url=validate(PROVIDER+path)
  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'Jealousfin-Catalogue-Diagnostics/1.0'})
  with opener.open(req,timeout=8) as f:
@@ -85,17 +102,23 @@ def catalogue():
   if len(found)==prior:break
  if len(found)<100:raise ValueError('Incomplete channel catalogue')
  return found
-raw=catalogue()
 channels={}
 sources={}
 preferred_hosts={s[0]:s[2] for s in SAMPLES}
 attempts={}
-for i,(source_id,row) in enumerate(raw.items(),1):
- cid=hashlib.md5(source_id.encode()).hexdigest()
- genres=row.get('genres',[])
- if not isinstance(genres,list):genres=[]
- channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
- sources[cid]=source_id
+def initialize_catalogue():
+ raw=catalogue()
+ for i,(source_id,row) in enumerate(raw.items(),1):
+  cid=hashlib.md5(source_id.encode()).hexdigest()
+  genres=row.get('genres',[])
+  if not isinstance(genres,list):genres=[]
+  channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
+  sources[cid]=source_id
+ # A pre-existing initialized database may acquire new channels. Preserve every
+ # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
+ with policy_connect(ROOT/'policy.sqlite3') as db:
+  if db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():
+   db.executemany("INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)",[(cid,c['Name']) for cid,c in channels.items()])
 def resolve(cid):
  source_id=sources[cid]
  candidates=[]
@@ -123,20 +146,52 @@ def record_attempt(cid):
   temp.write_text(json.dumps(updated,separators=(',',':')))
   os.replace(temp,ROTATION_FILE)
   rotation.update(updated)
-def ordered_catalogue():
- # Consult the observer's durable policy database without a restart.
- # Keep the last valid policy if SQLite is momentarily busy.
- global policy_snapshot
- try:
-  with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
-   rows=db.execute('SELECT id,last_attempt,hiatus_until,banned FROM channel').fetchall()
-  if len(rows)>=len(channels):
-   policy_snapshot={cid:(attempt,until,banned) for cid,attempt,until,banned in rows}
- except (sqlite3.Error,OSError):pass
+def policy_rows():
+ # No false readiness marker or silent fail-open when policy storage fails.
+ with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
+  if not db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():raise RuntimeError("Policy migration pending")
+  columns={r[1] for r in db.execute("PRAGMA table_info(channel)")}
+  policy_penalty(db)
+  approval="approved_at" if "approved_at" in columns else "0"
+  success="last_success" if "last_success" in columns else "0"
+  rows=db.execute("SELECT id,last_attempt,hiatus_until,banned,failures,last_failure,reason,sustained,"+approval+","+success+" FROM channel").fetchall()
+ result={r[0]:dict(lastAttempt=r[1],hiatusUntil=r[2],banned=bool(r[3]),failures=r[4],lastFailure=r[5],reason=r[6],successes=r[7],approvedAt=r[8],lastSuccess=r[9]) for r in rows if r[0] in channels}
+ if not set(channels).issubset(result):raise RuntimeError("Policy catalogue incomplete")
+ return result
+def policy_eligible(row,now):
+ return not row["banned"] and row["hiatusUntil"]<=now
+def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
- valid=[item for item in channels.items() if not policy_snapshot.get(item[0],(0,0,0))[2] and policy_snapshot.get(item[0],(0,0,0))[1]<=now]
- return sorted(valid,key=lambda item:policy_snapshot.get(item[0],(0,0,0))[0])
-policy_snapshot={}
+ return sorted((item for item in channels.items() if include_excluded or policy_eligible(snapshot[item[0]],now)),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
+def policy_payload(snapshot):
+ with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
+  days,ban=policy_penalty(db)
+ return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban}}
+def policy_event(cid,trace,action,reason):
+ with policy_connect(ROOT/'policy.sqlite3') as db:
+  if not db.execute("SELECT 1 FROM channel WHERE id=?",(cid,)).fetchone():raise ValueError("Unknown policy channel")
+  now=time.time()
+  event_id="native-policy:"+trace+":"+action
+  prior=db.execute("SELECT cid FROM observed WHERE id=?",(event_id,)).fetchone()
+  if prior:
+   if prior[0]!=cid:raise ValueError("Policy event identity mismatch")
+   return
+  db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_"+action,cid,trace,reason[:300]))
+  if action=="failure":
+   db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)",(trace,cid,now))
+   if db.execute("SELECT cid FROM sessions WHERE trace=?",(trace,)).fetchone()[0]!=cid:raise ValueError("Trace/channel mismatch")
+   policy_failure(db,cid,now,reason,trace)
+  elif action=="success":
+   # Native client sends success only after sustained decoded playback.
+   db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened,confirmed) VALUES(?,?,?,?)",(trace,cid,now,now))
+   row=db.execute("SELECT cid,failed,outcome,opened FROM sessions WHERE trace=?",(trace,)).fetchone()
+   if row[0]!=cid:raise ValueError("Trace/channel mismatch")
+   if not row[1] and row[2]!='sustained':
+    updated=db.execute("UPDATE channel SET sustained=sustained+1,failures=0,hiatus_until=0,last_success=? WHERE id=? AND banned=0 AND hiatus_until<=? AND last_failure<?",(now,cid,now,row[3]))
+    if updated.rowcount:db.execute("UPDATE sessions SET outcome='sustained' WHERE trace=?",(trace,))
+  elif action=="approve":
+   db.execute("UPDATE channel SET banned=0,failures=0,hiatus_until=0,approved_at=? WHERE id=? AND banned=1",(now,cid))
+  else:raise ValueError("Unknown policy action")
 def record_source_error(cid,url,phase,error):
  # Never persist stream URLs, query parameters, headers or credentials.
  host=urllib.parse.urlsplit(url).hostname if url else None
@@ -170,7 +225,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
   with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
   if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial','Version':'10.10.0','Id':USER_ID})
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v1','policyChannels':len(policy_snapshot)})
+   try:snapshot=policy_rows();ready=True
+   except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot)})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -183,7 +240,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
    rid=parts[3].split('.')[0]
    with lock:
     entry=resources.get(rid)
-    if entry:resources.move_to_end(rid)
+    if entry:
+     now=time.monotonic()
+     if now-resource_touched.get(rid,0)>RESOURCE_TTL:
+      resources.pop(rid,None);reverse.pop(entry,None);resource_touched.pop(rid,None);entry=None
+     else:
+      resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+120
    if not entry:return self.reply(404,{})
    cid,url=entry
    try:
@@ -200,21 +262,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except Exception as e:
     record_source_error(cid,url,'media',type(e).__name__);log('upstream failure '+type(e).__name__);return self.reply(502,{})
   if not self.authorized(q):return self.reply(401,{})
-  if path=='/LiveTv/Channels':
-   out=[]
-   with lock:
-    for cid,c in ordered_catalogue():out.append(dict(c,UserData={'IsFavorite':cid in favorites}))
-   return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinPolicyRevision':'sqlite-policy-v1'})
+  if path in ('/LiveTv/Channels','/Jealousfin/Policy'):
+   try:snapshot=policy_rows()
+   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   if path=='/Jealousfin/Policy':return self.reply(200,policy_payload(snapshot))
+   include=q.get('JealousfinIncludePolicy',['false'])[0]=='true'
+   with lock:out=[dict(c,UserData={'IsFavorite':cid in favorites}) for cid,c in ordered_catalogue(snapshot,include)]
+   result={'Items':out,'TotalRecordCount':len(out),'JealousfinPolicyRevision':'sqlite-policy-v1'}
+   if include:result['JealousfinPolicy']=policy_payload(snapshot)
+   return self.reply(200,result)
+  if path=='/Jealousfin/Policy/Event' and self.command=='POST':
+   n=int(self.headers.get('Content-Length','0'))
+   if not 0<n<=8192:return self.reply(400,{})
+   try:
+    d=json.loads(self.rfile.read(n));cid=d['channelID'];trace=d['trace'];action=d['action'];reason=d.get('reason','')
+    if cid not in channels or not isinstance(trace,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',trace) or not isinstance(reason,str) or len(reason)>512:raise ValueError("Invalid event")
+    if action=='approve' and d.get('approval')!='explicit':return self.reply(403,{})
+    policy_event(cid,trace,action,reason)
+    return self.reply(200,policy_payload(policy_rows()))
+   except (KeyError,ValueError,TypeError):return self.reply(400,{})
+   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
   if path in ('/LiveTv/Programs','/LiveTv/Recordings'):return self.reply(200,{'Items':[],'TotalRecordCount':0})
   m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)
   if m and m[1] in sources:
    n=int(self.headers.get('Content-Length','0'))
    if n>262144:return self.reply(413,{})
    if n:self.rfile.read(n)
-   cid=m[1];record_attempt(cid)
+   cid=m[1]
+   try:snapshot=policy_rows()
+   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
+   record_attempt(cid)
+   with lock:
+    now=time.monotonic();active_channels[cid]=now+120;evict_resources(now)
    try:url=register(resolve(cid),cid);url=url.rsplit('.',1)[0]+'.m3u8'
    except Exception as e:
     record_source_error(cid,None,'resolve',type(e).__name__);return self.reply(502,{})
+   try:snapshot=policy_rows()
+   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    return self.reply(200,{'PlaySessionId':uuid.uuid4().hex,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
   if path.startswith('/Sessions/Playing') or path=='/LiveStreams/Close':
    n=int(self.headers.get('Content-Length','0'))
@@ -237,11 +323,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
  do_POST=do_GET
  do_DELETE=do_GET
  do_HEAD=do_GET
-server=Server((HOST,PORT),Handler)
-(ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
-log('READY channels='+str(len(channels)))
-try:server.serve_forever(poll_interval=.5)
-finally:
- server.server_close()
- try:(ROOT/'trial-info.json').unlink()
- except FileNotFoundError:pass
+def main():
+ global PROVIDER
+ PROVIDER=provider()
+ initialize_catalogue()
+ server=Server((HOST,PORT),Handler)
+ (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
+ log('READY channels='+str(len(channels)))
+ try:server.serve_forever(poll_interval=.5)
+ finally:
+  server.server_close()
+  try:(ROOT/'trial-info.json').unlink()
+  except FileNotFoundError:pass
+if __name__=='__main__':main()

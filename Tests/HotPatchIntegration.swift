@@ -23,6 +23,17 @@ final class JellyfinFixture:URLProtocol {
             if request.httpMethod=="POST" && request.value(forHTTPHeaderField:"X-Emby-Token")=="fixture-token" {
                 object=["url":url.path.replacingOccurrences(of:"ticket",with:"index.m3u8")+"?ticket=fixture-ticket"]
             }else{status=401}
+        case "/Users/AuthenticateByName":object=["AccessToken":"fixture-token","User":["Id":"fixture-user"]]
+        case "/LiveTv/Channels","/Jealousfin/Policy","/Jealousfin/Policy/Event":
+            let row:[String:Any]=["lastAttempt":0,"hiatusUntil":0,"banned":false,"failures":0,"lastFailure":0,"reason":"","successes":0,"approvedAt":0,"lastSuccess":0]
+            let snapshot:[String:Any]=["revision":"sqlite-policy-v2","channels":["channel-b":row],"penalty":["baseDays":3,"banAfter":8]]
+            if url.path=="/LiveTv/Channels"{
+                if URLComponents(url:url,resolvingAgainstBaseURL:false)?.queryItems?.contains(where:{$0.name=="JealousfinIncludePolicy" && $0.value=="true"})==true{
+                    object=["Items":[["Id":"channel-b","Name":"Policy fixture"]],"JealousfinPolicy":snapshot]
+                }else{status=400}
+            }else{object=snapshot}
+        case "/Items/channel-b/PlaybackInfo":
+            status=409;object=["JealousfinPolicyError":"excluded"]
         case "/System/Info/Public":object=["ServerName":"Fixture"]
         case "/Items/channel-a/PlaybackInfo":
             object=["PlaySessionId":"fixture-play","MediaSources":[["Id":"fixture-source","LiveStreamId":"fixture-live","TranscodingUrl":"/original.m3u8?api_key=old"]]]
@@ -188,6 +199,18 @@ final class TorrioConflictFixture:URLProtocol {
         try require(stream.url.path=="/patched.m3u8" && stream.method=="Transcode" && URLComponents(url:stream.url,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name=="api_key"})?.value=="fixture-token","patched playback URL and native credential injection")
         await client.close(stream,position:0)
         try require(client.inFlight==0,"session cleanup drains transport")
+        let nativePolicyClient=Jellyfin(deviceID:"policy-fixture",transport:URLSession(configuration:config))
+        var policySettings=fixtureSettings;policySettings.server="http://fixture.invalid:18796"
+        try await nativePolicyClient.connect(policySettings)
+        let policyCatalogue=try await nativePolicyClient.channels()
+        try require(policyCatalogue.count==1 && nativePolicyClient.gatewayHealth?.revision=="sqlite-policy-v2","native full catalogue and gateway health negotiation")
+        try await nativePolicyClient.refreshGatewayHealth()
+        try require(nativePolicyClient.gatewayHealth?.penalty?.baseDays==3,"native gateway refresh")
+        var excluded=false
+        do{_ = try await nativePolicyClient.stream(policyCatalogue[0],mbps:5)}catch GatewayPolicyError.excluded{excluded=true}
+        try require(excluded,"typed gateway rejection is not a new playback failure")
+        try await nativePolicyClient.submitGatewayHealth(channelID:"channel-b",trace:"fixture-trace",action:"failure",reason:"fixture")
+        try require(nativePolicyClient.gatewayHealth?.channels.count==1,"native authenticated policy event transport")
         let healthy=await client.healthy()
         try require(healthy,"patched server health probe")
         var secureSettings=fixtureSettings;secureSettings.server="https://fixture.invalid"

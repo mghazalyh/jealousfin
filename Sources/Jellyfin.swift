@@ -18,6 +18,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     var token = ""
     var userID = ""
     private(set) var sharedSurfAvailable=false
+    private(set) var gatewayHealth:GatewayHealthSnapshot?
     var adapter:JellyfinAPIAdapter?
     var gatewayConfiguration=GatewayConfiguration()
     private(set) var inFlight=0
@@ -30,7 +31,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     var connected: Bool { !token.isEmpty && !userID.isEmpty }
     func adoptConnection(from staged:Jellyfin){
         base=staged.base;token=staged.token;userID=staged.userID
-        sharedSurfAvailable=staged.sharedSurfAvailable
+        sharedSurfAvailable=staged.sharedSurfAvailable;gatewayHealth=staged.gatewayHealth
     }
     private var auth: String {
         "MediaBrowser Client=\"Jealousfin\", Device=\"iOS\", DeviceId=\"\(deviceID)\", Version=\"0.1\"" + (token.isEmpty ? "" : ", Token=\"\(token)\"")
@@ -63,6 +64,11 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             let (data, httpResponse) = try await transport.data(for: r)
             guard let http = httpResponse as? HTTPURLResponse else { throw AppError.message("Invalid HTTP response") }
             log?(http.statusCode < 400 ? "INFO" : "ERROR","HTTP_RESULT",["operation":operation,"endpoint":plan.path,"method":plan.method,"adapter":revision,"requestID":requestID,"status":String(http.statusCode),"bytes":String(data.count),"ms":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
+            if [409,503].contains(http.statusCode),let body=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+               let marker=body["JealousfinPolicyError"] as? String {
+                if marker=="excluded",http.statusCode==409{throw GatewayPolicyError.excluded}
+                if marker=="unavailable",http.statusCode==503{throw GatewayPolicyError.unavailable}
+            }
             guard (200..<300).contains(http.statusCode) else { throw AppError.message("Jellyfin HTTP \(http.statusCode)") }
             phase="response_decode"
             let response:[String:Any]
@@ -85,7 +91,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     func connect(_ settings: Settings) async throws {
         let s = settings.server.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let u = URL(string: s), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil else { throw AppError.message("Enter an HTTP or HTTPS server URL") }
-        base = u; token = ""; userID = ""; sharedSurfAvailable=false
+        base = u; token = ""; userID = ""; sharedSurfAvailable=false;gatewayHealth=nil
         let a = try await request("Users/AuthenticateByName", method: "POST", body: ["Username": settings.username, "Pw": settings.password])
         let spec=adapterSpec
         guard let t=JellyfinAdapterRules.string(at:spec.tokenPath,in:a),let id=JellyfinAdapterRules.string(at:spec.userIDPath,in:a),!t.isEmpty,!id.isEmpty else{throw AppError.message("Jellyfin authentication failed")}
@@ -134,7 +140,13 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         return Program(id: id, name: name, start: JSONCodec.date(x["StartDate"] as? String), end: JSONCodec.date(x["EndDate"] as? String), channelID: x["ChannelId"] as? String)
     }
     func channels() async throws -> [Channel] {
-        let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true","Fields":"Genres,Tags"])
+        let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true","Fields":"Genres,Tags","JealousfinIncludePolicy":"true"])
+        if let raw=a["JealousfinPolicy"] {
+            let snapshot=try decodeGatewayHealth(raw)
+            guard let items=a["Items"] as? [[String:Any]],Set(items.compactMap{$0["Id"] as? String})==Set(snapshot.channels.keys)
+            else{throw AppError.message("Gateway policy/catalogue mismatch")}
+            gatewayHealth=snapshot
+        }else if gatewayHealth != nil{throw GatewayPolicyError.unavailable}
         guard let items = a["Items"] as? [[String: Any]] else { throw AppError.message("Channel catalogue missing") }
         return items.compactMap { x in
             guard let id = x["Id"] as? String, let n = x["Name"] as? String else { return nil }
@@ -146,6 +158,27 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             let favorite=(x["UserData"] as? [String:Any])?["IsFavorite"] as? Bool ?? false
             return Channel(id:id,name:n,number:x["ChannelNumber"] as? String,logo:hasLogo,favorite:favorite,program:p,genres:genres+tags+genreItems)
         }
+    }
+    private func decodeGatewayHealth(_ raw:Any)throws->GatewayHealthSnapshot{
+        let data=try JSONSerialization.data(withJSONObject:raw)
+        guard data.count<=4*1024*1024 else{throw AppError.message("Gateway policy exceeds size limit")}
+        return try JSONDecoder().decode(GatewayHealthSnapshot.self,from:data).checked()
+    }
+    func refreshGatewayHealth()async throws{
+        guard gatewayHealth != nil else{return}
+        let origin=base,account=userID
+        let raw=try await request("Jealousfin/Policy")
+        let snapshot=try decodeGatewayHealth(raw)
+        guard base==origin,userID==account else{throw CancellationError()}
+        gatewayHealth=snapshot
+    }
+    func submitGatewayHealth(channelID:String,trace:String,action:String,reason:String)async throws{
+        guard gatewayHealth != nil else{return}
+        let origin=base,account=userID
+        let raw=try await request("Jealousfin/Policy/Event",method:"POST",body:["channelID":channelID,"trace":trace,"action":action,"reason":reason,"approval":action=="approve" ? "explicit":""])
+        let snapshot=try decodeGatewayHealth(raw)
+        guard base==origin,userID==account else{throw CancellationError()}
+        gatewayHealth=snapshot
     }
     func programs() async throws -> [Program] {
         let f = ISO8601DateFormatter()

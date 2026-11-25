@@ -73,6 +73,14 @@ enum SharedSurf {
         return url
     }
 }
+struct HealthPenaltyPolicy:Codable,Equatable{
+    var baseDays:Int=3
+    var banAfter:Int=8
+    func checked()throws->Self{
+        guard (1...30).contains(baseDays),(2...20).contains(banAfter) else{throw AppError.message("Invalid progressive hiatus policy")}
+        return self
+    }
+}
 struct ChannelHealth: Codable, Equatable {
     var failures = 0
     var lifetimeFailures = 0
@@ -84,14 +92,14 @@ struct ChannelHealth: Codable, Equatable {
     var reason: String?
     var approvedAt: Date?
     func eligible(at date: Date) -> Bool { !banned && (hiatusUntil.map { $0 <= date } ?? true) }
-    mutating func fail(at date: Date, reason: String) {
+    mutating func fail(at date: Date, reason: String, policy:HealthPenaltyPolicy=HealthPenaltyPolicy()) {
         guard eligible(at: date) else { return }
         failures += 1
         lifetimeFailures += 1
         lastFailure = date
         self.reason = reason
-        if failures >= 8 { banned = true; hiatusUntil = nil }
-        else { hiatusUntil = date.addingTimeInterval(Double(failures * 3) * 86400) }
+        if failures >= policy.banAfter { banned = true; hiatusUntil = nil }
+        else { hiatusUntil = date.addingTimeInterval(Double(failures * policy.baseDays) * 86400) }
     }
     mutating func succeed(at date: Date) {
         guard eligible(at: date) else { return }
@@ -109,6 +117,7 @@ struct HealthEvent: Codable, Identifiable, Equatable {
     var channelName: String
     var action: String
     var reason: String
+    var penalty:HealthPenaltyPolicy?=nil
 }
 struct HealthLedger: Codable {
     var schemaVersion = 1
@@ -120,7 +129,7 @@ struct HealthLedger: Codable {
             guard seen.insert(e.id).inserted else { continue }
             var s = result[e.channelID] ?? ChannelHealth()
             switch e.action {
-            case "failure": s.fail(at: e.at, reason: e.reason)
+            case "failure": s.fail(at: e.at, reason: e.reason,policy:(try? e.penalty?.checked()) ?? HealthPenaltyPolicy())
             case "success": s.succeed(at: e.at)
             case "approve": s.approve(at: e.at)
             default: continue
@@ -231,6 +240,7 @@ struct Settings: Codable {
         set {githubRepositoryURL=newValue}
     }
     var rotationMinutes = 5
+    var videoBrightness:Int?=nil
     var retries = 2
     var startupTimeout = 15
     var validation = true
@@ -330,10 +340,18 @@ enum AppError: LocalizedError {
 // A cycle is scoped to the server, account and category, not the process.
 struct SurfRotationState: Codable, Equatable {
     var visited: [String:Set<String>] = [:]
+    // Optional for decoding rotation state from previous IPAs.
+    var cycles:[String:Int]?=nil
+    func progress(scope:String,ids:[String])->(cycle:Int,attempted:Int,remaining:Int){
+        let unique=Set(ids)
+        let attempted=unique.intersection(visited[scope] ?? []).count
+        return (cycles?[scope] ?? 1,attempted,unique.count-attempted)
+    }
     mutating func candidates(scope:String, ids:[String], current:String?) -> [String] {
         var remaining=ids.filter{!(visited[scope] ?? []).contains($0)}
         if remaining.isEmpty && !ids.isEmpty {
             visited[scope]=[]
+            var updated=cycles ?? [:];updated[scope]=(updated[scope] ?? 1)+1;cycles=updated
             remaining=ids
         }
         let others=remaining.filter{$0 != current}
@@ -518,4 +536,88 @@ struct GatewayConfiguration:Codable,Equatable{
         return self
     }
     func path(mode:String,leaf:String)->String{(routePrefix ?? "/api/surf")+"/"+mode+"/hls/"+leaf}
+}
+
+// Same-origin IPTV policy contract. Never sums native and gateway penalties:
+// a single terminal event can be observed by both systems.
+struct GatewayChannelHealth:Codable,Equatable{
+    let lastAttempt:Double
+    let hiatusUntil:Double
+    let banned:Bool
+    let failures:Int
+    let lastFailure:Double
+    let reason:String
+    let successes:Int
+    let approvedAt:Double?
+    var lastSuccess:Double?=nil
+    var valid:Bool{
+        [lastAttempt,hiatusUntil,lastFailure,approvedAt ?? 0,lastSuccess ?? 0].allSatisfy{$0.isFinite && $0>=0}
+        && (0...20).contains(failures) && successes>=0 && reason.utf8.count<=2048
+    }
+    func merge(_ native:ChannelHealth)->ChannelHealth{
+        var n=native
+        let approval=Date(timeIntervalSince1970:approvedAt ?? 0)
+        if (approvedAt ?? 0)>0,approval>(n.lastFailure ?? .distantPast),approval>(n.approvedAt ?? .distantPast){
+            n.banned=false;n.failures=0;n.hiatusUntil=nil;n.approvedAt=approval
+        }
+        let nativeApproval=n.approvedAt?.timeIntervalSince1970 ?? 0
+        if lastFailure>nativeApproval && (banned || lastFailure >= (n.lastSuccess?.timeIntervalSince1970 ?? 0)){
+            n.failures=max(n.failures,failures)
+            n.lifetimeFailures=max(n.lifetimeFailures,failures)
+            n.banned=n.banned || banned
+            if hiatusUntil>0{
+                let until=Date(timeIntervalSince1970:hiatusUntil)
+                n.hiatusUntil=max(n.hiatusUntil ?? .distantPast,until)
+            }
+            if lastFailure>0,Date(timeIntervalSince1970:lastFailure)>=(n.lastFailure ?? .distantPast){
+                n.lastFailure=Date(timeIntervalSince1970:lastFailure);n.reason=reason
+            }
+        }
+        if let stamp=lastSuccess,stamp>0{
+            let success=Date(timeIntervalSince1970:stamp)
+            if !n.banned,success>(n.lastFailure ?? .distantPast),success>(n.lastSuccess ?? .distantPast){
+                n.failures=0;n.hiatusUntil=nil;n.lastSuccess=success
+            }
+        }
+        n.successes=max(n.successes,successes)
+        return n
+    }
+}
+struct GatewayHealthSnapshot:Codable,Equatable{
+    let revision:String
+    let channels:[String:GatewayChannelHealth]
+    var penalty:HealthPenaltyPolicy?=nil
+    func checked()throws->Self{
+        _ = try penalty?.checked()
+        guard revision=="sqlite-policy-v2",!channels.isEmpty,channels.count<=10000,
+              channels.allSatisfy({!$0.key.isEmpty && $0.key.utf8.count<=128 && $0.value.valid})
+        else{throw AppError.message("Invalid gateway health snapshot")}
+        return self
+    }
+    func merging(_ native:[String:ChannelHealth])->[String:ChannelHealth]{
+        var merged=native
+        for (id,row) in channels where row.failures>0 || row.banned || row.successes>0 || (row.approvedAt ?? 0)>0{
+            merged[id]=row.merge(merged[id] ?? ChannelHealth())
+        }
+        return merged
+    }
+}
+enum GatewayPolicyError:LocalizedError{
+    case excluded,unavailable
+    var errorDescription:String?{self == .excluded ? "Gateway channel excluded":"Gateway policy unavailable"}
+}
+enum PlaybackFailureCategory:String{
+    case policy,provider,manifestOrSegment,network,decoder,timeout,videoFrozen,unknown
+    static func classify(_ reason:String)->Self{
+        let r=reason.lowercased()
+        if r.contains("gateway policy") || r.contains("gateway channel excluded"){return .policy}
+        if r.contains("video frame") || r.contains("stalled"){return .videoFrozen}
+        if r.contains("stream http") || r.contains("manifest") || r.contains("segment"){return .manifestOrSegment}
+        if r.contains("http") || r.contains("no media source"){return .provider}
+        if r.contains("network") || r.contains("offline"){return .network}
+        if r.contains("timeout"){return .timeout}
+        if r.contains("player error") || r.contains("avplayer"){return .decoder}
+        return .unknown
+    }
+    var definitive:Bool{self == .policy || self == .provider}
 }
