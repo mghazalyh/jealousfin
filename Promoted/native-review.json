@@ -28,6 +28,10 @@
       "fullscreen-night-controls-20261125": {
         "disposition": "native",
         "evidence": "FullscreenControlPalette default night, native control styling, single brightness slider and favorite toggle"
+      },
+      "fullscreen-now-playing-20261125": {
+        "disposition": "native",
+        "evidence": "CurrentProgram gateway feed and native fullscreen programme heading use refreshed catalogue with channel fallback; native favorite, rotation, brightness and night controls retained. Upcoming programme title remains a separate enhancement."
       }
     },
     "jellyfinAPIRevision": {

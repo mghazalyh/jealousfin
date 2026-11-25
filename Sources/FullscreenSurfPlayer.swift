@@ -69,7 +69,6 @@ struct FullscreenSurfPlayer:View {
                 PatchableRegion("player.fullscreen.header"){
                 VStack(alignment:.leading,spacing:3){
                     Text(model.current?.name ?? "Choose a channel").font(.headline).lineLimit(1)
-                    Text(model.current?.program?.title ?? model.status).font(.caption).lineLimit(1)
                 }
                 }
                 Spacer(minLength:4)
@@ -93,12 +92,20 @@ struct FullscreenSurfPlayer:View {
     private func footer(maxHeight:CGFloat)->some View{
         ScrollView(showsIndicators:false){
             VStack(alignment:.leading,spacing:spacing){
-                HStack{
-                    Label(model.surfing ? (model.surfPaused ? "Surf paused":"Surf active"):"Surf stopped",systemImage:"shuffle").font(.headline)
-                    Spacer()
-                    Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
-                        .font(.subheadline.monospacedDigit())
-                }.foregroundColor(palette.secondary)
+                PatchableRegion("player.fullscreen.heading"){
+                    HStack(spacing:8){
+                        Text(model.currentProgrammeTitle ?? model.current?.name ?? "Choose a channel")
+                            .font(.headline).lineLimit(1).truncationMode(.tail)
+                            .accessibilityIdentifier("player.fullscreen.programmeTitle")
+                        Spacer(minLength:4)
+                        Text(model.usingSharedSurf ? "Server rotation" : String(format:"%02d:%02d",model.remaining/60,model.remaining%60))
+                            .font(.subheadline.monospacedDigit())
+                            .fixedSize(horizontal:true,vertical:false)
+                            .accessibilityLabel("Rotation countdown")
+                            .accessibilityValue(model.surfPaused ? "Paused, "+String(model.remaining)+" seconds remaining":String(model.remaining)+" seconds remaining")
+                            .accessibilityIdentifier("player.fullscreen.countdown")
+                    }.foregroundColor(palette.secondary)
+                }
                 PatchableRegion("player.fullscreen.transport"){
                 HStack(spacing:spacing){
                     ForEach(presentation.fullscreenControlOrder ?? DynamicPresentation.defaultControlOrder,id:\.self){id in

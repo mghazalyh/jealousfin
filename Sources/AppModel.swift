@@ -817,6 +817,19 @@ import CryptoKit
         recalculateInsights()
     }
     func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
+    // Prefer the refreshed catalogue over the playback-start copy. An absent
+    // programme in a refreshed row must not resurrect the old programme.
+    var currentProgrammeTitle:String?{
+        guard let c=current else{return nil}
+        let channel=channels.first(where:{$0.id==c.id}) ?? c
+        let now=Date()
+        if jelly.gatewayHealth != nil && now.timeIntervalSince(lastRefresh)>300{return nil}
+        guard let p=channel.program,
+              p.start.map({$0<=now}) ?? true,
+              p.end.map({$0>now}) ?? true else{return nil}
+        let title=p.title.trimmingCharacters(in:.whitespacesAndNewlines)
+        return title.isEmpty ? nil:title
+    }
     var currentFavoriteState:FullscreenFavoriteState{
         guard let c=current,!c.isSurf,!currentSharedTransport else{return FullscreenFavoriteState(favorite:nil,pending:false)}
         let value=channels.first(where:{$0.id==c.id})?.favorite ?? c.favorite
@@ -1673,6 +1686,7 @@ import CryptoKit
         snapshot["startupProfileCount"]=startupProfiles.entries.count
         snapshot["eventModuleCount"]=platformStore.modules.count
         snapshot["eventModuleRevisions"]=Dictionary(uniqueKeysWithValues:platformStore.modules.map{($0.module.id,$0.module.revision)})
+        snapshot["currentProgrammeTitle"]=currentProgrammeTitle ?? ""
         snapshot["videoBrightness"]=videoBrightness
         let favoriteState=currentFavoriteState
         snapshot["currentFavorite"]=favoriteState.favorite.map{$0 as Any} ?? NSNull()

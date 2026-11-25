@@ -609,3 +609,7 @@ check(JellyfinConnectionFault.networkError(URLError(.cannotConnectToHost)) != ni
 check(JellyfinConnectionFault.networkError(URLError(.timedOut))==nil,"unclassified source timeout remains a real failure")
 check(JellyfinConnectionFault.networkError(URLError(.cancelled))==nil,"cancellation remains distinct")
 print("PASS: \(checks) assertions including server-session recovery gate")
+
+let headingLayout=DynamicUILayout(schemaVersion:1,revision:"fullscreen-heading-fixture",slots:[DynamicUISlot(location:"player.fullscreen.heading",nodes:[])],pages:[])
+_ = try headingLayout.checked()
+check(DynamicUILayout.replacementLocations.contains("player.fullscreen.heading"),"fullscreen programme and countdown heading can be replaced without an IPA")
