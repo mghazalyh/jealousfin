@@ -86,3 +86,22 @@ with tempfile.TemporaryDirectory() as d:
     assert not p.retain_programme(c,{k:v for k,v in status.items() if k!='currentProgrammeTitle'},now+250)
     assert c.execute('SELECT failures,sustained FROM channel').fetchone()==(0,0)
 print('PASS: programme observation freshness, missing titles, deduplication and policy isolation')
+
+# Rotation evidence is retained from the existing observer loop, without
+# altering policy, opening channels, or counting a paused sample as rollover.
+with tempfile.TemporaryDirectory() as d:
+    c=p.connect(pathlib.Path(d)/'rotation.sqlite3')
+    c.execute('INSERT INTO channel(id,name) VALUES(?,?)',('a','A'))
+    now=int(time.time())
+    status={'surfing':True,'rotationOwner':'device','launchID':'launch','systemMetrics':{'buildNumber':'1031'},'currentChannelID':'a','rotationCycle':2,'rotationAttempted':1,'rotationRemaining':0,'eligible':1,'channels':1,'hiatus':0,'banned':0,'playing':True,'surfPaused':False}
+    assert p.retain_rotation(c,status,now)
+    assert not p.retain_rotation(c,status,now+5)
+    assert p.retain_rotation(c,status,now+30)
+    assert p.retain_rotation(c,dict(status,rotationCycle=3),now+31)
+    assert not p.retain_rotation(c,dict(status,rotationCycle=True),now+32)
+    assert not p.retain_rotation(c,dict(status,rotationOwner='server'),now+32)
+    assert not p.retain_rotation(c,dict(status,currentChannelID='unknown'),now+32)
+    assert not p.retain_rotation(c,dict(status,channels=2),now+32)
+    assert c.execute('SELECT cycle,attempted,remaining,server_hiatus,server_banned FROM rotation_observations ORDER BY at').fetchall()==[(2,1,0,0,0),(2,1,0,0,0),(3,1,0,0,0)]
+    assert c.execute('SELECT failures,sustained FROM channel').fetchone()==(0,0)
+print('PASS: bounded rotation evidence, cycle changes, policy count comparison, and policy isolation')
