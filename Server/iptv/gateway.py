@@ -348,7 +348,107 @@ def release_year(value):
  else:return None
  return year if 1888<=year<=datetime.datetime.now(datetime.timezone.utc).year+1 else None
 def title_year(title):
- match=re.search(r'\s+\((\d{4})\)(value):
+ match=re.search(r'\s+\((\d{4})\)$',title)
+ if match and release_year(match[1]):return title[:match.start()].strip(),int(match[1])
+ return title,None
+def year_key(row):
+ title,_=title_year(row['title'])
+ return hashlib.sha256(json.dumps([guide_norm(title),row.get('guideSynopsis',''),row.get('guideEpisode','')],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+def load_year_cache():
+ try:
+  if not YEAR_CACHE_FILE.exists():return
+  if YEAR_CACHE_FILE.stat().st_size>1024*1024:raise ValueError('Year cache too large')
+  raw=json.loads(YEAR_CACHE_FILE.read_text())
+  if not isinstance(raw,dict):raise ValueError('Invalid year cache')
+  now=time.time()
+  with lock:
+   for key,row in list(raw.items())[-YEAR_CACHE_LIMIT:]:
+    if isinstance(key,str) and re.fullmatch(r'[a-f0-9]{64}',key) and isinstance(row,dict) and type(row.get('expires')) in (int,float) and now<row['expires']<=now+YEAR_POSITIVE_TTL and (row.get('year') is None or release_year(row.get('year'))):
+     year_cache[key]=row
+ except (ValueError,OSError,TypeError) as error:log('year cache ignored '+type(error).__name__)
+def cached_year(row,now=None):
+ _,explicit=title_year(row['title'])
+ if explicit:return explicit
+ now=time.time() if now is None else now
+ with lock:
+  entry=year_cache.get(year_key(row))
+  return entry.get('year') if entry and now<entry['expires'] else None
+def lookup_json(path):
+ req=urllib.request.Request(validate(YEAR_API+path),headers={'User-Agent':'Jealousfin-Programme-Metadata/1.0','Accept':'application/json'})
+ with opener.open(req,timeout=5) as f:data=f.read(512*1024+1)
+ if len(data)>512*1024:raise ValueError('Metadata response too large')
+ return json.loads(data)
+def evidence_words(value):
+ return re.findall(r"[a-z0-9]+",value.casefold()) if isinstance(value,str) else []
+def synopsis_match(synopsis,meta):
+ words=evidence_words(synopsis);desc=evidence_words(meta.get('description'))
+ if len(words)>=7 and len(desc)>=7:
+  phrases={tuple(words[i:i+7]) for i in range(len(words)-6)}
+  if any(tuple(desc[i:i+7]) in phrases for i in range(len(desc)-6)):return True
+ if not isinstance(meta.get('cast'),list):return False
+ joined=' '+' '.join(words)+' '
+ names={' '.join(evidence_words(name)) for name in meta['cast'] if isinstance(name,str)}
+ return sum(1 for name in names if len(name.split())>=2 and ' '+name+' ' in joined)>=2
+def lookup_year(row):
+ title,explicit=title_year(row['title'])
+ if explicit:return explicit
+ if not title or len(title)>180:return None
+ norm=guide_norm(title)
+ if len(norm)<3:return None
+ candidates={}
+ for kind in ('movie','series'):
+  result=lookup_json('/catalog/'+kind+'/top/search='+urllib.parse.quote(title,safe='')+'.json')
+  metas=result.get('metas')
+  if not isinstance(metas,list):raise ValueError('Invalid metadata search')
+  for meta in metas:
+   if not isinstance(meta,dict) or not isinstance(meta.get('name'),str) or guide_norm(meta['name'])!=norm:continue
+   mid=meta.get('id')
+   if not isinstance(mid,str) or not re.fullmatch(r'tt\d{5,12}',mid):continue
+   candidates[mid]=(kind,release_year(meta.get('releaseInfo')))
+ if len(candidates)==1:return next(iter(candidates.values()))[1]
+ synopsis=row.get('guideSynopsis','')
+ if not synopsis or not 1<len(candidates)<=6:return None
+ positive=[]
+ for mid,(kind,year) in candidates.items():
+  if not year:continue
+  try:
+   meta=lookup_json('/meta/'+kind+'/'+mid+'.json').get('meta',{})
+   if isinstance(meta,dict) and synopsis_match(synopsis,meta):positive.append(year)
+  except urllib.error.HTTPError as error:
+   if error.code!=404:raise
+ return positive[0] if len(positive)==1 else None
+def year_worker(stop):
+ global year_fault,year_last_lookup
+ load_year_cache()
+ while not stop.is_set():
+  try:
+   now=time.time()
+   rows=programme_snapshot(now)
+   with lock:recent=dict(active_channels)
+   ordered=sorted(rows.items(),key=lambda item:recent.get(item[0],0),reverse=True)
+   selected=None
+   for cid,row in ordered:
+    if cached_year(row,now):continue
+    key=year_key(row)
+    with lock:entry=year_cache.get(key)
+    if entry and now<entry['expires']:continue
+    selected=(key,row);break
+   if selected:
+    key,row=selected
+    year=lookup_year(row)
+    with lock:
+     year_cache[key]={'year':year,'expires':now+(YEAR_POSITIVE_TTL if year else YEAR_NEGATIVE_TTL)}
+     year_cache.move_to_end(key)
+     while len(year_cache)>YEAR_CACHE_LIMIT:year_cache.popitem(last=False)
+     snapshot=dict(year_cache);year_last_lookup=time.time();year_fault=None
+    atomic_json(YEAR_CACHE_FILE,snapshot)
+   if stop.wait(3 if selected else 15):return
+  except Exception as error:
+   with lock:year_fault=type(error).__name__
+   log('programme year lookup failed '+type(error).__name__)
+   if stop.wait(60):return
+
+def guide_norm(value):
  return re.sub(r'[^a-z0-9]','',value.casefold())
 def guide_time(value):
  try:return datetime.datetime.strptime(value,'%Y%m%d%H%M%S %z').timestamp()
@@ -765,516 +865,6 @@ def main():
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  years=threading.Thread(target=year_worker,args=(stop,),name='programme-year-refresh',daemon=True);years.start()
- log('READY channels='+str(len(channels)))
- try:server.serve_forever(poll_interval=.5)
- finally:
-  stop.set();server.server_close()
-  try:(ROOT/'trial-info.json').unlink()
-  except FileNotFoundError:pass
-if __name__=='__main__':main()
-,title)
- if match and release_year(match[1]):return title[:match.start()].strip(),int(match[1])
- return title,None
-def year_key(row):
- title,_=title_year(row['title'])
- return hashlib.sha256(json.dumps([guide_norm(title),row.get('guideSynopsis',''),row.get('guideEpisode','')],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-def load_year_cache():
- try:
-  if not YEAR_CACHE_FILE.exists():return
-  if YEAR_CACHE_FILE.stat().st_size>1024*1024:raise ValueError('Year cache too large')
-  raw=json.loads(YEAR_CACHE_FILE.read_text())
-  if not isinstance(raw,dict):raise ValueError('Invalid year cache')
-  now=time.time()
-  with lock:
-   for key,row in list(raw.items())[-YEAR_CACHE_LIMIT:]:
-    if isinstance(key,str) and re.fullmatch(r'[a-f0-9]{64}',key) and isinstance(row,dict) and type(row.get('expires')) in (int,float) and now<row['expires']<=now+YEAR_POSITIVE_TTL and (row.get('year') is None or release_year(row.get('year'))):
-     year_cache[key]=row
- except (ValueError,OSError,TypeError) as error:log('year cache ignored '+type(error).__name__)
-def cached_year(row,now=None):
- _,explicit=title_year(row['title'])
- if explicit:return explicit
- now=time.time() if now is None else now
- with lock:
-  entry=year_cache.get(year_key(row))
-  return entry.get('year') if entry and now<entry['expires'] else None
-def lookup_json(path):
- req=urllib.request.Request(validate(YEAR_API+path),headers={'User-Agent':'Jealousfin-Programme-Metadata/1.0','Accept':'application/json'})
- with opener.open(req,timeout=5) as f:data=f.read(512*1024+1)
- if len(data)>512*1024:raise ValueError('Metadata response too large')
- return json.loads(data)
-def evidence_words(value):
- return re.findall(r"[a-z0-9]+",value.casefold()) if isinstance(value,str) else []
-def synopsis_match(synopsis,meta):
- words=evidence_words(synopsis);desc=evidence_words(meta.get('description'))
- if len(words)>=7 and len(desc)>=7:
-  phrases={tuple(words[i:i+7]) for i in range(len(words)-6)}
-  if any(tuple(desc[i:i+7]) in phrases for i in range(len(desc)-6)):return True
- if not isinstance(meta.get('cast'),list):return False
- joined=' '+' '.join(words)+' '
- names={' '.join(evidence_words(name)) for name in meta['cast'] if isinstance(name,str)}
- return sum(1 for name in names if len(name.split())>=2 and ' '+name+' ' in joined)>=2
-def lookup_year(row):
- title,explicit=title_year(row['title'])
- if explicit:return explicit
- if not title or len(title)>180:return None
- norm=guide_norm(title)
- if len(norm)<3:return None
- candidates={}
- for kind in ('movie','series'):
-  result=lookup_json('/catalog/'+kind+'/top/search='+urllib.parse.quote(title,safe='')+'.json')
-  metas=result.get('metas')
-  if not isinstance(metas,list):raise ValueError('Invalid metadata search')
-  for meta in metas:
-   if not isinstance(meta,dict) or not isinstance(meta.get('name'),str) or guide_norm(meta['name'])!=norm:continue
-   mid=meta.get('id')
-   if not isinstance(mid,str) or not re.fullmatch(r'tt\d{5,12}',mid):continue
-   candidates[mid]=(kind,release_year(meta.get('releaseInfo')))
- if len(candidates)==1:return next(iter(candidates.values()))[1]
- synopsis=row.get('guideSynopsis','')
- if not synopsis or not 1<len(candidates)<=6:return None
- positive=[]
- for mid,(kind,year) in candidates.items():
-  if not year:continue
-  try:
-   meta=lookup_json('/meta/'+kind+'/'+mid+'.json').get('meta',{})
-   if isinstance(meta,dict) and synopsis_match(synopsis,meta):positive.append(year)
-  except urllib.error.HTTPError as error:
-   if error.code!=404:raise
- return positive[0] if len(positive)==1 else None
-def year_worker(stop):
- global year_fault,year_last_lookup
- load_year_cache()
- while not stop.is_set():
-  try:
-   now=time.time()
-   rows=programme_snapshot(now)
-   with lock:recent=dict(active_channels)
-   ordered=sorted(rows.items(),key=lambda item:recent.get(item[0],0),reverse=True)
-   selected=None
-   for cid,row in ordered:
-    if cached_year(row,now):continue
-    key=year_key(row)
-    with lock:entry=year_cache.get(key)
-    if entry and now<entry['expires']:continue
-    selected=(key,row);break
-   if selected:
-    key,row=selected
-    year=lookup_year(row)
-    with lock:
-     year_cache[key]={'year':year,'expires':now+(YEAR_POSITIVE_TTL if year else YEAR_NEGATIVE_TTL)}
-     year_cache.move_to_end(key)
-     while len(year_cache)>YEAR_CACHE_LIMIT:year_cache.popitem(last=False)
-     snapshot=dict(year_cache);year_last_lookup=time.time();year_fault=None
-    atomic_json(YEAR_CACHE_FILE,snapshot)
-   if stop.wait(3 if selected else 15):return
-  except Exception as error:
-   with lock:year_fault=type(error).__name__
-   log('programme year lookup failed '+type(error).__name__)
-   if stop.wait(60):return
-
-def guide_norm(value):
- return re.sub(r'[^a-z0-9]','',value.casefold())
-def guide_time(value):
- try:return datetime.datetime.strptime(value,'%Y%m%d%H%M%S %z').timestamp()
- except (TypeError,ValueError,OverflowError):return None
-def parse_guide(data,ids,now):
- if len(data)>40*1024*1024:raise ValueError('Guide too large')
- # The two reviewed XMLTV feeds contain exactly this harmless declaration.
- # Strip it before parsing; never fetch the external DTD.
- data=data.replace(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">',b'',1)
- upper=data.upper()
- if b'<!DOCTYPE' in upper or b'<!ENTITY' in upper:raise ValueError('Unsupported guide document')
- root=ET.fromstring(data)
- if root.tag!='tv':raise ValueError('Invalid guide root')
- out={}
- for p in root.findall('programme'):
-  key=p.get('channel')
-  if key not in ids:continue
-  start=guide_time(p.get('start'));end=guide_time(p.get('stop'))
-  title=programme_text(p.findtext('title'))
-  if not title or start is None or end is None or not 0<end-start<=86400 or end<=now-60 or start>now+86400:continue
-  rows=out.setdefault(key,[])
-  if len(rows)>=256:raise ValueError('Guide channel limit exceeded')
-  rows.append((start,end,title))
- return out
-def fetch_guide(url,ids,now):
- req=urllib.request.Request(validate(url),headers={'User-Agent':'Jealousfin-EPG/1.0'})
- with opener.open(req,timeout=10) as f:raw=f.read(8*1024*1024+1)
- if len(raw)>8*1024*1024:raise ValueError('Compressed guide too large')
- with gzip.GzipFile(fileobj=io.BytesIO(raw)) as f:data=f.read(40*1024*1024+1)
- return parse_guide(data,ids,now)
-def guide_worker(stop):
- global guide_rows,guide_observed_at,guide_fault
- while not stop.is_set():
-  try:
-   now=time.time()
-   parsed=tuple(fetch_guide(url,{ids[i] for ids in GUIDE_CHANNELS.values()},now) for i,url in enumerate(GUIDE_URLS))
-   with lock:guide_rows=parsed;guide_observed_at=now;guide_fault=None
-  except Exception as error:
-   with lock:guide_fault=type(error).__name__
-   log('external programme refresh failed '+type(error).__name__)
-  if stop.wait(GUIDE_REFRESH):return
-def guide_snapshot(now):
- with lock:
-  observed=guide_observed_at
-  if not 0<=now-observed<=GUIDE_MAX_AGE:return {}
-  first,second=guide_rows
-  mapped=[(cid,GUIDE_CHANNELS[c['Name']]) for cid,c in channels.items() if c['Name'] in GUIDE_CHANNELS]
- out={}
- for cid,(aid,bid) in mapped:
-  a=[r for r in first.get(aid,[]) if r[0]<=now<r[1]]
-  b=[r for r in second.get(bid,[]) if r[0]<=now<r[1]]
-  if len(a)!=1 or len(b)!=1:continue
-  sa,ea,ta=a[0];sb,eb,tb=b[0]
-  if guide_norm(ta)!=guide_norm(tb) or abs(sa-sb)>60 or abs(ea-eb)>60:continue
-  if not guide_norm(ta):continue
-  out[cid]={'title':ta,'source':'corroborated-external-schedule','observedAt':observed,'start':max(sa,sb),'end':min(ea,eb)}
- return out
-
-def programme_text(value):
- if not isinstance(value,str):return ''
- value=' '.join(value.split())
- if not value or len(value)>300 or re.search(r'(?i)https?://|api_key=|token=',value):return ''
- return value
-
-def parse_programme(row):
- # Provider clock strings are unzoned. Do not manufacture start/end dates.
- description=row.get('description')
- if not isinstance(description,str) or len(description)>8192:description=''
- release=row.get('releaseInfo')
- if not isinstance(release,str):release=''
- current=''
- next_title=''
- end_clock=''
- next_clock=''
- for line in description.splitlines():
-  if line.startswith('Now: '):
-   value=line[5:].strip()
-   match=re.fullmatch(r'(.+?) \(until ((?:[01]\d|2[0-3]):[0-5]\d)\)',value)
-   current=programme_text(match[1] if match else value)
-   if match:end_clock=match[2]
-  elif line.startswith('Next: '):
-   value=line[6:].strip()
-   match=re.fullmatch(r'(.+?) at ((?:[01]\d|2[0-3]):[0-5]\d)',value)
-   next_title=programme_text(match[1] if match else value)
-   if match:next_clock=match[2]
- release_title=programme_text(release[6:]) if release.startswith('Now · ') else ''
- if not current:current=release_title
- if not current or (release_title and current!=release_title):return None
- if current.casefold() in ('unknown','no information','no programme information','no program information','n/a','live tv','tba','to be announced'):return None
- if current.casefold()==str(row.get('name','')).strip().casefold():return None
- return {'title':current,'nextTitle':next_title,'providerEndClock':end_clock,'providerNextClock':next_clock}
-
-def update_programmes(raw,observed=None):
- global programme_rows,programme_observed_at,programme_fault
- now=time.time() if observed is None else observed
- # Metadata refresh is independent from catalogue identity, policy and playback.
- valid={}
- for source_id,row in raw.items():
-  if not isinstance(row,dict):continue
-  cid=hashlib.md5(source_id.encode()).hexdigest()
-  if cid not in sources:continue
-  parsed=parse_programme(row)
-  if parsed:valid[cid]=parsed
- with lock:
-  programme_rows=valid;programme_observed_at=now;programme_fault=None
-
-def programme_snapshot(now=None):
- now=time.time() if now is None else now
- result=guide_snapshot(now)
- with lock:
-  if 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:
-   result.update({cid:dict(row,source='provider-catalogue',observedAt=programme_observed_at) for cid,row in programme_rows.items()})
- return result
-
-def programme_item(cid,row):
- # The provider supplies a title and an unzoned end clock, not a reliable
- # UTC schedule. Keep the standard programme dates absent and expose evidence.
- title=row['title']
- item={'Id':hashlib.sha256((cid+'\0'+title).encode()).hexdigest()[:32],
-       'Name':title,'ChannelId':cid,'Type':'Program',
-       'JealousfinProgramme':dict(row)}
- if row.get('source')=='corroborated-external-schedule':
-  item['Name']='Scheduled: '+title
-  item['StartDate']=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
-  item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
- return item
-
-def programme_worker(stop):
- global programme_fault
- while not stop.wait(PROGRAMME_REFRESH):
-  try:
-   raw=catalogue()
-   if len(raw)<len(sources)*.9:raise ValueError('Incomplete programme refresh')
-   update_programmes(raw)
-  except Exception as error:
-   with lock:programme_fault=type(error).__name__
-   log('programme refresh failed '+type(error).__name__)
-
-def initialize_catalogue():
- global catalogue_source,catalogue_fault
- cache=ROOT/'catalogue-metadata.json'
- prior=None
- fresh=None
- if cache.exists():
-  data=json.loads(cache.read_text())
-  if isinstance(data,dict) and len(data)>=100 and all(isinstance(k,str) and k.startswith('nltv:') and isinstance(v,dict) and isinstance(v.get('name'),str) for k,v in data.items()):
-   prior=data
- try:
-  fresh=catalogue()
-  if prior and len(fresh)<len(prior)*.9:raise ValueError('Catalogue unexpectedly contracted')
-  # Only metadata is retained; no stream URLs or request credentials.
-  raw={k:{'name':v['name'],'genres':[x for x in v.get('genres',[]) if isinstance(x,str)] if isinstance(v.get('genres'),list) else []} for k,v in fresh.items()}
-  atomic_json(cache,raw);catalogue_source='provider';catalogue_fault=None
- except Exception as error:
-  if prior is None:raise
-  fresh=None;raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
-  log('catalogue fallback '+catalogue_fault)
- for i,(source_id,row) in enumerate(raw.items(),1):
-  cid=hashlib.md5(source_id.encode()).hexdigest()
-  genres=row.get('genres',[])
-  if not isinstance(genres,list):genres=[]
-  channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
-  sources[cid]=source_id
- if fresh is not None:update_programmes(fresh)
- # A pre-existing initialized database may acquire new channels. Preserve every
- # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
- with policy_connect(ROOT/'policy.sqlite3') as db:
-  if db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():
-   db.executemany("INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)",[(cid,c['Name']) for cid,c in channels.items()])
-def resolve(cid):
- source_id=sources[cid]
- candidates=[]
- for v in provider_json('/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json').get('streams',[]):
-  url=v.get('url')
-  if not isinstance(url,str) or url in candidates:continue
-  try:validate(url)
-  except Exception:continue
-  candidates.append(url)
- if not candidates:raise ValueError('No usable stream source')
- config=gateway_config
- prefer=config['preferredHosts'].get(cid) or preferred_hosts.get(source_id)
- if prefer and config['sourceSelection']!='first':candidates.sort(key=lambda u:urllib.parse.urlsplit(u).hostname!=prefer)
- with lock:
-  idx=attempts.get(cid,0)%len(candidates) if config['sourceSelection']=='round-robin' else 0
-  attempts[cid]=idx+1
- return candidates[idx]
-ROTATION_FILE=ROOT/'rotation-history.json'
-rotation=json.loads(ROTATION_FILE.read_text()) if ROTATION_FILE.exists() else {'schemaVersion':1,'sequence':0,'attemptOrder':{}}
-if rotation.get('schemaVersion')!=1 or not isinstance(rotation.get('attemptOrder'),dict):raise ValueError('Invalid rotation history')
-def record_attempt(cid):
- with lock:
-  updated={'schemaVersion':1,'sequence':rotation['sequence']+1,'attemptOrder':dict(rotation['attemptOrder'])}
-  updated['attemptOrder'][cid]=updated['sequence']
-  atomic_json(ROTATION_FILE,updated)
-  rotation.update(updated)
- with policy_connect(ROOT/'policy.sqlite3') as db:
-  db.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(time.time(),cid))
-def policy_rows():
- # No false readiness marker or silent fail-open when policy storage fails.
- with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
-  if not db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():raise RuntimeError("Policy migration pending")
-  columns={r[1] for r in db.execute("PRAGMA table_info(channel)")}
-  policy_penalty(db)
-  approval="approved_at" if "approved_at" in columns else "0"
-  success="last_success" if "last_success" in columns else "0"
-  rows=db.execute("SELECT id,last_attempt,hiatus_until,banned,failures,last_failure,reason,sustained,"+approval+","+success+" FROM channel").fetchall()
- result={r[0]:dict(lastAttempt=max(r[1],r[5]),hiatusUntil=r[2],banned=bool(r[3]),failures=r[4],lastFailure=r[5],reason=r[6],successes=r[7],approvedAt=r[8],lastSuccess=r[9]) for r in rows if r[0] in channels}
- if not set(channels).issubset(result):raise RuntimeError("Policy catalogue incomplete")
- return result
-def policy_eligible(row,now):
- return not row["banned"] and row["hiatusUntil"]<=now
-def ordered_catalogue(snapshot,include_excluded=False):
- now=time.time()
- return sorted((item for item in channels.items() if include_excluded or policy_eligible(snapshot[item[0]],now)),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
-def policy_payload(snapshot):
- with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
-  days,ban=policy_penalty(db)
-  row=db.execute("SELECT value FROM meta WHERE key='surf_resume'").fetchone()
-  resume=json.loads(row[0]) if row else None
-  if not isinstance(resume,dict) or resume.get('channelID') not in snapshot:resume=None
- return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
-def policy_event(cid,trace,action,reason):
- with policy_connect(ROOT/'policy.sqlite3') as db:
-  if not db.execute("SELECT 1 FROM channel WHERE id=?",(cid,)).fetchone():raise ValueError("Unknown policy channel")
-  now=time.time()
-  event_id="native-policy:"+trace+":"+action
-  prior=db.execute("SELECT cid FROM observed WHERE id=?",(event_id,)).fetchone()
-  if prior:
-   if prior[0]!=cid:raise ValueError("Policy event identity mismatch")
-   return
-  db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_"+action,cid,trace,reason[:300]))
-  if action=="failure":
-   db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)",(trace,cid,now))
-   if db.execute("SELECT cid FROM sessions WHERE trace=?",(trace,)).fetchone()[0]!=cid:raise ValueError("Trace/channel mismatch")
-   policy_failure(db,cid,now,reason,trace)
-  elif action=="success":
-   # Native client sends success only after sustained decoded playback.
-   db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened,confirmed) VALUES(?,?,?,?)",(trace,cid,now,now))
-   row=db.execute("SELECT cid,failed,outcome,opened FROM sessions WHERE trace=?",(trace,)).fetchone()
-   if row[0]!=cid:raise ValueError("Trace/channel mismatch")
-   if not row[1] and row[2]!='sustained':
-    updated=db.execute("UPDATE channel SET sustained=sustained+1,failures=0,hiatus_until=0,last_success=? WHERE id=? AND banned=0 AND hiatus_until<=? AND last_failure<?",(now,cid,now,row[3]))
-    if updated.rowcount:db.execute("UPDATE sessions SET outcome='sustained' WHERE trace=?",(trace,))
-  elif action=="approve":
-   db.execute("UPDATE channel SET banned=0,failures=0,hiatus_until=0,approved_at=? WHERE id=? AND banned=1",(now,cid))
-  else:raise ValueError("Unknown policy action")
-def record_source_error(cid,url,phase,error,correlation=None):
- # Never persist stream URLs, query parameters, headers or credentials.
- host=urllib.parse.urlsplit(url).hostname if url else None
- entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation}
- with lock:
-  p=ROOT/'source-errors.jsonl'
-  if p.exists() and p.stat().st_size>4*1024*1024:
-   os.replace(p,ROOT/'source-errors.previous.jsonl')
-  with p.open('a') as f:f.write(json.dumps(entry,separators=(',',':'))+'\n')
-
-
-class Server(http.server.ThreadingHTTPServer):
- daemon_threads=True
- allow_reuse_address=True
-class Handler(http.server.BaseHTTPRequestHandler):
- protocol_version='HTTP/1.1'
- def log_message(self,*args):pass
- def reply(self,code,body,mime='application/json',extra=None):
-  if not isinstance(body,bytes):body=json.dumps(body,separators=(',',':')).encode()
-  self.send_response(code);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.send_header('Connection','close')
-  for k,v in (extra or {}).items():self.send_header(k,v)
-  self.end_headers();self.close_connection=True
-  if self.command!='HEAD':
-   try:self.wfile.write(body)
-   except (BrokenPipeError,ConnectionResetError):pass
- def authorized(self,q):
-  h=self.headers.get('Authorization','')+' '+self.headers.get('X-Emby-Authorization','')
-  return hmac.compare_digest(q.get('api_key',[''])[0],TOKEN) or hmac.compare_digest(self.headers.get('X-Emby-Token',''),TOKEN) or ('Token="'+TOKEN+'"') in h
- def handle_request(self):
-  reload_gateway_config()
-  correlation=request_correlation(self.headers.get('X-Jealousfin-Request-ID'))
-  p=urllib.parse.urlsplit(self.path);path=p.path;q=urllib.parse.parse_qs(p.query)
-  with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
-  if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial','Version':'10.10.0','Id':USER_ID})
-  if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
-   try:snapshot=policy_rows();ready=True
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'deliveryQuality':quality_summary()})
-  if path=='/Users/AuthenticateByName' and self.command=='POST':
-   n=int(self.headers.get('Content-Length','0'))
-   if n>65536:return self.reply(413,{})
-   d=json.loads(self.rfile.read(n))
-   if not hmac.compare_digest(str(d.get('Username','')),TEST_USER) or not hmac.compare_digest(str(d.get('Pw','')),TEST_PASSWORD):return self.reply(401,{})
-   return self.reply(200,{'AccessToken':TOKEN,'User':{'Id':USER_ID,'Name':TEST_USER}})
-  if path.startswith('/media/'):
-   parts=path.split('/')
-   if len(parts)!=4 or not hmac.compare_digest(parts[2],TOKEN):return self.reply(401,{})
-   rid=parts[3].split('.')[0]
-   with lock:
-    entry=resources.get(rid)
-    if entry:
-     now=time.monotonic()
-     if now-resource_touched.get(rid,0)>RESOURCE_TTL:
-      remove_resource(rid);entry=None
-     else:
-      resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+gateway_config['activeProtectionSeconds']
-      correlation=resource_correlation.get(rid,correlation)
-   if not entry:return self.reply(404,{})
-   cid,url=entry
-   started=time.monotonic();kind='segment' if rid in segment_resources else 'other'
-   try:
-    rg=self.headers.get('Range')
-    if rg and not re.fullmatch(r'bytes=\d*-\d*',rg):return self.reply(416,{})
-    (data,headers,status,final),cache_hit=fetch_media(rid,url,rg)
-    record_delivery(cid,kind,time.monotonic()-started,len(data),cache_hit)
-    if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
-     if len(data)>MAX_PLAYLIST:return self.reply(502,{})
-     return self.reply(200,rewrite(data,final,cid,correlation),'application/vnd.apple.mpegurl')
-    extra={k:headers[k] for k in ('Content-Range','Accept-Ranges') if headers.get(k)}
-    return self.reply(status,data,headers.get('Content-Type','application/octet-stream'),extra)
-   except urllib.error.HTTPError as e:
-    record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'media','HTTP '+str(e.code),correlation);log('upstream HTTP '+str(e.code));return self.reply(502,{})
-   except Exception as e:
-    record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'media',type(e).__name__,correlation);log('upstream failure '+type(e).__name__);return self.reply(502,{})
-  if not self.authorized(q):return self.reply(401,{})
-  if path in ('/LiveTv/Channels','/Jealousfin/Policy'):
-   try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-   if path=='/Jealousfin/Policy':return self.reply(200,policy_payload(snapshot))
-   include=q.get('JealousfinIncludePolicy',['false'])[0]=='true'
-   with lock:out=[dict(c,UserData={'IsFavorite':cid in favorites}) for cid,c in ordered_catalogue(snapshot,include)]
-   programmes=programme_snapshot()
-   for item in out:
-    row=programmes.get(item['Id'])
-    if row:item['CurrentProgram']=programme_item(item['Id'],row)
-   result={'Items':out,'TotalRecordCount':len(out),'JealousfinPolicyRevision':'sqlite-policy-v1'}
-   if include:result['JealousfinPolicy']=policy_payload(snapshot)
-   return self.reply(200,result)
-  if path=='/Jealousfin/Policy/Event' and self.command=='POST':
-   n=int(self.headers.get('Content-Length','0'))
-   if not 0<n<=8192:return self.reply(400,{})
-   try:
-    d=json.loads(self.rfile.read(n));cid=d['channelID'];trace=d['trace'];action=d['action'];reason=d.get('reason','')
-    if cid not in channels or not isinstance(trace,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',trace) or not isinstance(reason,str) or len(reason)>512:raise ValueError("Invalid event")
-    if action=='approve' and d.get('approval')!='explicit':return self.reply(403,{})
-    policy_event(cid,trace,action,reason)
-    return self.reply(200,policy_payload(policy_rows()))
-   except (KeyError,ValueError,TypeError):return self.reply(400,{})
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-  if path=='/LiveTv/Programs':
-   # The current-title feed is not a full EPG. For queries needing a real
-   # time range, do not invent times; the client can use CurrentProgram.
-   selected=set(','.join(q.get('ChannelIds',[])).split(','))-{''}
-   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if not selected or cid in selected]
-   return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinCurrentOnly':True})
-  if path=='/LiveTv/Recordings':return self.reply(200,{'Items':[],'TotalRecordCount':0})
-  m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)
-  if m and m[1] in sources:
-   n=int(self.headers.get('Content-Length','0'))
-   if n>262144:return self.reply(413,{})
-   if n:self.rfile.read(n)
-   cid=m[1]
-   try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-   if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
-   record_attempt(cid)
-   with lock:
-    now=time.monotonic();active_channels[cid]=now+gateway_config['activeProtectionSeconds'];evict_resources(now)
-   try:url=register(resolve(cid),cid,correlation);url=url.rsplit('.',1)[0]+'.m3u8'
-   except Exception as e:
-    record_source_error(cid,None,'resolve',type(e).__name__,correlation);return self.reply(502,{})
-   try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-   if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
-   return self.reply(200,{'PlaySessionId':uuid.uuid4().hex,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
-  if path.startswith('/Sessions/Playing') or path=='/LiveStreams/Close':
-   n=int(self.headers.get('Content-Length','0'))
-   if n>262144:return self.reply(413,{})
-   if n:self.rfile.read(n)
-   return self.reply(200,{})
-  m=re.fullmatch(r'/Users/[^/]+/FavoriteItems/([a-f0-9]{32})',path)
-  if m and m[1] in channels:
-   if self.command not in ('POST','DELETE'):return self.reply(405,{})
-   set_favorite(m[1],self.command=='POST')
-   return self.reply(200,{})
-  return self.reply(404,{})
- def do_GET(self):
-  try:self.handle_request()
-  except Exception as e:
-   log('request failure '+type(e).__name__)
-   try:self.reply(500,{})
-   except Exception:pass
- do_POST=do_GET
- do_DELETE=do_GET
- do_HEAD=do_GET
-def main():
- global PROVIDER
- PROVIDER=provider()
- reload_gateway_config(force=True)
- initialize_catalogue()
- load_favorites()
- server=Server((HOST,PORT),Handler)
- (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
- stop=threading.Event()
- worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
- guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
  finally:
