@@ -2,6 +2,7 @@ import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client
 from collections import OrderedDict, deque
 from pathlib import Path
 import regional_guide
+import opencode_discovery
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -25,7 +26,9 @@ active_channels={}
 CONFIG_FILE=ROOT/'gateway-runtime.json'
 CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeoutSeconds':10,
                  'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
-                 'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{}}
+                 'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
+                 'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
+                 'metadataResearchDailyBudget':12,'metadataResearchTimeoutSeconds':45}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -49,6 +52,10 @@ def validate_gateway_config(raw):
  for key,lo,hi in [('upstreamTimeoutSeconds',2,30),('providerTimeoutSeconds',2,30),('upstreamRetries',0,2),('resourceTTLSeconds',120,3600),('resourceLimit',500,50000),('activeProtectionSeconds',30,300)]:
   value=result[key]
   if type(value) is not int or not lo<=value<=hi:raise ValueError('Invalid '+key)
+ if type(result['metadataResearchEnabled']) is not bool:raise ValueError('Invalid metadata research toggle')
+ if not isinstance(result['metadataResearchModel'],str) or not opencode_discovery.MODEL_RE.fullmatch(result['metadataResearchModel']):raise ValueError('Invalid research model')
+ for key,lo,hi in [('metadataResearchDailyBudget',1,48),('metadataResearchTimeoutSeconds',10,90)]:
+  if type(result[key]) is not int or not lo<=result[key]<=hi:raise ValueError('Invalid '+key)
  if result['activeProtectionSeconds']>result['resourceTTLSeconds']:raise ValueError('Protection exceeds resource TTL')
  if result['sourceSelection'] not in ('round-robin','preferred-first','first'):raise ValueError('Unknown selection strategy')
  hosts=result['preferredHosts']
@@ -392,6 +399,7 @@ guide_fault=None
 regional_programme=None
 regional_fault=None
 regional_observed_at=0.0
+discovery=opencode_discovery.Discovery(ROOT/'opencode-discovery.json')
 year_cache=OrderedDict()
 YEAR_CACHE_FILE=ROOT/'programme-years.json'
 YEAR_CACHE_LIMIT=2048
@@ -689,11 +697,74 @@ def update_programmes(raw,observed=None):
  with lock:
   programme_rows=valid;programme_observed_at=now;programme_fault=None
 
+def fetch_discovery_page(url):
+ allowed=opencode_discovery.GUIDE_HOSTS
+ original_host=urllib.parse.urlsplit(url).hostname
+ class GuideRedirect(Redirect):
+  def redirect_request(self,req,fp,code,msg,headers,newurl):
+   target=opencode_discovery.public_url(urllib.parse.urljoin(req.full_url,newurl))
+   if not target or urllib.parse.urlsplit(target).hostname.removeprefix('www.')!=original_host.removeprefix('www.'):raise ValueError('Unapproved guide redirect')
+   return super().redirect_request(req,fp,code,msg,headers,target)
+ target=opencode_discovery.public_url(url)
+ if not target or original_host not in allowed:raise ValueError('Unapproved guide source')
+ request=urllib.request.Request(validate(target),headers={'User-Agent':'Jealousfin-EPG/1.0','Accept':'text/html'})
+ agent=urllib.request.build_opener(urllib.request.ProxyHandler({}),GuideRedirect())
+ with agent.open(request,timeout=8) as f:
+  raw=f.read(2*1024*1024+1)
+  encoding=f.headers.get_content_charset() or 'utf-8'
+ if len(raw)>2*1024*1024:raise ValueError('Research guide too large')
+ return raw.decode(encoding,errors='strict')
+
+def discovery_worker(stop):
+ # Normal bounded gateway worker; not an external scheduled task.
+ while not stop.wait(15):
+  try:
+   reload_gateway_config()
+   if not gateway_config['metadataResearchEnabled'] or not opencode_discovery.available():continue
+   now=time.time()
+   with lock:
+    if programme_fault or not 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:continue
+    known=programme_snapshot(now)
+    active={cid for cid,until in active_channels.items() if until>time.monotonic()}
+    missing={cid for cid in channels if cid not in known and sources.get(cid)}
+    cid=discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
+    if not cid:continue
+    channel=channels[cid]['Name'];provider_id=sources[cid]
+    model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
+    if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
+    discovery.calls.append(now)
+    discovery.records[cid]={'at':now,'outcome':'started','candidate':opencode_discovery.normalize_result({})}
+    discovery.save(atomic_json);discovery.in_flight=True
+   try:
+    raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout)
+    candidate=opencode_discovery.normalize_result(raw)
+    checked_at=time.time()
+    row=opencode_discovery.verify_candidate(candidate,channel,provider_id,checked_at,fetch_discovery_page)
+    with lock:
+     discovery.records[cid]={'at':now,'outcome':'verified' if row else 'unverified' if candidate['title'] else 'missing','candidate':candidate}
+     if row and gateway_config['metadataResearchEnabled']:discovery.verified[cid]=row
+     discovery.last_fault=None
+     discovery.save(atomic_json)
+    log('programme research '+('verified' if row else 'lead only' if candidate['title'] else 'no evidence')+' channel='+cid)
+   except Exception as error:
+    with lock:
+     discovery.last_fault=type(error).__name__
+     discovery.records[cid]['outcome']='error'
+     discovery.save(atomic_json)
+    log('programme research failed '+type(error).__name__)
+   finally:
+    with lock:discovery.in_flight=False
+  except Exception as error:
+   with lock:discovery.in_flight=False;discovery.last_fault=type(error).__name__
+   log('programme research worker '+type(error).__name__)
+
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
  result=guide_snapshot(now)
  result.update(regional_snapshot(now))
  with lock:
+  if gateway_config['metadataResearchEnabled']:
+   for cid,row in discovery.snapshot(now).items():result.setdefault(cid,row)
   if 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:
    for cid,row in programme_rows.items():
     evidence=result.get(cid,{})
@@ -914,7 +985,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':dict(discovery.status(time.time(),gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled']),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1034,6 +1105,7 @@ def main():
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  regional=threading.Thread(target=regional_worker,args=(stop,),name='regional-guide-refresh',daemon=True);regional.start()
+ research=threading.Thread(target=discovery_worker,args=(stop,),name='programme-research',daemon=True);research.start()
  years=threading.Thread(target=year_worker,args=(stop,),name='programme-year-refresh',daemon=True);years.start()
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
