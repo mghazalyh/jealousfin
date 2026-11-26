@@ -230,6 +230,29 @@ class RealtimeFixtureTests(unittest.TestCase):
         self.assertEqual(self._language(en)[0], "en")
         self.assertEqual(self._language(pt)[0], "pt")
 
+    def test_aes128_plaintext_and_encrypted_ts_decode(self):
+        try:
+            from cryptography.hazmat.primitives import padding
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        except Exception:
+            self.skipTest("cryptography unavailable")
+        source = pathlib.Path(self.temp.name) / "aes-source.ts"
+        subprocess.run([self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                        "-t", "2", "-c:a", "aac", "-f", "mpegts", str(source)], check=True, timeout=30)
+        plain = source.read_bytes()
+        key = os.urandom(16); iv = os.urandom(16)
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(plain) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+        work = pathlib.Path(self.temp.name)
+        plain_pcm = spanish_audio.decode_audio(plain, None, self.ffmpeg, work, key=key, iv="0x" + iv.hex())
+        encrypted_pcm = spanish_audio.decode_audio(encrypted, None, self.ffmpeg, work, key=key, iv="0x" + iv.hex())
+        self.assertGreater(len(plain_pcm), 1000)
+        self.assertGreater(len(encrypted_pcm), 1000)
+        self.assertEqual(len(plain_pcm), len(encrypted_pcm))
+
     def test_noise_and_silence_fixtures_are_inconclusive(self):
         silence = pathlib.Path(self.temp.name) / "silence.wav"
         noise = pathlib.Path(self.temp.name) / "noise.wav"
@@ -279,6 +302,7 @@ video.m3u8
 #EXT-X-TARGETDURATION:6
 #EXT-X-MEDIA-SEQUENCE:1
 #EXT-X-MAP:URI="init.mp4"
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x000102030405060708090a0b0c0d0e0f
 #EXTINF:6,
 seg1.ts
 #EXTINF:6,
@@ -291,9 +315,13 @@ seg2.ts
         map_rid = next(iter(self.g.map_resources.values()))
         self.assertIn(map_rid, self.g.map_bases)
         self.assertIn(audio_rid, self.g.audio_playlists)
-        for rid in list(self.g.audio_segments) + [map_rid]:
+        self.assertEqual(len(self.g.key_resources), 1)
+        self.assertTrue(all(self.g.segment_keys.get(rid, {}).get("keyRid") for rid in self.g.audio_segments))
+        self.assertTrue(self.g.manifest_quality[self.a]["playlistEncrypted"])
+        for rid in list(self.g.audio_segments) + [map_rid] + list(self.g.key_resources):
             self.g.remove_resource(rid)
         self.assertEqual(self.g.audio_segments, set())
+        self.assertEqual(self.g.key_resources, {})
 
     def test_manual_marker_path_and_auto_override(self):
         g = self.g

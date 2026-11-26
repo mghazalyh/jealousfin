@@ -164,10 +164,71 @@ def analyze_speech(pcm, window_seconds=WINDOW_SECONDS, max_windows=MAX_WINDOWS):
     }
 
 
-def decode_audio(data, map_data, ffmpeg, tmpdir, timeout=DECODE_TIMEOUT):
-    """Decode one complete media segment to 16 kHz mono PCM using ffmpeg."""
+def looks_plain(data):
+    """True for recognizable plaintext TS/fMP4/ADTS/MP3 media magic."""
+    head = data[:32]
+    if not head:
+        return False
+    if head[0] == 0x47:
+        return True
+    if b"ftyp" in head or b"styp" in head or b"moof" in head:
+        return True
+    if len(head) > 1 and head[0] == 0xFF and (head[1] & 0xF0) == 0xF0:
+        return True
+    if head.startswith(b"ID3") or head.startswith(b"\xff\xfb") or head.startswith(b"\xff\xf3"):
+        return True
+    return False
+
+
+def _aes_decrypt(data, key, iv):
+    """AES-CBC decrypt one HLS AES-128/256 segment. Key stays in memory."""
+    if not data or len(data) % 16 or len(key) not in (16, 24, 32) or len(iv) != 16:
+        return b""
+    plain = None
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        plain = decryptor.update(data) + decryptor.finalize()
+    except Exception:
+        try:
+            from Crypto.Cipher import AES
+            plain = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+        except Exception:
+            return b""
+    if not plain:
+        return b""
+    pad = plain[-1]
+    if 1 <= pad <= 16 and plain.endswith(bytes([pad]) * pad):
+        plain = plain[:-pad]
+    return plain
+
+
+def _iv_bytes(iv, sequence):
+    if isinstance(iv, str) and iv:
+        value = iv[2:] if iv.lower().startswith("0x") else iv
+        try:
+            raw = bytes.fromhex(value)
+            if len(raw) == 16:
+                return raw
+        except ValueError:
+            pass
+    if isinstance(sequence, int) and 0 <= sequence < (1 << 128):
+        return sequence.to_bytes(16, "big")
+    return None
+
+
+def decode_audio(data, map_data, ffmpeg, tmpdir, timeout=DECODE_TIMEOUT, key=None, iv=None, sequence=None):
+    """Decode one complete media segment to 16 kHz mono PCM using ffmpeg.
+
+    If the segment is an HLS AES-128/256 encrypted blob and the session key is
+    supplied in memory, decrypt it first. The key is never written or logged.
+    """
     if not data or len(data) > MAX_SEGMENT_BYTES:
         return b""
+    if key and not looks_plain(data):
+        decrypted = _aes_decrypt(data, key, _iv_bytes(iv, sequence))
+        if decrypted:
+            data = decrypted
     head = data[:32]
     if head.lstrip(b"\xef\xbb\xbf \r\n").startswith(b"#EXTM3U"):
         return b""
@@ -391,6 +452,7 @@ class Manager:
         self._samples = {}
         self._finalized = {}
         self._maps = {}
+        self._keys = {}
         self._control_cache = (0.0, True)
         self._last_media = 0.0
         self._tmpdir = None
@@ -419,7 +481,8 @@ class Manager:
             "counters": {
                 "tested": 0, "spanish": 0, "nonSpanish": 0, "inconclusive": 0,
                 "errors": 0, "suppressed": 0, "segmentsDecoded": 0,
-                "segmentsRejected": 0, "samplesFinalized": 0,
+                "segmentsRejected": 0, "segmentsDecrypted": 0, "keyMissing": 0,
+                "samplesFinalized": 0,
             },
             "last": None,
             "current": None,
@@ -526,7 +589,8 @@ class Manager:
         if self._tmpdir:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    def tap(self, cid, provider, name, rid, base, data, is_audio, content_type="", correlation=None):
+    def tap(self, cid, provider, name, rid, base, data, is_audio, content_type="", correlation=None,
+            key_bytes=None, key_rid=None, iv=None, sequence=None):
         """Enqueue one already-fetched media segment. Never blocks or raises."""
         if self.fault or not cid or not provider or not base or not data:
             return
@@ -543,6 +607,7 @@ class Manager:
             self._taps.put_nowait({
                 "cid": cid, "provider": provider, "name": name, "rid": rid, "base": base,
                 "data": data, "is_audio": bool(is_audio), "contentType": content_type,
+                "keyBytes": key_bytes, "keyRid": key_rid, "iv": iv, "sequence": sequence,
                 "wall": now,
             })
         except Exception:
@@ -558,6 +623,16 @@ class Manager:
             except (StopIteration, KeyError):
                 pass
         self._maps[base] = bytes(data)
+
+    def tap_key(self, key_rid, data):
+        if self.fault or not key_rid or not data or not 16 <= len(data) <= 64:
+            return
+        if len(self._keys) >= 256 and key_rid not in self._keys:
+            try:
+                self._keys.pop(next(iter(self._keys)))
+            except (StopIteration, KeyError):
+                pass
+        self._keys[key_rid] = bytes(data)
 
     def _probe(self):
         if self.probe is None:
@@ -613,13 +688,21 @@ class Manager:
             return
         base.seen.add(event["rid"])
         map_data = self._maps.get(event["base"])
-        pcm = decode_audio(event["data"], map_data, self.ffmpeg, self._tmpdir)
+        key_bytes = event.get("keyBytes") or self._keys.get(event.get("keyRid"))
+        plain = looks_plain(event["data"])
+        pcm = decode_audio(event["data"], map_data, self.ffmpeg, self._tmpdir,
+                           key=key_bytes, iv=event.get("iv"), sequence=event.get("sequence"))
         if not pcm:
             base.failures += 1
             self._write_diagnostic(event, map_data)
             with self._lock:
                 self.telemetry["counters"]["segmentsRejected"] += 1
+                if not plain and event.get("keyRid") and not key_bytes:
+                    self.telemetry["counters"]["keyMissing"] += 1
             return
+        if key_bytes and not plain:
+            with self._lock:
+                self.telemetry["counters"]["segmentsDecrypted"] += 1
         if base.seconds < MAX_SECONDS:
             room = int((MAX_PCM_SECONDS - base.seconds) * BYTES_PER_SECOND)
             if len(pcm) > room:

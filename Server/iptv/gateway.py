@@ -73,6 +73,9 @@ audio_playlists=set()
 audio_segments=set()
 map_resources={}
 map_bases={}
+key_resources={}
+segment_keys={}
+key_cache={}
 segment_cache=OrderedDict()
 segment_cache_bytes=0
 segment_flights={}
@@ -222,6 +225,7 @@ def remove_resource(rid):
  if entry:reverse.pop(resource_keys.pop(rid,entry),None)
  resource_touched.pop(rid,None);resource_correlation.pop(rid,None);segment_resources.discard(rid)
  resource_bases.pop(rid,None);audio_playlists.discard(rid);audio_segments.discard(rid)
+ key_resources.pop(rid,None);segment_keys.pop(rid,None);key_cache.pop(rid,None)
  base=map_bases.pop(rid,None)
  if base is not None and map_resources.get(base)==rid:map_resources.pop(base,None)
  for base,map_rid in list(map_resources.items()):
@@ -322,6 +326,7 @@ def rewrite(data,base,cid,correlation=None,audio_only=False):
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
  out=[];sequence=None;discontinuity=0;segment=False;byterange=False
  durations=[];discontinuity_tags=0;first_sequence=None
+ current_key=None;key_method=None;encrypted=False
  for line in text.splitlines():
   if line.startswith('#'):
    tag=line
@@ -345,14 +350,26 @@ def rewrite(data,base,cid,correlation=None,audio_only=False):
     if rid and tag.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in tag:audio_playlists.add(rid)
     elif rid and tag.startswith('#EXT-X-MAP:'):
      map_resources[base]=rid;map_bases[rid]=base
+    elif rid and tag.startswith('#EXT-X-KEY:'):
+     key_resources[rid]=base
     return 'URI="'+url+'"'
    line=re.sub(r'URI="([^"]+)"',replace_uri,line)
+   if tag.startswith('#EXT-X-KEY:'):
+    method=re.search(r'METHOD=([A-Za-z0-9-]+)',tag)
+    iv=re.search(r'IV=0x([0-9A-Fa-f]+)',tag)
+    label=method.group(1).upper() if method else ''
+    key_method=label or key_method
+    encrypted=encrypted or label not in ('','NONE')
+    uri_match=re.search(r'URI="([^"]+)"',line)
+    key_rid=media_rid(uri_match.group(1)) if uri_match else None
+    current_key=(key_rid,iv.group(1) if iv else None) if key_rid and label and label!='NONE' else None
   elif line.strip():
    absolute=urllib.parse.urljoin(base,line.strip())
    identity=(base,discontinuity,sequence) if segment and sequence is not None and not byterange else None
    line=register(absolute,cid,correlation,identity)
    rid=media_rid(line)
    if rid and audio_only:audio_segments.add(rid)
+   if rid and current_key:segment_keys[rid]={'keyRid':current_key[0],'iv':current_key[1],'sequence':sequence if segment else None}
    if segment and sequence is not None:sequence+=1
    segment=False;byterange=False
   out.append(line)
@@ -361,7 +378,8 @@ def rewrite(data,base,cid,correlation=None,audio_only=False):
    manifest_quality[cid]={'playlistMediaSequence':first_sequence,'playlistSegments':len(durations),
                          'playlistDurationSeconds':round(sum(durations),3),
                          'playlistMinSegmentSeconds':min(durations),'playlistMaxSegmentSeconds':max(durations),
-                         'playlistDiscontinuities':discontinuity_tags,'playlistObservedAt':time.time()}
+                         'playlistDiscontinuities':discontinuity_tags,'playlistEncrypted':bool(encrypted),
+                         'playlistKeyMethod':key_method or '','playlistObservedAt':time.time()}
    manifest_quality.move_to_end(cid)
    while len(manifest_quality)>300:manifest_quality.popitem(last=False)
  return ('\n'.join(out)+'\n').encode()
@@ -1922,12 +1940,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     (data,headers,status,final),cache_hit=fetch_media(rid,url,rg)
     record_delivery(cid,kind,time.monotonic()-started,len(data),cache_hit)
     if spanish_auto_manager is not None and not data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
-     if rid in map_bases:
+     if rid in key_resources and status==200:
+      if 16<=len(data)<=64:
+       if len(key_cache)>=256 and rid not in key_cache:
+        try:key_cache.pop(next(iter(key_cache)))
+        except (StopIteration,KeyError):pass
+       key_cache[rid]=bytes(data)
+       spanish_auto_manager.tap_key(rid,data)
+     elif rid in map_bases:
       spanish_auto_manager.tap_map(map_bases[rid],data)
      elif kind=='segment' and rg is None and status==200:
       base=resource_bases.get(rid)
       if base:
-       spanish_auto_manager.tap(cid,sources.get(cid),channels.get(cid,{}).get('Name',''),rid,base,data,rid in audio_segments,headers.get('Content-Type','application/octet-stream'),correlation)
+       crypto=segment_keys.get(rid) or {}
+       key_rid=crypto.get('keyRid')
+       spanish_auto_manager.tap(cid,sources.get(cid),channels.get(cid,{}).get('Name',''),rid,base,data,rid in audio_segments,headers.get('Content-Type','application/octet-stream'),correlation,key_bytes=key_cache.get(key_rid) if key_rid else None,key_rid=key_rid,iv=crypto.get('iv'),sequence=crypto.get('sequence'))
     if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
      if len(data)>MAX_PLAYLIST:
       record_source_error(cid,url,'media','Playlist exceeds gateway limit',correlation);return self.reply(502,{})
