@@ -17,6 +17,7 @@ MAX_MEDIA = 32 * 1024 * 1024
 DEVICE_PORT = 8765
 ID = re.compile(r"^[a-f0-9]{32}$")
 NODE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+ACTION_ID = re.compile(r"^[a-z_]{1,80}$")
 
 def load_selector(root):
     p = Path(root) / "prototype-source-selector.json"
@@ -66,27 +67,33 @@ def selected_profile(config, device_token=""):
         raise RuntimeError("Prototype device category unavailable")
     return "malay" if category == MALAY_CATEGORY else "american"
 
-def device_ui_trigger(config, device_token, node_id):
-    """Invoke one fixed, already-installed read-only UI action on the device.
+def device_command(config, device_token, action, arguments=None):
+    """Invoke one bounded device command over the fixed LAN endpoint.
 
-    This is the only device write path used for Spanish classification. The
-    node ID is fixed by the gateway, never supplied by an HTTP client.
+    The action and arguments are supplied by gateway code only, never by an
+    HTTP client. Media URLs and credentials are never logged or returned.
     """
-    if not isinstance(node_id, str) or not NODE_ID.fullmatch(node_id):
-        raise ValueError("Invalid device UI node")
+    if not isinstance(action, str) or not ACTION_ID.fullmatch(action):
+        raise ValueError("Invalid device action")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        raise ValueError("Invalid device arguments")
     command = {
         "schemaVersion": 1,
-        "id": "spanish-read-" + uuid.uuid4().hex,
-        "action": "ui_trigger",
-        "arguments": {"id": node_id},
+        "id": action + "-" + uuid.uuid4().hex,
+        "action": action,
+        "arguments": arguments,
     }
     body = json.dumps(command, separators=(",", ":")).encode()
+    if len(body) > 32768:
+        raise ValueError("Device command too large")
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if device_token:
         headers["Authorization"] = "Bearer " + device_token
     code, data, _ = read_response(
         config["deviceIP"], DEVICE_PORT, "/command",
-        method="POST", headers=headers, body=body, limit=MAX_JSON, timeout=5,
+        method="POST", headers=headers, body=body, limit=MAX_JSON, timeout=8,
     )
     if code != 200:
         raise RuntimeError("Prototype device command unavailable")
@@ -97,6 +104,15 @@ def device_ui_trigger(config, device_token, node_id):
     if not isinstance(result, str):
         raise RuntimeError("Prototype device command result unavailable")
     return result
+
+def device_ui_trigger(config, device_token, node_id):
+    """Invoke one fixed, already-installed read-only UI action on the device.
+
+    The node ID is fixed by the gateway, never supplied by an HTTP client.
+    """
+    if not isinstance(node_id, str) or not NODE_ID.fullmatch(node_id):
+        raise ValueError("Invalid device UI node")
+    return device_command(config, device_token, "ui_trigger", {"id": node_id})
 
 def source_ids(root):
     p = Path(root) / "profiles" / "malay" / "trial-info.json"

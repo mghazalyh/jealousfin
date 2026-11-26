@@ -7,6 +7,7 @@ import opencode_discovery
 import source_profiles
 import prototype_selector
 import spanish_classification
+import spanish_audio
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -51,9 +52,27 @@ spanish_state=spanish_classification.empty()
 spanish_provider_ids=set()
 spanish_fingerprint=None
 spanish_checked_at=0.0
+SPANISH_AUTO_CONTROL_FILE=ROOT/'spanish-auto-control.json'
+SPANISH_AUTO_REVISION='spanish-auto-control-v1'
+spanish_auto_control=True
+spanish_auto_control_fingerprint=None
+spanish_auto_control_checked=0.0
+spanish_auto_manager=None
+device_identity_cache=None
+device_identity_checked=0.0
+MAINTENANCE_FILE=ROOT/'maintenance-window.json'
+MAINTENANCE_IGNORED_FILE=ROOT/'maintenance-ignored.jsonl'
+maintenance_state=None
+maintenance_fingerprint=None
+maintenance_checked_at=0.0
 resource_correlation={}
 resource_keys={}
 segment_resources=set()
+resource_bases={}
+audio_playlists=set()
+audio_segments=set()
+map_resources={}
+map_bases={}
 segment_cache=OrderedDict()
 segment_cache_bytes=0
 segment_flights={}
@@ -202,6 +221,11 @@ def remove_resource(rid):
  entry=resources.pop(rid,None)
  if entry:reverse.pop(resource_keys.pop(rid,entry),None)
  resource_touched.pop(rid,None);resource_correlation.pop(rid,None);segment_resources.discard(rid)
+ resource_bases.pop(rid,None);audio_playlists.discard(rid);audio_segments.discard(rid)
+ base=map_bases.pop(rid,None)
+ if base is not None and map_resources.get(base)==rid:map_resources.pop(base,None)
+ for base,map_rid in list(map_resources.items()):
+  if map_rid==rid:map_resources.pop(base,None)
  cached=segment_cache.pop(rid,None)
  if cached:segment_cache_bytes-=len(cached[1][0])
 
@@ -285,17 +309,22 @@ def register(url,cid,correlation=None,identity=None):
    if len(resources)>=RESOURCE_LIMIT:evict_resources(now,1)
    if len(resources)>=RESOURCE_LIMIT:raise RuntimeError("Resource registry saturated")
    rid=secrets.token_hex(16);resources[rid]=(cid,url);reverse[key]=rid;resource_keys[rid]=key
-   if identity is not None:segment_resources.add(rid)
+   if identity is not None:segment_resources.add(rid);resource_bases[rid]=identity[0]
   resource_touched[rid]=now
   if correlation:resource_correlation[rid]=correlation
  return ('/malay/media/' if SOURCE_PROFILE=='malay' else '/media/')+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
-def rewrite(data,base,cid,correlation=None):
+MEDIA_RID=re.compile(r'/(?:malay/)?media/[^/]+/([a-f0-9]{32})(?:\.(?:m3u8|bin))?$')
+def media_rid(url):
+ match=MEDIA_RID.search(url)
+ return match[1] if match else None
+def rewrite(data,base,cid,correlation=None,audio_only=False):
  text=data.decode('utf-8-sig')
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
  out=[];sequence=None;discontinuity=0;segment=False;byterange=False
  durations=[];discontinuity_tags=0;first_sequence=None
  for line in text.splitlines():
   if line.startswith('#'):
+   tag=line
    if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
     try:sequence=int(line.split(':',1)[1]);first_sequence=sequence
     except ValueError:sequence=None
@@ -310,11 +339,20 @@ def rewrite(data,base,cid,correlation=None):
      if 0<duration<3600:durations.append(duration)
     except ValueError:pass
    elif line.startswith('#EXT-X-BYTERANGE:'):byterange=True
-   line=re.sub(r'URI="([^"]+)"',lambda m:'URI="'+register(urllib.parse.urljoin(base,m[1]),cid,correlation)+'"',line)
+   def replace_uri(match):
+    url=register(urllib.parse.urljoin(base,match[1]),cid,correlation)
+    rid=media_rid(url)
+    if rid and tag.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in tag:audio_playlists.add(rid)
+    elif rid and tag.startswith('#EXT-X-MAP:'):
+     map_resources[base]=rid;map_bases[rid]=base
+    return 'URI="'+url+'"'
+   line=re.sub(r'URI="([^"]+)"',replace_uri,line)
   elif line.strip():
    absolute=urllib.parse.urljoin(base,line.strip())
    identity=(base,discontinuity,sequence) if segment and sequence is not None and not byterange else None
    line=register(absolute,cid,correlation,identity)
+   rid=media_rid(line)
+   if rid and audio_only:audio_segments.add(rid)
    if segment and sequence is not None:sequence+=1
    segment=False;byterange=False
   out.append(line)
@@ -1444,11 +1482,15 @@ def apply_device_spanish_request(config, device_token):
   return
  marker=spanish_classification.parse_marker(raw)
  if marker is None:return
- maybe_reload_spanish()
  provider_id=sources.get(marker['channelID'])
  try:
   with lock:
-   state,changed=spanish_classification.apply(spanish_state,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
+   # Reload under the writer lock so a pending automatic mark can never
+   # clobber a manual add/remove made since the last fingerprint check.
+   fresh=spanish_classification.load(ROOT)
+   state,changed,reason=spanish_classification.apply_manual(fresh,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
+   spanish_state=fresh
+   spanish_provider_ids=spanish_classification.excluded(fresh)
    if not changed:return
    spanish_classification.atomic_write(ROOT,state)
    spanish_state=state
@@ -1459,7 +1501,144 @@ def apply_device_spanish_request(config, device_token):
  except (ValueError,OSError,TypeError) as error:
   log('Spanish marker rejected '+type(error).__name__)
   return
- log('SPANISH_CLASSIFICATION '+marker['action']+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
+ log('SPANISH_CLASSIFICATION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
+SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','updatedAt'}
+def reload_spanish_auto_control(force=False):
+ global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
+ if SOURCE_PROFILE!='american':
+  spanish_auto_control=False;return False
+ now=time.monotonic()
+ if not force and now-spanish_auto_control_checked<2:return spanish_auto_control
+ spanish_auto_control_checked=now
+ try:
+  if not SPANISH_AUTO_CONTROL_FILE.exists():
+   spanish_auto_control_fingerprint=None;spanish_auto_control=True;return True
+  stat=SPANISH_AUTO_CONTROL_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+  if not force and fingerprint==spanish_auto_control_fingerprint:return spanish_auto_control
+  if stat.st_size>4096:raise ValueError('Spanish auto control too large')
+  data=json.loads(SPANISH_AUTO_CONTROL_FILE.read_text())
+  if not isinstance(data,dict) or set(data)!=SPANISH_AUTO_CONTROL_KEYS or data.get('schemaVersion')!=1 or type(data.get('enabled')) is not bool or type(data.get('updatedAt')) not in (int,float):raise ValueError('Invalid Spanish auto control')
+  spanish_auto_control_fingerprint=fingerprint;spanish_auto_control=data['enabled']
+ except (ValueError,OSError,TypeError) as error:
+  # Fail closed for new automatic marks; existing exclusions are untouched.
+  spanish_auto_control=False;spanish_auto_control_fingerprint=None
+  log('Spanish auto control ignored '+type(error).__name__)
+ return spanish_auto_control
+def set_spanish_auto_enabled(enabled):
+ global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
+ if SOURCE_PROFILE!='american':raise ValueError('Spanish auto is English-trial only')
+ if type(enabled) is not bool:raise ValueError('Invalid Spanish auto control')
+ control={'schemaVersion':1,'enabled':enabled,'updatedAt':time.time()}
+ atomic_json(SPANISH_AUTO_CONTROL_FILE,control)
+ spanish_auto_control=enabled;spanish_auto_control_checked=time.monotonic()
+ try:
+  stat=SPANISH_AUTO_CONTROL_FILE.stat();spanish_auto_control_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+ except OSError:spanish_auto_control_fingerprint=None
+ if spanish_auto_manager is not None:spanish_auto_manager.refresh_control()
+ log('SPANISH_AUTO_CONTROL enabled='+str(enabled))
+ return control
+MAINTENANCE_KEYS={'schemaVersion','start','until','reason','launchID','channelID','allowedReasons'}
+def maintenance_window(force=False):
+ global maintenance_state,maintenance_fingerprint,maintenance_checked_at
+ now=time.monotonic()
+ if not force and now-maintenance_checked_at<2:return maintenance_state
+ maintenance_checked_at=now
+ try:
+  if not MAINTENANCE_FILE.exists():
+   maintenance_fingerprint=None;maintenance_state=None;return None
+  stat=MAINTENANCE_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+  if not force and fingerprint==maintenance_fingerprint:return maintenance_state
+  if stat.st_size>8192:raise ValueError('Maintenance window too large')
+  data=json.loads(MAINTENANCE_FILE.read_text())
+  if not isinstance(data,dict) or set(data)!=MAINTENANCE_KEYS or data.get('schemaVersion')!=1:raise ValueError('Invalid maintenance window')
+  start=data.get('start');until=data.get('until')
+  if type(start) not in (int,float) or type(until) not in (int,float) or not 0<=start<=until or until-start>900:raise ValueError('Invalid maintenance interval')
+  if not isinstance(data.get('reason'),str) or not data['reason'] or len(data['reason'])>160:raise ValueError('Invalid maintenance reason')
+  if not isinstance(data.get('launchID'),str) or len(data['launchID'])>100:raise ValueError('Invalid maintenance launch')
+  channel=data.get('channelID')
+  if channel and (not isinstance(channel,str) or not re.fullmatch(r'[a-f0-9]{32}',channel)):raise ValueError('Invalid maintenance channel')
+  reasons=data.get('allowedReasons')
+  if not isinstance(reasons,list) or len(reasons)>24 or any(not isinstance(item,str) or not item or len(item)>80 for item in reasons):raise ValueError('Invalid maintenance reasons')
+  maintenance_fingerprint=fingerprint;maintenance_state=data
+ except (ValueError,OSError,TypeError) as error:
+  maintenance_fingerprint=None;maintenance_state=None
+  log('Maintenance window ignored '+type(error).__name__)
+ return maintenance_state
+def maintenance_ignores(reason, now=None):
+ window=maintenance_window()
+ if window is None:return None
+ current=time.time() if now is None else now
+ if not window['start']<=current<=window['until']:return None
+ text=(reason or '').casefold()
+ for allowed in window['allowedReasons']:
+  if allowed.casefold() in text:return window
+ return None
+def record_maintenance_ignored(cid,trace,reason,now):
+ entry={'at':now,'channelID':cid,'trace':trace,'reason':str(reason)[:300]}
+ try:
+  fd=os.open(MAINTENANCE_IGNORED_FILE,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+  try:os.write(fd,(json.dumps(entry,separators=(',',':'))+'\n').encode())
+  finally:os.close(fd)
+ except OSError:pass
+def resolve_whisper_model():
+ candidates=[]
+ explicit=os.environ.get('JEALOUSFIN_WHISPER_MODEL','')
+ if explicit:candidates.append(Path(explicit))
+ home=Path.home()/'.config'/'jealousfin'/'models'
+ candidates.extend([home/'ggml-small.bin',home/'ggml-base.bin',ROOT/'models'/'ggml-small.bin',ROOT/'models'/'ggml-base.bin'])
+ for path in candidates:
+  try:
+   if path.is_file() and path.stat().st_size>1024*1024:return path
+  except OSError:pass
+ return None
+def device_language_probe():
+ global device_identity_cache,device_identity_checked
+ config=prototype_selector.load_selector(ROOT)
+ if config is None:return None
+ token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
+ try:
+  snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+ except Exception:
+  return None
+ if not isinstance(snapshot,dict):return None
+ now=time.time()
+ if device_identity_cache is None or now-device_identity_checked>60:
+  try:
+   status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
+   if isinstance(status,dict):
+    device_identity_cache=str(status.get('launchID',''));device_identity_checked=now
+  except Exception:pass
+ return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration',''))}
+def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
+ global spanish_state,spanish_provider_ids,spanish_fingerprint
+ if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
+ if sources.get(cid)!=provider:return {'changed':False,'reason':'unknown_provider'}
+ try:
+  with lock:
+   fresh=spanish_classification.load(ROOT)
+   state,changed,why=spanish_classification.apply_auto(fresh,provider,cid,name,confidence,reason,evidence)
+   if changed:spanish_classification.atomic_write(ROOT,state)
+   spanish_state=state;spanish_provider_ids=spanish_classification.excluded(state)
+   try:
+    stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+   except OSError:spanish_fingerprint=None
+  if changed:log('Spanish auto classification added provider='+provider+' channel='+cid)
+  return {'changed':changed,'reason':why}
+ except (ValueError,OSError,TypeError) as error:
+  log('Spanish auto commit rejected '+type(error).__name__)
+  return {'changed':False,'reason':'commit_'+type(error).__name__}
+def spanish_auto_status():
+ try:description=spanish_classification.describe(spanish_state)
+ except (ValueError,TypeError):description={'entries':len(spanish_provider_ids)}
+ if SOURCE_PROFILE!='american' or spanish_auto_manager is None:
+  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':'not_started','classification':description}
+ try:status=spanish_auto_manager.status()
+ except Exception as error:
+  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':type(error).__name__,'classification':description}
+ status['classification']=description
+ return status
+def spanish_auto_admin():
+ return {'control':{'enabled':bool(reload_spanish_auto_control(force=True)),'file':SPANISH_AUTO_CONTROL_FILE.name},'status':spanish_auto_status()}
 def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
  return sorted((item for item in channels.items() if not spanish_excluded(item[0]) and (include_excluded or policy_eligible(snapshot[item[0]],now))),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
@@ -1479,6 +1658,16 @@ def policy_event(cid,trace,action,reason):
   prior=db.execute("SELECT cid FROM observed WHERE id=?",(event_id,)).fetchone()
   if prior:
    if prior[0]!=cid:raise ValueError("Policy event identity mismatch")
+   return
+  if action=="failure" and maintenance_ignores(reason,now) is not None:
+   # A declared, time-bounded maintenance window may suppress only the
+   # infrastructure reasons listed in the window. Record the original event
+   # identity so a later replay cannot be penalised; never clear existing
+   # penalties and never suppress channel-specific failures outside the window.
+   db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_MAINTENANCE_IGNORED",cid,trace,reason[:300]))
+   db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)",(trace,cid,now))
+   record_maintenance_ignored(cid,trace,reason,now)
+   log('MAINTENANCE_IGNORED failure channel='+cid)
    return
   db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_"+action,cid,trace,reason[:300]))
   if action=="failure":
@@ -1692,7 +1881,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'spanishClassification':{'revision':SPANISH_REVISION,'entries':len(spanish_provider_ids),'lastNonce':spanish_state.get('lastNonce','')},'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'spanishClassification':{'revision':SPANISH_REVISION,'entries':len(spanish_provider_ids),'lastNonce':spanish_state.get('lastNonce','')},'spanishAuto':spanish_auto_status(),'deliveryQuality':quality_summary()})
+  if path=='/spanish-auto' and self.client_address[0] in (HOST,'127.0.0.1'):
+   if self.command=='GET':return self.reply(200,spanish_auto_admin())
+   if self.command=='POST':
+    n=int(self.headers.get('Content-Length','0'))
+    if not 0<n<=4096:return self.reply(400,{})
+    try:data=json.loads(self.rfile.read(n))
+    except (ValueError,TypeError):return self.reply(400,{})
+    if not isinstance(data,dict) or set(data)!={'enabled'} or type(data.get('enabled')) is not bool:return self.reply(400,{})
+    try:set_spanish_auto_enabled(data['enabled'])
+    except (ValueError,OSError,TypeError):return self.reply(503,{})
+    return self.reply(200,spanish_auto_admin())
+   return self.reply(405,{})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1720,10 +1921,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     if rg and not re.fullmatch(r'bytes=\d*-\d*',rg):return self.reply(416,{})
     (data,headers,status,final),cache_hit=fetch_media(rid,url,rg)
     record_delivery(cid,kind,time.monotonic()-started,len(data),cache_hit)
+    if spanish_auto_manager is not None and not data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
+     if rid in map_bases:
+      spanish_auto_manager.tap_map(map_bases[rid],data)
+     elif kind=='segment' and rg is None and status==200:
+      base=resource_bases.get(rid)
+      if base:
+       spanish_auto_manager.tap(cid,sources.get(cid),channels.get(cid,{}).get('Name',''),rid,base,data,rid in audio_segments,headers.get('Content-Type','application/octet-stream'),correlation)
     if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
      if len(data)>MAX_PLAYLIST:
       record_source_error(cid,url,'media','Playlist exceeds gateway limit',correlation);return self.reply(502,{})
-     return self.reply(200,rewrite(data,final,cid,correlation),'application/vnd.apple.mpegurl')
+     return self.reply(200,rewrite(data,final,cid,correlation,audio_only=rid in audio_playlists),'application/vnd.apple.mpegurl')
     extra={k:headers[k] for k in ('Content-Range','Accept-Ranges') if headers.get(k)}
     return self.reply(status,data,headers.get('Content-Type','application/octet-stream'),extra)
    except MediaCompatibilityError:
@@ -1823,7 +2031,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
  do_DELETE=do_GET
  do_HEAD=do_GET
 def main():
- global PROVIDER
+ global PROVIDER,spanish_auto_manager
  PROVIDER=provider()
  reload_gateway_config(force=True)
  initialize_catalogue()
@@ -1832,6 +2040,10 @@ def main():
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'sourceProfile':SOURCE_PROFILE,'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  stop=threading.Event()
+ if SOURCE_PROFILE=='american':
+  model=resolve_whisper_model()
+  spanish_auto_manager=spanish_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),spanish_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4)
+  if not spanish_auto_manager.start():log('Spanish auto unavailable '+str(spanish_auto_manager.fault))
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()
@@ -1842,7 +2054,9 @@ def main():
  log('READY channels='+str(len(channels)))
  try:server.serve_forever(poll_interval=.5)
  finally:
-  stop.set();server.server_close()
+  stop.set()
+  if spanish_auto_manager is not None:spanish_auto_manager.stop()
+  server.server_close()
   try:(ROOT/'trial-info.json').unlink()
   except FileNotFoundError:pass
 if __name__=='__main__':main()

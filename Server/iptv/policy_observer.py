@@ -8,6 +8,44 @@ DB=ROOT/'policy.sqlite3'
 BASE=os.environ.get('JEALOUSFIN_DEVICE_URL','http://127.0.0.1:8765').rstrip('/')
 AUTH=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
 DAY=86400
+MAINTENANCE_FILE=ROOT/'maintenance-window.json'
+MAINTENANCE_IGNORED_FILE=ROOT/'maintenance-ignored.jsonl'
+_MAINTENANCE_CACHE=(0.0,None,None)
+def maintenance_window():
+    global _MAINTENANCE_CACHE
+    now=time.monotonic()
+    checked,state,fingerprint=_MAINTENANCE_CACHE
+    if now-checked<2:return state
+    try:
+        if not MAINTENANCE_FILE.exists():
+            _MAINTENANCE_CACHE=(now,None,None);return None
+        stat=MAINTENANCE_FILE.stat();current=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+        if fingerprint==current:return state
+        if stat.st_size>8192:raise ValueError('Maintenance window too large')
+        data=json.loads(MAINTENANCE_FILE.read_text())
+        required={'schemaVersion','start','until','reason','launchID','channelID','allowedReasons'}
+        if not isinstance(data,dict) or set(data)!=required or data.get('schemaVersion')!=1:raise ValueError('Invalid maintenance window')
+        start=data.get('start');until=data.get('until')
+        if type(start) not in (int,float) or type(until) not in (int,float) or not 0<=start<=until or until-start>900:raise ValueError('Invalid maintenance interval')
+        reasons=data.get('allowedReasons')
+        if not isinstance(reasons,list) or len(reasons)>24 or any(not isinstance(item,str) or not item or len(item)>80 for item in reasons):raise ValueError('Invalid maintenance reasons')
+        _MAINTENANCE_CACHE=(now,data,current);return data
+    except (OSError,ValueError,TypeError):
+        _MAINTENANCE_CACHE=(now,None,None);return None
+def maintenance_ignores(reason,at):
+    window=maintenance_window()
+    if window is None or not window['start']<=at<=window['until']:return None
+    text=(reason or '').casefold()
+    for allowed in window['allowedReasons']:
+        if allowed.casefold() in text:return window
+    return None
+def record_maintenance_ignored(cid,trace,reason,at):
+    entry={'at':at,'channelID':cid,'trace':trace,'reason':str(reason)[:300]}
+    try:
+        fd=os.open(MAINTENANCE_IGNORED_FILE,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+        try:os.write(fd,(json.dumps(entry,separators=(',',':'))+'\n').encode())
+        finally:os.close(fd)
+    except OSError:pass
 def epoch(v):
     return dt.datetime.fromisoformat(v.replace('Z','+00:00')).timestamp()
 def connect(path=DB):
@@ -153,7 +191,13 @@ def ingest(c,events,status):
             row=c.execute('SELECT cid FROM sessions WHERE trace=?',(trace,)).fetchone()
             if row:cid=row[0]
         if not cid or not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():continue
-        cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,code,cid,trace,str(fields.get('reason',''))[:300]))
+        reason=str(fields.get('reason',''))
+        if code in ('PLAYBACK_STALLED','FAILURE_UNCONFIRMED','CHANNEL_FAILED') and fields.get('terminal') not in ('false',False):
+            if maintenance_ignores(reason,at) is not None:
+                cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,'MAINTENANCE_IGNORED_'+code,cid,trace,reason[:300]))
+                if cur.rowcount:record_maintenance_ignored(cid,trace,reason,at)
+                continue
+        cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,code,cid,trace,reason[:300]))
         if not cur.rowcount:continue
         if code=='OPEN':
             for old,oldcid,confirmed,count,first,last,stalls,outcome in c.execute("SELECT trace,cid,confirmed,sample_count,first_position,last_position,stalls,outcome FROM sessions WHERE closed=0 AND trace!=? AND opened<=?",(trace,at)).fetchall():
