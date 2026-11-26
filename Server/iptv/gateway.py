@@ -948,7 +948,7 @@ def discovery_worker(stop):
     if programme_fault or not 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE:continue
     known=programme_snapshot(now)
     active={cid for cid,until in active_channels.items() if until>time.monotonic()}
-    missing={cid for cid in channels if cid not in known and sources.get(cid)}
+    missing={cid for cid in channels if cid not in known and sources.get(cid) and opencode_discovery.supported_region(sources[cid])}
     recheck=discovery.choose_recheck(missing,active,now)
     cid=recheck or discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
     if not cid:continue
@@ -997,7 +997,10 @@ def discovery_worker(stop):
    log('programme research worker '+type(error).__name__)
 
 def discovery_status():
- with lock:return dict(discovery.status(time.time(),gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'])
+ with lock:
+  now=time.time();known=programme_snapshot(now)
+  missing=[cid for cid in channels if cid not in known and sources.get(cid)]
+  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
@@ -1376,7 +1379,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     now=time.monotonic();active_channels[cid]=now+gateway_config['activeProtectionSeconds'];evict_resources(now)
    try:url=register(resolve(cid),cid,correlation);url=url.rsplit('.',1)[0]+'.m3u8'
    except Exception as e:
-    record_source_error(cid,None,'resolve',type(e).__name__,correlation);return self.reply(502,{})
+    record_source_error(cid,None,'resolve','HTTP '+str(e.code) if isinstance(e,urllib.error.HTTPError) else type(e).__name__,correlation);return self.reply(502,{})
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})

@@ -33,6 +33,12 @@ class ResearchTests(unittest.TestCase):
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:page("Fixture TV","Example",fmt(now-60),fmt(now+600),"Canada")))
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:page("Fixture TV","Example","2026-11-26T06:00:00","2026-11-26T07:00:00")))
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:good if "tvguide" in u else page("Fixture TV","Other",fmt(now-60),fmt(now+600))))
+    def test_supported_region(self):
+        self.assertTrue(d.supported_region("nltv:us:Fixture.us"))
+        self.assertTrue(d.supported_region("nltv:uk:Fixture.uk"))
+        self.assertFalse(d.supported_region("nltv:sg:Fixture.sg"))
+        self.assertFalse(d.supported_region("nltv:my:Fixture.my"))
+        self.assertFalse(d.supported_region("nltv:id:Fixture.id"))
     def test_persistent_budget(self):
         with tempfile.TemporaryDirectory() as work:
             p=pathlib.Path(work)/"research.json";now=time.time();a,b="a"*32,"b"*32

@@ -94,14 +94,39 @@ with tempfile.TemporaryDirectory() as d:
     c.execute('INSERT INTO channel(id,name) VALUES(?,?)',('a','A'))
     now=int(time.time())
     status={'surfing':True,'rotationOwner':'device','launchID':'launch','systemMetrics':{'buildNumber':'1031'},'currentChannelID':'a','rotationCycle':2,'rotationAttempted':1,'rotationRemaining':0,'eligible':1,'channels':1,'hiatus':0,'banned':0,'playing':True,'surfPaused':False}
-    assert p.retain_rotation(c,status,now)
-    assert not p.retain_rotation(c,status,now+5)
-    assert p.retain_rotation(c,status,now+30)
-    assert p.retain_rotation(c,dict(status,rotationCycle=3),now+31)
-    assert not p.retain_rotation(c,dict(status,rotationCycle=True),now+32)
-    assert not p.retain_rotation(c,dict(status,rotationOwner='server'),now+32)
-    assert not p.retain_rotation(c,dict(status,currentChannelID='unknown'),now+32)
-    assert not p.retain_rotation(c,dict(status,channels=2),now+32)
+    assert p.retain_rotation(c,status,now,{'a'})
+    assert not p.retain_rotation(c,status,now+5,{'a'})
+    assert p.retain_rotation(c,status,now+30,{'a'})
+    assert p.retain_rotation(c,dict(status,rotationCycle=3),now+31,{'a'})
+    assert not p.retain_rotation(c,dict(status,rotationCycle=True),now+32,{'a'})
+    assert not p.retain_rotation(c,dict(status,rotationOwner='server'),now+32,{'a'})
+    assert not p.retain_rotation(c,dict(status,currentChannelID='unknown'),now+32,{'a'})
+    assert not p.retain_rotation(c,dict(status,channels=2),now+32,{'a'})
     assert c.execute('SELECT cycle,attempted,remaining,server_hiatus,server_banned FROM rotation_observations ORDER BY at').fetchall()==[(2,1,0,0,0),(2,1,0,0,0),(3,1,0,0,0)]
     assert c.execute('SELECT failures,sustained FROM channel').fetchone()==(0,0)
 print('PASS: bounded rotation evidence, cycle changes, policy count comparison, and policy isolation')
+
+# Historical absent channels must not prevent live rotation samples or inflate policy counts.
+with tempfile.TemporaryDirectory() as d:
+    import json
+    root=pathlib.Path(d); c=p.connect(root/'test.sqlite3')
+    a,b='a'*32,'b'*32
+    now=int(time.time())
+    c.executemany('INSERT INTO channel(id,name,hiatus_until) VALUES(?,?,?)',[(a,'A',0),(b,'B',now+1000)])
+    (root/'trial-info.json').write_text(json.dumps({'sourceProfile':'american','channels':[{'id':a}]}))
+    ids=p.live_catalogue_ids(c,root,'american'); assert ids=={a}
+    status={'surfing':True,'rotationOwner':'device','launchID':'launch','systemMetrics':{'buildNumber':'1031'},'currentChannelID':a,'rotationCycle':3,'rotationAttempted':1,'rotationRemaining':0,'eligible':1,'channels':1,'hiatus':0,'banned':0,'playing':True,'surfPaused':False}
+    assert p.retain_rotation(c,status,now,ids)
+    assert c.execute('SELECT server_hiatus,server_banned FROM rotation_observations').fetchone()==(0,0)
+    assert p.retain_catalogue(c,ids,now)
+    assert not p.retain_catalogue(c,ids,now+1)
+    assert p.retain_catalogue(c,{a,b},now+2)
+    assert p.retain_catalogue(c,{a},now+3)
+    assert json.loads(c.execute('SELECT removed FROM catalogue_observations ORDER BY at DESC LIMIT 1').fetchone()[0])==[b]
+    assert c.execute('SELECT count(*) FROM channel').fetchone()[0]==2
+    assert p.retain_system_sample(c,status,now,'american')
+    assert not p.retain_system_sample(c,dict(status,currentChannelID='c'*32),now+61,'american')
+    assert c.execute('SELECT cid,source_profile,channel FROM samples').fetchone()==(a,'american','A')
+    assert p.live_catalogue_ids(c,root,'malay') is None
+    c.close()
+print('PASS: live membership, catalogue changes, historical retention and source-owned samples')

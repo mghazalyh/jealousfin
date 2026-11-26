@@ -1,6 +1,6 @@
 """Observe Jealousfin events, persist rotation and strict channel health.
 Never controls playback, changes credentials, or contacts an upstream media source."""
-import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys, re
+import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys, re, hashlib
 import source_profiles
 SOURCE_PROFILE=source_profiles.profile_name(os.environ)
 ROOT=source_profiles.state_root(os.environ.get('JEALOUSFIN_STATE_DIR',str(pathlib.Path(__file__).resolve().parent)),SOURCE_PROFILE)
@@ -30,13 +30,14 @@ def connect(path=DB):
         CREATE INDEX IF NOT EXISTS programme_observations_channel_at ON programme_observations(cid,at);
         CREATE TABLE IF NOT EXISTS rotation_observations(at INTEGER NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,cycle INTEGER NOT NULL,attempted INTEGER NOT NULL,remaining INTEGER NOT NULL,eligible INTEGER NOT NULL,catalogue INTEGER NOT NULL,hiatus INTEGER NOT NULL,banned INTEGER NOT NULL,cid TEXT NOT NULL,playing INTEGER NOT NULL,paused INTEGER NOT NULL,server_hiatus INTEGER NOT NULL,server_banned INTEGER NOT NULL,PRIMARY KEY(launch_id,at));
         CREATE INDEX IF NOT EXISTS rotation_observations_at ON rotation_observations(at);
+        CREATE TABLE IF NOT EXISTS catalogue_observations(at INTEGER PRIMARY KEY,digest TEXT NOT NULL,channel_count INTEGER NOT NULL,added TEXT NOT NULL,removed TEXT NOT NULL,baseline INTEGER NOT NULL);
         """)
         for column in ("approved_at","last_success"):
             if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
                 try:c.execute("ALTER TABLE channel ADD COLUMN "+column+" REAL DEFAULT 0")
                 except sqlite3.OperationalError:
                     if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:raise
-        for column in ("launch_id","build","policy_revision"):
+        for column in ("launch_id","build","policy_revision","cid","source_profile"):
             if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:
                 try:c.execute("ALTER TABLE samples ADD COLUMN "+column+" TEXT DEFAULT ''")
                 except sqlite3.OperationalError:
@@ -229,7 +230,48 @@ def retain_programme(c,status,now=None):
     c.execute('INSERT OR IGNORE INTO programme_observations VALUES(?,?,?,?,?,?,?,?,?,?)',(now,cid,trace,launch,build,title,year,source,observed,state))
     return True
 
-def retain_rotation(c,status,now=None):
+def live_catalogue_ids(c,root=None,profile=None):
+    """Read the gateway's published membership; never substitute history for live membership."""
+    root=ROOT if root is None else root
+    profile=SOURCE_PROFILE if profile is None else profile
+    try:
+        info=json.loads((root/'trial-info.json').read_text())
+        if info.get('sourceProfile', 'american')!=profile:return None
+        rows=info['channels']
+        if not isinstance(rows,list) or not rows or len(rows)>10000:return None
+        ids={row['id'] for row in rows if isinstance(row,dict) and isinstance(row.get('id'),str) and re.fullmatch(r'[a-f0-9]{32}',row['id'])}
+        if len(ids)!=len(rows):return None
+        known={r[0] for r in c.execute('SELECT id FROM channel')}
+        return ids if ids.issubset(known) else None
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):return None
+
+def retain_catalogue(c,ids,now):
+    if not ids:return False
+    ordered=sorted(ids)
+    encoded=json.dumps(ordered,separators=(',',':'))
+    prior=c.execute("SELECT value FROM meta WHERE key='live_catalogue_ids'").fetchone()
+    previous=set(json.loads(prior[0])) if prior else set()
+    if prior and previous==ids:return False
+    digest=hashlib.sha256(encoded.encode()).hexdigest()
+    if c.execute('SELECT 1 FROM catalogue_observations WHERE at=?',(now,)).fetchone():return False
+    c.execute('INSERT INTO catalogue_observations VALUES(?,?,?,?,?,?)',(now,digest,len(ids),json.dumps(sorted(ids-previous)),json.dumps(sorted(previous-ids)),int(prior is None)))
+    c.execute("INSERT OR REPLACE INTO meta VALUES('live_catalogue_ids',?)",(encoded,))
+    return True
+
+def retain_system_sample(c,status,now,profile=None):
+    cid=status.get('currentChannelID')
+    if not cid:return False
+    row=c.execute('SELECT name FROM channel WHERE id=?',(cid,)).fetchone()
+    if not row:return False
+    if c.execute('SELECT 1 FROM samples WHERE at>=? AND source_profile=?',(now-60,profile or SOURCE_PROFILE)).fetchone():return False
+    m=status.get('systemMetrics',{})
+    footprint=finite_number(m.get('processFootprintBytes'))
+    cpu=finite_number(m.get('processCPUPercentOneCore'))
+    queued=finite_number(m.get('queuedEvents'))
+    c.execute('INSERT OR IGNORE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision,cid,source_profile) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(now,int(footprint) if footprint is not None and footprint>=0 else None,cpu if cpu is not None and cpu>=0 else None,str(m.get('thermalState',''))[:100],int(queued) if queued is not None and queued>=0 else None,None,row[0],status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision',''),cid,profile or SOURCE_PROFILE))
+    return True
+
+def retain_rotation(c,status,now=None,catalogue_ids=None):
     """Record observed device rotation boundaries and policy counts.
     This is observational only: no playback commands or policy mutations."""
     now=int(time.time() if now is None else now)
@@ -244,8 +286,12 @@ def retain_rotation(c,status,now=None):
     cycle,attempted,remaining,eligible,catalogue,hiatus,banned=vals
     if cycle<1 or catalogue<1 or eligible>catalogue or hiatus+banned>catalogue:return False
     if not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():return False
-    count,sh,sb=c.execute('SELECT count(*),coalesce(sum(banned=0 AND hiatus_until>?),0),coalesce(sum(banned=1),0) FROM channel',(now,)).fetchone()
-    if count!=catalogue:return False
+    if catalogue_ids is None:catalogue_ids=live_catalogue_ids(c)
+    if not catalogue_ids or cid not in catalogue_ids or len(catalogue_ids)!=catalogue:return False
+    rows=[r for r in c.execute('SELECT id,banned,hiatus_until FROM channel') if r[0] in catalogue_ids]
+    if len(rows)!=catalogue:return False
+    sh=sum(not r[1] and r[2]>now for r in rows)
+    sb=sum(bool(r[1]) for r in rows)
     values=(cycle,attempted,remaining,eligible,catalogue,hiatus,banned,cid,int(status.get('playing') is True),int(status.get('surfPaused') is True),sh,sb)
     prior=c.execute('SELECT at,cycle,attempted,remaining,eligible,catalogue,hiatus,banned,cid,playing,paused,server_hiatus,server_banned FROM rotation_observations WHERE launch_id=? ORDER BY at DESC LIMIT 1',(launch,)).fetchone()
     if prior and now-prior[0]<30 and tuple(prior[1:])==values:return False
@@ -259,21 +305,21 @@ def cycle(c):
         if not c.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():
             seed(c,json.loads((ROOT/'trial-info.json').read_text()),health())
         ingest(c,events,status)
-        # The device may be viewing the other profile. Its channel IDs are
-        # disjoint, so never attach those live samples to this profile.
+        now=int(time.time())
+        ids=live_catalogue_ids(c)
+        retain_catalogue(c,ids,now)
         cid=status.get('currentChannelID')
-        if SOURCE_PROFILE=='malay' and (not cid or not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone()):
-            return
-        now=int(time.time());m=status.get('systemMetrics',{})
-        retain_programme(c,status,now)
-        retain_rotation(c,status,now)
-        if not c.execute('SELECT 1 FROM samples WHERE at>=?',(now-60,)).fetchone():
-            c.execute('INSERT OR REPLACE INTO samples(at,footprint,cpu,thermal,queued,resources,channel,launch_id,build,policy_revision) VALUES(?,?,?,?,?,?,?,?,?,?)',(now,int(m.get('processFootprintBytes',0)),float(m.get('processCPUPercentOneCore',0)),m.get('thermalState',''),int(m.get('queuedEvents',0)),None,status.get('currentChannel',''),status.get('launchID',''),m.get('buildNumber',''),status.get('gatewayPolicyRevision','')))
+        if cid and c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():
+            retain_programme(c,status,now)
+            if ids is not None:retain_rotation(c,status,now,ids)
+            retain_system_sample(c,status,now)
+        # Maintenance and heartbeat continue even while the other source plays.
         c.execute('DELETE FROM observed WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM playback_quality WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM programme_observations WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM rotation_observations WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM samples WHERE at<?',(now-30*DAY,))
+        c.execute('DELETE FROM catalogue_observations WHERE at<?',(now-30*DAY,))
         c.execute('DELETE FROM sessions WHERE closed>0 AND closed<?',(now-30*DAY,))
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(str(now),))
 def main():
