@@ -1544,8 +1544,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    body=upstream.read(MAX_BODY+1)
    if len(body)>MAX_BODY:return self.reply(502,{})
    mime=upstream.getheader('Content-Type','application/octet-stream')
-   if not re.fullmatch(r'[A-Za-z0-9!# def log_message(self,*args):pass
-^_.+/-]+(?:; ?charset=[A-Za-z0-9_-]+)?',mime):mime='application/octet-stream'
+   if not re.fullmatch(r'[A-Za-z0-9_.+/-]+(?:; ?charset=[A-Za-z0-9_-]+)?',mime):mime='application/octet-stream'
    return self.reply(200,body,mime,{'Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY'})
   except (OSError,http.client.HTTPException,ValueError):
    return self.reply(502,{})
