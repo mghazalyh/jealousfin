@@ -6,8 +6,10 @@ import regional_guide
 import opencode_discovery
 import source_profiles
 import prototype_selector
-import spanish_classification
-import spanish_audio
+import language_exclusions
+import language_audio
+spanish_classification=language_exclusions
+spanish_audio=language_audio
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -44,16 +46,18 @@ config_checked_at=0.0
 config_fault=None
 # Manual Spanish classification is a separate membership filter, never a
 # failure/ban/hiatus and never a mutation of rotation or health history.
-SPANISH_REVISION='spanish-classification-20261126'
+SPANISH_REVISION='language-exclusions-v3'
 SPANISH_UI_FIELD='spanishRequest'
 SPANISH_UI_NODE='spanish-read'
-SPANISH_FILE=ROOT/'spanish-classification.json'
+SPANISH_FILE=ROOT/'language-exclusions.json'
+LEGACY_SPANISH_FILE=ROOT/'spanish-classification.json'
 spanish_state=spanish_classification.empty()
 spanish_provider_ids=set()
 spanish_fingerprint=None
 spanish_checked_at=0.0
-SPANISH_AUTO_CONTROL_FILE=ROOT/'spanish-auto-control.json'
-SPANISH_AUTO_REVISION='spanish-auto-control-v1'
+SPANISH_AUTO_CONTROL_FILE=ROOT/'language-auto-control.json'
+LEGACY_SPANISH_AUTO_CONTROL_FILE=ROOT/'spanish-auto-control.json'
+SPANISH_AUTO_REVISION='language-auto-control-v1'
 spanish_auto_control=True
 spanish_auto_control_fingerprint=None
 spanish_auto_control_checked=0.0
@@ -1475,19 +1479,23 @@ def maybe_reload_spanish(force=False):
  if not force and now-spanish_checked_at<2:return
  spanish_checked_at=now
  try:
-  if SPANISH_FILE.exists():
+  try:
    stat=SPANISH_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
    if not force and fingerprint==spanish_fingerprint:return
-   state=spanish_classification.load(ROOT)
-  else:
-   fingerprint=None;state=spanish_classification.empty()
+  except OSError:
+   fingerprint=None
+  state=spanish_classification.load_or_migrate(ROOT)
+  try:
+   stat=SPANISH_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+  except OSError:
+   fingerprint=None
   if state!=spanish_state:
    spanish_state=state
    spanish_provider_ids=spanish_classification.excluded(state)
-   log('Spanish classification loaded entries='+str(len(spanish_provider_ids)))
+   log('Language exclusions loaded entries='+str(len(spanish_provider_ids)))
   spanish_fingerprint=fingerprint
  except (ValueError,OSError,TypeError) as error:
-  log('Spanish classification ignored '+type(error).__name__)
+  log('Language exclusions ignored '+type(error).__name__)
 def spanish_excluded(cid):
  return SOURCE_PROFILE=='american' and sources.get(cid) in spanish_provider_ids
 def apply_device_spanish_request(config, device_token):
@@ -1505,7 +1513,7 @@ def apply_device_spanish_request(config, device_token):
   with lock:
    # Reload under the writer lock so a pending automatic mark can never
    # clobber a manual add/remove made since the last fingerprint check.
-   fresh=spanish_classification.load(ROOT)
+   fresh=spanish_classification.load_or_migrate(ROOT)
    state,changed,reason=spanish_classification.apply_manual(fresh,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
    spanish_state=fresh
    spanish_provider_ids=spanish_classification.excluded(fresh)
@@ -1519,7 +1527,7 @@ def apply_device_spanish_request(config, device_token):
  except (ValueError,OSError,TypeError) as error:
   log('Spanish marker rejected '+type(error).__name__)
   return
- log('SPANISH_CLASSIFICATION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
+ log('LANGUAGE_EXCLUSION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
 SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','updatedAt'}
 def reload_spanish_auto_control(force=False):
  global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
@@ -1529,23 +1537,26 @@ def reload_spanish_auto_control(force=False):
  if not force and now-spanish_auto_control_checked<2:return spanish_auto_control
  spanish_auto_control_checked=now
  try:
-  if not SPANISH_AUTO_CONTROL_FILE.exists():
+  path=SPANISH_AUTO_CONTROL_FILE
+  if not path.exists() and LEGACY_SPANISH_AUTO_CONTROL_FILE.exists():
+   path=LEGACY_SPANISH_AUTO_CONTROL_FILE
+  if not path.exists():
    spanish_auto_control_fingerprint=None;spanish_auto_control=True;return True
-  stat=SPANISH_AUTO_CONTROL_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+  stat=path.stat();fingerprint=(path.name,stat.st_mtime_ns,stat.st_size,stat.st_ino)
   if not force and fingerprint==spanish_auto_control_fingerprint:return spanish_auto_control
-  if stat.st_size>4096:raise ValueError('Spanish auto control too large')
-  data=json.loads(SPANISH_AUTO_CONTROL_FILE.read_text())
-  if not isinstance(data,dict) or set(data)!=SPANISH_AUTO_CONTROL_KEYS or data.get('schemaVersion')!=1 or type(data.get('enabled')) is not bool or type(data.get('updatedAt')) not in (int,float):raise ValueError('Invalid Spanish auto control')
+  if stat.st_size>4096:raise ValueError('Language auto control too large')
+  data=json.loads(path.read_text())
+  if not isinstance(data,dict) or set(data)!=SPANISH_AUTO_CONTROL_KEYS or data.get('schemaVersion')!=1 or type(data.get('enabled')) is not bool or type(data.get('updatedAt')) not in (int,float):raise ValueError('Invalid language auto control')
   spanish_auto_control_fingerprint=fingerprint;spanish_auto_control=data['enabled']
  except (ValueError,OSError,TypeError) as error:
   # Fail closed for new automatic marks; existing exclusions are untouched.
   spanish_auto_control=False;spanish_auto_control_fingerprint=None
-  log('Spanish auto control ignored '+type(error).__name__)
+  log('Language auto control ignored '+type(error).__name__)
  return spanish_auto_control
 def set_spanish_auto_enabled(enabled):
  global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
- if SOURCE_PROFILE!='american':raise ValueError('Spanish auto is English-trial only')
- if type(enabled) is not bool:raise ValueError('Invalid Spanish auto control')
+ if SOURCE_PROFILE!='american':raise ValueError('Language auto is English-trial only')
+ if type(enabled) is not bool:raise ValueError('Invalid language auto control')
  control={'schemaVersion':1,'enabled':enabled,'updatedAt':time.time()}
  atomic_json(SPANISH_AUTO_CONTROL_FILE,control)
  spanish_auto_control=enabled;spanish_auto_control_checked=time.monotonic()
@@ -1553,7 +1564,7 @@ def set_spanish_auto_enabled(enabled):
   stat=SPANISH_AUTO_CONTROL_FILE.stat();spanish_auto_control_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
  except OSError:spanish_auto_control_fingerprint=None
  if spanish_auto_manager is not None:spanish_auto_manager.refresh_control()
- log('SPANISH_AUTO_CONTROL enabled='+str(enabled))
+ log('LANGUAGE_AUTO_CONTROL enabled='+str(enabled))
  return control
 MAINTENANCE_KEYS={'schemaVersion','start','until','reason','launchID','channelID','allowedReasons'}
 def maintenance_window(force=False):
@@ -1627,24 +1638,27 @@ def device_language_probe():
     device_identity_cache=str(status.get('launchID',''));device_identity_checked=now
   except Exception:pass
  return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration',''))}
-def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
+def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence):
  global spanish_state,spanish_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
  if sources.get(cid)!=provider:return {'changed':False,'reason':'unknown_provider'}
  try:
   with lock:
-   fresh=spanish_classification.load(ROOT)
-   state,changed,why=spanish_classification.apply_auto(fresh,provider,cid,name,confidence,reason,evidence)
+   fresh=spanish_classification.load_or_migrate(ROOT)
+   state,changed,why=spanish_classification.apply_auto(fresh,provider,cid,name,language,language_name,confidence,reason,evidence)
    if changed:spanish_classification.atomic_write(ROOT,state)
    spanish_state=state;spanish_provider_ids=spanish_classification.excluded(state)
    try:
     stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
    except OSError:spanish_fingerprint=None
-  if changed:log('Spanish auto classification added provider='+provider+' channel='+cid)
+  if changed:log('LANGUAGE_EXCLUSION_ADD language='+language+' provider='+provider+' channel='+cid)
   return {'changed':changed,'reason':why}
  except (ValueError,OSError,TypeError) as error:
-  log('Spanish auto commit rejected '+type(error).__name__)
+  log('Language auto commit rejected '+type(error).__name__)
   return {'changed':False,'reason':'commit_'+type(error).__name__}
+def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
+ # Backward-compatible manual-era entry point; automatic manager uses language_auto_commit.
+ return language_auto_commit(cid,provider,name,'es','Spanish',confidence,reason,evidence)
 def spanish_auto_status():
  try:description=spanish_classification.describe(spanish_state)
  except (ValueError,TypeError):description={'entries':len(spanish_provider_ids)}
@@ -1657,6 +1671,11 @@ def spanish_auto_status():
  return status
 def spanish_auto_admin():
  return {'control':{'enabled':bool(reload_spanish_auto_control(force=True)),'file':SPANISH_AUTO_CONTROL_FILE.name},'status':spanish_auto_status()}
+language_excluded=spanish_excluded
+maybe_reload_languages=maybe_reload_spanish
+apply_device_language_request=apply_device_spanish_request
+language_auto_status=spanish_auto_status
+language_auto_admin=spanish_auto_admin
 def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
  return sorted((item for item in channels.items() if not spanish_excluded(item[0]) and (include_excluded or policy_eligible(snapshot[item[0]],now))),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
@@ -1899,8 +1918,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'spanishClassification':{'revision':SPANISH_REVISION,'entries':len(spanish_provider_ids),'lastNonce':spanish_state.get('lastNonce','')},'spanishAuto':spanish_auto_status(),'deliveryQuality':quality_summary()})
-  if path=='/spanish-auto' and self.client_address[0] in (HOST,'127.0.0.1'):
+   try:language_description=spanish_classification.describe(spanish_state)
+   except (ValueError,TypeError):language_description={'entries':len(spanish_provider_ids)}
+   language_status=spanish_auto_status()
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'deliveryQuality':quality_summary()})
+  if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
     n=int(self.headers.get('Content-Length','0'))
@@ -2069,8 +2091,8 @@ def main():
  stop=threading.Event()
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
-  spanish_auto_manager=spanish_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),spanish_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4)
-  if not spanish_auto_manager.start():log('Spanish auto unavailable '+str(spanish_auto_manager.fault))
+  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4)
+  if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()
