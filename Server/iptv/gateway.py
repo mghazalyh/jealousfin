@@ -1,6 +1,7 @@
 import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
+from contextlib import closing
 import regional_guide
 import opencode_discovery
 import source_profiles
@@ -1117,7 +1118,7 @@ def initialize_catalogue():
  if fresh is not None:update_programmes(fresh)
  # A pre-existing initialized database may acquire new channels. Preserve every
  # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
- with policy_connect(ROOT/'policy.sqlite3') as db:
+ with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
   seeded=db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone()
   if seeded or SOURCE_PROFILE=='malay':
    db.executemany("INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)",[(cid,c['Name']) for cid,c in channels.items()])
@@ -1152,11 +1153,11 @@ def record_attempt(cid):
   updated['attemptOrder'][cid]=updated['sequence']
   atomic_json(ROTATION_FILE,updated)
   rotation.update(updated)
- with policy_connect(ROOT/'policy.sqlite3') as db:
+ with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
   db.execute('UPDATE channel SET last_attempt=max(last_attempt,?) WHERE id=?',(time.time(),cid))
 def policy_rows():
  # No false readiness marker or silent fail-open when policy storage fails.
- with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
+ with closing(sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
   if not db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():raise RuntimeError("Policy migration pending")
   columns={r[1] for r in db.execute("PRAGMA table_info(channel)")}
   policy_penalty(db)
@@ -1172,14 +1173,14 @@ def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
  return sorted((item for item in channels.items() if include_excluded or policy_eligible(snapshot[item[0]],now)),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
 def policy_payload(snapshot):
- with sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1) as db:
+ with closing(sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
   days,ban=policy_penalty(db)
   row=db.execute("SELECT value FROM meta WHERE key='surf_resume'").fetchone()
   resume=json.loads(row[0]) if row else None
   if not isinstance(resume,dict) or resume.get('channelID') not in snapshot:resume=None
  return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
 def policy_event(cid,trace,action,reason):
- with policy_connect(ROOT/'policy.sqlite3') as db:
+ with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
   if not db.execute("SELECT 1 FROM channel WHERE id=?",(cid,)).fetchone():raise ValueError("Unknown policy channel")
   now=time.time()
   event_id="native-policy:"+trace+":"+action

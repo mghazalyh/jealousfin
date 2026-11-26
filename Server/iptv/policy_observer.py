@@ -12,36 +12,40 @@ def epoch(v):
     return dt.datetime.fromisoformat(v.replace('Z','+00:00')).timestamp()
 def connect(path=DB):
     c=sqlite3.connect(path,timeout=5)
-    c.execute('PRAGMA journal_mode=WAL')
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS channel(id TEXT PRIMARY KEY,name TEXT,last_attempt REAL DEFAULT 0,failures INTEGER DEFAULT 0,hiatus_until REAL DEFAULT 0,banned INTEGER DEFAULT 0,last_failure REAL DEFAULT 0,reason TEXT DEFAULT '',sustained INTEGER DEFAULT 0,startups INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS sessions(trace TEXT PRIMARY KEY,cid TEXT NOT NULL,opened REAL NOT NULL,confirmed REAL DEFAULT 0,closed REAL DEFAULT 0,failed INTEGER DEFAULT 0,outcome TEXT DEFAULT 'pending',sample_count INTEGER DEFAULT 0,first_position REAL,last_position REAL,stalls INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS observed(id TEXT PRIMARY KEY,at REAL NOT NULL,code TEXT NOT NULL,cid TEXT,trace TEXT,reason TEXT);
-    CREATE TABLE IF NOT EXISTS samples(at INTEGER PRIMARY KEY,footprint INTEGER,cpu REAL,thermal TEXT,queued INTEGER,resources INTEGER,channel TEXT);
-    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
-    CREATE TABLE IF NOT EXISTS playback_quality(event_id TEXT PRIMARY KEY,at REAL NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT,build TEXT,position REAL,rate REAL,buffer_total REAL,buffer_ahead REAL,live_edge REAL,frame_age REAL,dropped INTEGER,stalls INTEGER,observed_bitrate REAL,indicated_bitrate REAL);
-    CREATE INDEX IF NOT EXISTS playback_quality_at ON playback_quality(at);
-    CREATE INDEX IF NOT EXISTS playback_quality_channel_at ON playback_quality(cid,at);
-    CREATE INDEX IF NOT EXISTS playback_quality_trace_at ON playback_quality(trace,at);
-    CREATE INDEX IF NOT EXISTS sessions_channel_opened ON sessions(cid,opened);
-    CREATE TABLE IF NOT EXISTS programme_observations(at INTEGER NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,title TEXT NOT NULL,year INTEGER,source TEXT NOT NULL,observed_at REAL,state TEXT NOT NULL,PRIMARY KEY(trace,at));
-    CREATE INDEX IF NOT EXISTS programme_observations_at ON programme_observations(at);
-    CREATE INDEX IF NOT EXISTS programme_observations_channel_at ON programme_observations(cid,at);
-    CREATE TABLE IF NOT EXISTS rotation_observations(at INTEGER NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,cycle INTEGER NOT NULL,attempted INTEGER NOT NULL,remaining INTEGER NOT NULL,eligible INTEGER NOT NULL,catalogue INTEGER NOT NULL,hiatus INTEGER NOT NULL,banned INTEGER NOT NULL,cid TEXT NOT NULL,playing INTEGER NOT NULL,paused INTEGER NOT NULL,server_hiatus INTEGER NOT NULL,server_banned INTEGER NOT NULL,PRIMARY KEY(launch_id,at));
-    CREATE INDEX IF NOT EXISTS rotation_observations_at ON rotation_observations(at);
-    """)
-    for column in ("approved_at","last_success"):
-        if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
-            try:c.execute("ALTER TABLE channel ADD COLUMN "+column+" REAL DEFAULT 0")
-            except sqlite3.OperationalError:
-                if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:raise
-    for column in ("launch_id","build","policy_revision"):
-        if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:
-            try:c.execute("ALTER TABLE samples ADD COLUMN "+column+" TEXT DEFAULT ''")
-            except sqlite3.OperationalError:
-                if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:raise
-    c.execute('UPDATE channel SET last_attempt=max(last_attempt,last_failure) WHERE last_attempt<last_failure')
-    c.commit()
+    try:
+        c.execute('PRAGMA journal_mode=WAL')
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS channel(id TEXT PRIMARY KEY,name TEXT,last_attempt REAL DEFAULT 0,failures INTEGER DEFAULT 0,hiatus_until REAL DEFAULT 0,banned INTEGER DEFAULT 0,last_failure REAL DEFAULT 0,reason TEXT DEFAULT '',sustained INTEGER DEFAULT 0,startups INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS sessions(trace TEXT PRIMARY KEY,cid TEXT NOT NULL,opened REAL NOT NULL,confirmed REAL DEFAULT 0,closed REAL DEFAULT 0,failed INTEGER DEFAULT 0,outcome TEXT DEFAULT 'pending',sample_count INTEGER DEFAULT 0,first_position REAL,last_position REAL,stalls INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS observed(id TEXT PRIMARY KEY,at REAL NOT NULL,code TEXT NOT NULL,cid TEXT,trace TEXT,reason TEXT);
+        CREATE TABLE IF NOT EXISTS samples(at INTEGER PRIMARY KEY,footprint INTEGER,cpu REAL,thermal TEXT,queued INTEGER,resources INTEGER,channel TEXT);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE IF NOT EXISTS playback_quality(event_id TEXT PRIMARY KEY,at REAL NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT,build TEXT,position REAL,rate REAL,buffer_total REAL,buffer_ahead REAL,live_edge REAL,frame_age REAL,dropped INTEGER,stalls INTEGER,observed_bitrate REAL,indicated_bitrate REAL);
+        CREATE INDEX IF NOT EXISTS playback_quality_at ON playback_quality(at);
+        CREATE INDEX IF NOT EXISTS playback_quality_channel_at ON playback_quality(cid,at);
+        CREATE INDEX IF NOT EXISTS playback_quality_trace_at ON playback_quality(trace,at);
+        CREATE INDEX IF NOT EXISTS sessions_channel_opened ON sessions(cid,opened);
+        CREATE TABLE IF NOT EXISTS programme_observations(at INTEGER NOT NULL,cid TEXT NOT NULL,trace TEXT NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,title TEXT NOT NULL,year INTEGER,source TEXT NOT NULL,observed_at REAL,state TEXT NOT NULL,PRIMARY KEY(trace,at));
+        CREATE INDEX IF NOT EXISTS programme_observations_at ON programme_observations(at);
+        CREATE INDEX IF NOT EXISTS programme_observations_channel_at ON programme_observations(cid,at);
+        CREATE TABLE IF NOT EXISTS rotation_observations(at INTEGER NOT NULL,launch_id TEXT NOT NULL,build TEXT NOT NULL,cycle INTEGER NOT NULL,attempted INTEGER NOT NULL,remaining INTEGER NOT NULL,eligible INTEGER NOT NULL,catalogue INTEGER NOT NULL,hiatus INTEGER NOT NULL,banned INTEGER NOT NULL,cid TEXT NOT NULL,playing INTEGER NOT NULL,paused INTEGER NOT NULL,server_hiatus INTEGER NOT NULL,server_banned INTEGER NOT NULL,PRIMARY KEY(launch_id,at));
+        CREATE INDEX IF NOT EXISTS rotation_observations_at ON rotation_observations(at);
+        """)
+        for column in ("approved_at","last_success"):
+            if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:
+                try:c.execute("ALTER TABLE channel ADD COLUMN "+column+" REAL DEFAULT 0")
+                except sqlite3.OperationalError:
+                    if column not in {row[1] for row in c.execute("PRAGMA table_info(channel)")}:raise
+        for column in ("launch_id","build","policy_revision"):
+            if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:
+                try:c.execute("ALTER TABLE samples ADD COLUMN "+column+" TEXT DEFAULT ''")
+                except sqlite3.OperationalError:
+                    if column not in {row[1] for row in c.execute("PRAGMA table_info(samples)")}:raise
+        c.execute('UPDATE channel SET last_attempt=max(last_attempt,last_failure) WHERE last_attempt<last_failure')
+        c.commit()
+    except BaseException:
+        c.close()
+        raise
     return c
 def http(path):
     req=urllib.request.Request(BASE+path,headers={'Authorization':'Bearer '+AUTH} if AUTH else {})
@@ -274,10 +278,13 @@ def cycle(c):
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(str(now),))
 def main():
     c=connect()
-    while True:
-        try:cycle(c)
-        except Exception as e:
-            print(dt.datetime.now().isoformat(),type(e).__name__,str(e)[:200],flush=True)
-        if '--once' in sys.argv:break
-        time.sleep(5)
+    try:
+        while True:
+            try:cycle(c)
+            except Exception as e:
+                print(dt.datetime.now().isoformat(),type(e).__name__,str(e)[:200],flush=True)
+            if '--once' in sys.argv:break
+            time.sleep(5)
+    finally:
+        c.close()
 if __name__=='__main__':main()

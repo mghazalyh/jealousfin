@@ -4,6 +4,8 @@ import json
 import os
 import pathlib
 import tempfile
+import sqlite3
+from contextlib import closing
 import threading
 import time
 import unittest
@@ -51,6 +53,36 @@ class GatewayAcceptance(unittest.TestCase):
             with urllib.request.urlopen(request,timeout=3) as response:return response.status,json.load(response)
         except urllib.error.HTTPError as error:
             with error:return error.code,json.load(error)
+
+    def test_policy_connections_closed_on_success_and_failure(self):
+        # Hold strong references to every opened connection so GC cannot hide
+        # leaked descriptors. Exercise both read and transactional write paths.
+        original=sqlite3.connect
+        opened=[]
+        def tracked(*args, **kwargs):
+            db=original(*args, **kwargs)
+            opened.append(db)
+            return db
+        try:
+            with patch.object(sqlite3, "connect", side_effect=tracked):
+                for n in range(100):
+                    snapshot=self.g.policy_rows()
+                    self.assertEqual(len(self.g.policy_payload(snapshot)["channels"]),3)
+                    self.g.record_attempt(self.c)
+                    self.g.policy_event(self.c, "close-test-"+str(n), "success", "")
+                with self.assertRaises(ValueError):
+                    self.g.policy_event(self.c,"invalid-action","invalid","")
+                with closing(original(self.db)) as db, db:
+                    db.execute("DELETE FROM meta WHERE key='seeded'")
+                with self.assertRaises(RuntimeError):
+                    self.g.policy_rows()
+                self.assertGreaterEqual(len(opened),402)
+                for db in opened:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        db.execute("SELECT 1")
+        finally:
+            for db in opened:
+                db.close()
 
     def test_isolated_source_profiles_and_policy(self):
         import source_profiles as sp
