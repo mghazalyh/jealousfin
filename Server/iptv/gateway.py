@@ -35,7 +35,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
                  'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180,'metadataResearchVariant':opencode_discovery.DEFAULT_VARIANT,
                  'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False,
-                 'expandedManifest':None,'expandedTrialProviderIds':[],'expandedCataloguePageCount':6}
+                 'expandedManifest':None,'expandedTrialProviderIds':[],'expandedCataloguePageCount':6,'mediaEndpointAllowlist':{}}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -71,6 +71,13 @@ def validate_gateway_config(raw):
  if extra is not None and (not isinstance(extra,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',extra)):raise ValueError('Invalid expanded manifest')
  if type(result['expandedCataloguePageCount']) is not int or not 1<=result['expandedCataloguePageCount']<=100:raise ValueError('Invalid expanded page count')
  if (extra is None)!=(not extra_ids) or (SOURCE_PROFILE!='american' and (extra or extra_ids)):raise ValueError('Invalid expanded trial configuration')
+ endpoints=result['mediaEndpointAllowlist']
+ if not isinstance(endpoints,dict) or len(endpoints)>256:raise ValueError('Invalid media endpoint allowlist')
+ for host,ports in endpoints.items():
+  if not isinstance(host,str) or not re.fullmatch(r'[a-z0-9.-]{1,253}',host) or not isinstance(ports,list) or not ports or len(ports)>16 or any(type(p) is not int or not 1024<=p<=65535 for p in ports) or len(set(ports))!=len(ports):raise ValueError('Invalid media endpoint')
+  try:address=ipaddress.ip_address(host)
+  except ValueError:address=None
+  if address is not None and not address.is_global:raise ValueError('Non-public media endpoint')
  # Legacy quota settings are accepted but ignored; research has no daily cap.
  result['metadataResearchDailyBudget']=None
  for key,lo,hi in [('metadataResearchTimeoutSeconds',10,300)]:
@@ -140,26 +147,37 @@ def set_favorite(cid,value):
 
 def log(msg):
  print(time.strftime('%Y-%m-%dT%H:%M:%S'),msg,flush=True)
-def validate(url):
+class MediaCompatibilityError(ValueError):
+ pass
+def validate(url,media=False):
  p=urllib.parse.urlsplit(url)
- if p.scheme not in ('http','https') or not p.hostname or p.username or p.password or p.port not in (None,80,443):
+ if p.scheme not in ('http','https') or not p.hostname or p.username or p.password:
   raise ValueError('Unsupported upstream URL')
- ips=socket.getaddrinfo(p.hostname,p.port or (443 if p.scheme=='https' else 80),type=socket.SOCK_STREAM)
+ port=p.port if p.port is not None else (443 if p.scheme=='https' else 80)
+ if not media and port not in (80,443):raise ValueError('Unsupported upstream URL')
+ if port not in (80,443) and not 1024<=port<=65535:raise ValueError('Unsupported upstream port')
+ ips=socket.getaddrinfo(p.hostname,port,type=socket.SOCK_STREAM)
  if not ips or any(not ipaddress.ip_address(x[4][0]).is_global for x in ips):
   raise ValueError('Non-public upstream address')
+ if port not in (80,443) and port not in gateway_config['mediaEndpointAllowlist'].get(p.hostname,[]):
+  raise MediaCompatibilityError('Unconfigured public media endpoint')
  return url
 class Redirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,req,fp,code,msg,headers,newurl):
   return super().redirect_request(req,fp,code,msg,headers,validate(urllib.parse.urljoin(req.full_url,newurl)))
+class MediaRedirect(Redirect):
+ def redirect_request(self,req,fp,code,msg,headers,newurl):
+  return urllib.request.HTTPRedirectHandler.redirect_request(self,req,fp,code,msg,headers,validate(urllib.parse.urljoin(req.full_url,newurl),media=True))
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),Redirect())
+media_opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),MediaRedirect())
 def fetch(url,limit,range_header=None):
- validate(url)
+ validate(url,media=True)
  headers={'User-Agent':'Jealousfin-IPTV-Trial/1.0','Accept':'*/*','Accept-Encoding':'identity'}
  if range_header:headers['Range']=range_header
  config=gateway_config
  for attempt in range(config['upstreamRetries']+1):
   try:
-   with opener.open(urllib.request.Request(url,headers=headers),timeout=config['upstreamTimeoutSeconds']) as f:
+   with media_opener.open(urllib.request.Request(url,headers=headers),timeout=config['upstreamTimeoutSeconds']) as f:
     data=f.read(limit+1)
     if len(data)>limit:raise ValueError('Response too large')
     return data,f.headers,f.status,f.geturl()
@@ -247,7 +265,7 @@ def evict_resources(now,required=0):
  for cid,until in list(active_channels.items()):
   if until<=now:active_channels.pop(cid,None)
 def register(url,cid,correlation=None,identity=None):
- validate(url)
+ validate(url,media=True)
  with lock:
   key=(cid,url) if identity is None else (cid,url,identity);now=time.monotonic()
   if key in reverse and reverse[key] in resources:
@@ -1323,7 +1341,7 @@ def initialize_catalogue():
     db.execute("INSERT INTO meta VALUES('seed_time',?)",(str(time.time()),))
 def resolve(cid):
  source_id=sources[cid]
- candidates=[]
+ candidates=[];local_rejections=0;other_rejections=0
  config=gateway_config
  path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
  bases=[None]
@@ -1335,15 +1353,22 @@ def resolve(cid):
   try:response=provider_json(path) if base is None else provider_json(path,base)
   except Exception:
    if len(bases)==1:raise
+   other_rejections+=1
    continue
-  for v in response.get('streams',[]):
-   if not isinstance(v,dict):continue
+  streams=response.get('streams',[])
+  if not isinstance(streams,list) or not streams:other_rejections+=1;continue
+  for v in streams:
+   if not isinstance(v,dict):other_rejections+=1;continue
    url=v.get('url')
-   if not isinstance(url,str) or url in candidates:continue
-   try:validate(url)
-   except Exception:continue
+   if not isinstance(url,str):other_rejections+=1;continue
+   if url in candidates:continue
+   try:validate(url,media=True)
+   except MediaCompatibilityError:local_rejections+=1;continue
+   except Exception:other_rejections+=1;continue
    candidates.append(url)
- if not candidates:raise ValueError('No usable stream source')
+ if not candidates:
+  if local_rejections and not other_rejections:raise MediaCompatibilityError('Only unconfigured public media endpoints')
+  raise ValueError('No usable stream source')
  config=gateway_config
  prefer=config['preferredHosts'].get(cid) or preferred_hosts.get(source_id)
  if prefer and config['sourceSelection']!='first':candidates.sort(key=lambda u:urllib.parse.urlsplit(u).hostname!=prefer)
@@ -1414,7 +1439,7 @@ def policy_event(cid,trace,action,reason):
 def record_source_error(cid,url,phase,error,correlation=None):
  # Never persist stream URLs, query parameters, headers or credentials.
  host=urllib.parse.urlsplit(url).hostname if url else None
- entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation,'category':('gateway_infrastructure' if phase in ('policy','selector') else 'upstream_http' if re.fullmatch(r'HTTP [1-5][0-9]{2}',error) else 'upstream_transport' if error in ('URLError','TimeoutError','ConnectionError','ConnectionResetError','RemoteDisconnected') else 'resolution_or_delivery_unknown')}
+ entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation,'category':('gateway_infrastructure' if phase in ('policy','selector','compatibility') else 'upstream_http' if re.fullmatch(r'HTTP [1-5][0-9]{2}',error) else 'upstream_transport' if error in ('URLError','TimeoutError','ConnectionError','ConnectionResetError','RemoteDisconnected') else 'resolution_or_delivery_unknown')}
  with lock:
   p=ROOT/'source-errors.jsonl'
   if p.exists() and p.stat().st_size>4*1024*1024:
@@ -1540,6 +1565,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
      return self.reply(200,rewrite(data,final,cid,correlation),'application/vnd.apple.mpegurl')
     extra={k:headers[k] for k in ('Content-Range','Accept-Ranges') if headers.get(k)}
     return self.reply(status,data,headers.get('Content-Type','application/octet-stream'),extra)
+   except MediaCompatibilityError:
+    record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'compatibility','Unconfigured public media endpoint',correlation);return self.reply(502,{})
    except urllib.error.HTTPError as e:
     record_delivery(cid,kind,time.monotonic()-started,0,error=True);record_source_error(cid,url,'media','HTTP '+str(e.code),correlation);log('upstream HTTP '+str(e.code));return self.reply(502,{})
    except Exception as e:
@@ -1595,6 +1622,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
    with lock:
     now=time.monotonic();active_channels[cid]=now+gateway_config['activeProtectionSeconds'];evict_resources(now)
    try:url=register(resolve(cid),cid,correlation);url=url.rsplit('.',1)[0]+'.m3u8'
+   except MediaCompatibilityError:
+    record_source_error(cid,None,'compatibility','Unconfigured public media endpoint',correlation)
+    return self.reply(409,{'JealousfinPolicyError':'excluded'})
    except Exception as e:
     record_source_error(cid,None,'resolve','HTTP '+str(e.code) if isinstance(e,urllib.error.HTTPError) else ('No usable stream source' if isinstance(e,ValueError) and str(e)=='No usable stream source' else type(e).__name__),correlation);return self.reply(502,{})
    try:snapshot=policy_rows()

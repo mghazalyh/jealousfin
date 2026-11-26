@@ -68,14 +68,14 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(projected[1]['Tags'],['Sports'])
         self.assertEqual(rows[0]['Genres'],['Sports'])
         g.gateway_config=config
-        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/a.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/a.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url,**kwargs:url):
             self.assertEqual(g.resolve(self.c),'https://example.com/a.m3u8')
             provider.assert_called_once_with('/stream/tv/nltv:uk:Fixture.uk.json',manifest.rsplit('/',1)[0])
         with patch.object(g,'provider_json',side_effect=TimeoutError) as provider:
             with self.assertRaises(TimeoutError):g.resolve(self.c)
             self.assertEqual(provider.call_count,1)
         g.gateway_config=dict(config,ukTrialEnabled=False)
-        with patch.object(g,'provider_json',side_effect=[TimeoutError,{'streams':[{'url':'https://example.com/b.m3u8'}]}]) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+        with patch.object(g,'provider_json',side_effect=[TimeoutError,{'streams':[{'url':'https://example.com/b.m3u8'}]}]) as provider,patch.object(g,'validate',side_effect=lambda url,**kwargs:url):
             self.assertEqual(g.resolve(self.c),'https://example.com/b.m3u8')
             self.assertEqual(provider.call_count,2)
         with patch.object(g,'catalogue',side_effect=TimeoutError):
@@ -121,13 +121,35 @@ class GatewayAcceptance(unittest.TestCase):
         with patch.object(g,'catalogue',side_effect=TimeoutError):
             self.assertEqual(g.expanded_catalogue(cfg,True),{sid:row})
             self.assertEqual(g.expanded_catalogue(cfg),{})
-        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/new.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/new.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url,**kwargs:url):
             self.assertEqual(g.resolve(self.c),'https://example.com/new.m3u8')
             provider.assert_called_once_with('/stream/tv/nltv:us:Extra.us.json',manifest.rsplit('/',1)[0])
         projected=g.uk_trial_projection([{'Id':self.c,'Genres':[],'Tags':[]}],dict(cfg,ukTrialEnabled=True))
         self.assertEqual(projected[0]['Tags'],['Sports'])
         with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':[sid,sid]})
         with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':['nltv:my:Other.my']})
+    def test_exact_media_endpoint_and_local_deferral(self):
+        g=self.g
+        g.gateway_config=g.validate_gateway_config({'mediaEndpointAllowlist':{'fixture.example':[8000]}})
+        public=[(2,1,6,'',('93.184.216.34',8000))]
+        real_dns=g.socket.getaddrinfo
+        def fixture_dns(host,*args,**kwargs):
+            return real_dns(host,*args,**kwargs) if host=='127.0.0.1' else public
+        with patch.object(g.socket,'getaddrinfo',side_effect=fixture_dns):
+            self.assertEqual(g.validate('http://fixture.example:8000/live',media=True),'http://fixture.example:8000/live')
+            with self.assertRaises(ValueError):g.validate('http://fixture.example:8000/live')
+            with self.assertRaises(g.MediaCompatibilityError):g.validate('http://other.example:8000/live',media=True)
+            with self.assertRaises(g.MediaCompatibilityError):g.validate('http://fixture.example:9000/live',media=True)
+            self.assertEqual(g.validate('https://other.example/live',media=True),'https://other.example/live')
+            with self.assertRaises(ValueError):g.validate('http://user:pass@fixture.example:8000/live',media=True)
+            with patch.object(g,'provider_json',return_value={'streams':[{'url':'http://other.example:8000/live'}]}):
+                self.assertEqual(self.req('/Items/'+self.c+'/PlaybackInfo',{})[0],409)
+                self.assertEqual(g.policy_rows()[self.c]['failures'],0)
+            with patch.object(g,'provider_json',return_value={'streams':[{'url':'http://other.example:8000/live'},{'url':'rtmp://other.example/live'}]}):
+                self.assertEqual(self.req('/Items/'+self.c+'/PlaybackInfo',{})[0],502)
+        with patch.object(g.socket,'getaddrinfo',return_value=[(2,1,6,'',('127.0.0.1',8000))]):
+            with self.assertRaises(ValueError):g.validate('http://fixture.example:8000/live',media=True)
+        with self.assertRaises(ValueError):g.validate_gateway_config({'mediaEndpointAllowlist':{'127.0.0.1':[8000]}})
     def test_policy_connections_closed_on_success_and_failure(self):
         # Hold strong references to every opened connection so GC cannot hide
         # leaked descriptors. Exercise both read and transactional write paths.
@@ -291,7 +313,7 @@ class GatewayAcceptance(unittest.TestCase):
     def test_sequence_segment_cache(self):
         g=self.g
         playlist=b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:5,\nsegment.ts\n"
-        with patch.object(g,"validate",side_effect=lambda u:u):
+        with patch.object(g,"validate",side_effect=lambda u,**kwargs:u):
             first=g.rewrite(playlist,"https://fixture.invalid/live.m3u8",self.c)
             second=g.rewrite(playlist.replace(b":100",b":101"),"https://fixture.invalid/live.m3u8",self.c)
             self.assertNotEqual(first,second)
