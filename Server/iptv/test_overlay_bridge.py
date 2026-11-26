@@ -1,0 +1,278 @@
+"""Fixture tests for the additive language overlay adapter.
+
+No provider, credential, production gateway or live device is contacted.
+The mock transport records exactly the command payload the existing
+authorized device path would receive.
+"""
+import json
+import pathlib
+import unittest
+
+import overlay_bridge as ob
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+LAYOUT_PATH = ROOT / "Examples" / "language-evidence-overlay-20261127.json"
+FIXTURE_PATH = pathlib.Path(__file__).with_name("fixtures") / "language-overlay-evidence.json"
+A = "a" * 32
+B = "b" * 32
+C = "c" * 32
+
+
+class Clock:
+    def __init__(self, monotonic=1000.0, wall=1764201600.0):
+        self.monotonic = monotonic
+        self.wall = wall
+
+    def now(self):
+        return self.monotonic
+
+    def time(self):
+        return self.wall
+
+    def advance(self, seconds):
+        self.monotonic += seconds
+        self.wall += seconds
+
+
+class MockTransport:
+    def __init__(self, failures=0):
+        self.calls = []
+        self.failures = failures
+
+    def set_value(self, field, value):
+        self.calls.append((field, value))
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("mock transport unavailable")
+
+
+def load_fixture():
+    return json.loads(FIXTURE_PATH.read_text())
+
+
+def find_nodes(layout):
+    found = {}
+
+    def walk(nodes):
+        for node in nodes:
+            found[node["id"]] = node
+            walk(node.get("children") or [])
+
+    for slot in layout["slots"]:
+        walk(slot["nodes"])
+    for page in layout["pages"]:
+        walk(page["nodes"])
+    return found
+
+
+def editable_fields(layout):
+    return {node["valueKey"] for node in find_nodes(layout).values()
+            if node["kind"] in ob.EDITABLE_KINDS}
+
+
+class LayoutContractTests(unittest.TestCase):
+    def setUp(self):
+        self.layout = json.loads(LAYOUT_PATH.read_text())
+
+    def test_layout_is_valid_and_preserves_source_switcher_and_controls(self):
+        ob.validate_layout(self.layout)
+        nodes = find_nodes(self.layout)
+        switcher = nodes["prototype-source-switcher"]
+        self.assertEqual(switcher["kind"], "web")
+        self.assertIn("selectSource", switcher["html"])
+        self.assertIn("English", switcher["html"])
+        self.assertIn("Malay", switcher["html"])
+        for node_id in ("spanish-mark", "spanish-unmark", "language-mistaken",
+                        "spanish-request-value", "spanish-read"):
+            self.assertIn(node_id, nodes)
+        self.assertEqual(nodes["spanish-read"]["id"], "spanish-read")
+
+    def test_hidden_editable_field_shares_key_with_text_label(self):
+        nodes = find_nodes(self.layout)
+        hidden = nodes["language-overlay-value"]
+        label = nodes["language-evidence"]
+        self.assertEqual(hidden["kind"], "input")
+        self.assertEqual(hidden["valueKey"], "form.languageOverlay")
+        self.assertEqual(hidden["visibleWhen"], "form.languageOverlayVisible")
+        self.assertEqual(label["kind"], "text")
+        self.assertEqual(label["valueKey"], "form.languageOverlay")
+        # The hidden condition references a form key that has no editable node.
+        self.assertNotIn("form.languageOverlayVisible", editable_fields(self.layout))
+        self.assertTrue(ob.binding_truth(ob.resolve_binding("form.languageOverlayVisible", {"languageOverlay": "x"})) is False)
+        self.assertEqual(ob.resolve_binding("form.languageOverlay", {"languageOverlay": "x"}), "x")
+
+    def test_manual_correction_action_uses_current_channel_and_v2_marker(self):
+        nodes = find_nodes(self.layout)
+        source = nodes["language-mistaken"]["action"]["arguments"]["source"]
+        self.assertIn("currentChannelID", source)
+        self.assertIn("mistaken_english", source)
+        self.assertIn("schemaVersion:2", source)
+        self.assertIn("ui_set_value", source)
+        self.assertEqual(nodes["spanish-mark"]["action"]["arguments"]["source"].count("schemaVersion:1"), 1)
+
+
+class PublisherTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.transport = MockTransport()
+        self.bridge = ob.OverlayBridge(
+            self.transport, min_interval=0.0,
+            clock=self.clock.now, wallclock=self.clock.time)
+        self.fixture = load_fixture()
+
+    def event(self, index):
+        return dict(self.fixture["events"][index])
+
+    def test_publish_updates_single_form_field_with_full_snapshot(self):
+        evidence = self.event(0)
+        self.assertEqual(self.bridge.observe_channel(A, "Fixture English One"), "published")
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", evidence), "published")
+        self.assertEqual(len(self.transport.calls), 2)
+        field, value = self.transport.calls[-1]
+        self.assertEqual(field, "languageOverlay")
+        self.assertIn("Fixture English One", value)
+        self.assertIn("Spanish 7/25", value)
+        self.assertIn("sampling", value)
+        self.assertIn("82.0%", value)
+        self.assertIn("2025-11-27T00:00:00Z", value)
+        self.assertLessEqual(len(value.encode("utf-8")), ob.MAX_TEXT)
+
+    def test_authorized_transport_uses_existing_device_command_shape(self):
+        seen = {}
+
+        def command(config, token, action, arguments):
+            seen.update(config=config, token=token, action=action, arguments=arguments)
+            return "OK"
+
+        transport = ob.AuthorizedDeviceTransport({"deviceIP": "192.0.2.10"}, "fixture-token", command=command)
+        transport.set_value("languageOverlay", "snapshot")
+        self.assertEqual(seen["action"], "ui_set_value")
+        self.assertEqual(seen["arguments"], {"key": "form.languageOverlay", "value": "snapshot"})
+        self.assertEqual(seen["token"], "fixture-token")
+        self.assertNotIn("fixture-token", repr(transport))
+
+    def test_duplicate_event_is_deduplicated(self):
+        evidence = self.event(0)
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", evidence), "published")
+        before = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", evidence), "duplicate")
+        self.assertEqual(len(self.transport.calls), before)
+
+    def test_channel_transition_replaces_and_suppresses_stale_evidence(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(0)), "published")
+        self.bridge.observe_channel(B, "Fixture English Two")
+        transition = self.transport.calls[-1][1]
+        self.assertIn("Fixture English Two", transition)
+        self.assertIn("waiting for language evidence", transition)
+        before = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(1)),
+                         "suppressed_channel")
+        self.assertEqual(len(self.transport.calls), before)
+        self.assertNotIn("Fixture English One", transition)
+        self.assertEqual(self.bridge.publish_evidence(B, "Fixture English Two", self.event(2)), "published")
+        self.assertIn("Fixture English Two", self.transport.calls[-1][1])
+        self.assertIn("English 4/25", self.transport.calls[-1][1])
+
+    def test_out_of_order_evidence_is_suppressed(self):
+        newer = self.event(1)
+        older = self.event(0)
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", newer), "published")
+        before = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", older), "stale")
+        self.assertEqual(len(self.transport.calls), before)
+        self.assertIn("8/25", self.transport.calls[-1][1])
+
+    def test_rate_limit_defers_then_publishes_on_next_lifecycle_call(self):
+        bridge = ob.OverlayBridge(self.transport, min_interval=1.0,
+                                  clock=self.clock.now, wallclock=self.clock.time)
+        bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual(bridge.publish_evidence(A, "Fixture English One", self.event(0)), "rate_limited")
+        self.assertEqual(len(self.transport.calls), 1)
+        self.clock.advance(1.0)
+        self.assertEqual(bridge.pump(), "published")
+        self.assertEqual(len(self.transport.calls), 2)
+
+    def test_retry_is_bounded_then_recovers_on_new_evidence(self):
+        self.assertEqual(self.bridge.observe_channel(A, "Fixture English One"), "published")
+        self.transport.failures = 2
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(0)), "retry")
+        self.clock.advance(0.25)
+        self.assertEqual(self.bridge.pump(), "retry")
+        self.clock.advance(0.50)
+        self.assertEqual(self.bridge.pump(), "published")
+        self.assertEqual(len(self.transport.calls), 4)
+        self.assertEqual(self.bridge.fault, "")
+
+    def test_transport_failure_is_bounded_and_fails_safe(self):
+        self.assertEqual(self.bridge.observe_channel(A, "Fixture English One"), "published")
+        self.transport.failures = 10
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(0)), "retry")
+        self.clock.advance(0.25)
+        self.assertEqual(self.bridge.pump(), "retry")
+        self.clock.advance(0.50)
+        self.assertEqual(self.bridge.pump(), "failed")
+        self.assertEqual(len(self.transport.calls), 4)
+        self.assertIn("transport_unavailable", self.bridge.fault)
+        self.assertEqual(self.bridge.status()["pending"], False)
+        self.transport.failures = 0
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(1)), "published")
+
+    def test_pending_result_expires_instead_of_publishing_late(self):
+        self.assertEqual(self.bridge.observe_channel(A, "Fixture English One"), "published")
+        self.transport.failures = 10
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(0)), "retry")
+        self.clock.advance(31.0)
+        self.assertEqual(self.bridge.pump(), "stale")
+        self.assertEqual(self.bridge.status()["pending"], False)
+        self.assertEqual(self.bridge.fault, "stale_pending")
+
+    def test_manual_correction_requires_latest_evidence_and_current_channel(self):
+        with self.assertRaises(ob.ManualCorrectionError):
+            self.bridge.manual_correction(A, "Fixture English One", "nonce-1")
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.bridge.publish_evidence(A, "Fixture English One", self.event(0))
+        with self.assertRaises(ob.ManualCorrectionError):
+            self.bridge.manual_correction(B, "Fixture English Two", "nonce-1")
+        payload = self.bridge.manual_correction(A, "Fixture English One", "nonce-1")
+        self.assertEqual(payload["schemaVersion"], 2)
+        self.assertEqual(payload["action"], "mistaken_english")
+        self.assertEqual(payload["channelID"], A)
+        self.assertEqual(payload["channelName"], "Fixture English One")
+        self.bridge.confirm_correction()
+        with self.assertRaises(ob.AlreadyCorrected):
+            self.bridge.manual_correction(A, "Fixture English One", "nonce-2")
+        self.bridge.publish_evidence(A, "Fixture English One", self.event(1))
+        self.assertEqual(self.bridge.manual_correction(A, "Fixture English One", "nonce-3")["nonce"], "nonce-3")
+        self.bridge.observe_channel(B, "Fixture English Two")
+        with self.assertRaises(ob.ManualCorrectionError):
+            self.bridge.manual_correction(A, "Fixture English One", "nonce-4")
+
+    def test_transport_failure_during_transition_reports_stale_label(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.bridge.publish_evidence(A, "Fixture English One", self.event(0))
+        self.transport.failures = 10
+        self.assertEqual(self.bridge.observe_channel(B, "Fixture English Two"), "retry")
+        status = self.bridge.status()
+        self.assertEqual(status["publishedChannelID"], A)
+        self.assertTrue(status["staleLabel"])
+        self.transport.failures = 0
+        self.assertEqual(self.bridge.publish_evidence(B, "Fixture English Two", self.event(2)), "published")
+        status = self.bridge.status()
+        self.assertEqual(status["publishedChannelID"], B)
+        self.assertFalse(status["staleLabel"])
+
+    def test_clear_replaces_old_language_with_waiting_label(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.bridge.publish_evidence(A, "Fixture English One", self.event(0))
+        self.assertIn("Spanish", self.transport.calls[-1][1])
+        self.assertEqual(self.bridge.clear(), "published")
+        self.assertIn("waiting for language evidence", self.transport.calls[-1][1])
+        self.assertNotIn("Spanish", self.transport.calls[-1][1])
+
+
+if __name__ == "__main__":
+    unittest.main()

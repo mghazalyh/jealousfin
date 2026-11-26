@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "description": "Deterministic language-overlay evidence used by test_overlay_bridge.py. No provider, credential or live device data.",
+  "channels": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "Fixture English One",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "Fixture English Two"
+  },
+  "events": [
+    {
+      "channelID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "eventID": "evt-fixture-a-1",
+      "at": 1764201600.0,
+      "language": "es",
+      "languageName": "Spanish",
+      "count": 7,
+      "threshold": 25,
+      "phase": "sampling",
+      "outcome": "excluded",
+      "confidence": 0.82
+    },
+    {
+      "channelID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "eventID": "evt-fixture-a-2",
+      "at": 1764201660.0,
+      "language": "es",
+      "languageName": "Spanish",
+      "count": 8,
+      "threshold": 25,
+      "phase": "sampling",
+      "outcome": "excluded",
+      "confidence": 0.86
+    },
+    {
+      "channelID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "eventID": "evt-fixture-b-1",
+      "at": 1764201720.0,
+      "language": "en",
+      "languageName": "English",
+      "count": 4,
+      "threshold": 25,
+      "phase": "allowed",
+      "outcome": "allowed",
+      "confidence": 0.91
+    }
+  ]
+}

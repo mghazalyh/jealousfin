@@ -1,67 +1,135 @@
 {
-  "schemaVersion": 1,
-  "revision": "language-evidence-overlay-20261127",
-  "slots": [
+ "schemaVersion": 1,
+ "revision": "language-evidence-overlay-bridge-20261127",
+ "slots": [
+  {
+   "location": "player.fullscreen.category",
+   "nodes": [
     {
-      "location": "player.fullscreen.top",
-      "nodes": [
-        {
-          "id": "language-evidence-top",
-          "kind": "text",
-          "title": "Language evidence (hotpatch)",
-          "style": "caption"
-        }
-      ]
-    },
-    {
-      "location": "player.fullscreen.bottom",
-      "nodes": [
-        {
-          "id": "language-evidence-panel",
-          "kind": "web",
-          "height": 178,
-          "html": "<style>#evidence{font-size:13px;line-height:18px;color:#e8e5f0;min-height:58px}#mistaken{width:100%;min-height:42px;margin-top:6px;border-radius:9px;border:1px solid #8a6b4d;background:#4a3322;color:#fff;font-weight:600}#mistaken:disabled{opacity:.45}#msg{font-size:11px;text-align:center;color:#c3c3c3;padding-top:4px}</style><div id='evidence'></div><button id='mistaken'>Mistaken — English</button><div id='msg'>Correction retracts the latest evidence only; playback is unchanged.</div><script>function render(s){s=s||{};var id=String(s.currentChannelID||''),name=String(s.currentChannel||''),source=String(s.surfSource||'');var e=s.languageEvidence||null;var lines=[];lines.push(name?name+' · '+id:'No current channel');lines.push('Source: '+(source||'unknown')+(s.surfing===true?(s.surfPaused?' · Surf paused':' · Surf active'):' · Not surfing'));if(e&&typeof e==='object'){var lang=String(e.languageName||e.language||'unknown');var count=e.count==null?'-':String(e.count);var threshold=e.threshold==null?'-':String(e.threshold);var phase=String(e.phase||e.outcome||'sampling');var conf=e.confidence==null?'-':(Number(e.confidence)*100).toFixed(1)+'%';lines.push('Language: '+lang+' · count '+count+'/'+threshold+' · '+phase+' · confidence '+conf);}else{lines.push('Language: gateway evidence is not exposed by this hotpatch UI ABI');lines.push('Blocker: stateSnapshot has no language field; web connect-src is none');}var box=document.getElementById('evidence');if(box)box.textContent=lines.join(' | ');var b=document.getElementById('mistaken');if(b){b.disabled=!/^[a-f0-9]{32}$/.test(id);b.onclick=function(){if(!/^[a-f0-9]{32}$/.test(id))return;var n=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);var p={schemaVersion:2,action:'mistaken_english',channelID:id,channelName:name||id,nonce:n};window.jealousfin.command('ui_set_value',{key:'spanishRequest',value:JSON.stringify(p)},'mistaken-'+n);window.jealousfin.command('refresh_catalogue',{},'mistaken-refresh-'+n);document.getElementById('msg').textContent='Retraction queued; playback unchanged';};}}window.addEventListener('jealousfin-state',function(ev){render(ev.detail||window.jealousfinState);});window.addEventListener('jealousfin-receipt',function(ev){var d=ev.detail||{};var m=document.getElementById('msg');if(m&&d.requestID&&String(d.requestID).indexOf('mistaken')===0)m.textContent='Retraction '+String(d.status||'queued');});render(window.jealousfinState);</script>"
-        }
-      ]
-    },
-    {
-      "location": "more.bottom",
-      "nodes": [
-        {
-          "id": "language-evidence-more",
-          "kind": "disclosure",
-          "title": "Language evidence gate",
-          "detail": "Hotpatch overlay; observation and enforcement are separate gateway controls",
-          "children": [
-            {
-              "id": "language-request-value",
-              "kind": "input",
-              "title": "Pending request",
-              "valueKey": "form.spanishRequest",
-              "defaultValue": ""
-            },
-            {
-              "id": "language-read",
-              "kind": "button",
-              "title": "Read language request",
-              "style": "muted",
-              "action": {
-                "command": "script",
-                "arguments": {
-                  "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||'');})()"
-                }
-              }
-            },
-            {
-              "id": "language-evidence-note",
-              "kind": "text",
-              "title": "Threshold and observation are adjusted through the existing LAN /language-auto control; this overlay never resumes, advances, reloads or resets rotation.",
-              "style": "caption"
-            }
-          ]
-        }
-      ]
+     "id": "prototype-source-label",
+     "kind": "text",
+     "style": "caption",
+     "title": "Channel source"
     }
-  ],
-  "pages": []
+   ]
+  },
+  {
+   "location": "player.fullscreen.controls",
+   "nodes": [
+    {
+     "height": 80,
+     "html": "<style>body{padding:3px 1px}.sources{display:flex;gap:8px}.sources button{flex:1;min-height:42px;border:1px solid #555;color:#eee;background:#262626;border-radius:9px;font-weight:600}.sources button.active{background:#385c77;border-color:#80a6c2;color:white}.sources button:disabled{opacity:.5}#msg{font-size:12px;text-align:center;padding-top:5px;color:#c3c3c3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}</style><div class=\"sources\"><button id=\"american\" onclick=\"selectSource('american')\">English</button><button id=\"malay\" onclick=\"selectSource('malay')\">Malay</button></div><div id=\"msg\">Source selector</div><script>\nlet busy=false,serial=0,waiters={};const el=id=>document.getElementById(id);\nfunction paint(){let s=window.jealousfinState||{},p=s.preferences||{},a=p.surfCategory==='Movies & Series'?'malay':'american';for(let name of ['american','malay']){el(name).classList.toggle('active',a===name);el(name).disabled=busy;}if(!busy)el('msg').textContent=(a==='malay'?'Malay':'English')+' \u00b7 '+(s.channels??'\u2014')+' channels';}\nwindow.addEventListener('jealousfin-state',paint);\nwindow.addEventListener('jealousfin-receipt',e=>{let d=e.detail,w=waiters[d.requestID];if(w){delete waiters[d.requestID];clearTimeout(w.timer);d.status==='succeeded'?w.resolve(d):w.reject(Error(d.result||d.status));}});\nfunction call(command,args){return new Promise((resolve,reject)=>{let id='source-'+Date.now()+'-'+(++serial);let timer=setTimeout(()=>{delete waiters[id];reject(Error('Command timed out: '+command));},120000);waiters[id]={resolve,reject,timer};window.jealousfin.command(command,args||{},id);});}\nasync function selectSource(name){if(busy)return;let s=window.jealousfinState||{},p=s.preferences||{},old=p.surfCategory||'All Channels',target=name==='malay'?'Movies & Series':'All Channels';busy=true;paint();el('msg').textContent='Loading '+(name==='american'?'English':'Malay')+'\u2026';try{if(old===target&&s.surfing&&s.channels){if(s.surfPaused)await call('resume_surf');}else{if(s.surfing&&!s.surfPaused)await call('pause_surf');await call('stop');await call('set_preferences',{surfCategory:target});await call('refresh_catalogue');await call('start_surf',{category:target});}el('msg').textContent='Loaded '+(name==='american'?'English':'Malay');}catch(e){el('msg').textContent='Switch failed: '+String(e.message).slice(0,140);try{await call('stop');await call('set_preferences',{surfCategory:old});await call('refresh_catalogue');}catch(_){} }finally{busy=false;for(let name of ['american','malay'])el(name).disabled=false;}}\npaint();</script>",
+     "id": "prototype-source-switcher",
+     "kind": "web"
+    }
+   ]
+  },
+  {
+   "location": "player.fullscreen.bottom",
+   "nodes": [
+    {
+     "id": "language-evidence",
+     "kind": "text",
+     "title": "Language evidence",
+     "style": "caption",
+     "valueKey": "form.languageOverlay"
+    },
+    {
+     "id": "spanish-actions",
+     "kind": "vstack",
+     "children": [
+      {
+       "id": "spanish-mark",
+       "kind": "button",
+       "title": "Spanish",
+       "symbol": "globe",
+       "style": "prominent",
+       "detail": "Mark this English channel Spanish, exclude it and advance",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nif(s.surfing!==true){return \"Spanish: Surf is not active\";}\nif(s.currentSharedTransport===true||s.surfRotationControllable===false){return \"Spanish: device-owned rotation required\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"add\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.command(\"next_channel\",{});\napi.log(\"Spanish mark requested: \"+id);\nreturn \"Spanish: marked \"+name+\"; excluding and advancing\";\n})()"
+        }
+       }
+      },
+      {
+       "id": "spanish-unmark",
+       "kind": "button",
+       "title": "Not Spanish",
+       "symbol": "globe.badge.chevron.backward",
+       "style": "muted",
+       "detail": "Explicitly remove this English channel from Spanish exclusion",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"remove\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"Spanish unmark requested: \"+id);\nreturn \"Spanish: unmarked \"+name+\"; English membership will refresh\";\n})()"
+        }
+        }
+       },
+       {
+        "id": "language-mistaken",
+        "kind": "button",
+        "title": "Mistaken — English",
+        "symbol": "checkmark.circle",
+        "style": "muted",
+        "detail": "Retract the latest automatic language evidence for this channel; playback is unchanged",
+        "action": {
+         "command": "script",
+         "arguments": {
+          "source": "(function(){\nvar s=api.state||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Correction: no current channel\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:2,action:\"mistaken_english\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"English correction requested: \"+id);\nreturn \"Correction: English retraction queued for \"+name;\n})()"
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "location": "more.bottom",
+   "nodes": [
+    {
+     "id": "spanish-advanced",
+     "kind": "disclosure",
+     "title": "Spanish classification",
+      "detail": "Automatic gateway read path",
+      "children": [
+       {
+        "id": "language-overlay-value",
+        "kind": "input",
+        "title": "Language overlay value",
+        "valueKey": "form.languageOverlay",
+        "defaultValue": "",
+        "visibleWhen": "form.languageOverlayVisible"
+       },
+       {
+        "id": "language-overlay-note",
+        "kind": "text",
+        "title": "The installed app cannot compare channel IDs in a binding. The gateway suppresses stale evidence before pushing this one atomic label.",
+        "style": "caption"
+       },
+       {
+        "id": "spanish-request-value",
+       "kind": "input",
+       "title": "Pending request",
+       "valueKey": "form.spanishRequest",
+       "defaultValue": ""
+      },
+      {
+       "id": "spanish-read",
+       "kind": "button",
+       "title": "Read Spanish request",
+       "style": "muted",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||\"\");})()"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "pages": []
 }
