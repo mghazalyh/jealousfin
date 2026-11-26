@@ -38,6 +38,23 @@ class ResearchTests(unittest.TestCase):
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:page("Fixture TV","Example",fmt(now-60),fmt(now+600),"Canada")))
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:page("Fixture TV","Example","2026-11-26T06:00:00","2026-11-26T07:00:00")))
         self.assertIsNone(d.verify_candidate(candidate,"Fixture TV","nltv:us:Fixture.us",now,lambda u:good if "tvguide" in u else page("Fixture TV","Other",fmt(now-60),fmt(now+600))))
+    def test_prompt_escalation_and_episode_contract(self):
+        prompt=d.prompt_for('JAG','nltv:us:JAG.us',time.time(),variant='low',attempt=2,previous_title='Invented')
+        self.assertIn('Previous research',prompt)
+        self.assertIn('episodeTitle',prompt)
+        self.assertIn('never use a series premiere',prompt)
+        self.assertIn('Invented',prompt)
+    def test_tool_diagnostics_omit_queries(self):
+        events=[{"type":"tool_use","part":{"tool":"websearch","state":{"status":"completed"}}},
+                {"type":"tool_use","part":{"tool":"webfetch","state":{"status":"error"}}},
+                {"type":"text","part":{"text":'{"title": null, "region": "us", "sources": []}'}}]
+        data="\n".join(json.dumps(row) for row in events).encode()
+        raw,diag=d.parse_events_detailed(data)
+        self.assertIsNone(raw)
+        self.assertEqual(diag['completedSearches'],1)
+        self.assertIn('webfetch',diag['otherTools'])
+        self.assertEqual(diag['error'],'unexpected-tool')
+        self.assertNotIn('query',json.dumps(diag).casefold())
     def test_supported_region(self):
         self.assertTrue(d.supported_region("nltv:us:Fixture.us"))
         self.assertTrue(d.supported_region("nltv:uk:Fixture.uk"))
