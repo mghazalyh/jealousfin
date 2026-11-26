@@ -56,7 +56,7 @@ class GatewayAcceptance(unittest.TestCase):
         import source_profiles as sp
         import hashlib
         g=self.g
-        root=pathlib.Path(self.temp.name)
+        root=pathlib.Path(self.temp.name).resolve()
         sid='nltv:my:fixture'
         american=sp.channel_id('american',sid)
         malay=sp.channel_id('malay',sid)
