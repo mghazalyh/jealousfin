@@ -34,7 +34,8 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
                  'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180,'metadataResearchVariant':opencode_discovery.DEFAULT_VARIANT,
-                 'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False}
+                 'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False,
+                 'expandedManifest':None,'expandedTrialProviderIds':[]}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -65,6 +66,10 @@ def validate_gateway_config(raw):
  if type(enabled) is not bool or not isinstance(ids,list) or len(ids)>100 or any(not isinstance(i,str) or not re.fullmatch(r'nltv:uk:[A-Za-z0-9_.-]{1,160}',i) for i in ids) or len(ids)!=len(set(ids)):raise ValueError('Invalid UK trial cohort')
  if manifest is not None and (not isinstance(manifest,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',manifest)):raise ValueError('Invalid UK manifest')
  if (manifest is None)!= (not ids) or (enabled and not ids) or (SOURCE_PROFILE!='american' and (manifest or ids or enabled)):raise ValueError('Invalid UK trial configuration')
+ extra=result['expandedManifest'];extra_ids=result['expandedTrialProviderIds']
+ if not isinstance(extra_ids,list) or len(extra_ids)>1000 or any(not isinstance(i,str) or not re.fullmatch(r'nltv:(us|uk):[A-Za-z0-9_.-]{1,160}',i) for i in extra_ids) or len(extra_ids)!=len(set(extra_ids)) or set(extra_ids).intersection(ids):raise ValueError('Invalid expanded trial identities')
+ if extra is not None and (not isinstance(extra,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',extra)):raise ValueError('Invalid expanded manifest')
+ if (extra is None)!=(not extra_ids) or (SOURCE_PROFILE!='american' and (extra or extra_ids)):raise ValueError('Invalid expanded trial configuration')
  # Legacy quota settings are accepted but ignored; research has no daily cap.
  result['metadataResearchDailyBudget']=None
  for key,lo,hi in [('metadataResearchTimeoutSeconds',10,300)]:
@@ -331,10 +336,39 @@ def uk_base(config):
  return url[:-len('/manifest.json')] if url else None
 def uk_cohort(config):
  return set(config['ukTrialProviderIds'])
+expanded_manifest_status={'observedAt':None,'channels':0,'matched':0,'fault':None}
+primary_source_ids=set()
+def expanded_cohort(config):
+ return set(config['expandedTrialProviderIds'])
+def trial_cohort(config):
+ return uk_cohort(config)|expanded_cohort(config)
+def expanded_base(config):
+ url=config['expandedManifest']
+ return url[:-len('/manifest.json')] if url else None
+def expanded_catalogue(config,cache_fallback=False):
+ global expanded_manifest_status
+ base=expanded_base(config)
+ if base is None:return {}
+ ids=expanded_cohort(config)
+ cache=ROOT/'expanded-catalogue-metadata.json'
+ try:
+  raw=catalogue(base,1)
+  selected={sid:row for sid,row in raw.items() if sid in ids}
+  if set(selected)!=ids:raise ValueError('Incomplete expanded trial catalogue')
+  if cache_fallback:atomic_json(cache,{sid:{'name':row['name'],'genres':row.get('genres',[])} for sid,row in selected.items()})
+  expanded_manifest_status={'observedAt':time.time(),'channels':len(raw),'matched':len(selected),'fault':None}
+  return selected
+ except Exception as error:
+  expanded_manifest_status=dict(expanded_manifest_status,fault=type(error).__name__)
+  log('Expanded manifest refresh failed '+type(error).__name__)
+  if cache_fallback and cache.exists():
+   raw=json.loads(cache.read_text())
+   if isinstance(raw,dict) and set(raw)==ids and all(isinstance(v,dict) and isinstance(v.get('name'),str) for v in raw.values()):return raw
+  return {}
 def uk_trial_projection(items,config):
  # Sports is a temporary native rotation alias; never change stored genres or IDs.
  if not config['ukTrialEnabled']:return items
- cohort=uk_cohort(config)
+ cohort=trial_cohort(config)
  out=[]
  for item in items:
   row=dict(item)
@@ -945,7 +979,7 @@ def parse_programme(row):
   if not release_title or not end_clock or not next_title or next_clock!=end_clock:return None
  return {'title':current,'nextTitle':next_title,'providerEndClock':end_clock,'providerNextClock':next_clock}
 
-def update_programmes(raw,observed=None):
+def update_programmes(raw,observed=None,expanded=None):
  global programme_rows,programme_observed_at,programme_fault
  now=time.time() if observed is None else observed
  # Metadata refresh is independent from catalogue identity, policy and playback.
@@ -956,6 +990,12 @@ def update_programmes(raw,observed=None):
   if cid not in sources:continue
   parsed=parse_programme(row)
   if parsed:valid[cid]=parsed
+ # The admitted expanded provider has independent stream and metadata routing.
+ for source_id,row in (expanded_catalogue(gateway_config) if expanded is None else expanded).items():
+  cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
+  if sources.get(cid)==source_id and source_id not in primary_source_ids:
+   parsed=parse_programme(row)
+   if parsed:valid[cid]=parsed
  # A UK provider fault cannot erase the original provider's metadata.
  for source_id,row in uk_programmes(gateway_config).items():
   cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
@@ -1131,7 +1171,7 @@ def programme_worker(stop):
   with lock:programme_last_attempt=time.time()
   try:
    raw=catalogue()
-   if len(raw)<len(sources)*.9:raise ValueError('Incomplete programme refresh')
+   if len(raw)<(len(primary_source_ids) or len(sources))*.9:raise ValueError('Incomplete programme refresh')
    update_programmes(raw)
    failures=0;delay=PROGRAMME_REFRESH
    with lock:programme_refresh_failures=0
@@ -1162,13 +1202,17 @@ def initialize_catalogue():
   if prior is None:raise
   fresh=None;raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
   log('catalogue fallback '+catalogue_fault)
+ primary_source_ids.clear();primary_source_ids.update(raw)
+ expanded=expanded_catalogue(gateway_config,cache_fallback=True)
+ raw=dict(raw)
+ for sid,row in expanded.items():raw.setdefault(sid,row)
  for i,(source_id,row) in enumerate(raw.items(),1):
   cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
   genres=row.get('genres',[])
   if not isinstance(genres,list):genres=[]
   channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
   sources[cid]=source_id
- if fresh is not None:update_programmes(fresh)
+ if fresh is not None:update_programmes(fresh,expanded=expanded)
  # A pre-existing initialized database may acquire new channels. Preserve every
  # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
  with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
@@ -1186,7 +1230,9 @@ def resolve(cid):
  config=gateway_config
  path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
  bases=[None]
- if source_id in uk_cohort(config) and uk_base(config):
+ if source_id in expanded_cohort(config) and expanded_base(config):
+  bases=[expanded_base(config)] if source_id not in primary_source_ids or config['ukTrialEnabled'] else [expanded_base(config),None]
+ elif source_id in uk_cohort(config) and uk_base(config):
   bases=[uk_base(config)] if config['ukTrialEnabled'] else [uk_base(config),None]
  for base in bases:
   try:response=provider_json(path) if base is None else provider_json(path,base)
@@ -1363,7 +1409,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})

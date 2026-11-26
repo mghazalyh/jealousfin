@@ -83,6 +83,28 @@ class GatewayAcceptance(unittest.TestCase):
             self.assertEqual(g.uk_manifest_status['fault'],'TimeoutError')
         with self.assertRaises(ValueError):g.validate_gateway_config({'ukTrialEnabled':True})
         with self.assertRaises(ValueError):g.validate_gateway_config({'metadataResearchVariant':'medium'})
+    def test_expanded_trial_catalogue_and_origin(self):
+        g=self.g
+        sid='nltv:us:Extra.us'
+        primary='nltv:us:Original.us'
+        manifest='https://ptv3-livetv-addon.pages.dev/fixture/manifest.json'
+        cfg=g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':[sid]})
+        g.gateway_config=cfg
+        row={'name':'Extra','genres':['Movies']}
+        g.sources[self.c]=sid
+        g.primary_source_ids.add(primary)
+        with patch.object(g,'catalogue',return_value={sid:row,primary:{'name':'Original'}}):
+            self.assertEqual(g.expanded_catalogue(cfg,True),{sid:row})
+        with patch.object(g,'catalogue',side_effect=TimeoutError):
+            self.assertEqual(g.expanded_catalogue(cfg,True),{sid:row})
+            self.assertEqual(g.expanded_catalogue(cfg),{})
+        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/new.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+            self.assertEqual(g.resolve(self.c),'https://example.com/new.m3u8')
+            provider.assert_called_once_with('/stream/tv/nltv:us:Extra.us.json',manifest.rsplit('/',1)[0])
+        projected=g.uk_trial_projection([{'Id':self.c,'Genres':[],'Tags':[]}],dict(cfg,ukTrialEnabled=True))
+        self.assertEqual(projected[0]['Tags'],['Sports'])
+        with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':[sid,sid]})
+        with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':['nltv:my:Other.my']})
     def test_policy_connections_closed_on_success_and_failure(self):
         # Hold strong references to every opened connection so GC cannot hide
         # leaked descriptors. Exercise both read and transactional write paths.
