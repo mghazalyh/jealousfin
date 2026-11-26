@@ -86,6 +86,30 @@ class GatewayAcceptance(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM channel').fetchone()[0],3)
             self.assertIsNone(db.execute('SELECT id FROM channel WHERE id=?',(malay,)).fetchone())
 
+    def test_prototype_selector_contract(self):
+        import prototype_selector as ps
+        from unittest.mock import patch
+        root=pathlib.Path(self.temp.name).resolve()
+        self.assertIsNone(ps.load_selector(root))
+        cfg={'schemaVersion':1,'deviceIP':'192.168.31.82','backendPort':18797}
+        (root/'prototype-source-selector.json').write_text(json.dumps(cfg))
+        self.assertEqual(ps.load_selector(root),cfg)
+        for category,expected in [('All Channels','american'),('Movies & Series','malay')]:
+            with patch.object(ps,'read_response',return_value=(200,json.dumps({'preferences':{'surfCategory':category}}).encode(),{})):
+                self.assertEqual(ps.selected_profile(cfg),expected)
+        with patch.object(ps,'read_response',return_value=(503,b'{}',{})):
+            with self.assertRaises(RuntimeError):ps.selected_profile(cfg)
+        row={'Id':'a'*32,'Name':'Fixture','Tags':[]}
+        payload={'Items':[row],'JealousfinPolicy':{'channels':{'a'*32:{'failures':1}}}}
+        result=json.loads(ps.tag_catalogue(json.dumps(payload).encode()))
+        self.assertEqual(result['JealousfinPolicy'],payload['JealousfinPolicy'])
+        self.assertEqual(result['Items'][0]['Tags'],['Movies & Series'])
+        self.assertEqual(ps.channel_id('/Items/'+'a'*32+'/PlaybackInfo'),'a'*32)
+        self.assertEqual(ps.channel_id('/Jealousfin/Policy/Event',json.dumps({'channelID':'b'*32}).encode()),'b'*32)
+        with self.assertRaises(ValueError):ps.tag_catalogue(json.dumps({'Items':[row],'JealousfinPolicy':{'channels':{}}}).encode())
+        (root/'prototype-source-selector.json').unlink()
+        self.assertIsNone(ps.load_selector(root))
+
     def test_prototype_catalogue_denial_fails_closed(self):
         g=self.g
         pilot=pathlib.Path(self.temp.name)/'blocked-pilot';pilot.mkdir()

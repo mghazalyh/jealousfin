@@ -4,6 +4,7 @@ from pathlib import Path
 import regional_guide
 import opencode_discovery
 import source_profiles
+import prototype_selector
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -243,7 +244,7 @@ def register(url,cid,correlation=None,identity=None):
    if identity is not None:segment_resources.add(rid)
   resource_touched[rid]=now
   if correlation:resource_correlation[rid]=correlation
- return '/media/'+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
+ return ('/malay/media/' if SOURCE_PROFILE=='malay' else '/media/')+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
 def rewrite(data,base,cid,correlation=None):
  text=data.decode('utf-8-sig')
  if not text.lstrip().startswith('#EXTM3U'):raise ValueError('Invalid playlist')
@@ -1230,10 +1231,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
  def authorized(self,q):
   h=self.headers.get('Authorization','')+' '+self.headers.get('X-Emby-Authorization','')
   return hmac.compare_digest(q.get('api_key',[''])[0],TOKEN) or hmac.compare_digest(self.headers.get('X-Emby-Token',''),TOKEN) or ('Token="'+TOKEN+'"') in h
+ def proxy_malay(self,config,path,body=None):
+  # Fixed local backend; forward only authenticated, enumerated Jellyfin routes.
+  headers={k:self.headers[k] for k in ('Authorization','X-Emby-Authorization','X-Emby-Token','Content-Type','Range','X-Jealousfin-Request-ID','Accept') if self.headers.get(k)}
+  code,data,response=prototype_selector.read_response(HOST,config['backendPort'],self.path,method=self.command,headers=headers,body=body,limit=prototype_selector.MAX_MEDIA if path.startswith('/malay/media/') else prototype_selector.MAX_JSON,timeout=45)
+  if code==200 and path=='/LiveTv/Channels':data=prototype_selector.tag_catalogue(data)
+  extra={k:v for k,v in response.items() if k.lower() in ('content-range','accept-ranges')}
+  mime=next((v for k,v in response.items() if k.lower()=='content-type'),'application/octet-stream')
+  return self.reply(code,data,mime,extra)
+ def route_prototype(self,path,q):
+  # Removal of the selector file immediately returns the American API to
+  # baseline. Restrict the opt-in alias to one configured LAN client.
+  if SOURCE_PROFILE!='american':return False
+  config=prototype_selector.load_selector(ROOT)
+  if config is None or self.client_address[0]!=config['deviceIP']:return False
+  if path.startswith('/malay/media/'):
+   parts=path.split('/')
+   if len(parts)!=5 or not hmac.compare_digest(parts[3],TOKEN):self.reply(401,{});return True
+   self.proxy_malay(config,path);return True
+  if not self.authorized(q):return False
+  if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
+   if prototype_selector.selected_profile(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))=='malay':
+    self.proxy_malay(config,path);return True
+   return False
+  if path=='/Jealousfin/Policy/Event' and self.command=='POST':
+   # Peek by consuming once, then restore the local handler's input for
+   # American events. Old-session events always go to their actual owner.
+   n=int(self.headers.get('Content-Length','0'))
+   if not 0<n<=8192:return False
+   body=self.rfile.read(n)
+   cid=prototype_selector.channel_id(path,body)
+   if cid in prototype_selector.source_ids(ROOT):
+    self.proxy_malay(config,path,body);return True
+   self.rfile=io.BytesIO(body)
+   return False
+  cid=prototype_selector.channel_id(path)
+  if cid:
+   malay=cid in prototype_selector.source_ids(ROOT)
+   if path.endswith('/PlaybackInfo'):
+    selected=prototype_selector.selected_profile(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
+    if (selected=='malay')!=malay:
+     self.reply(409,{'JealousfinPolicyError':'excluded'});return True
+   if malay:
+    n=int(self.headers.get('Content-Length','0'))
+    if not 0<=n<=262144:self.reply(413,{});return True
+    body=self.rfile.read(n) if n else None
+    self.proxy_malay(config,path,body);return True
+  return False
  def handle_request(self):
   reload_gateway_config()
   correlation=request_correlation(self.headers.get('X-Jealousfin-Request-ID'))
   p=urllib.parse.urlsplit(self.path);path=p.path;q=urllib.parse.parse_qs(p.query)
+  try:
+   if self.route_prototype(path,q):return
+  except (OSError,RuntimeError,ValueError,KeyError,TypeError,http.client.HTTPException):
+   return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+  if SOURCE_PROFILE=='malay' and path.startswith('/malay/media/'):path=path[len('/malay'):]
   with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
   if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial' if SOURCE_PROFILE=='american' else 'Jealousfin Malay Prototype','Version':'10.10.0','Id':USER_ID})
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
