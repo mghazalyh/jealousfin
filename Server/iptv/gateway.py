@@ -1458,6 +1458,30 @@ class Server(http.server.ThreadingHTTPServer):
 # The web application executes on the user's LAN browser. Only its exact
 # production origin is permitted; native clients without Origin are unchanged.
 WEB_ORIGIN='https://jealouswin.pages.dev'
+# Serve only the known Cloudflare build assets, never forward user credentials,
+# API calls, cookies, query strings, or arbitrary remote destinations.
+WEB_ASSET_HOST='jealouswin.pages.dev'
+WEB_ROOT_ASSETS=frozenset(('/', '/index.html', '/main.dart.js', '/flutter.js',
+ '/flutter_bootstrap.js', '/flutter_service_worker.js', '/version.json',
+ '/manifest.json', '/favicon.png', '/player.js', '/hls.min.js'))
+def web_asset(path):
+ if path in WEB_ROOT_ASSETS:return True
+ return bool(re.fullmatch(r'/(?:assets|canvaskit|icons)/(?:[A-Za-z0-9_@.+%~-]+/)*[A-Za-z0-9_@.+%~-]+',path)) and all(
+  urllib.parse.unquote(part) not in ('.','..') and '/' not in urllib.parse.unquote(part) and '\\' not in urllib.parse.unquote(part) for part in path.split('/'))
+def local_web_origin():
+ # Use the configured bind address, never the untrusted HTTP Host header.
+ try:address=ipaddress.ip_address(HOST)
+ except ValueError:return None
+ if address.version!=4 or not address.is_private or address.is_unspecified:return None
+ return 'http://'+str(address)+':18796'
+def audit_route(path):
+ # Never log URL queries, media tokens, identifiers or arbitrary user input.
+ if path=='/Users/AuthenticateByName':return path
+ if path.startswith(('/media/','/malay/media/')):return '/media/[redacted]'
+ if re.fullmatch(r'/Items/[^/]+/PlaybackInfo',path):return '/Items/[id]/PlaybackInfo'
+ if re.fullmatch(r'/Users/[^/]+/FavoriteItems/[^/]+',path):return '/Users/[id]/FavoriteItems/[id]'
+ if path in ('/System/Info/Public','/LiveTv/Channels','/LiveTv/Programs','/LiveTv/Recordings','/Jealousfin/Policy','/Jealousfin/Policy/Event','/Sessions/Playing','/Sessions/Playing/Progress','/Sessions/Playing/Stopped','/LiveStreams/Close','/trial-status'):return path
+ return '/web-asset' if web_asset(path) else '/other'
 WEB_HEADERS=frozenset(('accept','authorization','content-type','range','x-emby-token','x-emby-authorization','x-jealousfin-request-id'))
 def web_route(path,method):
  if method in ('GET','HEAD'):
@@ -1472,7 +1496,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'
  def browser_origin(self):
   origins=self.headers.get_all('Origin') or []
-  return WEB_ORIGIN if origins==[WEB_ORIGIN] else None
+  return origins[0] if len(origins)==1 and origins[0] in (WEB_ORIGIN,local_web_origin()) else None
  def browser_allowed(self,method):
   return self.browser_origin() is not None and web_route(urllib.parse.urlsplit(self.path).path,method)
  def do_OPTIONS(self):
@@ -1487,12 +1511,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
    extra['Access-Control-Allow-Private-Network']='true'
   return self.reply(204,b'',extra=extra)
  def log_message(self,*args):pass
+ def log_request(self,code='-',size='-'):
+  # Status-only structured diagnostics, including rejected requests and preflight.
+  try:
+   path=urllib.parse.urlsplit(self.path).path
+   origin=self.browser_origin()
+   requested=self.headers.get('Access-Control-Request-Method','')
+   headers={s.strip().lower() for s in self.headers.get('Access-Control-Request-Headers','').split(',') if s.strip()}
+   method=self.command if self.command in ('GET','HEAD','POST','DELETE','OPTIONS','PUT','PATCH') else 'other'
+   log('HTTP_AUDIT '+json.dumps({'profile':SOURCE_PROFILE,'client':self.client_address[0],
+    'method':method,'route':audit_route(path),'status':int(code) if str(code).isdigit() else None,
+    'origin':origin or ('unapproved' if self.headers.get_all('Origin') else 'none'),
+    'preflightMethod':requested if requested in ('GET','HEAD','POST','DELETE') else None,
+    'preflightHeaders':sorted(headers.intersection(WEB_HEADERS)),
+    'unknownPreflightHeaders':bool(headers-WEB_HEADERS),
+    'privateNetwork':self.headers.get('Access-Control-Request-Private-Network')=='true'},
+    separators=(',',':')))
+  except Exception:pass
+ def serve_web_asset(self,path):
+  # This is a LAN-only compatibility entry point. HTTPS remains the public
+  # distribution source; no browser-supplied headers are forwarded to it.
+  if SOURCE_PROFILE!='american' or not local_web_origin():return self.reply(404,{})
+  try:
+   client=ipaddress.ip_address(self.client_address[0])
+   if not (client.is_private or client.is_loopback):return self.reply(403,{})
+  except ValueError:return self.reply(403,{})
+  connection=http.client.HTTPSConnection(WEB_ASSET_HOST,timeout=20)
+  try:
+   connection.request('GET',path,headers={'Accept-Encoding':'identity','User-Agent':'Jealousfin-LAN-assets/1'})
+   upstream=connection.getresponse()
+   if upstream.status!=200:return self.reply(502,{})
+   body=upstream.read(MAX_BODY+1)
+   if len(body)>MAX_BODY:return self.reply(502,{})
+   mime=upstream.getheader('Content-Type','application/octet-stream')
+   if not re.fullmatch(r'[A-Za-z0-9!# def log_message(self,*args):pass
+^_.+/-]+(?:; ?charset=[A-Za-z0-9_-]+)?',mime):mime='application/octet-stream'
+   return self.reply(200,body,mime,{'Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY'})
+  except (OSError,http.client.HTTPException,ValueError):
+   return self.reply(502,{})
+  finally:connection.close()
  def reply(self,code,body,mime='application/json',extra=None):
   if not isinstance(body,bytes):body=json.dumps(body,separators=(',',':')).encode()
   self.send_response(code);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.send_header('Connection','close')
   self.send_header('Vary','Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network')
   if self.browser_origin() and (self.command=='OPTIONS' and code==204 or self.browser_allowed(self.command)):
-   self.send_header('Access-Control-Allow-Origin',WEB_ORIGIN)
+   self.send_header('Access-Control-Allow-Origin',self.browser_origin())
    self.send_header('Access-Control-Expose-Headers','Content-Length, Content-Range, Accept-Ranges, Content-Type')
   for k,v in (extra or {}).items():self.send_header(k,v)
   self.end_headers();self.close_connection=True
@@ -1677,6 +1740,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
    return self.reply(200,{})
   return self.reply(404,{})
  def do_GET(self):
+  # Serve a narrowly scoped static entry point before the API route checks.
+  if self.command in ('GET','HEAD') and web_asset(urllib.parse.urlsplit(self.path).path):
+   if self.headers.get_all('Origin') and self.browser_origin() is None:return self.reply(403,{})
+   return self.serve_web_asset(urllib.parse.urlsplit(self.path).path)
   # Reject unexpected browser origins before authentication or side effects.
   # CORS is not authentication: permitted routes still require existing tokens.
   if self.headers.get_all('Origin') and not self.browser_allowed(self.command):

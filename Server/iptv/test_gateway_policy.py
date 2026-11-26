@@ -54,6 +54,40 @@ class GatewayAcceptance(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:return error.code,json.load(error)
 
+    def test_http_audit_redacts_secrets_and_records_login_status(self):
+        with patch.object(self.g,'log') as audit:
+            self.assertEqual(self.req('/Users/AuthenticateByName',{'Username':'fixture','Pw':'fixture'})[0],200)
+            self.assertEqual(self.req('/Users/AuthenticateByName',{'Username':'fixture','Pw':'wrong-secret'})[0],401)
+            self.assertEqual(self.req('/media/sensitive-token/unknown.bin?api_key=secret-query')[0],401)
+        rows=[json.loads(c.args[0].split(' ',1)[1]) for c in audit.call_args_list if c.args[0].startswith('HTTP_AUDIT ')]
+        self.assertEqual([r['status'] for r in rows],[200,401,401])
+        self.assertEqual(rows[-1]['route'],'/media/[redacted]')
+        for secret in ('wrong-secret','sensitive-token','secret-query','fixture-token'):
+            self.assertNotIn(secret,str(rows))
+
+    def test_lan_static_asset_route_and_origin(self):
+        from unittest.mock import MagicMock
+        self.assertTrue(self.g.web_asset('/assets/fonts/MaterialIcons-Regular.otf'))
+        self.assertFalse(self.g.web_asset('/assets/%2e%2e/gateway-runtime.json'))
+        self.assertFalse(self.g.web_asset('/assets/a%2fb'))
+        self.assertFalse(self.g.web_asset('/gateway-runtime.json'))
+        upstream=MagicMock()
+        upstream.status=200
+        upstream.read.return_value=b'<html>Jealouswin</html>'
+        upstream.getheader.return_value='text/html; charset=utf-8'
+        with patch.object(self.g.http.client,'HTTPSConnection') as connection:
+            connection.return_value.getresponse.return_value=upstream
+            req=urllib.request.Request(self.base+'/?api_key=never-forward',headers={'Cookie':'never-forward','Authorization':'never-forward'})
+            with urllib.request.urlopen(req,timeout=3) as response:
+                self.assertEqual(response.read(),b'<html>Jealouswin</html>')
+            connection.assert_called_once_with('jealouswin.pages.dev',timeout=20)
+            connection.return_value.request.assert_called_once_with('GET','/',headers={'Accept-Encoding':'identity','User-Agent':'Jealousfin-LAN-assets/1'})
+        origin=self.g.local_web_origin()
+        req=urllib.request.Request(self.base+'/Users/AuthenticateByName',data=b'{"Username":"fixture","Pw":"fixture"}',headers={'Origin':origin,'Content-Type':'application/json'})
+        with urllib.request.urlopen(req,timeout=3) as response:
+            self.assertEqual(response.status,200)
+            self.assertEqual(response.headers['Access-Control-Allow-Origin'],origin)
+
     def test_browser_origin_cors_preflight_and_authentication(self):
         origin='https://jealouswin.pages.dev'
         def send(path,method='GET',headers=None,body=None):
