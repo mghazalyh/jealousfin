@@ -7,14 +7,21 @@ import struct
 import unittest
 from unittest.mock import patch
 
-import aiohttp
-from aiohttp import web
-from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
-import webrtc_bridge as bridge
+try:
+    import aiohttp
+    from aiohttp import web
+    import aioice.ice
+    from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+    import webrtc_bridge as bridge
+except ImportError as exc:
+    raise unittest.SkipTest("WebRTC bridge dependencies are not installed") from exc
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pairing_rpc_authentication_and_binary_segments(self):
-        bind = "127.0.0.1"
+        candidates=aioice.ice.get_host_addresses(use_ipv4=True,use_ipv6=False)
+        bind=next((a for a in candidates if ipaddress.ip_address(a).is_private),None)
+        if not bind:
+            self.skipTest("no private non-loopback ICE interface")
         payload = bytes(range(251)) * 5000
         async def fixture(request):
             if request.path == "/System/Info/Public":
@@ -43,7 +50,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bridge,"PORTS",{port}):
             # Use a real LAN-capable host candidate for the peer transport,
             # while the test HTTP server uses an ephemeral loopback port.
-            app=bridge.create_app(bind,18800,ipaddress.ip_network("127.0.0.0/8"))
+            app=bridge.create_app(bind,18800,ipaddress.ip_network(bind+"/24",strict=False))
             runner=web.AppRunner(app)
             await runner.setup()
             self.addAsyncCleanup(runner.cleanup)
@@ -73,38 +80,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     body.extend(data[4:])
                     if len(body)==row["length"]:
                         responses[rid].set_result((row,bytes(body)))
-            # aioice intentionally excludes loopback ICE candidates. Test
-            # signaling rejection on loopback and test the RPC handler using
-            # a real negotiated data channel on a detected private interface.
-            import aioice.ice
-            candidates=aioice.ice.get_host_addresses(use_ipv4=True,use_ipv6=False)
-            host=next((a for a in candidates if ipaddress.ip_address(a).is_private),None)
-            if not host:
-                self.skipTest("no private non-loopback ICE interface")
-            app["bind"]=host
-            app["network"]=ipaddress.ip_network(host+"/24",strict=False)
-            # Keep fixture HTTP on loopback through an isolated HTTP adapter:
-            # only the fixture port can be reached, regardless of the host.
-            real_http=app["http"]
-            class FixtureHTTP:
-                def request(self,method,url,**kwargs):
-                    from urllib.parse import urlsplit
-                    target=urlsplit(url)
-                    assert target.port==port
-                    return real_http.request(method,f"http://127.0.0.1:{port}{target.path}"+("?"+target.query if target.query else ""),**kwargs)
-                async def close(self):
-                    await real_http.close()
-            app["http"]=FixtureHTTP()
-            # Run pairing from the allowed LAN source through a second test
-            # listener; no production listeners or credentials are touched.
-            await site.stop()
-            site=web.TCPSite(runner,host,0)
-            await site.start()
-            http_port=site._server.sockets[0].getsockname()[1]
-            base=f"http://{host}:{http_port}"
-            app["origin"]=base
+            base=f"http://{bind}:{http_port}"
             await pc.setLocalDescription(await pc.createOffer())
-            sdp=bridge.answer_lan_only(pc.localDescription.sdp,host)
+            sdp=bridge.answer_lan_only(pc.localDescription.sdp,bind)
             async with aiohttp.ClientSession() as session:
                 async with session.get(base+"/pair") as r:
                     self.assertEqual(r.status,200)
