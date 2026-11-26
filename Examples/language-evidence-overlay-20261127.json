@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "revision": "language-evidence-overlay-20261127",
+  "slots": [
+    {
+      "location": "player.fullscreen.top",
+      "nodes": [
+        {
+          "id": "language-evidence-top",
+          "kind": "text",
+          "title": "Language evidence (hotpatch)",
+          "style": "caption"
+        }
+      ]
+    },
+    {
+      "location": "player.fullscreen.bottom",
+      "nodes": [
+        {
+          "id": "language-evidence-panel",
+          "kind": "web",
+          "height": 178,
+          "html": "<style>#evidence{font-size:13px;line-height:18px;color:#e8e5f0;min-height:58px}#mistaken{width:100%;min-height:42px;margin-top:6px;border-radius:9px;border:1px solid #8a6b4d;background:#4a3322;color:#fff;font-weight:600}#mistaken:disabled{opacity:.45}#msg{font-size:11px;text-align:center;color:#c3c3c3;padding-top:4px}</style><div id='evidence'></div><button id='mistaken'>Mistaken — English</button><div id='msg'>Correction retracts the latest evidence only; playback is unchanged.</div><script>function render(s){s=s||{};var id=String(s.currentChannelID||''),name=String(s.currentChannel||''),source=String(s.surfSource||'');var e=s.languageEvidence||null;var lines=[];lines.push(name?name+' · '+id:'No current channel');lines.push('Source: '+(source||'unknown')+(s.surfing===true?(s.surfPaused?' · Surf paused':' · Surf active'):' · Not surfing'));if(e&&typeof e==='object'){var lang=String(e.languageName||e.language||'unknown');var count=e.count==null?'-':String(e.count);var threshold=e.threshold==null?'-':String(e.threshold);var phase=String(e.phase||e.outcome||'sampling');var conf=e.confidence==null?'-':(Number(e.confidence)*100).toFixed(1)+'%';lines.push('Language: '+lang+' · count '+count+'/'+threshold+' · '+phase+' · confidence '+conf);}else{lines.push('Language: gateway evidence is not exposed by this hotpatch UI ABI');lines.push('Blocker: stateSnapshot has no language field; web connect-src is none');}var box=document.getElementById('evidence');if(box)box.textContent=lines.join(' | ');var b=document.getElementById('mistaken');if(b){b.disabled=!/^[a-f0-9]{32}$/.test(id);b.onclick=function(){if(!/^[a-f0-9]{32}$/.test(id))return;var n=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);var p={schemaVersion:2,action:'mistaken_english',channelID:id,channelName:name||id,nonce:n};window.jealousfin.command('ui_set_value',{key:'spanishRequest',value:JSON.stringify(p)},'mistaken-'+n);window.jealousfin.command('refresh_catalogue',{},'mistaken-refresh-'+n);document.getElementById('msg').textContent='Retraction queued; playback unchanged';};}}window.addEventListener('jealousfin-state',function(ev){render(ev.detail||window.jealousfinState);});window.addEventListener('jealousfin-receipt',function(ev){var d=ev.detail||{};var m=document.getElementById('msg');if(m&&d.requestID&&String(d.requestID).indexOf('mistaken')===0)m.textContent='Retraction '+String(d.status||'queued');});render(window.jealousfinState);</script>"
+        }
+      ]
+    },
+    {
+      "location": "more.bottom",
+      "nodes": [
+        {
+          "id": "language-evidence-more",
+          "kind": "disclosure",
+          "title": "Language evidence gate",
+          "detail": "Hotpatch overlay; observation and enforcement are separate gateway controls",
+          "children": [
+            {
+              "id": "language-request-value",
+              "kind": "input",
+              "title": "Pending request",
+              "valueKey": "form.spanishRequest",
+              "defaultValue": ""
+            },
+            {
+              "id": "language-read",
+              "kind": "button",
+              "title": "Read language request",
+              "style": "muted",
+              "action": {
+                "command": "script",
+                "arguments": {
+                  "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||'');})()"
+                }
+              }
+            },
+            {
+              "id": "language-evidence-note",
+              "kind": "text",
+              "title": "Threshold and observation are adjusted through the existing LAN /language-auto control; this overlay never resumes, advances, reloads or resets rotation.",
+              "style": "caption"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "pages": []
+}

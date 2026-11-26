@@ -852,11 +852,15 @@ class Manager:
                 "speechCoverage": 0.0, "windows": 0, "languages": [], "lexicalMargin": None,
             }, device_verified=False, changed=changed, marked=False, reason_detail=reason)
             return
+        launch_id = str((sample.probe or {}).get("launchID", ""))
+        stream_generation = str((sample.probe or {}).get("streamGeneration", ""))
         job = {
             "cid": cid, "provider": sample.provider, "name": sample.name,
             "pcm": bytes(best.pcm), "seconds": best.seconds,
             "deviceVerified": start_verified if sample.probe else None,
             "changed": changed, "finalizeReason": reason,
+            "launchID": launch_id, "streamGeneration": stream_generation,
+            "visitID": ":".join((launch_id or "no-launch", cid, stream_generation or "no-stream", "%.3f" % sample.started)),
         }
         try:
             self._jobs.put_nowait(job)

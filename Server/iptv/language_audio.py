@@ -122,7 +122,8 @@ class Manager(base.Manager):
                 "allowed": 0, "unauthorized": 0, "inconclusive": 0,
                 "errors": 0, "suppressed": 0, "segmentsDecoded": 0,
                 "segmentsRejected": 0, "segmentsDecrypted": 0, "keyMissing": 0,
-                "samplesFinalized": 0,
+                "samplesFinalized": 0, "evidence": 0, "enforced": 0,
+                "duplicates": 0, "stale": 0,
             },
             "languages": {},
             "last": None,
@@ -219,48 +220,87 @@ class Manager(base.Manager):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
+    def _identity_matches(self, job, probe):
+        if not isinstance(probe, dict) or not probe.get("channelID"):
+            return False
+        if probe.get("channelID") != job["cid"]:
+            return False
+        for key in ("launchID", "streamGeneration"):
+            expected = job.get(key)
+            current = probe.get(key)
+            if expected and current and expected != current:
+                return False
+        return True
+
     def _record_result(self, job, decision):
         outcome = decision["outcome"]
         reason = decision["reason"]
         language = decision.get("language")
         language_name = decision.get("languageName")
         marked = False
+        evidence_recorded = False
         suppressed = False
         commit_reason = None
-        if outcome == "excluded" and self._enabled():
-            evidence = {
-                "model": pathlib.Path(self.model_path).name,
-                "windows": decision.get("windows", 0),
-                "speechSeconds": decision.get("speechSeconds"),
-                "sampleSeconds": decision.get("sampleSeconds"),
-                "speechCoverage": decision.get("speechCoverage"),
-                "languages": decision.get("languages", []),
-                "deviceVerified": job.get("deviceVerified"),
-                "channelChangedBeforeResult": bool(job.get("changed")),
-                "lexicalMargin": decision.get("lexicalMargin"),
-            }
-            try:
-                result = self.on_exclusion(
-                    job["cid"], job["provider"], job["name"] or job["provider"],
-                    language, language_name, decision.get("confidence", 0.0),
-                    "auto:" + reason, evidence,
-                )
-                commit_reason = (result or {}).get("reason")
-                if (result or {}).get("changed"):
-                    marked = True
-                elif commit_reason == "manual_not_spanish":
-                    suppressed = True
-                    outcome = "inconclusive"
-                    reason = "manual_not_spanish"
-                elif commit_reason in ("manual_exclusion", "already_marked"):
-                    marked = True
-                elif commit_reason == "unknown_provider":
-                    outcome = "inconclusive"
-                    reason = "unknown_provider"
-            except Exception as error:
-                commit_reason = "commit_" + type(error).__name__
+        count = None
+        threshold = None
+        if outcome in ("excluded", "allowed", "unauthorized") and self._enabled():
+            if job.get("deviceVerified") is not True:
                 outcome = "inconclusive"
-                reason = "commit_error"
+                reason = "device_unverified"
+            elif job.get("changed"):
+                outcome = "inconclusive"
+                reason = "stale_channel_changed"
+            else:
+                probe = self._probe()
+                if not self._identity_matches(job, probe):
+                    outcome = "inconclusive"
+                    reason = "stale_session"
+            if outcome in ("excluded", "allowed", "unauthorized"):
+                evidence = {
+                    "model": pathlib.Path(self.model_path).name,
+                    "windows": decision.get("windows", 0),
+                    "speechSeconds": decision.get("speechSeconds"),
+                    "sampleSeconds": decision.get("sampleSeconds"),
+                    "speechCoverage": decision.get("speechCoverage"),
+                    "languages": decision.get("languages", []),
+                    "deviceVerified": job.get("deviceVerified"),
+                    "channelChangedBeforeResult": bool(job.get("changed")),
+                    "lexicalMargin": decision.get("lexicalMargin"),
+                    "outcome": outcome,
+                    "visitID": job.get("visitID", ""),
+                    "launchID": job.get("launchID", ""),
+                    "streamGeneration": job.get("streamGeneration", ""),
+                }
+                try:
+                    result = self.on_exclusion(
+                        job["cid"], job["provider"], job["name"] or job["provider"],
+                        language, language_name, decision.get("confidence", 0.0),
+                        "auto:" + reason, evidence,
+                    ) or {}
+                    commit_reason = result.get("reason")
+                    count = result.get("count")
+                    threshold = result.get("threshold")
+                    if result.get("enforced"):
+                        marked = True
+                        evidence_recorded = bool(result.get("changed"))
+                    elif result.get("changed"):
+                        evidence_recorded = True
+                    if commit_reason == "manual_not_spanish":
+                        suppressed = True
+                        outcome = "inconclusive"
+                        reason = "manual_not_spanish"
+                    elif commit_reason in ("duplicate_visit", "maintenance", "observation_disabled"):
+                        outcome = "inconclusive"
+                        reason = commit_reason
+                    elif commit_reason in ("manual_exclusion", "already_marked"):
+                        marked = marked or False
+                    elif commit_reason in ("unknown_provider", "device_unverified", "stale_channel_changed"):
+                        outcome = "inconclusive"
+                        reason = commit_reason
+                except Exception as error:
+                    commit_reason = "commit_" + type(error).__name__
+                    outcome = "inconclusive"
+                    reason = "commit_error"
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1
@@ -279,6 +319,14 @@ class Manager(base.Manager):
                 counters["inconclusive"] += 1
             if language:
                 self.telemetry["languages"][language] = self.telemetry["languages"].get(language, 0) + 1
+            if evidence_recorded:
+                counters["evidence"] = counters.get("evidence", 0) + 1
+            if marked:
+                counters["enforced"] = counters.get("enforced", 0) + 1
+            if reason == "duplicate_visit":
+                counters["duplicates"] = counters.get("duplicates", 0) + 1
+            if reason in ("stale_session", "stale_channel_changed", "device_unverified"):
+                counters["stale"] = counters.get("stale", 0) + 1
             if suppressed:
                 counters["suppressed"] += 1
             if reason in ("commit_error", "inference_error"):
@@ -293,18 +341,23 @@ class Manager(base.Manager):
                 "speechCoverage": decision.get("speechCoverage", 0.0),
                 "windows": decision.get("windows", 0),
                 "deviceVerified": job.get("deviceVerified"),
+                "launchID": job.get("launchID", ""),
+                "streamGeneration": job.get("streamGeneration", ""),
+                "visitID": job.get("visitID", ""),
                 "channelChangedBeforeResult": bool(job.get("changed")),
-                "marked": marked, "suppressed": suppressed, "commitReason": commit_reason,
+                "marked": marked, "evidence": evidence_recorded, "count": count,
+                "threshold": threshold, "suppressed": suppressed, "commitReason": commit_reason,
             }
             self.telemetry["last"] = last
             self.telemetry["current"] = None
         if marked:
-            self.log("LANGUAGE_AUTO_EXCLUDE language=%s name=%s provider=%s channel=%s confidence=%.3f speech=%.1fs" % (
-                language, language_name, job["provider"], job["cid"],
+            self.log("LANGUAGE_AUTO_EXCLUDE language=%s name=%s provider=%s channel=%s count=%s threshold=%s confidence=%.3f speech=%.1fs" % (
+                language, language_name, job["provider"], job["cid"], str(count), str(threshold),
                 decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
         else:
-            self.log("LANGUAGE_AUTO_RESULT language=%s name=%s provider=%s channel=%s outcome=%s reason=%s confidence=%.3f speech=%.1fs" % (
+            self.log("LANGUAGE_AUTO_RESULT language=%s name=%s provider=%s channel=%s outcome=%s reason=%s evidence=%s count=%s threshold=%s confidence=%.3f speech=%.1fs" % (
                 language, language_name, job["provider"], job["cid"], outcome, reason,
+                str(evidence_recorded), str(count), str(threshold),
                 decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
         self._persist(force=True)
 

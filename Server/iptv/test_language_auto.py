@@ -81,13 +81,13 @@ class LanguageStoreTests(unittest.TestCase):
         state, _ = legacy.apply(state, "remove", cid, "Fixture", provider, "m2", now=11)
         legacy.atomic_write(self.root, state)
         migrated = language_exclusions.load_or_migrate(self.root)
-        self.assertEqual(migrated["schemaVersion"], 3)
+        self.assertEqual(migrated["schemaVersion"], 4)
         self.assertEqual(migrated["decisions"][provider]["decision"], "not_spanish")
         self.assertEqual(migrated["decisions"][provider]["language"], "all")
         self.assertTrue((self.root / "language-exclusions.json").exists())
         self.assertTrue((self.root / "spanish-classification.json").exists())
 
-    def test_auto_stores_exact_language_not_spanish(self):
+    def test_auto_records_exact_language_evidence_not_first_detection_exclusion(self):
         state = language_exclusions.empty()
         for code, name, cid in (("pt", "Portuguese", "a" * 32), ("fr", "French", "b" * 32),
                                 ("de", "German", "c" * 32), ("es", "Spanish", "d" * 32)):
@@ -95,11 +95,14 @@ class LanguageStoreTests(unittest.TestCase):
                 state, "nltv:us:" + code, cid, code, code, name, 0.95,
                 "auto:language_" + code + "_dominant", None)
             self.assertTrue(changed)
-        self.assertEqual(language_exclusions.describe(state)["languages"],
+            self.assertEqual(why, "evidence_recorded")
+        self.assertEqual(state["entries"], {})
+        self.assertEqual(language_exclusions.describe(state)["evidence"]["languages"],
                          {"pt": 1, "fr": 1, "de": 1, "es": 1})
-        self.assertEqual(state["entries"]["nltv:us:pt"]["language"], "pt")
-        self.assertEqual(state["entries"]["nltv:us:pt"]["languageName"], "Portuguese")
-        self.assertNotEqual(state["entries"]["nltv:us:pt"]["language"], "es")
+        latest = language_exclusions.latest_evidence(state, provider_id="nltv:us:pt")
+        self.assertEqual(latest["language"], "pt")
+        self.assertEqual(latest["languageName"], "Portuguese")
+        self.assertNotEqual(latest["language"], "es")
 
     def test_manual_spanish_and_not_spanish_override_auto(self):
         state = language_exclusions.empty()
@@ -157,8 +160,9 @@ class LanguageStoreTests(unittest.TestCase):
         self.assertNotIn(providers[0], state["entries"])
         self.assertEqual(state["decisions"][providers[0]]["decision"], "not_spanish")
         self.assertEqual(state["entries"]["nltv:us:manual"]["language"], "es")
-        self.assertGreaterEqual(len(state["entries"]), 8)
-        self.assertEqual(language_exclusions.describe(state)["languages"].get("pt", 0), 1)
+        self.assertEqual(len(state["entries"]), 1)
+        self.assertEqual(language_exclusions.counts_for(state, ("%032d" % 1)[-32:], "pt"), 1)
+        self.assertGreaterEqual(language_exclusions.describe(state)["evidence"]["languages"].get("pt", 0), 1)
 
     def test_legacy_apply_returns_two_values(self):
         state = language_exclusions.empty()
@@ -259,10 +263,12 @@ class LanguageSamplerTests(unittest.TestCase):
         self.assertEqual(calls[0]["language"], "es")
         self.assertEqual(status["counters"]["spanish"], 1)
 
-    def test_english_is_allowed_and_not_excluded(self):
+    def test_english_is_allowed_and_recorded_without_whitelist(self):
         calls, status = self._run("en", "en", "Hello and welcome to the news. The government announced new measures.")
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["language"], "en")
         self.assertGreaterEqual(status["counters"]["allowed"], 1)
+        self.assertGreaterEqual(status["counters"]["evidence"], 1)
         self.assertEqual(status["counters"]["excluded"], 0)
 
 
@@ -285,28 +291,53 @@ class LanguageGatewayTests(unittest.TestCase):
         with self.g.policy_connect(self.db) as db:
             db.executemany("INSERT INTO channel(id,name) VALUES(?,?)", [(cid, cid) for cid in (self.a, self.b, self.c)])
             db.execute("INSERT INTO meta VALUES('seeded','1')")
+        self.g.set_language_auto_control(enabled=True, enforcement=False, threshold=25)
 
-    def test_auto_commit_stores_exact_languages_and_filters(self):
+    def evidence(self, language="pt", language_name="Portuguese", visit="visit-1", launch="launch-1",
+                 outcome="excluded", lexical=-0.4):
+        return {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0, "sampleSeconds": 60.0,
+                "speechCoverage": 0.66, "languages": [{"language": language, "probability": 0.97}],
+                "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": lexical,
+                "outcome": outcome, "visitID": visit, "launchID": launch, "streamGeneration": "stream-1"}
+
+    def test_auto_commit_records_exact_evidence_without_observation_mode_filter(self):
         g = self.g
-        evidence = {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0, "sampleSeconds": 60.0,
-                    "speechCoverage": 0.66, "languages": [{"language": "pt", "probability": 0.97}],
-                    "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": -0.4}
         self.assertTrue(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                               "auto:language_pt_dominant", evidence)["changed"])
-        evidence_es = dict(evidence, languages=[{"language": "es", "probability": 0.98}], lexicalMargin=0.5)
+                                               "auto:language_pt_dominant", self.evidence())["changed"])
         self.assertTrue(g.language_auto_commit(self.b, g.sources[self.b], "B", "es", "Spanish", 0.98,
-                                               "auto:language_es_dominant", evidence_es)["changed"])
+                                               "auto:language_es_dominant", self.evidence("es", "Spanish", "visit-es", lexical=0.5))["changed"])
         g.maybe_reload_spanish(force=True)
-        self.assertEqual(g.spanish_provider_ids, {g.sources[self.a], g.sources[self.b]})
+        self.assertEqual(g.spanish_provider_ids, set())
         state = json.loads((pathlib.Path(self.temp.name) / "language-exclusions.json").read_text())
-        self.assertEqual(state["entries"][g.sources[self.a]]["language"], "pt")
-        self.assertEqual(state["entries"][g.sources[self.b]]["language"], "es")
-        self.assertTrue(hasattr(g, "language_excluded"))
+        self.assertEqual(state["entries"], {})
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 1)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.b, "es"), 1)
+        description = self.g.spanish_classification.describe(state)
+        self.assertEqual(description["evidence"]["languages"], {"pt": 1, "es": 1})
         with self.g.policy_connect(self.db) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM channel").fetchone()[0], 3)
-        description = self.g.spanish_classification.describe(state)
-        self.assertEqual(description["languages"], {"pt": 1, "es": 1})
+
+    def test_enforcement_threshold_adds_auto_entry_and_toggle_restores_eligibility(self):
+        g = self.g
+        g.set_language_auto_control(enabled=True, enforcement=True, threshold=2)
+        evidence = self.evidence()
+        self.assertFalse(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
+                                                "auto:language_pt_dominant", evidence)["enforced"])
+        second = self.evidence(visit="visit-2", launch="launch-2")
+        result = g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
+                                        "auto:language_pt_dominant", second)
+        self.assertTrue(result["enforced"])
+        g.maybe_reload_spanish(force=True)
         self.assertIn(g.sources[self.a], g.spanish_provider_ids)
+        self.assertTrue(g.spanish_excluded(self.a))
+        with self.g.policy_connect(self.db) as db:
+            before = db.execute("SELECT failures,hiatus_until,banned,sustained FROM channel WHERE id=?", (self.a,)).fetchone()
+        g.set_language_auto_control(enabled=True, enforcement=False, threshold=2)
+        g.maybe_reload_spanish(force=True)
+        self.assertFalse(g.spanish_excluded(self.a))
+        with self.g.policy_connect(self.db) as db:
+            after = db.execute("SELECT failures,hiatus_until,banned,sustained FROM channel WHERE id=?", (self.a,)).fetchone()
+        self.assertEqual(before, after)
 
     def test_manual_marker_path_and_not_spanish_blocks_auto(self):
         g = self.g
@@ -317,32 +348,367 @@ class LanguageGatewayTests(unittest.TestCase):
             g.apply_device_spanish_request({}, "")
         self.assertIn(provider, g.spanish_provider_ids)
         self.assertEqual(g.spanish_state["entries"][provider]["language"], "es")
-        evidence = {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0, "sampleSeconds": 60.0,
-                    "speechCoverage": 0.66, "languages": [{"language": "pt", "probability": 0.97}],
-                    "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": -0.4}
         self.assertEqual(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", evidence)["reason"], "manual_exclusion")
+                                                "auto:language_pt_dominant", self.evidence())["reason"], "manual_exclusion")
         remove = json.dumps({"schemaVersion": 1, "action": "remove", "channelID": self.a,
                              "channelName": "Fixture A", "nonce": "manual-remove-1"})
         with patch.object(g.prototype_selector, "device_ui_trigger", return_value=remove):
             g.apply_device_spanish_request({}, "")
         self.assertNotIn(provider, g.spanish_provider_ids)
         self.assertEqual(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", evidence)["reason"], "manual_not_spanish")
+                                                "auto:language_pt_dominant", self.evidence("pt", "Portuguese", "visit-2", "launch-2"))["reason"], "manual_not_spanish")
 
-    def test_control_endpoint_preserves_exclusions(self):
+    def test_control_endpoint_preserves_evidence_and_manual_exclusions(self):
         g = self.g
-        evidence = {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0, "sampleSeconds": 60.0,
-                    "speechCoverage": 0.66, "languages": [{"language": "pt", "probability": 0.97}],
-                    "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": -0.4}
-        g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                               "auto:language_pt_dominant", evidence)
+        provider = g.sources[self.a]
+        manual_provider = g.sources[self.b]
+        add = json.dumps({"schemaVersion": 1, "action": "add", "channelID": self.b,
+                          "channelName": "Fixture B", "nonce": "manual-b-1"})
+        with patch.object(g.prototype_selector, "device_ui_trigger", return_value=add):
+            g.apply_device_spanish_request({}, "")
+        g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
+                               "auto:language_pt_dominant", self.evidence())
         g.set_spanish_auto_enabled(False)
         self.assertFalse(g.reload_spanish_auto_control(force=True))
-        self.assertEqual(len(g.spanish_provider_ids), 1)
+        self.assertIn(manual_provider, g.spanish_provider_ids)
+        self.assertNotIn(provider, g.spanish_provider_ids)
         g.set_spanish_auto_enabled(True)
         self.assertTrue(g.reload_spanish_auto_control(force=True))
-        self.assertIn(g.sources[self.a], g.spanish_provider_ids)
+        state = json.loads((pathlib.Path(self.temp.name) / "language-exclusions.json").read_text())
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 1)
+
+    def test_legacy_auto_entries_restore_eligibility_without_touching_policy(self):
+        g = self.g
+        before = g.policy_rows()
+        entries = {
+            "nltv:fixture:" + self.a: v3_auto("nltv:fixture:" + self.a, self.a, "pt", 10.0),
+            "nltv:fixture:" + self.b: v3_auto("nltv:fixture:" + self.b, self.b, "fr", 11.0),
+            "nltv:fixture:" + self.c: v3_manual("nltv:fixture:" + self.c, self.c, 12.0),
+        }
+        decisions = {
+            "nltv:fixture:" + self.a: {"decision": "spanish", "language": "es", "languageName": "Spanish",
+                                       "at": 10.0, "nonce": "auto-a", "channelID": self.a, "channelName": "A"},
+            "nltv:fixture:" + self.c: {"decision": "spanish", "language": "es", "languageName": "Spanish",
+                                       "at": 12.0, "nonce": "manual-c", "channelID": self.c, "channelName": "C"},
+        }
+        (pathlib.Path(self.temp.name) / "language-exclusions.json").write_text(
+            json.dumps(v3_state(entries, decisions)))
+        g.maybe_reload_spanish(force=True)
+        self.assertFalse(g.spanish_excluded(self.a))
+        self.assertFalse(g.spanish_excluded(self.b))
+        self.assertTrue(g.spanish_excluded(self.c))
+        self.assertEqual(set(g.spanish_state["entries"]), {"nltv:fixture:" + self.c})
+        self.assertEqual(len(g.spanish_state["evidence"]["events"]), 2)
+        self.assertEqual(before, g.policy_rows())
+
+    def test_observation_defaults_off_and_threshold_is_runtime_adjustable(self):
+        g = self.g
+        g.SPANISH_AUTO_CONTROL_FILE.unlink()
+        self.assertFalse(g.reload_spanish_auto_control(force=True))
+        self.assertFalse(g.SPANISH_AUTO_ENFORCEMENT)
+        self.assertEqual(g.SPANISH_EVIDENCE_THRESHOLD, 25)
+        self.assertEqual(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
+                                                "auto:language_pt_dominant", self.evidence())["reason"], "observation_disabled")
+        control = g.set_language_auto_control(enabled=True, enforcement=False, threshold=13)
+        self.assertEqual(control["threshold"], 13)
+        self.assertTrue(g.reload_spanish_auto_control(force=True))
+        self.assertEqual(g.SPANISH_EVIDENCE_THRESHOLD, 13)
+        with self.assertRaises(ValueError):
+            g.set_language_auto_control(threshold=0)
+
+    def test_maintenance_window_skips_language_evidence(self):
+        g = self.g
+        now = time.time()
+        g.MAINTENANCE_FILE.write_text(json.dumps({
+            "schemaVersion": 1, "start": now - 1, "until": now + 120,
+            "reason": "language fixture maintenance", "launchID": "fixture-launch",
+            "channelID": self.a, "allowedReasons": ["fixture"],
+        }))
+        g.maintenance_state = None
+        g.maintenance_checked_at = 0.0
+        result = g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
+                                        "auto:language_pt_dominant", self.evidence())
+        self.assertEqual(result["reason"], "maintenance")
+        state = g.spanish_classification.load_or_migrate(self.temp.name)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 0)
+
+    def test_mistaken_english_retracts_once_without_playback_or_policy_change(self):
+        g = self.g
+        g.set_language_auto_control(enabled=True, enforcement=True, threshold=1)
+        provider = g.sources[self.a]
+        self.assertTrue(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
+                                               "auto:language_pt_dominant", self.evidence())["enforced"])
+        self.assertTrue(g.spanish_excluded(self.a))
+        before = g.policy_rows()
+        marker = json.dumps({"schemaVersion": 2, "action": "mistaken_english", "channelID": self.a,
+                             "channelName": "Fixture A", "nonce": "mistake-gateway-1"})
+        with patch.object(g.prototype_selector, "device_ui_trigger", return_value=marker):
+            g.apply_device_spanish_request({}, "")
+        self.assertFalse(g.spanish_excluded(self.a))
+        state = json.loads((pathlib.Path(self.temp.name) / "language-exclusions.json").read_text())
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 0)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "en"), 1)
+        self.assertNotIn(provider, state["decisions"])
+        self.assertEqual(before, g.policy_rows())
+        with patch.object(g.prototype_selector, "device_ui_trigger", return_value=marker):
+            g.apply_device_spanish_request({}, "")
+        state = json.loads((pathlib.Path(self.temp.name) / "language-exclusions.json").read_text())
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 0)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "en"), 1)
+
+
+def v3_auto(provider, cid, language, at, confidence=0.95):
+    return {
+        "channelID": cid, "channelName": provider, "markedAt": at,
+        "nonce": "auto-" + provider, "source": "auto", "language": language,
+        "languageName": language_catalog.language_name(language), "confidence": confidence,
+        "reason": "auto:language_" + language + "_dominant",
+        "evidence": {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0,
+                     "sampleSeconds": 60.0, "speechCoverage": 0.66,
+                     "languages": [{"language": language, "probability": confidence}],
+                     "deviceVerified": True, "channelChangedBeforeResult": False,
+                     "lexicalMargin": 0.4},
+    }
+
+
+def v3_manual(provider, cid, at):
+    return {
+        "channelID": cid, "channelName": provider, "markedAt": at,
+        "nonce": "manual-" + provider, "source": "manual", "language": "es",
+        "languageName": "Spanish", "confidence": None, "reason": "manual-spanish",
+        "evidence": None,
+    }
+
+
+def v3_state(entries, decisions=None):
+    return {
+        "schemaVersion": 3, "revision": "language-exclusions-v3", "updatedAt": 100.0,
+        "lastNonce": "nonce-1", "recentNonces": ["nonce-1"],
+        "entries": entries, "decisions": decisions or {},
+    }
+
+
+class LanguageEvidenceGateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+
+    def event(self, state, channel, language, name, visit, launch, now, threshold=25,
+              enforcement=False, outcome="excluded"):
+        return language_exclusions.record_evidence(
+            state, "nltv:us:" + channel, channel, channel, language, name, 0.97,
+            "auto:language_" + language + "_dominant", {"deviceVerified": True,
+            "channelChangedBeforeResult": False, "model": "fixture.bin", "windows": 4},
+            outcome=outcome, visit_id=visit, launch_id=launch, now=now,
+            threshold=threshold, enforcement=enforcement)
+
+    def test_three_legacy_auto_records_migrate_to_one_event_each_and_restore_eligibility(self):
+        a, b, c, manual, allowed = ("a" * 32, "b" * 32, "c" * 32, "d" * 32, "e" * 32)
+        entries = {
+            "nltv:us:a": v3_auto("nltv:us:a", a, "pt", 10.0),
+            "nltv:us:b": v3_auto("nltv:us:b", b, "fr", 11.0),
+            "nltv:us:c": v3_auto("nltv:us:c", c, "de", 12.0),
+            "nltv:us:manual": v3_manual("nltv:us:manual", manual, 13.0),
+        }
+        decisions = {
+            "nltv:us:a": {"decision": "spanish", "language": "es", "languageName": "Spanish",
+                          "at": 10.0, "nonce": "auto-a", "channelID": a, "channelName": "A"},
+            "nltv:us:manual": {"decision": "spanish", "language": "es", "languageName": "Spanish",
+                               "at": 13.0, "nonce": "manual-manual", "channelID": manual, "channelName": "Manual"},
+            "nltv:us:allowed": {"decision": "not_spanish", "language": "all", "languageName": "Any language",
+                                "at": 14.0, "nonce": "allow-e", "channelID": allowed, "channelName": "Allowed"},
+        }
+        state = language_exclusions.migrate(v3_state(entries, decisions))
+        self.assertEqual(state["schemaVersion"], 4)
+        self.assertEqual(set(state["entries"]), {"nltv:us:manual"})
+        self.assertEqual(language_exclusions.manual_excluded(state), {"nltv:us:manual"})
+        self.assertEqual(language_exclusions.auto_excluded(state), set())
+        self.assertEqual(len(state["evidence"]["events"]), 3)
+        for provider, cid, code in (("nltv:us:a", a, "pt"), ("nltv:us:b", b, "fr"), ("nltv:us:c", c, "de")):
+            self.assertEqual(language_exclusions.counts_for(state, cid, code), 1)
+            latest = language_exclusions.latest_evidence(state, provider_id=provider)
+            self.assertEqual(latest["language"], code)
+            self.assertIsNotNone(latest["at"])
+        self.assertNotIn("nltv:us:a", state["decisions"])
+        self.assertEqual(state["decisions"]["nltv:us:manual"]["decision"], "spanish")
+        self.assertEqual(state["decisions"]["nltv:us:allowed"]["decision"], "not_spanish")
+        language_exclusions.atomic_write(self.root, state)
+        reloaded = language_exclusions.load_or_migrate(self.root)
+        self.assertEqual(reloaded, state)
+
+    def test_english_is_evidence_not_a_permanent_whitelist(self):
+        state = language_exclusions.empty()
+        for index in range(2):
+            state, info = self.event(state, "a" * 32, "en", "English", "en-" + str(index),
+                                     "launch-" + str(index), 1 + index, outcome="allowed")
+            self.assertTrue(info["changed"])
+        self.assertEqual(state["decisions"], {})
+        self.assertEqual(language_exclusions.counts_for(state, "a" * 32, "en"), 2)
+        for index in range(25):
+            state, info = self.event(state, "a" * 32, "es", "Spanish", "es-" + str(index),
+                                     "launch-es-" + str(index), 10 + index,
+                                     threshold=25, enforcement=True)
+        self.assertTrue(info["enforced"])
+        self.assertEqual(language_exclusions.counts_for(state, "a" * 32, "es"), 25)
+        self.assertEqual(state["entries"]["nltv:us:" + "a" * 32]["source"], "auto")
+        self.assertNotIn("nltv:us:" + "a" * 32, state["decisions"])
+        with self.assertRaises(ValueError):
+            language_exclusions.record_evidence(
+                state, "nltv:us:" + "a" * 32, "a" * 32, "A", "es", "Spanish", 0.97,
+                "auto:inconclusive", {}, outcome="inconclusive", now=200)
+
+    def test_threshold_observation_only_then_enforcement_and_manual_allow(self):
+        state = language_exclusions.empty()
+        channel = "a" * 32
+        for index in range(25):
+            state, info = self.event(state, channel, "es", "Spanish", "v-" + str(index),
+                                     "l-" + str(index), 100 + index, threshold=25, enforcement=False)
+            self.assertFalse(info["enforced"])
+        self.assertEqual(state["entries"], {})
+        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 25)
+        state, info = self.event(state, channel, "es", "Spanish", "v-25", "l-25", 200,
+                                 threshold=25, enforcement=True)
+        self.assertTrue(info["enforced"])
+        self.assertEqual(state["entries"]["nltv:us:" + channel]["source"], "auto")
+        state, changed, reason = language_exclusions.apply_manual(
+            state, "remove", channel, "A", "nltv:us:" + channel, "allow-after", now=300)
+        self.assertTrue(changed)
+        self.assertNotIn("nltv:us:" + channel, state["entries"])
+        state, info = self.event(state, channel, "es", "Spanish", "v-26", "l-26", 400,
+                                 threshold=25, enforcement=True)
+        self.assertFalse(info["changed"])
+        self.assertEqual(info["reason"], "manual_not_spanish")
+        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 26)
+        for bad in (0, 1001, "25"):
+            with self.assertRaises(ValueError):
+                self.event(state, "b" * 32, "es", "Spanish", "bad", "bad", 500,
+                           threshold=bad, enforcement=False)
+
+    def test_mistaken_english_retracts_once_without_whitelist(self):
+        state = language_exclusions.empty()
+        channel = "a" * 32
+        provider = "nltv:us:" + channel
+        for index in range(2):
+            state, info = self.event(state, channel, "es", "Spanish", "v-" + str(index),
+                                     "l-" + str(index), 10 + index, threshold=2, enforcement=True)
+        self.assertTrue(info["enforced"])
+        self.assertIn(provider, state["entries"])
+        original_event = info["eventID"]
+        state, info = language_exclusions.retract_evidence(
+            state, provider, channel, "A", "mistake-1", now=20, threshold=2, enforcement=True)
+        self.assertTrue(info["changed"])
+        self.assertEqual(info["retractedEventID"], original_event)
+        self.assertNotIn(provider, state["entries"])
+        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 1)
+        self.assertEqual(language_exclusions.counts_for(state, channel, "en"), 1)
+        self.assertNotIn(provider, state["decisions"])
+        self.assertEqual(state["evidence"]["events"][original_event]["retractedBy"], "mistake-1")
+        self.assertEqual(language_exclusions.latest_evidence(state, provider_id=provider)["language"], "en")
+        replay, info = language_exclusions.retract_evidence(
+            state, provider, channel, "A", "mistake-1", now=21, threshold=2, enforcement=True)
+        self.assertFalse(info["changed"])
+        self.assertEqual(info["reason"], "replayed_nonce")
+        self.assertEqual(replay, state)
+        state, info = self.event(state, channel, "es", "Spanish", "v-2", "l-2", 30,
+                                 threshold=2, enforcement=True)
+        self.assertTrue(info["enforced"])
+        self.assertIn(provider, state["entries"])
+        manual = language_exclusions.empty()
+        manual, _, _ = language_exclusions.apply_manual(manual, "add", "b" * 32, "B", "nltv:us:b", "m-1", now=1)
+        manual, info = language_exclusions.retract_evidence(
+            manual, "nltv:us:b", "b" * 32, "B", "mistake-2", now=2, threshold=2, enforcement=True)
+        self.assertFalse(info["changed"])
+        self.assertEqual(info["reason"], "no_evidence")
+        self.assertIn("nltv:us:b", manual["entries"])
+
+    def test_visit_dedup_and_stale_session_identity(self):
+        state = language_exclusions.empty()
+        channel = "a" * 32
+        state, first = self.event(state, channel, "es", "Spanish", "visit-1", "launch-1", 1000)
+        state, duplicate = self.event(state, channel, "es", "Spanish", "visit-1", "launch-1", 1001)
+        self.assertTrue(first["changed"])
+        self.assertFalse(duplicate["changed"])
+        self.assertEqual(duplicate["reason"], "duplicate_visit")
+        state, reload = self.event(state, channel, "es", "Spanish", "visit-2", "launch-1", 1002)
+        self.assertFalse(reload["changed"])
+        self.assertEqual(reload["reason"], "duplicate_visit")
+        state, new_session = self.event(state, channel, "es", "Spanish", "visit-3", "launch-2", 1003)
+        self.assertTrue(new_session["changed"])
+        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 2)
+        manager = object.__new__(language_audio.Manager)
+        job = {"cid": channel, "launchID": "launch-1", "streamGeneration": "stream-1"}
+        self.assertTrue(manager._identity_matches(job, {"channelID": channel, "launchID": "launch-1", "streamGeneration": "stream-1"}))
+        self.assertFalse(manager._identity_matches(job, {"channelID": "b" * 32, "launchID": "launch-1", "streamGeneration": "stream-1"}))
+        self.assertFalse(manager._identity_matches(job, {"channelID": channel, "launchID": "launch-2", "streamGeneration": "stream-1"}))
+        self.assertFalse(manager._identity_matches(job, {"channelID": channel, "launchID": "launch-1", "streamGeneration": "stream-2"}))
+        self.assertFalse(manager._identity_matches(job, None))
+
+    def test_manager_skips_stale_and_inconclusive_samples_without_counts(self):
+        manager = object.__new__(language_audio.Manager)
+        calls = []
+        manager.fault = None
+        manager.control = lambda: True
+        manager._control_cache = (time.monotonic(), True)
+        manager.probe = lambda: {"channelID": "a" * 32, "launchID": "launch-1", "streamGeneration": "stream-1"}
+        manager.model_path = "/tmp/fixture-model.bin"
+        manager.threads = 1
+        manager._lock = threading.RLock()
+        manager.telemetry = language_audio.Manager._empty_state(manager)
+        manager.log = lambda message: None
+        manager._persist = lambda force=False: None
+        manager.on_exclusion = lambda *args: calls.append(args) or {"changed": True, "reason": "evidence_recorded",
+                                                                    "count": 1, "threshold": 25, "enforced": False}
+        job = {"cid": "a" * 32, "provider": "nltv:us:" + "a" * 32, "name": "A", "deviceVerified": True,
+               "changed": False, "launchID": "launch-1", "streamGeneration": "stream-1", "visitID": "v-1"}
+        decision = {"outcome": "excluded", "reason": "language_es_dominant", "language": "es",
+                    "languageName": "Spanish", "confidence": 0.97, "windows": 4,
+                    "speechSeconds": 40.0, "sampleSeconds": 60.0, "speechCoverage": 0.66,
+                    "languages": [], "lexicalMargin": 0.4}
+        manager._record_result(job, decision)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(manager.telemetry["counters"]["evidence"], 1)
+        stale = dict(job, launchID="launch-old", visitID="v-old")
+        manager._record_result(stale, decision)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(manager.telemetry["counters"]["stale"], 1)
+        manager._record_result(dict(job, changed=True), decision)
+        self.assertEqual(len(calls), 1)
+        manager._record_result(dict(job, deviceVerified=None), decision)
+        self.assertEqual(len(calls), 1)
+        inconclusive = dict(decision, outcome="inconclusive", reason="mixed_language", language=None,
+                            languageName=None, confidence=0.0)
+        manager._record_result(dict(job, visitID="v-2"), inconclusive)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(manager.telemetry["counters"]["excluded"], 1)
+        self.assertGreaterEqual(manager.telemetry["counters"]["inconclusive"], 4)
+
+    def test_overlay_is_hotpatch_only_and_has_no_playback_actions(self):
+        path = HERE.parent.parent / "Examples" / "language-evidence-overlay-20261127.json"
+        layout = json.loads(path.read_text())
+        self.assertEqual(layout["schemaVersion"], 1)
+        nodes = []
+        def walk(items):
+            for node in items:
+                nodes.append(node)
+                walk(node.get("children", []))
+        for slot in layout["slots"]:
+            self.assertIn(slot["location"], {
+                "player.fullscreen.top", "player.fullscreen.bottom", "more.bottom"})
+            walk(slot["nodes"])
+        commands = {node.get("action", {}).get("command") for node in nodes if node.get("action")}
+        forbidden = {"play", "pause", "resume", "stop", "next_channel", "previous_channel",
+                     "start_surf", "stop_surf", "pause_surf", "resume_surf", "reload_current_stream",
+                     "seek_live", "seek_relative", "open_channel"}
+        self.assertFalse(commands & forbidden)
+        html = " ".join(node.get("html", "") for node in nodes)
+        self.assertIn("mistaken_english", html)
+        self.assertIn("ui_set_value", html)
+        self.assertIn("refresh_catalogue", html)
+        self.assertIn("surfPaused", html)
+        self.assertNotIn("fetch(", html)
+        self.assertNotIn("XMLHttpRequest", html)
+        self.assertNotIn("next_channel", html)
 
 
 class LanguageRealtimeFixtureTests(unittest.TestCase):

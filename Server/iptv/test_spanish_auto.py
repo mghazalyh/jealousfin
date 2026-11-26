@@ -325,6 +325,7 @@ seg2.ts
 
     def test_manual_marker_path_and_auto_override(self):
         g = self.g
+        g.set_language_auto_control(enabled=True, enforcement=True, threshold=1)
         provider = g.sources[self.a]
         add = json.dumps({"schemaVersion": 1, "action": "add", "channelID": self.a,
                           "channelName": "Fixture A", "nonce": "manual-add-1"})
@@ -334,9 +335,11 @@ seg2.ts
         self.assertEqual(g.spanish_state["entries"][provider]["source"], "manual")
         evidence = {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0, "sampleSeconds": 60.0,
                     "speechCoverage": 0.66, "languages": [{"language": "es", "probability": 0.96}],
-                    "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": 0.4}
+                    "deviceVerified": True, "channelChangedBeforeResult": False, "lexicalMargin": 0.4,
+                    "outcome": "excluded", "visitID": "spanish-visit-b", "launchID": "launch-b",
+                    "streamGeneration": "stream-b"}
         self.assertTrue(g.spanish_auto_commit(self.b, g.sources[self.b], "Fixture B", 0.96,
-                                              "auto:spanish_dominant", evidence)["changed"])
+                                              "auto:spanish_dominant", evidence)["enforced"])
         self.assertIn(g.sources[self.b], g.spanish_provider_ids)
         remove = json.dumps({"schemaVersion": 1, "action": "remove", "channelID": self.a,
                              "channelName": "Fixture A", "nonce": "manual-remove-1"})

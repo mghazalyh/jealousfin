@@ -46,19 +46,23 @@ config_checked_at=0.0
 config_fault=None
 # Manual Spanish classification is a separate membership filter, never a
 # failure/ban/hiatus and never a mutation of rotation or health history.
-SPANISH_REVISION='language-exclusions-v3'
+SPANISH_REVISION='language-exclusions-v4'
 SPANISH_UI_FIELD='spanishRequest'
 SPANISH_UI_NODE='spanish-read'
 SPANISH_FILE=ROOT/'language-exclusions.json'
 LEGACY_SPANISH_FILE=ROOT/'spanish-classification.json'
 spanish_state=spanish_classification.empty()
 spanish_provider_ids=set()
+spanish_manual_provider_ids=set()
+spanish_auto_provider_ids=set()
 spanish_fingerprint=None
 spanish_checked_at=0.0
 SPANISH_AUTO_CONTROL_FILE=ROOT/'language-auto-control.json'
 LEGACY_SPANISH_AUTO_CONTROL_FILE=ROOT/'spanish-auto-control.json'
-SPANISH_AUTO_REVISION='language-auto-control-v1'
-spanish_auto_control=True
+SPANISH_AUTO_REVISION='language-auto-control-v2'
+SPANISH_EVIDENCE_THRESHOLD=language_exclusions.DEFAULT_THRESHOLD
+SPANISH_AUTO_ENFORCEMENT=False
+spanish_auto_control=False
 spanish_auto_control_fingerprint=None
 spanish_auto_control_checked=0.0
 spanish_auto_manager=None
@@ -1472,8 +1476,12 @@ def policy_rows():
  return result
 def policy_eligible(row,now):
  return not row["banned"] and row["hiatusUntil"]<=now
+def _language_membership(state):
+ return (spanish_classification.excluded(state),
+         spanish_classification.manual_excluded(state),
+         spanish_classification.auto_excluded(state))
 def maybe_reload_spanish(force=False):
- global spanish_state,spanish_provider_ids,spanish_fingerprint,spanish_checked_at
+ global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint,spanish_checked_at
  if SOURCE_PROFILE!='american':return
  now=time.monotonic()
  if not force and now-spanish_checked_at<2:return
@@ -1491,16 +1499,22 @@ def maybe_reload_spanish(force=False):
    fingerprint=None
   if state!=spanish_state:
    spanish_state=state
-   spanish_provider_ids=spanish_classification.excluded(state)
-   log('Language exclusions loaded entries='+str(len(spanish_provider_ids)))
+   spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids=_language_membership(state)
+   log('Language exclusions loaded entries='+str(len(spanish_provider_ids))+' manual='+str(len(spanish_manual_provider_ids))+' auto='+str(len(spanish_auto_provider_ids)))
   spanish_fingerprint=fingerprint
  except (ValueError,OSError,TypeError) as error:
   log('Language exclusions ignored '+type(error).__name__)
 def spanish_excluded(cid):
- return SOURCE_PROFILE=='american' and sources.get(cid) in spanish_provider_ids
+ if SOURCE_PROFILE!='american':return False
+ provider=sources.get(cid)
+ if not provider:return False
+ if provider in spanish_manual_provider_ids:return True
+ if not reload_spanish_auto_control():return False
+ return bool(SPANISH_AUTO_ENFORCEMENT and provider in spanish_auto_provider_ids)
 def apply_device_spanish_request(config, device_token):
- global spanish_state,spanish_provider_ids,spanish_fingerprint
+ global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return
+ reload_spanish_auto_control()
  try:
   raw=prototype_selector.device_ui_trigger(config,device_token,SPANISH_UI_NODE)
  except Exception as error:
@@ -1511,28 +1525,37 @@ def apply_device_spanish_request(config, device_token):
  provider_id=sources.get(marker['channelID'])
  try:
   with lock:
-   # Reload under the writer lock so a pending automatic mark can never
-   # clobber a manual add/remove made since the last fingerprint check.
+   # Reload under the writer lock so a pending automatic evidence commit can
+   # never clobber a manual correction made since the last fingerprint check.
    fresh=spanish_classification.load_or_migrate(ROOT)
-   state,changed,reason=spanish_classification.apply_manual(fresh,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
+   if marker['action']=='mistaken_english':
+    state,info=spanish_classification.retract_evidence(
+     fresh,provider_id,marker['channelID'],marker['channelName'],marker['nonce'],
+     threshold=SPANISH_EVIDENCE_THRESHOLD,enforcement=SPANISH_AUTO_ENFORCEMENT)
+    changed=bool(info.get('changed'));reason=str(info.get('reason'))
+   else:
+    state,changed,reason=spanish_classification.apply_manual(fresh,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
    spanish_state=fresh
-   spanish_provider_ids=spanish_classification.excluded(fresh)
+   spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids=_language_membership(fresh)
    if not changed:return
    spanish_classification.atomic_write(ROOT,state)
    spanish_state=state
-   spanish_provider_ids=spanish_classification.excluded(state)
+   spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids=_language_membership(state)
    try:
     stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
    except OSError:spanish_fingerprint=None
  except (ValueError,OSError,TypeError) as error:
   log('Spanish marker rejected '+type(error).__name__)
   return
- log('LANGUAGE_EXCLUSION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
-SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','updatedAt'}
+ log('LANGUAGE_EXCLUSION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids))+' manual='+str(len(spanish_manual_provider_ids))+' auto='+str(len(spanish_auto_provider_ids)))
+SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','enforcementEnabled','threshold','updatedAt'}
+LEGACY_SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','updatedAt'}
+def _control_defaults():
+ return {'schemaVersion':2,'enabled':False,'enforcementEnabled':False,'threshold':language_exclusions.DEFAULT_THRESHOLD,'updatedAt':0}
 def reload_spanish_auto_control(force=False):
- global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
+ global spanish_auto_control,SPANISH_AUTO_ENFORCEMENT,SPANISH_EVIDENCE_THRESHOLD,spanish_auto_control_fingerprint,spanish_auto_control_checked
  if SOURCE_PROFILE!='american':
-  spanish_auto_control=False;return False
+  spanish_auto_control=False;SPANISH_AUTO_ENFORCEMENT=False;return False
  now=time.monotonic()
  if not force and now-spanish_auto_control_checked<2:return spanish_auto_control
  spanish_auto_control_checked=now
@@ -1541,31 +1564,57 @@ def reload_spanish_auto_control(force=False):
   if not path.exists() and LEGACY_SPANISH_AUTO_CONTROL_FILE.exists():
    path=LEGACY_SPANISH_AUTO_CONTROL_FILE
   if not path.exists():
-   spanish_auto_control_fingerprint=None;spanish_auto_control=True;return True
+   # The live detector stays off until observation is explicitly enabled and
+   # the evidence gate has been reviewed on this host.
+   defaults=_control_defaults();spanish_auto_control=False;SPANISH_AUTO_ENFORCEMENT=False;SPANISH_EVIDENCE_THRESHOLD=defaults['threshold']
+   spanish_auto_control_fingerprint=None;return False
   stat=path.stat();fingerprint=(path.name,stat.st_mtime_ns,stat.st_size,stat.st_ino)
   if not force and fingerprint==spanish_auto_control_fingerprint:return spanish_auto_control
   if stat.st_size>4096:raise ValueError('Language auto control too large')
   data=json.loads(path.read_text())
-  if not isinstance(data,dict) or set(data)!=SPANISH_AUTO_CONTROL_KEYS or data.get('schemaVersion')!=1 or type(data.get('enabled')) is not bool or type(data.get('updatedAt')) not in (int,float):raise ValueError('Invalid language auto control')
-  spanish_auto_control_fingerprint=fingerprint;spanish_auto_control=data['enabled']
+  if not isinstance(data,dict):raise ValueError('Invalid language auto control')
+  if set(data)==SPANISH_AUTO_CONTROL_KEYS and data.get('schemaVersion')==2:
+   enabled=data.get('enabled');enforcement=data.get('enforcementEnabled');threshold=data.get('threshold')
+   if type(enabled) is not bool or type(enforcement) is not bool or type(threshold) is not int or not language_exclusions.MIN_THRESHOLD<=threshold<=language_exclusions.MAX_THRESHOLD or type(data.get('updatedAt')) not in (int,float):
+    raise ValueError('Invalid language auto control')
+  elif set(data)==LEGACY_SPANISH_AUTO_CONTROL_KEYS and data.get('schemaVersion')==1:
+   if type(data.get('enabled')) is not bool or type(data.get('updatedAt')) not in (int,float):raise ValueError('Invalid language auto control')
+   enabled=data['enabled'];enforcement=False;threshold=language_exclusions.DEFAULT_THRESHOLD
+  else:
+   raise ValueError('Invalid language auto control')
+  spanish_auto_control_fingerprint=fingerprint
+  spanish_auto_control=enabled;SPANISH_AUTO_ENFORCEMENT=enforcement;SPANISH_EVIDENCE_THRESHOLD=threshold
  except (ValueError,OSError,TypeError) as error:
-  # Fail closed for new automatic marks; existing exclusions are untouched.
-  spanish_auto_control=False;spanish_auto_control_fingerprint=None
+  # Fail closed for observation and enforcement; existing evidence and manual
+  # decisions are untouched.
+  spanish_auto_control=False;SPANISH_AUTO_ENFORCEMENT=False;SPANISH_EVIDENCE_THRESHOLD=language_exclusions.DEFAULT_THRESHOLD;spanish_auto_control_fingerprint=None
   log('Language auto control ignored '+type(error).__name__)
  return spanish_auto_control
-def set_spanish_auto_enabled(enabled):
- global spanish_auto_control,spanish_auto_control_fingerprint,spanish_auto_control_checked
+def set_language_auto_control(enabled=None,enforcement=None,threshold=None):
+ global spanish_auto_control,SPANISH_AUTO_ENFORCEMENT,SPANISH_EVIDENCE_THRESHOLD,spanish_auto_control_fingerprint,spanish_auto_control_checked
  if SOURCE_PROFILE!='american':raise ValueError('Language auto is English-trial only')
- if type(enabled) is not bool:raise ValueError('Invalid language auto control')
- control={'schemaVersion':1,'enabled':enabled,'updatedAt':time.time()}
+ reload_spanish_auto_control(force=True)
+ current_enabled=bool(spanish_auto_control);current_enforcement=bool(SPANISH_AUTO_ENFORCEMENT);current_threshold=int(SPANISH_EVIDENCE_THRESHOLD)
+ if enabled is not None:
+  if type(enabled) is not bool:raise ValueError('Invalid language auto control')
+  current_enabled=enabled
+ if enforcement is not None:
+  if type(enforcement) is not bool:raise ValueError('Invalid language enforcement control')
+  current_enforcement=enforcement
+ if threshold is not None:
+  if type(threshold) is not int or not language_exclusions.MIN_THRESHOLD<=threshold<=language_exclusions.MAX_THRESHOLD:raise ValueError('Invalid language evidence threshold')
+  current_threshold=threshold
+ control={'schemaVersion':2,'enabled':current_enabled,'enforcementEnabled':current_enforcement,'threshold':current_threshold,'updatedAt':time.time()}
  atomic_json(SPANISH_AUTO_CONTROL_FILE,control)
- spanish_auto_control=enabled;spanish_auto_control_checked=time.monotonic()
+ spanish_auto_control=current_enabled;SPANISH_AUTO_ENFORCEMENT=current_enforcement;SPANISH_EVIDENCE_THRESHOLD=current_threshold;spanish_auto_control_checked=time.monotonic()
  try:
   stat=SPANISH_AUTO_CONTROL_FILE.stat();spanish_auto_control_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
  except OSError:spanish_auto_control_fingerprint=None
  if spanish_auto_manager is not None:spanish_auto_manager.refresh_control()
- log('LANGUAGE_AUTO_CONTROL enabled='+str(enabled))
+ log('LANGUAGE_AUTO_CONTROL enabled='+str(current_enabled)+' enforcement='+str(current_enforcement)+' threshold='+str(current_threshold))
  return control
+def set_spanish_auto_enabled(enabled):
+ return set_language_auto_control(enabled=enabled)
 MAINTENANCE_KEYS={'schemaVersion','start','until','reason','launchID','channelID','allowedReasons'}
 def maintenance_window(force=False):
  global maintenance_state,maintenance_fingerprint,maintenance_checked_at
@@ -1639,20 +1688,37 @@ def device_language_probe():
   except Exception:pass
  return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration',''))}
 def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence):
- global spanish_state,spanish_provider_ids,spanish_fingerprint
+ global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
  if sources.get(cid)!=provider:return {'changed':False,'reason':'unknown_provider'}
+ if not reload_spanish_auto_control():return {'changed':False,'reason':'observation_disabled'}
+ payload=evidence if isinstance(evidence,dict) else {}
+ outcome=payload.get('outcome','excluded')
+ if outcome not in language_exclusions.OUTCOMES:return {'changed':False,'reason':'inconclusive'}
+ if payload.get('deviceVerified') is not True:return {'changed':False,'reason':'device_unverified'}
+ if payload.get('channelChangedBeforeResult') is True:return {'changed':False,'reason':'stale_channel_changed'}
+ window=maintenance_window()
+ if window is not None:
+  now=time.time()
+  if window['start']<=now<=window['until'] and (not window.get('channelID') or window['channelID']==cid):
+   return {'changed':False,'reason':'maintenance'}
  try:
   with lock:
    fresh=spanish_classification.load_or_migrate(ROOT)
-   state,changed,why=spanish_classification.apply_auto(fresh,provider,cid,name,language,language_name,confidence,reason,evidence)
-   if changed:spanish_classification.atomic_write(ROOT,state)
-   spanish_state=state;spanish_provider_ids=spanish_classification.excluded(state)
+   state,info=spanish_classification.record_evidence(
+    fresh,provider,cid,name,language,language_name,confidence,reason,payload,
+    outcome=outcome,visit_id=payload.get('visitID',''),launch_id=payload.get('launchID',''),
+    stream_generation=payload.get('streamGeneration',''),
+    threshold=SPANISH_EVIDENCE_THRESHOLD,enforcement=SPANISH_AUTO_ENFORCEMENT)
+   if info.get('changed'):spanish_classification.atomic_write(ROOT,state)
+   spanish_state=state
+   spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids=_language_membership(state)
    try:
     stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
    except OSError:spanish_fingerprint=None
-  if changed:log('LANGUAGE_EXCLUSION_ADD language='+language+' provider='+provider+' channel='+cid)
-  return {'changed':changed,'reason':why}
+  if info.get('enforced'):log('LANGUAGE_EVIDENCE_ENFORCED language='+language+' provider='+provider+' channel='+cid+' count='+str(info.get('count'))+' threshold='+str(info.get('threshold')))
+  elif info.get('changed'):log('LANGUAGE_EVIDENCE language='+language+' provider='+provider+' channel='+cid+' outcome='+outcome+' count='+str(info.get('count'))+' threshold='+str(info.get('threshold')))
+  return info
  except (ValueError,OSError,TypeError) as error:
   log('Language auto commit rejected '+type(error).__name__)
   return {'changed':False,'reason':'commit_'+type(error).__name__}
@@ -1662,15 +1728,17 @@ def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
 def spanish_auto_status():
  try:description=spanish_classification.describe(spanish_state)
  except (ValueError,TypeError):description={'entries':len(spanish_provider_ids)}
+ control={'enabled':bool(reload_spanish_auto_control()),'enforcementEnabled':bool(SPANISH_AUTO_ENFORCEMENT),'threshold':int(SPANISH_EVIDENCE_THRESHOLD),'revision':SPANISH_AUTO_REVISION}
  if SOURCE_PROFILE!='american' or spanish_auto_manager is None:
-  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':'not_started','classification':description}
+  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':'not_started','classification':description,'control':control}
  try:status=spanish_auto_manager.status()
  except Exception as error:
-  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':type(error).__name__,'classification':description}
- status['classification']=description
+  return {'revision':spanish_audio.REVISION,'enabled':False,'active':False,'fault':type(error).__name__,'classification':description,'control':control}
+ status['classification']=description;status['control']=control
  return status
 def spanish_auto_admin():
- return {'control':{'enabled':bool(reload_spanish_auto_control(force=True)),'file':SPANISH_AUTO_CONTROL_FILE.name},'status':spanish_auto_status()}
+ control={'enabled':bool(reload_spanish_auto_control(force=True)),'enforcementEnabled':bool(SPANISH_AUTO_ENFORCEMENT),'threshold':int(SPANISH_EVIDENCE_THRESHOLD),'revision':SPANISH_AUTO_REVISION,'file':SPANISH_AUTO_CONTROL_FILE.name}
+ return {'control':control,'status':spanish_auto_status()}
 language_excluded=spanish_excluded
 maybe_reload_languages=maybe_reload_spanish
 apply_device_language_request=apply_device_spanish_request
@@ -1929,8 +1997,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     if not 0<n<=4096:return self.reply(400,{})
     try:data=json.loads(self.rfile.read(n))
     except (ValueError,TypeError):return self.reply(400,{})
-    if not isinstance(data,dict) or set(data)!={'enabled'} or type(data.get('enabled')) is not bool:return self.reply(400,{})
-    try:set_spanish_auto_enabled(data['enabled'])
+    allowed={'enabled','enforcementEnabled','threshold'}
+    if not isinstance(data,dict) or not data or not set(data).issubset(allowed):return self.reply(400,{})
+    try:set_language_auto_control(enabled=data.get('enabled'),enforcement=data.get('enforcementEnabled'),threshold=data.get('threshold'))
     except (ValueError,OSError,TypeError):return self.reply(503,{})
     return self.reply(200,spanish_auto_admin())
    return self.reply(405,{})
