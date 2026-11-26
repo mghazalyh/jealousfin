@@ -675,6 +675,56 @@ class GatewayAcceptance(unittest.TestCase):
         g.programme_rows[self.c]['title']='Other series'
         self.assertNotIn('episodeTitle',g.programme_snapshot(now)[self.c])
 
+    def test_physical_playback_activity_is_distinct_from_resource_protection(self):
+        import programme_research
+        g=self.g
+        class Clock:
+            value=1000.0
+            def __call__(self):return self.value
+        clock=Clock()
+        g.playback_activity=programme_research.ActiveViewing(active_seconds=30,stale_seconds=45,clock=clock)
+        with patch.object(g,'resolve',return_value='https://fixture.invalid/live.m3u8'),patch.object(g,'register',return_value='/media/fixture-token/test.m3u8'):
+            status,body=self.req('/Items/'+self.c+'/PlaybackInfo',{})
+            self.assertEqual(status,200)
+            play_id=body['PlaySessionId']
+            self.assertIn(self.c,g.active_channels)
+            def report(action,ticks,paused=False):
+                path='/Sessions/Playing' if action=='start' else '/Sessions/Playing/'+action
+                return self.req(path,{'ItemId':self.c,'MediaSourceId':self.c,'PlaySessionId':play_id,'PositionTicks':ticks,'IsPaused':paused})
+            self.assertEqual(report('start',0)[0],200)
+            for index in range(1,5):
+                clock.value+=15
+                self.assertEqual(report('Progress',index*15*10_000_000)[0],200)
+            self.assertGreaterEqual(g.playback_activity.views()[self.c].active_seconds,30)
+            self.assertEqual(report('Progress',60*10_000_000,paused=True)[0],200)
+            self.assertNotIn(self.c,g.playback_activity.views())
+            clock.value+=15
+            self.assertEqual(report('Progress',75*10_000_000)[0],200)
+            clock.value+=15
+            self.assertEqual(report('Progress',90*10_000_000)[0],200)
+            self.assertEqual(report('Stopped',90*10_000_000)[0],200)
+            self.assertNotIn(self.c,g.playback_activity.views())
+            self.assertIn('activeViewing',self.req('/trial-status')[1]['metadataResearch'])
+            self.assertFalse(self.req('/trial-status')[1]['episodeAudio']['enabled'])
+
+    def test_researched_episode_passthrough_never_uses_series_premiere_year(self):
+        g=self.g
+        now=time.time()
+        g.channels[self.c]['Name']='JAG'
+        g.sources[self.c]='nltv:us:JAG.us'
+        g.gateway_config=dict(g.gateway_config,metadataResearchEnabled=True)
+        g.discovery.verified[self.c]={'title':'JAG','source':'corroborated-external-schedule','observedAt':now,
+            'start':now-60,'end':now+600,'episodeTitle':'Silent Service','seasonNumber':4,'episodeNumber':16,'seasonYear':1998}
+        row=g.programme_snapshot(now)[self.c]
+        item=g.programme_item(self.c,row)
+        self.assertEqual(item['Name'],'Scheduled: S04E16: Silent Service (1998)')
+        self.assertEqual(item['JealousfinProgramme']['seasonYear'],1998)
+        self.assertNotEqual(item.get('ProductionYear'),1995)
+        g.discovery.verified[self.c]={'title':'JAG','source':'corroborated-external-schedule','observedAt':now,
+            'start':now-60,'end':now+600,'year':1995}
+        item=g.programme_item(self.c,g.programme_snapshot(now)[self.c])
+        self.assertEqual(item['Name'],'Scheduled: JAG')
+
     def test_active_resource_protection(self):
         g=self.g
         g.RESOURCE_LIMIT=2

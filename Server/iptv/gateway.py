@@ -3,7 +3,9 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from contextlib import closing
 import regional_guide
+import episode_audio
 import opencode_discovery
+import programme_research
 import source_profiles
 import prototype_selector
 import language_exclusions
@@ -635,6 +637,8 @@ regional_programme=None
 regional_fault=None
 regional_observed_at=0.0
 discovery=opencode_discovery.Discovery(ROOT/'opencode-discovery.json')
+playback_activity=programme_research.ActiveViewing()
+research_coordinator=programme_research.ResearchCoordinator()
 year_cache=OrderedDict()
 YEAR_CACHE_FILE=ROOT/'programme-years.json'
 YEAR_CACHE_LIMIT=2048
@@ -1128,10 +1132,12 @@ def fetch_discovery_page(url):
 
 def discovery_worker(stop):
  # Normal bounded gateway worker; not an external scheduled task.
- while not stop.wait(15):
+ while not stop.wait(10):
+  plan=None
   try:
    reload_gateway_config()
    if not gateway_config['metadataResearchEnabled'] or not opencode_discovery.available():continue
+   if discovery.in_flight:continue
    now=time.time()
    with lock:
     if not 0<=now-max(programme_observed_at,paged_last_success)<=PROGRAMME_MAX_AGE:continue
@@ -1139,50 +1145,64 @@ def discovery_worker(stop):
     known=programme_snapshot(now)
     active={cid for cid,until in active_channels.items() if until>time.monotonic()}
     missing={cid for cid in channels if cid not in known and sources.get(cid) and opencode_discovery.supported_region(sources[cid])}
-    recheck=discovery.choose_recheck(missing,active,now)
-    cid=recheck or discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
+    views=playback_activity.views()
+    plan=research_coordinator.choose_active(missing,views,now,gateway_config['metadataResearchVariant'],discovery.records)
+    recheck=None if plan else discovery.choose_recheck(missing,active,now)
+    cid=plan.channel_id if plan else (recheck or discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget']))
     if not cid:continue
     channel=channels[cid]['Name'];provider_id=sources[cid]
-    model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds'];variant=gateway_config['metadataResearchVariant']
+    model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
+    variant=plan.variant if plan else gateway_config['metadataResearchVariant']
     if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
     if recheck:
      discovery.rechecked[cid]=now
      previous=dict(discovery.records[cid]['candidate'])
     else:
-     discovery.calls.append(now)
+     if plan:discovery.active_calls=(discovery.active_calls+[now])[-128:]
+     else:discovery.calls.append(now)
      discovery.records[cid]={'at':now,'outcome':'started','candidate':opencode_discovery.normalize_result({})}
      discovery.save(atomic_json)
     discovery.in_flight=True
    try:
     if recheck:
-     candidate=previous
+     candidate=previous;diagnostics=None
     else:
      started=time.monotonic()
      try:
-      raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout,variant)
+      prompt=opencode_discovery.prompt_for(channel,provider_id,now,variant,
+              plan.attempt if plan else 1,
+              discovery.records.get(cid,{}).get('candidate',{}).get('title') if plan else None)
+      raw,diagnostics=opencode_discovery.run_model_detailed(prompt,model,timeout,variant)
      finally:
       with lock:discovery.last_run={'variant':variant,'seconds':round(time.monotonic()-started,3),'channelID':cid,'at':time.time()}
      candidate=opencode_discovery.normalize_result(raw)
     checked_at=time.time()
-    row=opencode_discovery.verify_candidate(candidate,channel,provider_id,checked_at,fetch_discovery_page,match_title=not recheck)
+    row,verification=opencode_discovery.verify_candidate_detailed(candidate,channel,provider_id,checked_at,fetch_discovery_page,match_title=not recheck)
+    with lock:
+     discovery.last_tool_diagnostics=diagnostics
+     discovery.last_verification=verification
     if recheck and not row:
      # Source pages may be date-specific; return to budgeted research.
      with lock:
       discovery.records[cid]['outcome']='unverified'
       discovery.save(atomic_json)
      continue
+    outcome='verified' if row else 'unverified' if candidate['title'] else 'missing'
     if row:candidate=dict(candidate,title=row['title'],year=None)
     with lock:
-     discovery.records[cid]={'at':now,'outcome':'verified' if row else 'unverified' if candidate['title'] else 'missing','candidate':candidate}
+     discovery.records[cid]={'at':now,'outcome':outcome,'candidate':candidate}
      if row and gateway_config['metadataResearchEnabled']:discovery.verified[cid]=row
      discovery.last_fault=None
      discovery.save(atomic_json)
+     if plan:research_coordinator.record(plan,outcome,now)
     log('programme research '+('verified' if row else 'lead only' if candidate['title'] else 'no evidence')+' channel='+cid)
    except Exception as error:
     with lock:
      discovery.last_fault=type(error).__name__
+     discovery.last_tool_diagnostics=getattr(error,'diagnostics',None) or {'error':type(error).__name__}
      discovery.records[cid]['outcome']='error'
      discovery.save(atomic_json)
+     if plan:research_coordinator.record(plan,'error',time.time())
     log('programme research failed '+type(error).__name__)
    finally:
     with lock:discovery.in_flight=False
@@ -1194,7 +1214,7 @@ def discovery_status():
  with lock:
   now=time.time();known=programme_snapshot(now)
   missing=[cid for cid in channels if cid not in known and sources.get(cid)]
-  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],variant=gateway_config['metadataResearchVariant'],lastRun=discovery.last_run,missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
+  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],variant=gateway_config['metadataResearchVariant'],lastRun=discovery.last_run,missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing),activeViewing=playback_activity.diagnostics(),activeResearch=research_coordinator.diagnostics(now))
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
@@ -1989,7 +2009,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    try:language_description=spanish_classification.describe(spanish_state)
    except (ValueError,TypeError):language_description={'entries':len(spanish_provider_ids)}
    language_status=spanish_auto_status()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
@@ -2024,6 +2044,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
       correlation=resource_correlation.get(rid,correlation)
    if not entry:return self.reply(404,{})
    cid,url=entry
+   playback_activity.touch(cid)
    started=time.monotonic();kind='segment' if rid in segment_resources else 'other'
    try:
     rg=self.headers.get('Range')
@@ -2084,6 +2105,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     if cid not in channels or not isinstance(trace,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',trace) or not isinstance(reason,str) or len(reason)>512:raise ValueError("Invalid event")
     if action=='approve' and d.get('approval')!='explicit':return self.reply(403,{})
     policy_event(cid,trace,action,reason)
+    if action in ('failure','success'):playback_activity.correlate_trace(cid,trace)
     return self.reply(200,policy_payload(policy_rows()))
    except (KeyError,ValueError,TypeError):return self.reply(400,{})
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
@@ -2119,11 +2141,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if spanish_excluded(cid) or not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
-   return self.reply(200,{'PlaySessionId':uuid.uuid4().hex,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
+   play_id=uuid.uuid4().hex
+   playback_activity.issue(cid,play_id)
+   playback_activity.touch(cid)
+   return self.reply(200,{'PlaySessionId':play_id,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
   if path.startswith('/Sessions/Playing') or path=='/LiveStreams/Close':
    n=int(self.headers.get('Content-Length','0'))
    if n>262144:return self.reply(413,{})
-   if n:self.rfile.read(n)
+   payload=None
+   if n:
+    try:payload=json.loads(self.rfile.read(n))
+    except (ValueError,TypeError):payload=None
+   action={'/Sessions/Playing':'start','/Sessions/Playing/Progress':'progress','/Sessions/Playing/Stopped':'stop'}.get(path)
+   report=programme_research.parse_playback_report(payload,action) if action else None
+   if report and report['channelID'] in channels:playback_activity.observe(report,wall=time.time())
    return self.reply(200,{})
   m=re.fullmatch(r'/Users/[^/]+/FavoriteItems/([a-f0-9]{32})',path)
   if m and m[1] in channels:
