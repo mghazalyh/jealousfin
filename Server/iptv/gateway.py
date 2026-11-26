@@ -33,7 +33,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
-                 'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':75}
+                 'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -61,7 +61,7 @@ def validate_gateway_config(raw):
  if not isinstance(result['metadataResearchModel'],str) or not opencode_discovery.MODEL_RE.fullmatch(result['metadataResearchModel']):raise ValueError('Invalid research model')
  # Legacy quota settings are accepted but ignored; research has no daily cap.
  result['metadataResearchDailyBudget']=None
- for key,lo,hi in [('metadataResearchTimeoutSeconds',10,90)]:
+ for key,lo,hi in [('metadataResearchTimeoutSeconds',10,300)]:
   if type(result[key]) is not int or not lo<=result[key]<=hi:raise ValueError('Invalid '+key)
  if result['activeProtectionSeconds']>result['resourceTTLSeconds']:raise ValueError('Protection exceeds resource TTL')
  if result['sourceSelection'] not in ('round-robin','preferred-first','first'):raise ValueError('Unknown selection strategy')
@@ -1002,7 +1002,7 @@ def discovery_status():
  with lock:
   now=time.time();known=programme_snapshot(now)
   missing=[cid for cid in channels if cid not in known and sources.get(cid)]
-  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
+  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now

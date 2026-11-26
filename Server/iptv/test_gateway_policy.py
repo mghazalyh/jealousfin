@@ -199,6 +199,11 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertTrue(g.reload_gateway_config(force=True))
         self.assertEqual(g.RESOURCE_LIMIT,700)
         self.assertIsNone(g.config_fault)
+        self.assertEqual(g.validate_gateway_config({})['metadataResearchTimeoutSeconds'],180)
+        self.assertEqual(g.validate_gateway_config({'metadataResearchTimeoutSeconds':180})['metadataResearchTimeoutSeconds'],180)
+        with self.assertRaises(ValueError):g.validate_gateway_config({'metadataResearchTimeoutSeconds':301})
+        self.assertIsNone(g.validate_gateway_config({'metadataResearchDailyBudget':12})['metadataResearchDailyBudget'])
+        self.assertEqual(self.req('/trial-status')[1]['metadataResearch']['timeoutSeconds'],180)
 
     def test_favorites_persist(self):
         g=self.g
