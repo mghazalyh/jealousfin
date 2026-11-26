@@ -184,12 +184,12 @@ class Discovery:
                     self.records[cid]={"at":row["at"],"outcome":clean(row.get("outcome"),50),"candidate":normalize_result(row.get("candidate",{}))}
         except FileNotFoundError:pass
         except (OSError,ValueError,TypeError,KeyError):
-            self.calls=[time.time()]*128;self.last_fault="Discovery cache invalid"
+            self.calls=[time.time()];self.last_fault="Discovery cache invalid"
     def save(self,atomic_write):
         atomic_write(self.path,{"calls":self.calls[-128:],"records":self.records})
     def choose(self,missing,active,now,budget):
         self.calls=[t for t in self.calls if t>now-86400]
-        if self.in_flight or len(self.calls)>=budget or (self.calls and now-max(self.calls)<INTERVAL):return None
+        if self.in_flight or (self.calls and now-max(self.calls)<INTERVAL):return None
         choices=[cid for cid in missing if now-self.records.get(cid,{}).get("at",0)>=(MAX_AGE if self.records.get(cid,{}).get("outcome")=="verified" else CHANNEL_RETRY)]
         return min(choices,key=lambda cid:(0 if cid in active else 1,self.records.get(cid,{}).get("at",0),cid),default=None)
     def choose_recheck(self,missing,active,now):
@@ -202,5 +202,5 @@ class Discovery:
                 if 0<=now-row["observedAt"]<=MAX_AGE and row["start"]<=now<row["end"]}
     def status(self,now,budget):
         return {"available":available(),"inFlight":self.in_flight,"callsLast24Hours":sum(t>now-86400 for t in self.calls),
-                "dailyBudget":budget,"researchedChannels":len(self.records),"verifiedCurrent":len(self.snapshot(now)),
+                "dailyBudget":None,"researchedChannels":len(self.records),"verifiedCurrent":len(self.snapshot(now)),
                 "unverifiedLeads":sum(r["outcome"]=="unverified" for r in self.records.values()),"lastFault":self.last_fault}

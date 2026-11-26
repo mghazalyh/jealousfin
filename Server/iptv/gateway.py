@@ -33,7 +33,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
-                 'metadataResearchDailyBudget':12,'metadataResearchTimeoutSeconds':75}
+                 'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':75}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -59,7 +59,9 @@ def validate_gateway_config(raw):
   if type(value) is not int or not lo<=value<=hi:raise ValueError('Invalid '+key)
  if type(result['metadataResearchEnabled']) is not bool:raise ValueError('Invalid metadata research toggle')
  if not isinstance(result['metadataResearchModel'],str) or not opencode_discovery.MODEL_RE.fullmatch(result['metadataResearchModel']):raise ValueError('Invalid research model')
- for key,lo,hi in [('metadataResearchDailyBudget',1,48),('metadataResearchTimeoutSeconds',10,90)]:
+ # Legacy quota settings are accepted but ignored; research has no daily cap.
+ result['metadataResearchDailyBudget']=None
+ for key,lo,hi in [('metadataResearchTimeoutSeconds',10,90)]:
   if type(result[key]) is not int or not lo<=result[key]<=hi:raise ValueError('Invalid '+key)
  if result['activeProtectionSeconds']>result['resourceTTLSeconds']:raise ValueError('Protection exceeds resource TTL')
  if result['sourceSelection'] not in ('round-robin','preferred-first','first'):raise ValueError('Unknown selection strategy')

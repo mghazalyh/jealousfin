@@ -39,7 +39,7 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(d.supported_region("nltv:sg:Fixture.sg"))
         self.assertFalse(d.supported_region("nltv:my:Fixture.my"))
         self.assertFalse(d.supported_region("nltv:id:Fixture.id"))
-    def test_persistent_budget(self):
+    def test_persistent_cooldown_without_daily_quota(self):
         with tempfile.TemporaryDirectory() as work:
             p=pathlib.Path(work)/"research.json";now=time.time();a,b="a"*32,"b"*32
             state=d.Discovery(p);self.assertEqual(state.choose({a,b},{b},now,12),b)
@@ -48,8 +48,13 @@ class ResearchTests(unittest.TestCase):
             state.save(lambda path,data:path.write_text(json.dumps(data)))
             restored=d.Discovery(p)
             self.assertEqual(restored.choose({a,b},{b},now+901,12),a)
-            self.assertIsNone(restored.choose({a,b},{b},now+901,1))
-            p.write_text("corrupt");self.assertIsNone(d.Discovery(p).choose({a,b},{b},now+901,12))
+            self.assertEqual(restored.choose({a,b},{b},now+901,1),a)
+            restored.calls=[now-1800]*100
+            self.assertEqual(restored.choose({a,b},{b},now+901,12),a)
+            self.assertIsNone(restored.status(now+901,12)['dailyBudget'])
+            p.write_text("corrupt");corrupt=d.Discovery(p)
+            self.assertIsNone(corrupt.choose({a,b},{b},time.time()+60,12))
+            self.assertEqual(corrupt.choose({a,b},{b},time.time()+901,12),b)
     def test_unverified_does_not_publish(self):
         with tempfile.TemporaryDirectory() as work:
             s=d.Discovery(pathlib.Path(work)/"research.json")
