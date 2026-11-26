@@ -11,6 +11,7 @@ Spanish mark; it never removes a mark, never overrides a manual decision and
 never mutates rotation, policy, hiatus, Favorites or playback history.
 """
 import array
+import hashlib
 import json
 import math
 import os
@@ -187,6 +188,16 @@ def decode_audio(data, map_data, ffmpeg, tmpdir, timeout=DECODE_TIMEOUT):
             "-t", str(MAX_DECODE_SECONDS), "-f", "s16le", "-",
         ]
         completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout)
+        if completed.returncode != 0 or not completed.stdout:
+            # Some providers start a segment mid-stream or use a sparse header.
+            # Retry once with permissive demuxing; still local, still bounded.
+            command = [
+                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts",
+                "-err_detect", "ignore_err", "-probesize", "32M", "-analyzeduration", "32M",
+                "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE),
+                "-t", str(MAX_DECODE_SECONDS), "-f", "s16le", "-",
+            ]
+            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout)
         if completed.returncode != 0:
             return b""
         return completed.stdout[:int(MAX_DECODE_SECONDS * BYTES_PER_SECOND)]
@@ -384,6 +395,7 @@ class Manager:
         self._last_media = 0.0
         self._tmpdir = None
         self._last_persist = 0.0
+        self._diag_written = False
         self._sweep_stale()
         self.fault = self._check_tools()
         self.telemetry = self._load_state()
@@ -600,9 +612,11 @@ class Manager:
         if event["rid"] in base.seen:
             return
         base.seen.add(event["rid"])
-        pcm = decode_audio(event["data"], self._maps.get(event["base"]), self.ffmpeg, self._tmpdir)
+        map_data = self._maps.get(event["base"])
+        pcm = decode_audio(event["data"], map_data, self.ffmpeg, self._tmpdir)
         if not pcm:
             base.failures += 1
+            self._write_diagnostic(event, map_data)
             with self._lock:
                 self.telemetry["counters"]["segmentsRejected"] += 1
             return
@@ -618,6 +632,38 @@ class Manager:
         if base.seconds >= TARGET_SECONDS:
             self._finalize(event["cid"], "target_reached")
         self._update_current()
+
+    def _write_diagnostic(self, event, map_data):
+        """Capture one bounded, credential-free sample for local diagnosis.
+
+        It contains only media bytes (no URL, key or credential) and is meant
+        to be inspected and deleted. Status exposes only size/magic metadata.
+        """
+        if self._diag_written:
+            return
+        self._diag_written = True
+        try:
+            base = Path(tempfile.gettempdir()) / "jf-spanish-decode-diag"
+            base.mkdir(mode=0o700, exist_ok=True)
+            sample = base / "segment.bin"
+            sample.write_bytes(event["data"][:262144])
+            os.chmod(sample, 0o600)
+            head = event["data"][:16]
+            meta = {
+                "at": round(time.time(), 3), "size": len(event["data"]),
+                "magicHex": head.hex(),
+                "magicAscii": "".join(chr(value) if 32 <= value < 127 else "." for value in head),
+                "contentType": str(event.get("contentType", ""))[:80],
+                "hasMap": bool(map_data), "mapSize": len(map_data or b""),
+                "isAudio": bool(event.get("is_audio")),
+                "baseHash": hashlib.sha256(event["base"].encode("utf-8", "replace")).hexdigest()[:16],
+            }
+            (base / "meta.json").write_text(json.dumps(meta, separators=(",", ":")))
+            with self._lock:
+                self.telemetry["diagnostic"] = meta
+            self.log("Spanish auto decode diagnostic size=%d magic=%s" % (meta["size"], meta["magicAscii"]))
+        except OSError:
+            pass
 
     def _housekeeping(self):
         now = time.time()
@@ -889,5 +935,6 @@ class Manager:
             "pending": current is not None or bool(self._jobs and self._jobs.qsize()),
             "current": current,
             "last": last,
+            "diagnostic": self.telemetry.get("diagnostic"),
             "lastMediaAt": round(last_media, 3) if last_media else None,
         }
