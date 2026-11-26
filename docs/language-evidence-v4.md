@@ -95,21 +95,26 @@ requests a catalogue refresh. The gateway:
 5. never creates a permanent allow decision and never issues play/pause/stop/
    next/previous/resume/reload/rotation commands.
 
-A repeated nonce is idempotent. A manual Spanish entry is never retracted.
+A repeated nonce is idempotent. A correction always targets the latest excluded
+event only: if that event was already retracted, a fresh nonce returns
+`already_corrected` and never walks backwards to older evidence. A manual
+Spanish entry is never retracted.
 
 ## Hotpatch overlay
 
 `Examples/language-evidence-overlay-20261127.json` is a normal dynamic UI
-layout revision. It uses existing slots and the existing `script`/`ui_set_value`/
-`refresh_catalogue` commands. It displays the current channel, source and pause
-state, and the correction control. It never resumes a manually paused stream,
-advances, reloads or resets rotation.
+layout revision. The release integration uses the bridge revision
+`language-evidence-overlay-bridge-20261127`, which preserves the deployed
+English/Malay switcher, the Spanish mark/unmark actions and the Mistaken English
+correction. A hidden editable `input` and a native `text` node share
+`form.languageOverlay`; the gateway bridge writes that one field through the
+existing authorized `ui_set_value` command. It never resumes a manually paused
+stream, advances, reloads or resets rotation.
 
 ### Exact overlay capability blocker
 
-The current hotpatch UI ABI cannot display the gateway detector's actual
-current-channel language, count, threshold, sampling/inconclusive phase or
-confidence:
+The current hotpatch UI ABI still cannot let the overlay read the gateway
+detector directly:
 
 - `AppModel.stateSnapshot()` has no language/evidence field. It exposes only
   `gatewayPolicyRevision`, `gatewayPolicyChannels` and poll time.
@@ -122,12 +127,15 @@ confidence:
 - Adding a snapshot field, a native command or relaxing the CSP would require
   native Swift/release work, which this lane is explicitly not allowed to do.
 
-The overlay therefore renders the actual channel/source/pause state and shows
-the exact blocker text when `state.languageEvidence` is absent. If a future
-host build exposes that object, the same overlay displays language name,
-count/threshold, phase and confidence without another layout change. Full
-language/evidence readback is available now at the loopback endpoints:
-`GET /language-auto` and `GET /trial-status` (`languageAuto.classification`).
+The release integration avoids native changes by pushing one bounded label into
+the supported hidden form field. The label always includes the observation
+timestamp and channel name, plus language, count/threshold, phase and
+confidence when available. Because the binding cannot compare channel IDs, the
+gateway suppresses evidence for another channel or stream generation before
+each push. If a future host build exposes a language snapshot object, the same
+overlay can render it without another layout change. Full language/evidence
+readback is available now at the loopback endpoints: `GET /language-auto` and
+`GET /trial-status` (`languageAuto.classification`, `overlay`).
 
 ## Staged rollout
 

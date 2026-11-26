@@ -610,6 +610,12 @@ class LanguageEvidenceGateTests(unittest.TestCase):
         self.assertFalse(info["changed"])
         self.assertEqual(info["reason"], "replayed_nonce")
         self.assertEqual(replay, state)
+        same_latest, info = language_exclusions.retract_evidence(
+            state, provider, channel, "A", "mistake-fresh-nonce", now=22,
+            threshold=2, enforcement=True)
+        self.assertFalse(info["changed"])
+        self.assertEqual(info["reason"], "already_corrected")
+        self.assertEqual(language_exclusions.counts_for(same_latest, channel, "es"), 1)
         state, info = self.event(state, channel, "es", "Spanish", "v-2", "l-2", 30,
                                  threshold=2, enforcement=True)
         self.assertTrue(info["enforced"])
@@ -694,6 +700,7 @@ class LanguageEvidenceGateTests(unittest.TestCase):
                 walk(node.get("children", []))
         for slot in layout["slots"]:
             self.assertIn(slot["location"], {
+                "player.fullscreen.category", "player.fullscreen.controls",
                 "player.fullscreen.top", "player.fullscreen.bottom", "more.bottom"})
             walk(slot["nodes"])
         commands = {node.get("action", {}).get("command") for node in nodes if node.get("action")}
@@ -702,13 +709,21 @@ class LanguageEvidenceGateTests(unittest.TestCase):
                      "seek_live", "seek_relative", "open_channel"}
         self.assertFalse(commands & forbidden)
         html = " ".join(node.get("html", "") for node in nodes)
-        self.assertIn("mistaken_english", html)
-        self.assertIn("ui_set_value", html)
-        self.assertIn("refresh_catalogue", html)
+        sources = " ".join(node.get("action", {}).get("arguments", {}).get("source", "")
+                           for node in nodes if node.get("action"))
+        self.assertIn("mistaken_english", sources)
+        self.assertIn("ui_set_value", sources)
+        self.assertIn("refresh_catalogue", sources)
         self.assertIn("surfPaused", html)
         self.assertNotIn("fetch(", html)
         self.assertNotIn("XMLHttpRequest", html)
         self.assertNotIn("next_channel", html)
+        hidden = next(node for node in nodes if node["id"] == "language-overlay-value")
+        label = next(node for node in nodes if node["id"] == "language-evidence")
+        self.assertEqual(hidden["kind"], "input")
+        self.assertEqual(label["kind"], "text")
+        self.assertEqual(hidden["valueKey"], label["valueKey"])
+        self.assertEqual(hidden["valueKey"], "form.languageOverlay")
 
 
 class LanguageRealtimeFixtureTests(unittest.TestCase):

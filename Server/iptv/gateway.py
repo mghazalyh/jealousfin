@@ -1,4 +1,4 @@
-import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import datetime, email.utils, gzip, io, xml.etree.ElementTree as ET, http.client, sqlite3, base64, concurrent.futures, hashlib, hmac, http.server, ipaddress, json, os, queue, re, secrets, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 from contextlib import closing
@@ -10,6 +10,7 @@ import source_profiles
 import prototype_selector
 import language_exclusions
 import language_audio
+import overlay_bridge
 spanish_classification=language_exclusions
 spanish_audio=language_audio
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
@@ -68,6 +69,14 @@ spanish_auto_control=False
 spanish_auto_control_fingerprint=None
 spanish_auto_control_checked=0.0
 spanish_auto_manager=None
+# The overlay publisher is additive: it only writes the existing hidden
+# languageOverlay form field through the authorized device command transport.
+overlay_bridge_state=None
+overlay_bridge_fingerprint=None
+overlay_bridge_fault=''
+overlay_init_lock=threading.Lock()
+overlay_jobs=queue.Queue(maxsize=8)
+OVERLAY_SETTLE_SECONDS=2.0
 device_identity_cache=None
 device_identity_checked=0.0
 MAINTENANCE_FILE=ROOT/'maintenance-window.json'
@@ -1542,7 +1551,11 @@ def apply_device_spanish_request(config, device_token):
   return
  marker=spanish_classification.parse_marker(raw)
  if marker is None:return
+ if marker['action']=='mistaken_english' and not overlay_correction_allowed(marker['channelID']):
+  log('LANGUAGE_CORRECTION_STALE channel='+marker['channelID'])
+  return
  provider_id=sources.get(marker['channelID'])
+ retracted_event_id=''
  try:
   with lock:
    # Reload under the writer lock so a pending automatic evidence commit can
@@ -1553,6 +1566,7 @@ def apply_device_spanish_request(config, device_token):
      fresh,provider_id,marker['channelID'],marker['channelName'],marker['nonce'],
      threshold=SPANISH_EVIDENCE_THRESHOLD,enforcement=SPANISH_AUTO_ENFORCEMENT)
     changed=bool(info.get('changed'));reason=str(info.get('reason'))
+    retracted_event_id=str(info.get('retractedEventID') or '')
    else:
     state,changed,reason=spanish_classification.apply_manual(fresh,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
    spanish_state=fresh
@@ -1568,6 +1582,10 @@ def apply_device_spanish_request(config, device_token):
   log('Spanish marker rejected '+type(error).__name__)
   return
  log('LANGUAGE_EXCLUSION '+reason+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids))+' manual='+str(len(spanish_manual_provider_ids))+' auto='+str(len(spanish_auto_provider_ids)))
+ if retracted_event_id:
+  try:english_count=language_exclusions.counts_for(state,marker['channelID'],'en')
+  except (ValueError,TypeError):english_count=None
+  overlay_publish_correction(marker['channelID'],marker['channelName'],retracted_event_id,english_count,SPANISH_EVIDENCE_THRESHOLD)
 SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','enforcementEnabled','threshold','updatedAt'}
 LEGACY_SPANISH_AUTO_CONTROL_KEYS={'schemaVersion','enabled','updatedAt'}
 def _control_defaults():
@@ -1738,6 +1756,7 @@ def language_auto_commit(cid,provider,name,language,language_name,confidence,rea
    except OSError:spanish_fingerprint=None
   if info.get('enforced'):log('LANGUAGE_EVIDENCE_ENFORCED language='+language+' provider='+provider+' channel='+cid+' count='+str(info.get('count'))+' threshold='+str(info.get('threshold')))
   elif info.get('changed'):log('LANGUAGE_EVIDENCE language='+language+' provider='+provider+' channel='+cid+' outcome='+outcome+' count='+str(info.get('count'))+' threshold='+str(info.get('threshold')))
+  if info.get('changed'):overlay_publish_evidence(cid,name,language,language_name,confidence,payload,info)
   return info
  except (ValueError,OSError,TypeError) as error:
   log('Language auto commit rejected '+type(error).__name__)
@@ -1745,6 +1764,133 @@ def language_auto_commit(cid,provider,name,language,language_name,confidence,rea
 def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
  # Backward-compatible manual-era entry point; automatic manager uses language_auto_commit.
  return language_auto_commit(cid,provider,name,'es','Spanish',confidence,reason,evidence)
+def overlay_bridge_instance():
+ global overlay_bridge_state,overlay_bridge_fingerprint,overlay_bridge_fault
+ if SOURCE_PROFILE!='american':return None
+ try:config=prototype_selector.load_selector(ROOT)
+ except (OSError,ValueError,TypeError) as error:
+  overlay_bridge_fault='selector_'+type(error).__name__;return None
+ if config is None:
+  overlay_bridge_fault='';return None
+ fingerprint=(config['deviceIP'],config['backendPort'])
+ with overlay_init_lock:
+  if overlay_bridge_state is None or fingerprint!=overlay_bridge_fingerprint:
+   transport=overlay_bridge.AuthorizedDeviceTransport(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
+   overlay_bridge_state=overlay_bridge.OverlayBridge(transport)
+   overlay_bridge_fingerprint=fingerprint
+  return overlay_bridge_state
+def overlay_enqueue(kind,**fields):
+ global overlay_bridge_fault
+ if SOURCE_PROFILE!='american':return False
+ job=dict(fields,kind=kind,at=time.time())
+ try:overlay_jobs.put_nowait(job)
+ except queue.Full:
+  # Keep only the newest lifecycle event; the bridge is a display, never a
+  # durable queue, and a stale label must not block a current one.
+  try:overlay_jobs.get_nowait()
+  except queue.Empty:pass
+  try:overlay_jobs.put_nowait(job)
+  except queue.Full:
+   overlay_bridge_fault='queue_full';return False
+ return True
+def overlay_publish_evidence(cid,name,language,language_name,confidence,payload,info):
+ event_id=info.get('eventID')
+ if not isinstance(event_id,str) or not event_id:return False
+ evidence={'eventID':event_id,'at':time.time(),'language':language,'languageName':language_name,
+           'count':info.get('count'),'threshold':info.get('threshold'),
+           'phase':str(info.get('outcome') or 'recorded'),
+           'confidence':confidence if type(confidence) in (int,float) else None}
+ return overlay_enqueue('evidence',channelID=cid,channelName=name,
+                        streamGeneration=str((payload or {}).get('streamGeneration','')),evidence=evidence)
+def overlay_publish_correction(cid,name,event_id,count,threshold):
+ if not isinstance(event_id,str) or not event_id:return False
+ evidence={'eventID':event_id+':corrected','at':time.time(),'language':'en','languageName':'English',
+           'count':count,'threshold':threshold,'phase':'corrected','confidence':None}
+ return overlay_enqueue('correction',channelID=cid,channelName=name,eventID=event_id,evidence=evidence)
+def overlay_correction_allowed(cid):
+ bridge=overlay_bridge_state
+ if bridge is None:return True
+ if bridge.current_channel_id and bridge.current_channel_id!=cid:return False
+ if bridge.latest_snapshot is not None and bridge.latest_snapshot.channel_id!=cid:return False
+ return True
+def overlay_current_channel():
+ try:probe=device_language_probe()
+ except Exception:return None
+ if not isinstance(probe,dict):return None
+ cid=probe.get('channelID')
+ if not isinstance(cid,str) or cid not in channels:return None
+ name=channels[cid].get('Name')
+ if not isinstance(name,str) or not name:return None
+ return {'channelID':cid,'channelName':name,'streamGeneration':str(probe.get('streamGeneration') or '')}
+def _overlay_settle(bridge,stop):
+ # Retries stay inside one lifecycle job and are strictly time-bounded; there
+ # is no periodic timer or extra schedule.
+ deadline=time.monotonic()+OVERLAY_SETTLE_SECONDS
+ while not stop.is_set():
+  status=bridge.status().get('status')
+  if status not in ('retry','deferred','rate_limited'):break
+  if time.monotonic()>=deadline:break
+  if stop.wait(0.25 if status=='retry' else 0.5):break
+  bridge.pump()
+def _overlay_process(job,stop):
+ global overlay_bridge_fault
+ bridge=overlay_bridge_instance()
+ if bridge is None:
+  overlay_bridge_fault=overlay_bridge_fault or 'authorized_transport_unavailable'
+  return 'unavailable'
+ kind=job.get('kind')
+ if kind=='pump':
+  current=overlay_current_channel()
+  if current is None:
+   overlay_bridge_fault='device_unverified';return 'unverified'
+  if bridge.current_channel_id and current['channelID']!=bridge.current_channel_id:
+   overlay_bridge_fault='channel_changed';bridge.observe_channel(current['channelID'],current['channelName'])
+   return 'suppressed_channel'
+  bridge.pump();_overlay_settle(bridge,stop);return bridge.status().get('status','idle')
+ current=overlay_current_channel()
+ if current is None:
+  overlay_bridge_fault='device_unverified';return 'unverified'
+ cid=current['channelID'];name=current['channelName']
+ if kind=='refresh':
+  result=bridge.observe_channel(cid,name)
+ elif kind in ('evidence','correction'):
+  if job.get('channelID')!=cid:
+   overlay_bridge_fault='channel_changed';bridge.observe_channel(cid,name)
+   return 'suppressed_channel'
+  evidence=job.get('evidence')
+  if not isinstance(evidence,dict):return 'invalid'
+  stream=job.get('streamGeneration') or '';probe_stream=current['streamGeneration']
+  if stream and probe_stream and stream!=probe_stream:
+   overlay_bridge_fault='stale_stream_generation';return 'stale'
+  bridge.observe_channel(cid,name)
+  if kind=='correction' and job.get('eventID'):bridge.confirm_correction(job['eventID'])
+  result=bridge.publish_evidence(cid,name,evidence)
+ else:
+  return 'unknown'
+ overlay_bridge_fault=''
+ _overlay_settle(bridge,stop)
+ return bridge.status().get('status',result) or result
+def overlay_worker(stop):
+ # Existing daemon lifecycle only: it blocks for a triggered job and stops on
+ # the shutdown sentinel. It never polls the device on its own.
+ global overlay_bridge_fault
+ while not stop.is_set():
+  try:job=overlay_jobs.get()
+  except (queue.Empty,EOFError):break
+  if job is None or stop.is_set():break
+  try:_overlay_process(job,stop)
+  except Exception as error:
+   overlay_bridge_fault=type(error).__name__
+   log('Language overlay worker '+type(error).__name__)
+def overlay_request_pump():
+ bridge=overlay_bridge_state
+ if bridge is not None and bridge.status().get('pending'):overlay_enqueue('pump')
+def overlay_status():
+ bridge=overlay_bridge_instance()
+ fault=overlay_bridge_fault or (bridge.status().get('fault','') if bridge is not None else '')
+ base={'configured':bridge is not None,'fault':fault,'queueDepth':overlay_jobs.qsize()}
+ if bridge is None:return dict(base,revision=overlay_bridge.OVERLAY_REVISION)
+ return dict(bridge.status(),**base)
 def spanish_auto_status():
  try:description=spanish_classification.describe(spanish_state)
  except (ValueError,TypeError):description={'entries':len(spanish_provider_ids)}
@@ -1963,6 +2109,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
   # every few seconds. Failure never blocks the request.
   if path in ('/LiveTv/Channels',) or re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
    apply_device_spanish_request(config,token)
+   # Existing catalogue/playback lifecycle only. The worker re-probes the
+   # verified device channel before it writes the one overlay form field.
+   overlay_enqueue('refresh')
   if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
    if prototype_selector.selected_profile(config,token)=='malay':
     self.proxy_malay(config,path);return True
@@ -2009,7 +2158,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
    try:language_description=spanish_classification.describe(spanish_state)
    except (ValueError,TypeError):language_description={'entries':len(spanish_provider_ids)}
    language_status=spanish_auto_status()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'deliveryQuality':quality_summary()})
+   overlay_request_pump()
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
@@ -2189,10 +2339,12 @@ def main():
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'sourceProfile':SOURCE_PROFILE,'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  stop=threading.Event()
+ overlay_publisher=None
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
   spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4)
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
+  overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()
@@ -2204,6 +2356,10 @@ def main():
  try:server.serve_forever(poll_interval=.5)
  finally:
   stop.set()
+  if overlay_publisher is not None:
+   try:overlay_jobs.put_nowait(None)
+   except queue.Full:pass
+   overlay_publisher.join(timeout=2)
   if spanish_auto_manager is not None:spanish_auto_manager.stop()
   server.server_close()
   try:(ROOT/'trial-info.json').unlink()

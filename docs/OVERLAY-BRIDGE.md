@@ -4,6 +4,26 @@ This lane adds one supported, server-side publisher for the installed app. It
 does not modify Swift, install an IPA, restart a service, issue a live command
 or touch the gateway source.
 
+## Release integration
+
+The release-integration branch wires this adapter into the existing gateway
+lifecycle in `Server/iptv/gateway.py`:
+
+- one bounded daemon worker is started with the existing American workers and
+  stopped with the gateway; there is no periodic timer or new schedule;
+- catalogue and authenticated playback boundaries enqueue a channel refresh;
+  an evidence commit enqueues one update; an accepted Mistaken English marker
+  enqueues one corrected label; `/trial-status` may pump a pending retry;
+- before every write the gateway re-probes the verified current device channel
+  and stream generation. Evidence for a different channel or stream generation
+  is suppressed, and an unavailable probe publishes nothing;
+- the only command is the existing authorized `ui_set_value` with
+  `arguments:{key:"form.languageOverlay",value:"..."}`. Authentication is never
+  disabled and the token is never logged or exposed;
+- failures are bounded and fail safe; `GET /trial-status` exposes
+  `overlay.configured`, `overlay.fault`, `overlay.staleLabel`, the current
+  channel and queue depth. See `docs/release-integration-20261127.md`.
+
 ## Native contract used
 
 The installed ABI-1 UI accepts a remote value only through an editable node:

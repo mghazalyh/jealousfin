@@ -661,11 +661,18 @@ def retract_evidence(state, provider_id, channel_id, channel_name, nonce, now=No
                        "count": None, "threshold": threshold}
     candidates = [event for event in state["evidence"]["events"].values()
                   if event["providerID"] == provider_id and event["channelID"] == channel_id
-                  and event["outcome"] == "excluded" and event["retractedAt"] is None]
+                  and event["outcome"] == "excluded"]
     if not candidates:
         return state, {"changed": False, "reason": "no_evidence", "retractedEventID": None,
                        "count": None, "threshold": threshold}
     latest = max(candidates, key=lambda row: (row["at"], row["eventID"]))
+    if latest["retractedAt"] is not None:
+        # A correction always targets the latest event only. Repeating the
+        # gesture (even with a fresh nonce) must never walk backwards through
+        # older evidence or retract a second event.
+        return state, {"changed": False, "reason": "already_corrected",
+                       "retractedEventID": None, "count": None,
+                       "threshold": threshold}
     at = time.time() if now is None else now
     copy = json.loads(json.dumps(state))
     copy["updatedAt"] = at
