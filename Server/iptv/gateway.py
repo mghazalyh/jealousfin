@@ -1455,12 +1455,45 @@ def record_infrastructure_error(cid,phase,error,correlation=None):
 class Server(http.server.ThreadingHTTPServer):
  daemon_threads=True
  allow_reuse_address=True
+# The web application executes on the user's LAN browser. Only its exact
+# production origin is permitted; native clients without Origin are unchanged.
+WEB_ORIGIN='https://jealouswin.pages.dev'
+WEB_HEADERS=frozenset(('accept','authorization','content-type','range','x-emby-token','x-emby-authorization','x-jealousfin-request-id'))
+def web_route(path,method):
+ if method in ('GET','HEAD'):
+  return path in ('/System/Info/Public','/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy','/LiveTv/Recordings') or bool(re.fullmatch(r'/(?:malay/)?media/[^/]+/[^/]+',path))
+ if method=='POST':
+  return path in ('/Users/AuthenticateByName','/Sessions/Playing','/Sessions/Playing/Progress','/Sessions/Playing/Stopped','/LiveStreams/Close') or bool(re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path)) or bool(re.fullmatch(r'/Users/[^/]+/FavoriteItems/[a-f0-9]{32}',path))
+ if method=='DELETE':
+  return bool(re.fullmatch(r'/Users/[^/]+/FavoriteItems/[a-f0-9]{32}',path))
+ return False
+
 class Handler(http.server.BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'
+ def browser_origin(self):
+  origins=self.headers.get_all('Origin') or []
+  return WEB_ORIGIN if origins==[WEB_ORIGIN] else None
+ def browser_allowed(self,method):
+  return self.browser_origin() is not None and web_route(urllib.parse.urlsplit(self.path).path,method)
+ def do_OPTIONS(self):
+  requested=self.headers.get('Access-Control-Request-Method','')
+  raw=self.headers.get('Access-Control-Request-Headers','')
+  names={s.strip().lower() for s in raw.split(',') if s.strip()}
+  if not self.browser_allowed(requested) or not names.issubset(WEB_HEADERS):
+   return self.reply(403,{})
+  extra={'Access-Control-Allow-Methods':requested,'Access-Control-Allow-Headers':', '.join(sorted(names)),
+         'Access-Control-Max-Age':'600'}
+  if self.headers.get('Access-Control-Request-Private-Network')=='true':
+   extra['Access-Control-Allow-Private-Network']='true'
+  return self.reply(204,b'',extra=extra)
  def log_message(self,*args):pass
  def reply(self,code,body,mime='application/json',extra=None):
   if not isinstance(body,bytes):body=json.dumps(body,separators=(',',':')).encode()
   self.send_response(code);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.send_header('Connection','close')
+  self.send_header('Vary','Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network')
+  if self.browser_origin() and (self.command=='OPTIONS' and code==204 or self.browser_allowed(self.command)):
+   self.send_header('Access-Control-Allow-Origin',WEB_ORIGIN)
+   self.send_header('Access-Control-Expose-Headers','Content-Length, Content-Range, Accept-Ranges, Content-Type')
   for k,v in (extra or {}).items():self.send_header(k,v)
   self.end_headers();self.close_connection=True
   if self.command!='HEAD':
@@ -1644,6 +1677,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
    return self.reply(200,{})
   return self.reply(404,{})
  def do_GET(self):
+  # Reject unexpected browser origins before authentication or side effects.
+  # CORS is not authentication: permitted routes still require existing tokens.
+  if self.headers.get_all('Origin') and not self.browser_allowed(self.command):
+   return self.reply(403,{})
   try:self.handle_request()
   except Exception as e:
    log('request failure '+type(e).__name__)

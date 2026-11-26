@@ -54,6 +54,40 @@ class GatewayAcceptance(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:return error.code,json.load(error)
 
+    def test_browser_origin_cors_preflight_and_authentication(self):
+        origin='https://jealouswin.pages.dev'
+        def send(path,method='GET',headers=None,body=None):
+            req=urllib.request.Request(self.base+path,method=method,headers=headers or {},data=body)
+            try:
+                with urllib.request.urlopen(req,timeout=3) as response:
+                    return response.status,dict(response.headers),response.read()
+            except urllib.error.HTTPError as error:
+                with error:return error.code,dict(error.headers),error.read()
+        pre={'Origin':origin,'Access-Control-Request-Method':'POST',
+             'Access-Control-Request-Headers':'content-type, x-emby-token',
+             'Access-Control-Request-Private-Network':'true'}
+        code,h,body=send('/Users/AuthenticateByName','OPTIONS',pre)
+        self.assertEqual(code,204);self.assertEqual(body,b'')
+        self.assertEqual(h['Access-Control-Allow-Origin'],origin)
+        self.assertEqual(h['Access-Control-Allow-Private-Network'],'true')
+        self.assertNotIn('Access-Control-Allow-Credentials',h)
+        self.assertEqual(send('/Users/AuthenticateByName','OPTIONS',dict(pre,Origin='https://evil.example'))[0],403)
+        self.assertEqual(send('/Users/AuthenticateByName','OPTIONS',dict(pre,**{'Access-Control-Request-Headers':'x-arbitrary'}))[0],403)
+        self.assertEqual(send('/Jealousfin/Policy/Event','OPTIONS',pre)[0],403)
+        self.assertEqual(send('/LiveTv/Channels',headers={'Origin':origin})[0],401)
+        code,h,body=send('/Users/AuthenticateByName','POST',{'Origin':origin,'Content-Type':'application/json'},b'{"Username":"fixture","Pw":"fixture"}')
+        self.assertEqual(code,200);self.assertEqual(h['Access-Control-Allow-Origin'],origin)
+        self.assertEqual(json.loads(body)['AccessToken'],'fixture-token')
+        code,h,body=send('/LiveTv/Channels?JealousfinIncludePolicy=true',headers={'Origin':origin,'X-Emby-Token':'fixture-token'})
+        self.assertEqual(code,200);self.assertEqual(h['Access-Control-Allow-Origin'],origin)
+        self.assertEqual(len(json.loads(body)['Items']),3)
+        code,h,_=send('/media/wrong/unknown.bin',headers={'Origin':origin,'Range':'bytes=0-99'})
+        self.assertEqual(code,401);self.assertEqual(h['Access-Control-Allow-Origin'],origin)
+        code,h,_=send('/LiveTv/Channels',headers={'Origin':'https://evil.example','X-Emby-Token':'fixture-token'})
+        self.assertEqual(code,403);self.assertNotIn('Access-Control-Allow-Origin',h)
+        code,h,_=send('/System/Info/Public')
+        self.assertEqual(code,200);self.assertNotIn('Access-Control-Allow-Origin',h)
+        self.assertEqual(send('/Jealousfin/Policy/Event','POST',{'Origin':origin,'X-Emby-Token':'fixture-token'},b'{}')[0],403)
     def test_uk_trial_identity_and_resolution(self):
         g=self.g
         sid='nltv:uk:Fixture.uk'
