@@ -6,6 +6,7 @@ import regional_guide
 import opencode_discovery
 import source_profiles
 import prototype_selector
+import spanish_classification
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
@@ -40,6 +41,16 @@ gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
 config_fault=None
+# Manual Spanish classification is a separate membership filter, never a
+# failure/ban/hiatus and never a mutation of rotation or health history.
+SPANISH_REVISION='spanish-classification-20261126'
+SPANISH_UI_FIELD='spanishRequest'
+SPANISH_UI_NODE='spanish-read'
+SPANISH_FILE=ROOT/'spanish-classification.json'
+spanish_state=spanish_classification.empty()
+spanish_provider_ids=set()
+spanish_fingerprint=None
+spanish_checked_at=0.0
 resource_correlation={}
 resource_keys={}
 segment_resources=set()
@@ -1401,16 +1412,65 @@ def policy_rows():
  return result
 def policy_eligible(row,now):
  return not row["banned"] and row["hiatusUntil"]<=now
+def maybe_reload_spanish(force=False):
+ global spanish_state,spanish_provider_ids,spanish_fingerprint,spanish_checked_at
+ if SOURCE_PROFILE!='american':return
+ now=time.monotonic()
+ if not force and now-spanish_checked_at<2:return
+ spanish_checked_at=now
+ try:
+  if SPANISH_FILE.exists():
+   stat=SPANISH_FILE.stat();fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+   if not force and fingerprint==spanish_fingerprint:return
+   state=spanish_classification.load(ROOT)
+  else:
+   fingerprint=None;state=spanish_classification.empty()
+  if state!=spanish_state:
+   spanish_state=state
+   spanish_provider_ids=spanish_classification.excluded(state)
+   log('Spanish classification loaded entries='+str(len(spanish_provider_ids)))
+  spanish_fingerprint=fingerprint
+ except (ValueError,OSError,TypeError) as error:
+  log('Spanish classification ignored '+type(error).__name__)
+def spanish_excluded(cid):
+ return SOURCE_PROFILE=='american' and sources.get(cid) in spanish_provider_ids
+def apply_device_spanish_request(config, device_token):
+ global spanish_state,spanish_provider_ids,spanish_fingerprint
+ if SOURCE_PROFILE!='american':return
+ try:
+  raw=prototype_selector.device_ui_trigger(config,device_token,SPANISH_UI_NODE)
+ except Exception as error:
+  log('Spanish marker read failed '+type(error).__name__)
+  return
+ marker=spanish_classification.parse_marker(raw)
+ if marker is None:return
+ maybe_reload_spanish()
+ provider_id=sources.get(marker['channelID'])
+ try:
+  with lock:
+   state,changed=spanish_classification.apply(spanish_state,marker['action'],marker['channelID'],marker['channelName'],provider_id,marker['nonce'])
+   if not changed:return
+   spanish_classification.atomic_write(ROOT,state)
+   spanish_state=state
+   spanish_provider_ids=spanish_classification.excluded(state)
+   try:
+    stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+   except OSError:spanish_fingerprint=None
+ except (ValueError,OSError,TypeError) as error:
+  log('Spanish marker rejected '+type(error).__name__)
+  return
+ log('SPANISH_CLASSIFICATION '+marker['action']+' provider='+(provider_id or 'unknown')+' channel='+marker['channelID']+' entries='+str(len(spanish_provider_ids)))
 def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
- return sorted((item for item in channels.items() if include_excluded or policy_eligible(snapshot[item[0]],now)),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
+ return sorted((item for item in channels.items() if not spanish_excluded(item[0]) and (include_excluded or policy_eligible(snapshot[item[0]],now))),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
 def policy_payload(snapshot):
  with closing(sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
   days,ban=policy_penalty(db)
   row=db.execute("SELECT value FROM meta WHERE key='surf_resume'").fetchone()
   resume=json.loads(row[0]) if row else None
-  if not isinstance(resume,dict) or resume.get('channelID') not in snapshot:resume=None
- return {"revision":"sqlite-policy-v2","channels":snapshot,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
+  visible={cid:row for cid,row in snapshot.items() if not spanish_excluded(cid)}
+  if not isinstance(resume,dict) or resume.get('channelID') not in visible:resume=None
+ return {"revision":"sqlite-policy-v2","channels":visible,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
 def policy_event(cid,trace,action,reason):
  with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
   if not db.execute("SELECT 1 FROM channel WHERE id=?",(cid,)).fetchone():raise ValueError("Unknown policy channel")
@@ -1583,8 +1643,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if len(parts)!=5 or not hmac.compare_digest(parts[3],TOKEN):self.reply(401,{});return True
    self.proxy_malay(config,path);return True
   if not self.authorized(q):return False
+  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
+  # Read a pending manual Spanish request only on catalogue and playback
+  # boundaries. The health poll is deliberately excluded to avoid a callback
+  # every few seconds. Failure never blocks the request.
+  if path in ('/LiveTv/Channels',) or re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
+   apply_device_spanish_request(config,token)
   if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
-   if prototype_selector.selected_profile(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))=='malay':
+   if prototype_selector.selected_profile(config,token)=='malay':
     self.proxy_malay(config,path);return True
    return False
   if path=='/Jealousfin/Policy/Event' and self.command=='POST':
@@ -1626,7 +1692,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'spanishClassification':{'revision':SPANISH_REVISION,'entries':len(spanish_provider_ids),'lastNonce':spanish_state.get('lastNonce','')},'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1700,7 +1766,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    # The current-title feed is not a full EPG. For queries needing a real
    # time range, do not invent times; the client can use CurrentProgram.
    selected=set(','.join(q.get('ChannelIds',[])).split(','))-{''}
-   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if not selected or cid in selected]
+   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if not spanish_excluded(cid) and (not selected or cid in selected)]
    return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinCurrentOnly':True})
   if path=='/LiveTv/Recordings':return self.reply(200,{'Items':[],'TotalRecordCount':0})
   m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)
@@ -1709,6 +1775,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if n>262144:return self.reply(413,{})
    if n:self.rfile.read(n)
    cid=m[1]
+   if spanish_excluded(cid):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
@@ -1725,7 +1792,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-   if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
+   if spanish_excluded(cid) or not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    return self.reply(200,{'PlaySessionId':uuid.uuid4().hex,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
   if path.startswith('/Sessions/Playing') or path=='/LiveStreams/Close':
    n=int(self.headers.get('Content-Length','0'))
@@ -1761,6 +1828,7 @@ def main():
  reload_gateway_config(force=True)
  initialize_catalogue()
  load_favorites()
+ maybe_reload_spanish(force=True)
  server=Server((HOST,PORT),Handler)
  (ROOT/'trial-info.json').write_text(json.dumps({'sourceProfile':SOURCE_PROFILE,'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  stop=threading.Event()

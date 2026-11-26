@@ -8,12 +8,15 @@ import http.client
 import ipaddress
 import json
 import re
+import uuid
 from pathlib import Path
 
 MALAY_CATEGORY = "Movies & Series"
 MAX_JSON = 4 * 1024 * 1024
 MAX_MEDIA = 32 * 1024 * 1024
+DEVICE_PORT = 8765
 ID = re.compile(r"^[a-f0-9]{32}$")
+NODE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 def load_selector(root):
     p = Path(root) / "prototype-source-selector.json"
@@ -44,18 +47,56 @@ def read_response(host, port, path, method="GET", headers=None, body=None, limit
     finally:
         conn.close()
 
-def selected_profile(config, device_token=""):
+def device_status(config, device_token=""):
     headers = {"Accept": "application/json"}
     if device_token:
         headers["Authorization"] = "Bearer " + device_token
-    code, data, _ = read_response(config["deviceIP"], 8765, "/status", headers=headers)
+    code, data, _ = read_response(config["deviceIP"], DEVICE_PORT, "/status", headers=headers)
     if code != 200:
         raise RuntimeError("Prototype device status unavailable")
     status = json.loads(data)
+    if not isinstance(status, dict):
+        raise RuntimeError("Prototype device status invalid")
+    return status
+
+def selected_profile(config, device_token=""):
+    status = device_status(config, device_token)
     category = status.get("preferences", {}).get("surfCategory")
     if category not in ("All Channels", "Favorites", "Sports", MALAY_CATEGORY):
         raise RuntimeError("Prototype device category unavailable")
     return "malay" if category == MALAY_CATEGORY else "american"
+
+def device_ui_trigger(config, device_token, node_id):
+    """Invoke one fixed, already-installed read-only UI action on the device.
+
+    This is the only device write path used for Spanish classification. The
+    node ID is fixed by the gateway, never supplied by an HTTP client.
+    """
+    if not isinstance(node_id, str) or not NODE_ID.fullmatch(node_id):
+        raise ValueError("Invalid device UI node")
+    command = {
+        "schemaVersion": 1,
+        "id": "spanish-read-" + uuid.uuid4().hex,
+        "action": "ui_trigger",
+        "arguments": {"id": node_id},
+    }
+    body = json.dumps(command, separators=(",", ":")).encode()
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if device_token:
+        headers["Authorization"] = "Bearer " + device_token
+    code, data, _ = read_response(
+        config["deviceIP"], DEVICE_PORT, "/command",
+        method="POST", headers=headers, body=body, limit=MAX_JSON, timeout=5,
+    )
+    if code != 200:
+        raise RuntimeError("Prototype device command unavailable")
+    receipt = json.loads(data)
+    if not isinstance(receipt, dict) or receipt.get("status") != "succeeded":
+        raise RuntimeError("Prototype device command failed")
+    result = receipt.get("result")
+    if not isinstance(result, str):
+        raise RuntimeError("Prototype device command result unavailable")
+    return result
 
 def source_ids(root):
     p = Path(root) / "profiles" / "malay" / "trial-info.json"

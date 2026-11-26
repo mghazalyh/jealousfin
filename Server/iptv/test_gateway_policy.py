@@ -282,6 +282,57 @@ class GatewayAcceptance(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM channel').fetchone()[0],3)
             self.assertIsNone(db.execute('SELECT id FROM channel WHERE id=?',(malay,)).fetchone())
 
+    def test_spanish_classification_is_separate_membership_filter(self):
+        g=self.g
+        sc=g.spanish_classification
+        before=g.policy_rows()
+        state=sc.empty()
+        state,changed=sc.apply(state,'add',self.c,'Fixture C',g.sources[self.c],'nonce-add')
+        self.assertTrue(changed)
+        self.assertEqual(sc.excluded(state),{self.c})
+        # A repeated nonce is a no-op; an unknown provider advances the nonce
+        # without ever excluding a real catalogue row.
+        same,changed=sc.apply(state,'add',self.c,'Fixture C',g.sources[self.c],'nonce-add')
+        self.assertFalse(changed)
+        self.assertEqual(sc.excluded(same),{self.c})
+        state=sc.apply(state,'add','d'*32,'Synthetic',None,'nonce-unknown')[0]
+        self.assertEqual(sc.excluded(state),{self.c})
+        sc.atomic_write(self.temp.name,state)
+        g.maybe_reload_spanish(force=True)
+        code,body=self.req('/LiveTv/Channels?JealousfinIncludePolicy=true')
+        self.assertEqual(code,200)
+        ids={row['Id'] for row in body['Items']}
+        self.assertNotIn(self.c,ids)
+        self.assertIn(self.a,ids)
+        self.assertIn(self.b,ids)
+        self.assertNotIn(self.c,body['JealousfinPolicy']['channels'])
+        self.assertIn(self.a,body['JealousfinPolicy']['channels'])
+        self.assertEqual(self.req('/Items/'+self.c+'/PlaybackInfo',{})[0],409)
+        # Classification must not touch the health policy at all.
+        self.assertEqual(g.policy_rows()[self.c],before[self.c])
+        self.assertIn('spanishClassification',self.req('/trial-status')[1])
+        # Explicit removal restores membership without resetting counters.
+        removed,changed=sc.apply(g.spanish_state,'remove',self.c,'Fixture C',g.sources[self.c],'nonce-remove')
+        self.assertTrue(changed)
+        sc.atomic_write(self.temp.name,removed)
+        g.maybe_reload_spanish(force=True)
+        code,body=self.req('/LiveTv/Channels?JealousfinIncludePolicy=true')
+        self.assertIn(self.c,{row['Id'] for row in body['Items']})
+        self.assertIn(self.c,body['JealousfinPolicy']['channels'])
+        self.assertEqual(g.policy_rows()[self.c],before[self.c])
+
+    def test_spanish_marker_parser_rejects_unbounded_shapes(self):
+        sc=self.g.spanish_classification
+        good=json.dumps({'schemaVersion':1,'action':'add','channelID':'a'*32,'channelName':'A','nonce':'n-1'})
+        self.assertEqual(sc.parse_marker(good)['action'],'add')
+        self.assertEqual(sc.parse_marker(json.dumps({'schemaVersion':1,'action':'remove','channelID':'a'*32,'channelName':'A','nonce':'n-2'}))['action'],'remove')
+        for raw in (None,'','{}','not json','[]',json.dumps({'schemaVersion':2,'action':'add','channelID':'a'*32,'channelName':'A','nonce':'n'}),
+                    json.dumps({'schemaVersion':1,'action':'toggle','channelID':'a'*32,'channelName':'A','nonce':'n'}),
+                    json.dumps({'schemaVersion':1,'action':'add','channelID':'z'*32,'channelName':'A','nonce':'n'}),
+                    json.dumps({'schemaVersion':1,'action':'add','channelID':'a'*32,'channelName':'A','nonce':''}),
+                    json.dumps({'schemaVersion':1,'action':'add','channelID':'a'*32,'channelName':'A','nonce':'n','extra':1})):
+            self.assertIsNone(sc.parse_marker(raw))
+
     def test_prototype_selector_contract(self):
         import prototype_selector as ps
         from unittest.mock import patch
@@ -295,6 +346,20 @@ class GatewayAcceptance(unittest.TestCase):
                 self.assertEqual(ps.selected_profile(cfg),expected)
         with patch.object(ps,'read_response',return_value=(503,b'{}',{})):
             with self.assertRaises(RuntimeError):ps.selected_profile(cfg)
+        seen={}
+        def fake_trigger(host,port,path,method="GET",headers=None,body=None,limit=None,timeout=None):
+            seen.update(host=host,port=port,path=path,method=method,headers=headers,body=body)
+            return 200,json.dumps({'status':'succeeded','result':'{"schemaVersion":1}'}).encode(),{}
+        with patch.object(ps,'read_response',side_effect=fake_trigger):
+            self.assertEqual(ps.device_ui_trigger(cfg,'device-token','spanish-read'),'{"schemaVersion":1}')
+        self.assertEqual((seen['host'],seen['port'],seen['path'],seen['method']),('192.168.31.82',8765,'/command','POST'))
+        command=json.loads(seen['body'])
+        self.assertEqual(command['action'],'ui_trigger')
+        self.assertEqual(command['arguments'],{'id':'spanish-read'})
+        self.assertEqual(seen['headers']['Authorization'],'Bearer device-token')
+        with self.assertRaises(ValueError):ps.device_ui_trigger(cfg,'','bad node')
+        with patch.object(ps,'read_response',return_value=(200,json.dumps({'status':'failed'}).encode(),{})):
+            with self.assertRaises(RuntimeError):ps.device_ui_trigger(cfg,'','spanish-read')
         row={'Id':'a'*32,'Name':'Fixture','Tags':[]}
         payload={'Items':[row],'JealousfinPolicy':{'channels':{'a'*32:{'failures':1}}}}
         result=json.loads(ps.tag_catalogue(json.dumps(payload).encode()))

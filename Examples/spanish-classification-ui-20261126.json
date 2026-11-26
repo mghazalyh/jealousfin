@@ -1,0 +1,100 @@
+{
+ "schemaVersion": 1,
+ "revision": "prototype-source-switcher-english-spanish-20261126",
+ "slots": [
+  {
+   "location": "player.fullscreen.category",
+   "nodes": [
+    {
+     "id": "prototype-source-label",
+     "kind": "text",
+     "style": "caption",
+     "title": "Channel source"
+    }
+   ]
+  },
+  {
+   "location": "player.fullscreen.controls",
+   "nodes": [
+    {
+     "height": 80,
+     "html": "<style>body{padding:3px 1px}.sources{display:flex;gap:8px}.sources button{flex:1;min-height:42px;border:1px solid #555;color:#eee;background:#262626;border-radius:9px;font-weight:600}.sources button.active{background:#385c77;border-color:#80a6c2;color:white}.sources button:disabled{opacity:.5}#msg{font-size:12px;text-align:center;padding-top:5px;color:#c3c3c3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}</style><div class=\"sources\"><button id=\"american\" onclick=\"selectSource('american')\">English</button><button id=\"malay\" onclick=\"selectSource('malay')\">Malay</button></div><div id=\"msg\">Source selector</div><script>\nlet busy=false,serial=0,waiters={};const el=id=>document.getElementById(id);\nfunction paint(){let s=window.jealousfinState||{},p=s.preferences||{},a=p.surfCategory==='Movies & Series'?'malay':'american';for(let name of ['american','malay']){el(name).classList.toggle('active',a===name);el(name).disabled=busy;}if(!busy)el('msg').textContent=(a==='malay'?'Malay':'English')+' \u00b7 '+(s.channels??'\u2014')+' channels';}\nwindow.addEventListener('jealousfin-state',paint);\nwindow.addEventListener('jealousfin-receipt',e=>{let d=e.detail,w=waiters[d.requestID];if(w){delete waiters[d.requestID];clearTimeout(w.timer);d.status==='succeeded'?w.resolve(d):w.reject(Error(d.result||d.status));}});\nfunction call(command,args){return new Promise((resolve,reject)=>{let id='source-'+Date.now()+'-'+(++serial);let timer=setTimeout(()=>{delete waiters[id];reject(Error('Command timed out: '+command));},120000);waiters[id]={resolve,reject,timer};window.jealousfin.command(command,args||{},id);});}\nasync function selectSource(name){if(busy)return;let s=window.jealousfinState||{},p=s.preferences||{},old=p.surfCategory||'All Channels',target=name==='malay'?'Movies & Series':'All Channels';busy=true;paint();el('msg').textContent='Loading '+(name==='american'?'English':'Malay')+'\u2026';try{if(old===target&&s.surfing&&s.channels){if(s.surfPaused)await call('resume_surf');}else{if(s.surfing&&!s.surfPaused)await call('pause_surf');await call('stop');await call('set_preferences',{surfCategory:target});await call('refresh_catalogue');await call('start_surf',{category:target});}el('msg').textContent='Loaded '+(name==='american'?'English':'Malay');}catch(e){el('msg').textContent='Switch failed: '+String(e.message).slice(0,140);try{await call('stop');await call('set_preferences',{surfCategory:old});await call('refresh_catalogue');}catch(_){} }finally{busy=false;for(let name of ['american','malay'])el(name).disabled=false;}}\npaint();</script>",
+     "id": "prototype-source-switcher",
+     "kind": "web"
+    }
+   ]
+  },
+  {
+   "location": "player.fullscreen.bottom",
+   "nodes": [
+    {
+     "id": "spanish-actions",
+     "kind": "vstack",
+     "children": [
+      {
+       "id": "spanish-mark",
+       "kind": "button",
+       "title": "Spanish",
+       "symbol": "globe",
+       "style": "prominent",
+       "detail": "Mark this English channel Spanish, exclude it and advance",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nif(s.surfing!==true){return \"Spanish: Surf is not active\";}\nif(s.currentSharedTransport===true||s.surfRotationControllable===false){return \"Spanish: device-owned rotation required\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"add\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.command(\"next_channel\",{});\napi.log(\"Spanish mark requested: \"+id);\nreturn \"Spanish: marked \"+name+\"; excluding and advancing\";\n})()"
+        }
+       }
+      },
+      {
+       "id": "spanish-unmark",
+       "kind": "button",
+       "title": "Not Spanish",
+       "symbol": "globe.badge.chevron.backward",
+       "style": "muted",
+       "detail": "Explicitly remove this English channel from Spanish exclusion",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"remove\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"Spanish unmark requested: \"+id);\nreturn \"Spanish: unmarked \"+name+\"; English membership will refresh\";\n})()"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "location": "more.bottom",
+   "nodes": [
+    {
+     "id": "spanish-advanced",
+     "kind": "disclosure",
+     "title": "Spanish classification",
+     "detail": "Automatic gateway read path",
+     "children": [
+      {
+       "id": "spanish-request-value",
+       "kind": "input",
+       "title": "Pending request",
+       "valueKey": "form.spanishRequest",
+       "defaultValue": ""
+      },
+      {
+       "id": "spanish-read",
+       "kind": "button",
+       "title": "Read Spanish request",
+       "style": "muted",
+       "action": {
+        "command": "script",
+        "arguments": {
+         "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||\"\");})()"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "pages": []
+}
