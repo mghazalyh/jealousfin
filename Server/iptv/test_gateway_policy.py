@@ -83,6 +83,29 @@ class GatewayAcceptance(unittest.TestCase):
             self.assertEqual(g.uk_manifest_status['fault'],'TimeoutError')
         with self.assertRaises(ValueError):g.validate_gateway_config({'ukTrialEnabled':True})
         with self.assertRaises(ValueError):g.validate_gateway_config({'metadataResearchVariant':'medium'})
+    def test_page_refresh_preserves_independent_freshness_and_backoff(self):
+        g=self.g
+        a='nltv:us:A.us';b='nltv:us:B.us'
+        aid=g.source_profiles.channel_id(g.SOURCE_PROFILE,a);bid=g.source_profiles.channel_id(g.SOURCE_PROFILE,b)
+        g.sources={aid:a,bid:b};g.primary_source_ids={a,b}
+        good=lambda sid,title:{'metas':[{'id':sid,'name':'Fixture','description':'Now: '+title,'releaseInfo':'Now · '+title}]}
+        with patch.object(g,'provider_json',side_effect=[good(a,'First'),urllib.error.HTTPError('https://fixture.invalid',503,'fixture',{},None),good(b,'Second')]):
+            self.assertTrue(g.refresh_programme_page('primary',None,0,1000))
+            self.assertFalse(g.refresh_programme_page('primary',None,1,1001))
+            self.assertEqual(g.paged_faults[('primary',1)],'HTTP 503')
+            self.assertEqual(g.paged_due[('primary',1)],1016)
+            self.assertEqual(g.programme_snapshot(1002)[aid]['title'],'First')
+            self.assertNotIn(bid,g.programme_snapshot(1002))
+            self.assertTrue(g.refresh_programme_page('primary',None,1,1100))
+            self.assertEqual(g.programme_snapshot(1140)[bid]['title'],'Second')
+            self.assertNotIn(aid,g.programme_snapshot(1151))
+            self.assertEqual(g.programme_snapshot(1151)[bid]['observedAt'],1100)
+        with patch.object(g,'provider_json',return_value={'metas':[{'id':b,'name':'Fixture'}]}):
+            self.assertTrue(g.refresh_programme_page('primary',None,1,1152))
+            self.assertNotIn(bid,g.programme_snapshot(1153))
+        with patch.object(g,'provider_json',side_effect=urllib.error.HTTPError('https://fixture.invalid',429,'fixture',{'Retry-After':'180'},None)):
+            self.assertFalse(g.refresh_programme_page('primary',None,0,1200))
+            self.assertEqual(g.paged_origin_block_until,1380)
     def test_expanded_trial_catalogue_and_origin(self):
         g=self.g
         sid='nltv:us:Extra.us'
