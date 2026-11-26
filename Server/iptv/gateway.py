@@ -33,7 +33,8 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'providerTimeoutSeconds':8,'upstreamRetries':0,'resourceTTLSeconds':900,
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
-                 'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180}
+                 'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180,'metadataResearchVariant':opencode_discovery.DEFAULT_VARIANT,
+                 'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -59,6 +60,11 @@ def validate_gateway_config(raw):
   if type(value) is not int or not lo<=value<=hi:raise ValueError('Invalid '+key)
  if type(result['metadataResearchEnabled']) is not bool:raise ValueError('Invalid metadata research toggle')
  if not isinstance(result['metadataResearchModel'],str) or not opencode_discovery.MODEL_RE.fullmatch(result['metadataResearchModel']):raise ValueError('Invalid research model')
+ if result['metadataResearchVariant'] not in (None,'low','high','max'):raise ValueError('Invalid research variant')
+ manifest=result['ukManifest'];ids=result['ukTrialProviderIds'];enabled=result['ukTrialEnabled']
+ if type(enabled) is not bool or not isinstance(ids,list) or len(ids)>100 or any(not isinstance(i,str) or not re.fullmatch(r'nltv:uk:[A-Za-z0-9_.-]{1,160}',i) for i in ids) or len(ids)!=len(set(ids)):raise ValueError('Invalid UK trial cohort')
+ if manifest is not None and (not isinstance(manifest,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',manifest)):raise ValueError('Invalid UK manifest')
+ if (manifest is None)!= (not ids) or (enabled and not ids) or (SOURCE_PROFILE!='american' and (manifest or ids or enabled)):raise ValueError('Invalid UK trial configuration')
  # Legacy quota settings are accepted but ignored; research has no daily cap.
  result['metadataResearchDailyBudget']=None
  for key,lo,hi in [('metadataResearchTimeoutSeconds',10,300)]:
@@ -292,19 +298,20 @@ def provider():
   if base.endswith(suffix):base=base[:-len(suffix)].rstrip('/');break
  return validate(base)
 PROVIDER=None
-def provider_json(path):
- if PROVIDER is None:raise RuntimeError('Provider is not initialized')
- url=validate(PROVIDER+path)
+def provider_json(path,base=None):
+ base=PROVIDER if base is None else base
+ if base is None:raise RuntimeError('Provider is not initialized')
+ url=validate(base+path)
  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'Jealousfin-Catalogue-Diagnostics/1.0'})
  with opener.open(req,timeout=gateway_config['providerTimeoutSeconds']) as f:
   data=f.read(MAX_PLAYLIST+1)
   if len(data)>MAX_PLAYLIST:raise ValueError('Provider response too large')
   return json.loads(data)
-def catalogue():
+def catalogue(base=None,minimum=None):
  found={}
  for skip in range(0,10000,100):
   path='/catalog/tv/nltv_channels'+('/skip='+str(skip) if skip else '')+'.json'
-  response=provider_json(path)
+  response=provider_json(path) if base is None else provider_json(path,base)
   rows=response.get('metas') if isinstance(response,dict) else None
   if not isinstance(rows,list):raise ValueError('Invalid provider catalogue page')
   if not rows:break
@@ -314,10 +321,41 @@ def catalogue():
   # The provider catalogue is paginated in groups of 100. A partial final
   # page is complete; do not make an unnecessary request beyond its end.
   if len(found)==prior or len(rows)<100:break
- if len(found)<MIN_CHANNELS:raise ValueError('Incomplete channel catalogue')
+ if len(found)<(MIN_CHANNELS if minimum is None else minimum):raise ValueError('Incomplete channel catalogue')
  return found
 channels={}
 sources={}
+uk_manifest_status={'observedAt':None,'channels':0,'matched':0,'fault':None}
+def uk_base(config):
+ url=config['ukManifest']
+ return url[:-len('/manifest.json')] if url else None
+def uk_cohort(config):
+ return set(config['ukTrialProviderIds'])
+def uk_trial_projection(items,config):
+ # Sports is a temporary native rotation alias; never change stored genres or IDs.
+ if not config['ukTrialEnabled']:return items
+ cohort=uk_cohort(config)
+ out=[]
+ for item in items:
+  row=dict(item)
+  for field in ('Genres','Tags'):
+   row[field]=[v for v in item.get(field,[]) if isinstance(v,str) and 'sport' not in v.casefold()]
+  if sources.get(item['Id']) in cohort:row['Tags'].append('Sports')
+  out.append(row)
+ return out
+def uk_programmes(config):
+ global uk_manifest_status
+ base=uk_base(config)
+ if base is None:return {}
+ try:
+  raw=catalogue(base,1)
+  matched={sid:row for sid,row in raw.items() if sid in uk_cohort(config)}
+  uk_manifest_status={'observedAt':time.time(),'channels':len(raw),'matched':len(matched),'fault':None}
+  return matched
+ except Exception as error:
+  uk_manifest_status=dict(uk_manifest_status,fault=type(error).__name__)
+  log('UK manifest refresh failed '+type(error).__name__)
+  return {}
 preferred_hosts={s[0]:s[2] for s in SAMPLES}
 attempts={}
 catalogue_source='uninitialized'
@@ -918,6 +956,12 @@ def update_programmes(raw,observed=None):
   if cid not in sources:continue
   parsed=parse_programme(row)
   if parsed:valid[cid]=parsed
+ # A UK provider fault cannot erase the original provider's metadata.
+ for source_id,row in uk_programmes(gateway_config).items():
+  cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
+  if sources.get(cid)==source_id:
+   parsed=parse_programme(row)
+   if parsed:valid[cid]=parsed
  with lock:
   programme_rows=valid;programme_observed_at=now;programme_fault=None
 
@@ -955,7 +999,7 @@ def discovery_worker(stop):
     cid=recheck or discovery.choose(missing,active,now,gateway_config['metadataResearchDailyBudget'])
     if not cid:continue
     channel=channels[cid]['Name'];provider_id=sources[cid]
-    model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
+    model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds'];variant=gateway_config['metadataResearchVariant']
     if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
     if recheck:
      discovery.rechecked[cid]=now
@@ -969,7 +1013,11 @@ def discovery_worker(stop):
     if recheck:
      candidate=previous
     else:
-     raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout)
+     started=time.monotonic()
+     try:
+      raw=opencode_discovery.run_model(opencode_discovery.prompt_for(channel,provider_id,now),model,timeout,variant)
+     finally:
+      with lock:discovery.last_run={'variant':variant,'seconds':round(time.monotonic()-started,3),'channelID':cid,'at':time.time()}
      candidate=opencode_discovery.normalize_result(raw)
     checked_at=time.time()
     row=opencode_discovery.verify_candidate(candidate,channel,provider_id,checked_at,fetch_discovery_page,match_title=not recheck)
@@ -1002,7 +1050,7 @@ def discovery_status():
  with lock:
   now=time.time();known=programme_snapshot(now)
   missing=[cid for cid in channels if cid not in known and sources.get(cid)]
-  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
+  return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],variant=gateway_config['metadataResearchVariant'],lastRun=discovery.last_run,missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing))
 
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
@@ -1135,12 +1183,23 @@ def initialize_catalogue():
 def resolve(cid):
  source_id=sources[cid]
  candidates=[]
- for v in provider_json('/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json').get('streams',[]):
-  url=v.get('url')
-  if not isinstance(url,str) or url in candidates:continue
-  try:validate(url)
-  except Exception:continue
-  candidates.append(url)
+ config=gateway_config
+ path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
+ bases=[None]
+ if source_id in uk_cohort(config) and uk_base(config):
+  bases=[uk_base(config)] if config['ukTrialEnabled'] else [uk_base(config),None]
+ for base in bases:
+  try:response=provider_json(path) if base is None else provider_json(path,base)
+  except Exception:
+   if len(bases)==1:raise
+   continue
+  for v in response.get('streams',[]):
+   if not isinstance(v,dict):continue
+   url=v.get('url')
+   if not isinstance(url,str) or url in candidates:continue
+   try:validate(url)
+   except Exception:continue
+   candidates.append(url)
  if not candidates:raise ValueError('No usable stream source')
  config=gateway_config
  prefer=config['preferredHosts'].get(cid) or preferred_hosts.get(source_id)
@@ -1304,7 +1363,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1349,6 +1408,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if path=='/Jealousfin/Policy':return self.reply(200,policy_payload(snapshot))
    include=q.get('JealousfinIncludePolicy',['false'])[0]=='true'
    with lock:out=[dict(c,UserData={'IsFavorite':cid in favorites}) for cid,c in ordered_catalogue(snapshot,include)]
+   if SOURCE_PROFILE=='american' and gateway_config['ukTrialEnabled']:
+    selector=prototype_selector.load_selector(ROOT)
+    if selector and self.client_address[0]==selector['deviceIP']:out=uk_trial_projection(out,gateway_config)
    programmes=programme_snapshot()
    for item in out:
     row=programmes.get(item['Id'])

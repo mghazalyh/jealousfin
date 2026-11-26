@@ -54,6 +54,35 @@ class GatewayAcceptance(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:return error.code,json.load(error)
 
+    def test_uk_trial_identity_and_resolution(self):
+        g=self.g
+        sid='nltv:uk:Fixture.uk'
+        manifest='https://ptv3-livetv-addon.pages.dev/fixture/manifest.json'
+        config=g.validate_gateway_config({'ukManifest':manifest,'ukTrialProviderIds':[sid],'ukTrialEnabled':True})
+        self.assertEqual(config['metadataResearchVariant'],'low')
+        g.sources[self.c]=sid
+        rows=[{'Id':self.a,'Genres':['Sports'],'Tags':['Sports']},{'Id':self.c,'Genres':['Movies'],'Tags':[]}]
+        projected=g.uk_trial_projection(rows,config)
+        self.assertEqual(projected[0]['Genres'],[])
+        self.assertEqual(projected[0]['Tags'],[])
+        self.assertEqual(projected[1]['Tags'],['Sports'])
+        self.assertEqual(rows[0]['Genres'],['Sports'])
+        g.gateway_config=config
+        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/a.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+            self.assertEqual(g.resolve(self.c),'https://example.com/a.m3u8')
+            provider.assert_called_once_with('/stream/tv/nltv:uk:Fixture.uk.json',manifest.rsplit('/',1)[0])
+        with patch.object(g,'provider_json',side_effect=TimeoutError) as provider:
+            with self.assertRaises(TimeoutError):g.resolve(self.c)
+            self.assertEqual(provider.call_count,1)
+        g.gateway_config=dict(config,ukTrialEnabled=False)
+        with patch.object(g,'provider_json',side_effect=[TimeoutError,{'streams':[{'url':'https://example.com/b.m3u8'}]}]) as provider,patch.object(g,'validate',side_effect=lambda url:url):
+            self.assertEqual(g.resolve(self.c),'https://example.com/b.m3u8')
+            self.assertEqual(provider.call_count,2)
+        with patch.object(g,'catalogue',side_effect=TimeoutError):
+            self.assertEqual(g.uk_programmes(config),{})
+            self.assertEqual(g.uk_manifest_status['fault'],'TimeoutError')
+        with self.assertRaises(ValueError):g.validate_gateway_config({'ukTrialEnabled':True})
+        with self.assertRaises(ValueError):g.validate_gateway_config({'metadataResearchVariant':'medium'})
     def test_policy_connections_closed_on_success_and_failure(self):
         # Hold strong references to every opened connection so GC cannot hide
         # leaked descriptors. Exercise both read and transactional write paths.

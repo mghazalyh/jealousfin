@@ -2,6 +2,11 @@ import datetime as dt,json,pathlib,tempfile,time,unittest
 from unittest.mock import patch
 import opencode_discovery as d
 class ResearchTests(unittest.TestCase):
+    def test_research_variant_is_explicit_and_scoped(self):
+        args=d.model_args('fixture',d.DEFAULT_MODEL,'/tmp/fixture')
+        self.assertEqual(args[args.index('--variant')+1],'low')
+        self.assertNotIn('--variant',d.model_args('fixture',d.DEFAULT_MODEL,'/tmp/fixture',None))
+        with self.assertRaises(ValueError):d.model_args('fixture',d.DEFAULT_MODEL,'/tmp/fixture','medium')
     def test_restricted_environment(self):
         with tempfile.TemporaryDirectory() as work,patch.dict("os.environ",{"JEALOUSFIN_TOKEN":"secret","GITHUB_TOKEN":"secret"}):
             env=d.model_environment(work)

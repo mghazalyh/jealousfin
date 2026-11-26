@@ -5,6 +5,7 @@ from html import unescape
 
 BINARY="/opt/homebrew/bin/opencode"
 DEFAULT_MODEL="opencode-go/deepseek-v4.1-flash"
+DEFAULT_VARIANT="low"
 MODEL_RE=re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+")
 MAX_OUTPUT=512*1024
 MAX_AGE=1800
@@ -65,11 +66,17 @@ def parse_events(data):
     result=json.loads(m[1] if m else raw)
     if not isinstance(result,dict):raise ValueError("Invalid research answer")
     return result
-def run_model(prompt,model,timeout):
+def model_args(prompt,model,work,variant=DEFAULT_VARIANT):
+    if not MODEL_RE.fullmatch(model):raise ValueError("Invalid OpenCode model")
+    if variant not in (None,"low","high","max"):raise ValueError("Invalid research variant")
+    args=[BINARY,"run","--pure","--dir",work,"--model",model,"--format","json","--title","Jealousfin programme research"]
+    if variant is not None:args.extend(["--variant",variant])
+    return args+[prompt]
+def run_model(prompt,model,timeout,variant=DEFAULT_VARIANT):
     if not available():raise RuntimeError("OpenCode unavailable")
     if not MODEL_RE.fullmatch(model):raise ValueError("Invalid OpenCode model")
     with tempfile.TemporaryDirectory(prefix="jealousfin-epg-research-") as work:
-        args=[BINARY,"run","--pure","--dir",work,"--model",model,"--format","json","--title","Jealousfin programme research",prompt]
+        args=model_args(prompt,model,work,variant)
         p=subprocess.Popen(args,cwd=work,env=model_environment(work),stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
         data=bytearray()
@@ -172,7 +179,7 @@ def verify_candidate(candidate,channel,provider_id,now,fetch_page,match_title=Tr
 class Discovery:
     def __init__(self,path):
         self.path=pathlib.Path(path);self.calls=[];self.records={};self.verified={}
-        self.in_flight=False;self.last_fault=None;self.rechecked={};self.load()
+        self.in_flight=False;self.last_fault=None;self.last_run=None;self.rechecked={};self.load()
     def load(self):
         try:
             if self.path.stat().st_size>512*1024:raise ValueError("Discovery cache too large")
