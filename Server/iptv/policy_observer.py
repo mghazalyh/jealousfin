@@ -1,7 +1,9 @@
 """Observe Jealousfin events, persist rotation and strict channel health.
 Never controls playback, changes credentials, or contacts an upstream media source."""
 import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys, re
-ROOT=pathlib.Path(os.environ.get('JEALOUSFIN_STATE_DIR',str(pathlib.Path(__file__).resolve().parent))).expanduser().resolve()
+import source_profiles
+SOURCE_PROFILE=source_profiles.profile_name(os.environ)
+ROOT=source_profiles.state_root(os.environ.get('JEALOUSFIN_STATE_DIR',str(pathlib.Path(__file__).resolve().parent)),SOURCE_PROFILE)
 DB=ROOT/'policy.sqlite3'
 BASE=os.environ.get('JEALOUSFIN_DEVICE_URL','http://127.0.0.1:8765').rstrip('/')
 AUTH=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
@@ -253,6 +255,11 @@ def cycle(c):
         if not c.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():
             seed(c,json.loads((ROOT/'trial-info.json').read_text()),health())
         ingest(c,events,status)
+        # The device may be viewing the other profile. Its channel IDs are
+        # disjoint, so never attach those live samples to this profile.
+        cid=status.get('currentChannelID')
+        if SOURCE_PROFILE=='malay' and (not cid or not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone()):
+            return
         now=int(time.time());m=status.get('systemMetrics',{})
         retain_programme(c,status,now)
         retain_rotation(c,status,now)

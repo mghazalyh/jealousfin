@@ -52,6 +52,49 @@ class GatewayAcceptance(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:return error.code,json.load(error)
 
+    def test_isolated_source_profiles_and_policy(self):
+        import source_profiles as sp
+        import hashlib
+        g=self.g
+        root=pathlib.Path(self.temp.name)
+        sid='nltv:my:fixture'
+        american=sp.channel_id('american',sid)
+        malay=sp.channel_id('malay',sid)
+        self.assertEqual(american,hashlib.md5(sid.encode()).hexdigest())
+        self.assertNotEqual(american,malay)
+        self.assertEqual(len(malay),32)
+        self.assertEqual(sp.state_root(root,'american'),root)
+        self.assertEqual(sp.state_root(root,'malay'),root/'profiles'/'malay')
+        self.assertEqual(sp.gateway_port({},'american'),18796)
+        self.assertEqual(sp.gateway_port({},'malay'),18797)
+        with self.assertRaises(ValueError):sp.gateway_port({'JEALOUSFIN_PORT':'18796'},'malay')
+        with self.assertRaises(ValueError):sp.minimum_channels({},'malay')
+        with self.assertRaises(ValueError):sp.profile_name({'JEALOUSFIN_SOURCE_PROFILE':'unknown'})
+        pilot=sp.state_root(root,'malay');pilot.mkdir(parents=True)
+        with patch.object(g,'SOURCE_PROFILE','malay'),patch.object(g,'ROOT',pilot),patch.object(g,'MIN_CHANNELS',1),patch.object(g,'channels',{}),patch.object(g,'sources',{}),patch.object(g,'catalogue',return_value={sid:{'name':'Fixture','genres':['series']}}):
+            g.initialize_catalogue()
+            self.assertEqual(set(g.channels),{malay})
+            self.assertEqual(g.sources[malay],sid)
+            with g.policy_connect(pilot/'policy.sqlite3') as db:
+                self.assertEqual(g.policy_penalty(db),(3,8))
+                self.assertEqual(db.execute('SELECT count(*) FROM channel').fetchone()[0],1)
+                now=time.time()
+                g.policy_failure(db,malay,now,'fixture')
+                self.assertEqual(db.execute('SELECT failures,hiatus_until FROM channel WHERE id=?',(malay,)).fetchone(),(1,now+3*86400))
+            self.assertFalse(g.policy_eligible(g.policy_rows()[malay],time.time()))
+        with g.policy_connect(self.db) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM channel').fetchone()[0],3)
+            self.assertIsNone(db.execute('SELECT id FROM channel WHERE id=?',(malay,)).fetchone())
+
+    def test_prototype_catalogue_denial_fails_closed(self):
+        g=self.g
+        pilot=pathlib.Path(self.temp.name)/'blocked-pilot';pilot.mkdir()
+        with patch.object(g,'SOURCE_PROFILE','malay'),patch.object(g,'ROOT',pilot),patch.object(g,'MIN_CHANNELS',1),patch.object(g,'channels',{}),patch.object(g,'sources',{}),patch.object(g,'catalogue',side_effect=urllib.error.HTTPError('https://fixture.invalid',403,'Forbidden',None,None)):
+            with self.assertRaises(urllib.error.HTTPError):g.initialize_catalogue()
+            self.assertFalse((pilot/'catalogue-metadata.json').exists())
+            self.assertFalse((pilot/'policy.sqlite3').exists())
+            self.assertEqual(g.channels,{})
+
     def test_catalogue_visibility_and_final_gate(self):
         status,legacy=self.req("/LiveTv/Channels")
         self.assertEqual(status,200)

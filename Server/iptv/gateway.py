@@ -3,11 +3,14 @@ from collections import OrderedDict, deque
 from pathlib import Path
 import regional_guide
 import opencode_discovery
+import source_profiles
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
 
 HOST=os.environ.get('JEALOUSFIN_BIND','127.0.0.1')
-PORT=int(os.environ.get('JEALOUSFIN_PORT','18796'))
-ROOT=Path(os.environ['JEALOUSFIN_STATE_DIR']).expanduser().resolve()
+SOURCE_PROFILE=source_profiles.profile_name(os.environ)
+PORT=source_profiles.gateway_port(os.environ,SOURCE_PROFILE)
+MIN_CHANNELS=source_profiles.minimum_channels(os.environ,SOURCE_PROFILE)
+ROOT=source_profiles.state_root(os.environ['JEALOUSFIN_STATE_DIR'],SOURCE_PROFILE)
 ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
 MAX_BODY=32*1024*1024
 MAX_PLAYLIST=2*1024*1024
@@ -281,7 +284,8 @@ def rewrite(data,base,cid,correlation=None):
  return ('\n'.join(out)+'\n').encode()
 def provider():
  base=os.environ['JEALOUSFIN_PROVIDER_URL'].rstrip('/')
- if base.endswith('/manifest.json'):base=base[:-14].rstrip('/')
+ for suffix in ('/manifest.json','/playlist.m3u'):
+  if base.endswith(suffix):base=base[:-len(suffix)].rstrip('/');break
  return validate(base)
 PROVIDER=None
 def provider_json(path):
@@ -306,7 +310,7 @@ def catalogue():
   # The provider catalogue is paginated in groups of 100. A partial final
   # page is complete; do not make an unnecessary request beyond its end.
   if len(found)==prior or len(rows)<100:break
- if len(found)<100:raise ValueError('Incomplete channel catalogue')
+ if len(found)<MIN_CHANNELS:raise ValueError('Incomplete channel catalogue')
  return found
 channels={}
 sources={}
@@ -906,7 +910,7 @@ def update_programmes(raw,observed=None):
  valid={}
  for source_id,row in raw.items():
   if not isinstance(row,dict):continue
-  cid=hashlib.md5(source_id.encode()).hexdigest()
+  cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
   if cid not in sources:continue
   parsed=parse_programme(row)
   if parsed:valid[cid]=parsed
@@ -1091,7 +1095,7 @@ def initialize_catalogue():
  fresh=None
  if cache.exists():
   data=json.loads(cache.read_text())
-  if isinstance(data,dict) and len(data)>=100 and all(isinstance(k,str) and k.startswith('nltv:') and isinstance(v,dict) and isinstance(v.get('name'),str) for k,v in data.items()):
+  if isinstance(data,dict) and len(data)>=MIN_CHANNELS and all(isinstance(k,str) and k.startswith('nltv:') and isinstance(v,dict) and isinstance(v.get('name'),str) for k,v in data.items()):
    prior=data
  try:
   fresh=catalogue()
@@ -1104,7 +1108,7 @@ def initialize_catalogue():
   fresh=None;raw=prior;catalogue_source='cached';catalogue_fault=type(error).__name__
   log('catalogue fallback '+catalogue_fault)
  for i,(source_id,row) in enumerate(raw.items(),1):
-  cid=hashlib.md5(source_id.encode()).hexdigest()
+  cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
   genres=row.get('genres',[])
   if not isinstance(genres,list):genres=[]
   channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
@@ -1113,8 +1117,14 @@ def initialize_catalogue():
  # A pre-existing initialized database may acquire new channels. Preserve every
  # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
  with policy_connect(ROOT/'policy.sqlite3') as db:
-  if db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone():
+  seeded=db.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone()
+  if seeded or SOURCE_PROFILE=='malay':
    db.executemany("INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)",[(cid,c['Name']) for cid,c in channels.items()])
+   if not seeded:
+    # New isolated prototype has no legacy native history to migrate.
+    # The very same policy observer and strict penalty implementation apply.
+    db.execute("INSERT INTO meta VALUES('seeded','1')")
+    db.execute("INSERT INTO meta VALUES('seed_time',?)",(str(time.time()),))
 def resolve(cid):
  source_id=sources[cid]
  candidates=[]
@@ -1225,11 +1235,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
   correlation=request_correlation(self.headers.get('X-Jealousfin-Request-ID'))
   p=urllib.parse.urlsplit(self.path);path=p.path;q=urllib.parse.parse_qs(p.query)
   with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
-  if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial','Version':'10.10.0','Id':USER_ID})
+  if path=='/System/Info/Public':return self.reply(200,{'ServerName':'Jealousfin IPTV Trial' if SOURCE_PROFILE=='american' else 'Jealousfin Malay Prototype','Version':'10.10.0','Id':USER_ID})
   if path=='/trial-status' and self.client_address[0] in (HOST,'127.0.0.1'):
    try:snapshot=policy_rows();ready=True
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
-   return self.reply(200,{'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':programme_observed_at,'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'deliveryQuality':quality_summary()})
   if path=='/Users/AuthenticateByName' and self.command=='POST':
    n=int(self.headers.get('Content-Length','0'))
    if n>65536:return self.reply(413,{})
@@ -1344,7 +1354,7 @@ def main():
  initialize_catalogue()
  load_favorites()
  server=Server((HOST,PORT),Handler)
- (ROOT/'trial-info.json').write_text(json.dumps({'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
+ (ROOT/'trial-info.json').write_text(json.dumps({'sourceProfile':SOURCE_PROFILE,'url':f'http://{HOST}:{PORT}','pid':os.getpid(),'expiresAt':None,'channels':[{'id':x,'name':c['Name']} for x,c in channels.items()]}))
  stop=threading.Event()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
