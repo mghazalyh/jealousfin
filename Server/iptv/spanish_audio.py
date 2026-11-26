@@ -55,10 +55,12 @@ STRICT_NO_LEXICAL_PROBABILITY = 0.92
 MIN_LEXICAL_MARGIN = -0.05
 WINDOW_SECONDS = 15.0
 MAX_WINDOWS = 4
-IDLE_SECONDS = 12.0
+IDLE_SECONDS = 30.0
 SWITCH_GRACE_SECONDS = 4.0
 VISIT_GAP_SECONDS = 6.0
-FINALIZE_COOLDOWN_SECONDS = 30.0
+FINALIZE_COOLDOWN_SECONDS = 180.0
+MIN_REPORT_SECONDS = 15.0
+PROBE_INTERVAL_SECONDS = 10.0
 INACTIVE_SECONDS = 180.0
 DETECT_TIMEOUT = 25
 TRANSCRIBE_TIMEOUT = 75
@@ -455,6 +457,8 @@ class Manager:
         self._keys = {}
         self._control_cache = (0.0, True)
         self._last_media = 0.0
+        self._probe_cid = None
+        self._probe_at = 0.0
         self._tmpdir = None
         self._last_persist = 0.0
         self._diag_written = False
@@ -678,6 +682,9 @@ class Manager:
         if not sample.probe_done:
             sample.probe_done = True
             sample.probe = self._probe()
+            if sample.probe and sample.probe.get("channelID"):
+                self._probe_cid = sample.probe["channelID"]
+                self._probe_at = now
         base = sample.bases.get(event["base"])
         if base is None:
             base = _Base(event["base"], event["is_audio"], now)
@@ -756,6 +763,14 @@ class Manager:
             with self._lock:
                 self.telemetry["current"] = None
             return
+        # Verify the device's current channel before treating a segment-fetch
+        # gap as a channel change. Players buffer well ahead of the decoder,
+        # so short gaps are normal and must not end a 60-second sample.
+        if now - self._probe_at >= PROBE_INTERVAL_SECONDS:
+            current = self._probe()
+            self._probe_at = now
+            self._probe_cid = current.get("channelID") if isinstance(current, dict) else None
+        verified = self._probe_cid if now - self._probe_at <= PROBE_INTERVAL_SECONDS * 3 else None
         for cid, sample in list(self._samples.items()):
             best = self._best_base(sample)
             if not best:
@@ -764,8 +779,11 @@ class Manager:
                 continue
             if best.seconds >= TARGET_SECONDS:
                 self._finalize(cid, "target_reached")
-            elif best.seconds >= MIN_SAMPLE_SECONDS and now - sample.last_tap >= SWITCH_GRACE_SECONDS:
+            elif verified and verified != cid and best.seconds >= MIN_SAMPLE_SECONDS:
                 self._finalize(cid, "channel_changed")
+            elif verified and verified == cid:
+                # Still the current channel: keep accumulating across buffer gaps.
+                continue
             elif now - sample.last_tap >= IDLE_SECONDS:
                 self._finalize(cid, "idle")
         self._update_current()
@@ -809,6 +827,8 @@ class Manager:
                 if value < cutoff:
                     self._finalized.pop(key, None)
         best = self._best_base(sample)
+        if best is not None and best.seconds < MIN_REPORT_SECONDS:
+            return
         if best is None or best.seconds < MIN_SAMPLE_SECONDS:
             self._record_last(cid, sample.provider, sample.name, {
                 "outcome": "inconclusive", "reason": "sample_too_short", "confidence": 0.0,
@@ -819,6 +839,9 @@ class Manager:
         if not self._enabled():
             return
         end_probe = self._probe()
+        if end_probe and end_probe.get("channelID"):
+            self._probe_cid = end_probe["channelID"]
+            self._probe_at = time.time()
         start_verified = bool(sample.probe and sample.probe.get("channelID") == cid)
         identity_conflict = bool(sample.probe and sample.probe.get("channelID") and sample.probe.get("channelID") != cid)
         changed = bool(end_probe and end_probe.get("channelID") and end_probe.get("channelID") != cid)
