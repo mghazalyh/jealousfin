@@ -34,12 +34,16 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import html as html_module
 import json
+import queue
 import re
+import threading
 import time
+import urllib.parse
 from collections import OrderedDict
 
-REVISION = "episode-audio-evidence-20261127-v2"
+REVISION = "episode-audio-evidence-20261127-v3"
 DEFAULT_ENABLED = False
 MAX_SAMPLE_BYTES = 2 * 1024 * 1024
 MAX_CANDIDATES = 32
@@ -64,6 +68,23 @@ MAX_ATTEMPTS = 2
 COOLDOWN_SECONDS = 300.0
 DEDUP_SECONDS = 300.0
 MAX_DAILY_EPISODE_CALLS = 24
+
+# The existing language sampler completes a verified sample of at least
+# MIN_EVIDENCE_SAMPLE_SECONDS of real progressing playback before it hands over
+# a transcript.  A typical 60-second rotation never reaches the 120-second
+# active-research priority, so the audio-episode lane may use the verified
+# sample window as its own bounded active-viewing floor.  This changes neither
+# rotation nor any language confidence/threshold value; it only makes a
+# sample-backed, same-visit callback eligible for bounded episode research.
+MIN_EVIDENCE_SAMPLE_SECONDS = 40.0
+AUDIO_MIN_ACTIVE_SECONDS = 40.0
+
+# Bounded publication into the existing programme metadata path.
+PUBLICATION_TTL = 1800.0
+MAX_PUBLICATIONS = 64
+MAX_RESEARCH_SECONDS = 20.0
+MAX_PENDING = 8
+PENDING_DEDUP_SECONDS = 120.0
 
 ALLOWED_PROFILES = frozenset({"american"})
 # Preserve the generalized-language gate: only an allowed English stream may
@@ -522,6 +543,11 @@ def build_request(text, job, decision, binding, now=None):
     No part of ``text`` is stored on the returned object. The caller must not
     log or persist ``text``.
     """
+    return build_request_from_clues(extract_clues(text), job, decision, binding, now)
+
+
+def build_request_from_clues(clues, job, decision, binding, now=None):
+    """Same contract as :func:`build_request` for already-extracted clues."""
     now = time.time() if now is None else float(now)
     if not isinstance(binding, SessionBinding) or not binding.checked(now):
         return None
@@ -542,8 +568,8 @@ def build_request(text, job, decision, binding, now=None):
     language = decision.get("language")
     if language not in ALLOWED_LANGUAGES:
         return None
-    clues = extract_clues(text)
-    if len(clues) < MIN_DISTINCTIVE_CLUES:
+    clue_values = normalize_clues(clues)
+    if len(clue_values) < MIN_DISTINCTIVE_CLUES:
         return None
     sample_digest = job.get("sampleDigest") or binding.digest()
     if not isinstance(sample_digest, str) or not DIGEST_RE.fullmatch(sample_digest):
@@ -556,15 +582,15 @@ def build_request(text, job, decision, binding, now=None):
         sample = float(decision.get("sampleSeconds", 0.0))
     except (TypeError, ValueError):
         return None
-    return ClueRequest(clues, binding, channel_name, language, "allowed",
+    return ClueRequest(clue_values, binding, channel_name, language, "allowed",
                        probability, speech, sample, sample_digest)
 
 
 @dataclasses.dataclass(frozen=True)
 class OfficialEpisode:
     series_title: str
-    season_number: int
-    episode_number: int
+    season_number: int | None
+    episode_number: int | None
     episode_title: str
     original_air_date: str
     broadcaster_code: str = ""
@@ -575,8 +601,10 @@ class OfficialEpisode:
     def code(self):
         if self.broadcaster_code:
             match = CODE_RE.fullmatch(self.broadcaster_code.strip())
-            if match:
+            if match and self.season_number is not None and self.episode_number is not None:
                 return "S%02dE%02d" % (int(match[1]), int(match[2])) if len(match[2]) == 2 else "S%02dE%s" % (int(match[1]), match[2])
+        if self.season_number is None or self.episode_number is None:
+            return ""
         return "S%02dE%02d" % (self.season_number, self.episode_number)
 
     def episode_year(self):
@@ -588,9 +616,15 @@ class OfficialEpisode:
             return False
         if not isinstance(self.episode_title, str) or len(self.episode_title) > 300:
             return False
-        if type(self.season_number) is not int or not 1 <= self.season_number <= 99:
+        # Official archives that publish an explicit air date without numbering
+        # are valid.  Never invent a season/episode number to satisfy the
+        # contract; numbering is optional and only trusted when both fields are
+        # present and consistent with any broadcaster code.
+        if self.season_number is not None and (type(self.season_number) is not int or not 1 <= self.season_number <= 99):
             return False
-        if type(self.episode_number) is not int or not 1 <= self.episode_number <= 9999:
+        if self.episode_number is not None and (type(self.episode_number) is not int or not 1 <= self.episode_number <= 9999):
+            return False
+        if (self.season_number is None) != (self.episode_number is None):
             return False
         if not _date(self.original_air_date):
             return False
@@ -604,6 +638,8 @@ class OfficialEpisode:
         if self.broadcaster_code:
             match = CODE_RE.fullmatch(self.broadcaster_code.strip())
             if not match:
+                return False
+            if self.season_number is None or self.episode_number is None:
                 return False
             if (int(match[1]), int(match[2])) != (self.season_number, self.episode_number):
                 return False
@@ -654,8 +690,8 @@ class IndependentReport:
 @dataclasses.dataclass(frozen=True)
 class ContentIdentity:
     series_title: str
-    season_number: int
-    episode_number: int
+    season_number: int | None
+    episode_number: int | None
     episode_title: str
     original_air_date: str
     broadcaster_code: str
@@ -685,6 +721,13 @@ class Verification:
 
 
 def _numbering_differs(report, official):
+    if official.season_number is None or official.episode_number is None:
+        # An official air-date-only archive cannot prove numbering.  A
+        # third-party number is not a conflict, but it is never adopted as the
+        # official identity either.
+        if official.broadcaster_code and report.broadcaster_code:
+            return report.broadcaster_code.strip().upper() != official.code()
+        return False
     if report.broadcaster_code and report.broadcaster_code.strip().upper() != official.code():
         return True
     if report.season_number is not None and report.season_number != official.season_number:
@@ -982,16 +1025,143 @@ def programme_matches(identity, context):
     if isinstance(series, str) and series and _norm_text(series) != _norm_text(identity.series_title):
         return False
     season = context.get("seasonNumber")
-    if type(season) is int and season != identity.season_number:
+    # Existing provider numbering is allowed to remain stronger, but a known
+    # identity number must never contradict it.  When the official archive only
+    # publishes an air date, no number is invented or compared.
+    if type(season) is int and identity.season_number is not None and season != identity.season_number:
         return False
     number = context.get("episodeNumber")
-    if type(number) is int and number != identity.episode_number:
+    if type(number) is int and identity.episode_number is not None and number != identity.episode_number:
         return False
     air_date = _date(context.get("originalAirDate"))
     if air_date and air_date != identity.original_air_date:
         return False
     return True
 
+
+def programme_has_stronger_episode_metadata(row):
+    """True when an existing row already carries stronger episode data.
+
+    Audio publication is additive and lower precedence. It never replaces a
+    provider/episode-guide title, a verified season/episode number or an
+    existing corroborated schedule episode.
+    """
+    if not isinstance(row, dict):
+        return False
+    if programme_has_episode_identity(row):
+        return True
+    if row.get("episodeTitle"):
+        return True
+    if row.get("source") == "corroborated-external-schedule" and row.get("guideEpisode"):
+        return True
+    return False
+
+
+@dataclasses.dataclass(frozen=True)
+class Publication:
+    channel_id: str
+    expires_at: float
+    row: dict
+
+    def checked(self, now=None):
+        now = time.time() if now is None else float(now)
+        if not CHANNEL_RE.fullmatch(str(self.channel_id or "")):
+            return False
+        if not isinstance(self.row, dict) or not self.row:
+            return False
+        return now < self.expires_at
+
+
+class PublicationStore:
+    """Bounded, expiring publication into the existing programme metadata path.
+
+    Only public programme identity is retained. The transient transcript,
+    spoken clues, page bodies and raw launch/stream identifiers are never
+    stored here.
+    """
+
+    def __init__(self, ttl=PUBLICATION_TTL, clock=time.time):
+        self.ttl = max(1.0, float(ttl))
+        self.clock = clock
+        self.entries = OrderedDict()
+        self.published = 0
+        self.rejected = 0
+        self._lock = threading.RLock()
+
+    def _prune(self, now):
+        for key, entry in list(self.entries.items()):
+            if now >= entry.expires_at:
+                self.entries.pop(key, None)
+        while len(self.entries) > MAX_PUBLICATIONS:
+            self.entries.popitem(last=False)
+
+    def publish(self, promotion, context=None, now=None):
+        now = self.clock() if now is None else float(now)
+        if not isinstance(promotion, Promotion) or not promotion.accepted or promotion.episode is None:
+            return False
+        episode = promotion.episode
+        identity = episode.identity
+        if not isinstance(identity, ContentIdentity):
+            return False
+        if context is not None and not programme_matches(identity, context):
+            return False
+        if isinstance(context, dict) and context.get("channelID") and context.get("channelID") != episode.channel_id:
+            return False
+        if not CHANNEL_RE.fullmatch(str(episode.channel_id or "")):
+            return False
+        title = " ".join(str(identity.episode_title or "").split())[:300]
+        if not title:
+            title = _pretty_date(identity.original_air_date)
+        if not title:
+            return False
+        row = {
+            "episodeTitle": title,
+            "originalAirDate": _date(identity.original_air_date),
+            "episodeSource": "local-audio-episode-identity",
+            "episodeObservedAt": round(now, 3),
+            "episodeExpiresAt": round(now + self.ttl, 3),
+            "episodeVerification": str(promotion.episode.verification or "")[:80],
+            "episodeConfidence": round(float(episode.confidence), 3),
+            "episodeMatchCount": int(episode.matched_clue_count),
+            "episodeCorroboratingSources": int(episode.corroborating_sources),
+            "episodeNumberingConflict": bool(episode.numbering_conflict),
+            "episodeVisitDigest": episode.binding.digest(),
+        }
+        if identity.season_number is not None and identity.episode_number is not None:
+            row["seasonNumber"] = int(identity.season_number)
+            row["episodeNumber"] = int(identity.episode_number)
+        if identity.broadcaster_code:
+            row["episodeOfficialCode"] = str(identity.broadcaster_code)[:16]
+        if identity.episode_year is not None:
+            row["episodeYear"] = int(identity.episode_year)
+        with self._lock:
+            self._prune(now)
+            self.entries[episode.channel_id] = Publication(episode.channel_id, now + self.ttl, row)
+            self.entries.move_to_end(episode.channel_id)
+            self.published += 1
+        return True
+
+    def snapshot(self, now=None):
+        now = self.clock() if now is None else float(now)
+        with self._lock:
+            self._prune(now)
+            return {key: dict(entry.row) for key, entry in self.entries.items() if entry.checked(now)}
+
+    def get(self, channel_id, now=None):
+        now = self.clock() if now is None else float(now)
+        with self._lock:
+            self._prune(now)
+            entry = self.entries.get(channel_id)
+            return dict(entry.row) if entry is not None and entry.checked(now) else None
+
+    def diagnostics(self, now=None):
+        now = self.clock() if now is None else float(now)
+        with self._lock:
+            self._prune(now)
+            return {"revision": REVISION, "ttlSeconds": self.ttl,
+                    "entries": len(self.entries), "published": self.published,
+                    "channels": [{"channelID": key, "expiresAt": round(entry.expires_at, 3)}
+                                 for key, entry in list(self.entries.items())[-16:]]}
 
 
 def _session_key(view):
@@ -1037,7 +1207,7 @@ class EpisodeBudget:
             self.seen.popitem(last=False)
 
     def eligible(self, view, *, has_episode_identity, profile, language, language_outcome,
-                 now=None, dedup_key=""):
+                 now=None, dedup_key="", sample_seconds=0.0):
         now = self.clock() if now is None else float(now)
         if profile not in ALLOWED_PROFILES:
             return False, "profile"
@@ -1052,7 +1222,19 @@ class EpisodeBudget:
             active = float(_view_value(view, "active_seconds", "activeSeconds") or 0.0)
         except (TypeError, ValueError):
             active = 0.0
-        if active < self.active_seconds:
+        try:
+            sample = float(sample_seconds or 0.0)
+        except (TypeError, ValueError):
+            sample = 0.0
+        required = self.active_seconds
+        if sample >= MIN_EVIDENCE_SAMPLE_SECONDS:
+            # A completed, verified language sample already demonstrates real
+            # progressing playback for its own bounded window.  A 60-second
+            # rotation cannot reach 120 seconds, so use the sample window as a
+            # deliberate, bounded floor for this lane only.  Rotation and every
+            # language confidence threshold remain unchanged.
+            required = min(required, max(AUDIO_MIN_ACTIVE_SECONDS, sample))
+        if active < required:
             return False, "inactive"
         self._prune(now)
         if dedup_key and now - self.seen.get(dedup_key, -86400.0) < self.dedup_seconds:
@@ -1103,6 +1285,8 @@ class EpisodeBudget:
                          "lastOutcome": row["outcome"] or None,
                          "nextEligibleSeconds": max(0.0, round(self.cooldown_seconds - (now - row["last"]), 1))})
         return {"revision": REVISION, "activeSeconds": self.active_seconds,
+                "sampleBackedActiveSeconds": AUDIO_MIN_ACTIVE_SECONDS,
+                "minEvidenceSampleSeconds": MIN_EVIDENCE_SAMPLE_SECONDS,
                 "maxAttempts": self.max_attempts, "cooldownSeconds": self.cooldown_seconds,
                 "dedupSeconds": self.dedup_seconds, "dedupEntries": len(self.seen),
                 "dailyBudget": self.daily_budget,
@@ -1157,11 +1341,173 @@ def _jsonld_objects(page):
     return rows
 
 
+MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+MONTH_NAMES = ("Jan.", "Feb.", "Mar.", "Apr.", "May", "Jun.",
+               "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec.")
+DATE_TOKEN = (r"(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}"
+              r"|\d{1,2}/\d{1,2}/\d{4}"
+              r"|(?:19|20)\d{2}-\d{2}-\d{2})")
+_ISO_DATE = re.compile(r"\b((?:19|20)\d{2})-(\d{2})-(\d{2})\b")
+_MONTH_DATE = re.compile(
+    r"\b(" + "|".join(sorted(MONTHS, key=len, reverse=True)) + r")\.?\s+(\d{1,2}),?\s+((?:19|20)\d{2})\b",
+    re.IGNORECASE)
+_NUMERIC_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/((?:19|20)\d{2})\b")
+_BYLINE_DATE = re.compile(r"\bon\s+((?:19|20)\d{2}-\d{2}-\d{2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?",
+                          re.IGNORECASE)
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_META_ATTR = re.compile(r"([A-Za-z:-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.DOTALL)
+_TITLE_TAG = re.compile(r"<title\b[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_STRIP_BLOCK = re.compile(r"<(?:script|style|noscript|svg)\b.*?</(?:script|style|noscript|svg)>",
+                          re.IGNORECASE | re.DOTALL)
+_TAG = re.compile(r"<[^>]+>")
+_URL_DATE = re.compile(r"/((?:19|20)\d{2}-\d{2}-\d{2})(?:/|$)")
+
+
+def _valid_iso(year, month, day):
+    import datetime as dt
+    try:
+        value = dt.date(int(year), int(month), int(day))
+    except (TypeError, ValueError):
+        return ""
+    return value.isoformat() if 1888 <= value.year <= 2100 else ""
+
+
 def _page_date(value):
     if not isinstance(value, (str, int, float)):
         return ""
     text = str(value).strip()
+    match = _ISO_DATE.search(text)
+    if match:
+        return _valid_iso(match[1], match[2], match[3])
     return _date(text[:10])
+
+
+def _date_from_text(value):
+    """Extract only an explicitly written date. Never infer a missing date."""
+    if not isinstance(value, str) or not value:
+        return ""
+    candidates = []
+    for match in _ISO_DATE.finditer(value):
+        air = _valid_iso(match[1], match[2], match[3])
+        if air:
+            candidates.append((match.start(), air))
+    for match in _MONTH_DATE.finditer(value):
+        month = MONTHS.get(match[1].casefold().rstrip("."))
+        air = _valid_iso(match[3], month, match[2]) if month else ""
+        if air:
+            candidates.append((match.start(), air))
+    for match in _NUMERIC_DATE.finditer(value):
+        air = _valid_iso(match[3], match[1], match[2])
+        if air:
+            candidates.append((match.start(), air))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda row: row[0])
+    return candidates[0][1]
+
+
+def _pretty_date(value):
+    air = _date(value)
+    if not air:
+        return ""
+    return "%s %d, %s" % (MONTH_NAMES[int(air[5:7]) - 1], int(air[8:10]), air[:4])
+
+
+def _page_text(page):
+    if isinstance(page, (bytes, bytearray)):
+        if len(page) > MAX_PAGE_BYTES:
+            return ""
+        page = bytes(page).decode("utf-8", "replace")
+    if not isinstance(page, str) or len(page) > MAX_PAGE_BYTES:
+        return ""
+    return page
+
+
+def _meta_map(page):
+    page = _page_text(page)
+    values = {}
+    for tag in _META_TAG.findall(page)[:256]:
+        attrs = {}
+        for name, double, single in _META_ATTR.findall(tag):
+            attrs[name.casefold()] = (double or single or "").strip()
+        key = attrs.get("property") or attrs.get("name") or attrs.get("http-equiv")
+        content = attrs.get("content", "")
+        if key and content and len(content) <= MAX_PAGE_TEXT:
+            values.setdefault(key.casefold(), content)
+    return values
+
+
+def _title_tag(page):
+    page = _page_text(page)
+    match = _TITLE_TAG.search(page)
+    if not match:
+        return ""
+    return " ".join(html_module.unescape(_TAG.sub(" ", match[1])).split())[:300]
+
+
+def _visible_text(page, limit=MAX_PAGE_TEXT):
+    page = _page_text(page)
+    if not page:
+        return ""
+    body = _STRIP_BLOCK.sub(" ", page)
+    body = _TAG.sub(" ", body)
+    body = html_module.unescape(body)
+    body = " ".join(body.split())
+    return body[:max(0, int(limit))]
+
+
+def _strip_site_suffix(value):
+    text = " ".join(str(value or "").split())
+    return re.sub(r"\s+[|]\s+[^|]{1,48}$", "", text).strip()
+
+
+def _clean_series(value):
+    text = " ".join(str(value or "").split())
+    text = re.sub(r"\s+[-–—:,]+\s*$", "", text).strip()
+    text = re.sub(r"\s+(?:results?|report|recap|highlights?)\s*$", "", text, flags=re.IGNORECASE)
+    return text[:200]
+
+
+def _headline_parts(headline):
+    """Split an official headline into (series, episode headline, date text)."""
+    text = _strip_site_suffix(headline)
+    if not text:
+        return "", "", ""
+    patterns = (
+        (r"^(?P<series>.+?)\s+(?:results?|report|recap)\b\s*[,:]\s*"
+         r"(?P<date>" + DATE_TOKEN + r")\s*(?::\s*(?P<rest>.*))?$"),
+        (r"^(?P<series>.+?)\s*:\s*(?P<date>" + DATE_TOKEN + r")\s*$"),
+        (r"^(?P<series>.+?)\s+(?:results?|report|recap)\b\s*:\s*(?P<rest>.*)$"),
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            return (_clean_series(match.group("series")),
+                    " ".join((match.groupdict().get("rest") or "").split())[:300],
+                    match.groupdict().get("date") or "")
+    return "", "", ""
+
+
+def _series_from_url(source_url):
+    try:
+        parts = [part for part in urllib.parse.urlsplit(source_url).path.split("/") if part]
+    except ValueError:
+        return ""
+    if len(parts) >= 2 and parts[0].casefold() == "shows":
+        slug = parts[1]
+        known = {"wwenxt": "WWE NXT", "raw": "WWE Raw", "smackdown": "WWE SmackDown",
+                 "nxt": "WWE NXT", "wweraw": "WWE Raw", "wwesmackdown": "WWE SmackDown"}
+        if slug.casefold() in known:
+            return known[slug.casefold()]
+        words = re.sub(r"([a-z])([A-Z])", r"\1 \2", slug).replace("-", " ").replace("_", " ")
+        return " ".join(word.capitalize() for word in words.split())[:200]
+    return ""
 
 
 def _episode_numbers(obj):
@@ -1189,11 +1535,31 @@ def _series_title(obj, fallback=""):
 
 
 def parse_official_page(page, source_url, fallback_series=""):
-    """Parse bounded official-archive JSON-LD into typed official episodes."""
+    """Parse bounded official-archive JSON-LD or ordinary HTML.
+
+    Real WWE archive pages publish OpenGraph/title metadata and a URL date but
+    no JSON-LD and often no season/episode numbering. The parser therefore
+    accepts an explicit official air date without inventing numbers; numbering
+    is used only when the archive itself supplies it.
+    """
     host = _host(source_url)
     if host not in OFFICIAL_ARCHIVE_HOSTS:
         return []
     rows = []
+    seen = set()
+
+    def add(item):
+        if not isinstance(item, OfficialEpisode) or not item.checked():
+            return
+        # One official page contributes at most one row per series/date. A
+        # JSON-LD row with numbering is kept and the HTML fallback for the same
+        # date is not allowed to create a conflicting date-only duplicate.
+        key = (_norm_text(item.series_title), item.original_air_date)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(item)
+
     for obj in _jsonld_objects(page):
         if not _json_types(obj).intersection({"tvepisode", "episode", "broadcastevent"}):
             continue
@@ -1202,15 +1568,37 @@ def parse_official_page(page, source_url, fallback_series=""):
         title = " ".join(str(title).split())[:300] if title else ""
         season, number = _episode_numbers(obj)
         air = _page_date(obj.get("datePublished") or obj.get("startDate") or obj.get("uploadDate"))
-        if not series or season is None or number is None or not air:
+        air = air or _date_from_text(title)
+        if not series or not air:
             continue
-        code = "S%02dE%02d" % (season, number)
-        item = OfficialEpisode(series, season, number, title, air, code, None, source_url)
-        if item.checked() and item.code() not in {existing.code() for existing in rows}:
-            rows.append(item)
+        code = "S%02dE%02d" % (season, number) if season is not None and number is not None else ""
+        add(OfficialEpisode(series, season, number, title or _pretty_date(air), air, code,
+                            None, source_url))
         if len(rows) >= MAX_OFFICIAL_EPISODES:
-            break
-    return rows
+            return rows
+
+    meta = _meta_map(page)
+    headline = _strip_site_suffix(meta.get("og:title") or meta.get("twitter:title")
+                                  or _title_tag(page))
+    description = meta.get("og:description") or meta.get("description") or ""
+    if not headline:
+        return rows
+    series, episode_title, date_text = _headline_parts(headline)
+    try:
+        path = urllib.parse.urlsplit(source_url).path
+    except ValueError:
+        path = ""
+    match = _URL_DATE.search(path + "/")
+    url_date = _valid_iso(match[1][:4], match[1][5:7], match[1][8:10]) if match else ""
+    air = url_date or _date_from_text(date_text or headline)
+    if not air:
+        air = _date_from_text(description)
+    if not series:
+        series = fallback_series or _series_from_url(source_url)
+    if series and air:
+        add(OfficialEpisode(series, None, None, episode_title or _pretty_date(air),
+                            air, "", None, source_url))
+    return rows[:MAX_OFFICIAL_EPISODES]
 
 
 def _episode_from_text(text):
@@ -1220,8 +1608,60 @@ def _episode_from_text(text):
     return int(match[1]), int(match[2])
 
 
+def _series_from_report_headline(headline):
+    match = re.match(r"^(?:\d{1,2}/\d{1,2}\s+)?(?P<series>.+?)\s+"
+                     r"(?:report|results|recap|review)\b", headline or "", re.IGNORECASE)
+    return _clean_series(match.group("series")) if match else ""
+
+
+def _report_terms(headline, description, visible=""):
+    text = (headline + " " + description).strip()
+    terms = normalize_clues(text)
+    if len(terms) < MIN_DISTINCTIVE_CLUES and visible:
+        terms = normalize_clues(text + " " + visible[:1500])
+    return terms
+
+
+def _report_air_date(headline, description, visible, fallback_air=""):
+    air = _date_from_text((headline + " " + description).strip())
+    if air:
+        return air
+    match = _BYLINE_DATE.search(visible or "")
+    if match:
+        air = _valid_iso(match[1][:4], match[1][5:7], match[1][8:10])
+        if air:
+            return air
+    air = _date_from_text((visible or "")[:1500])
+    return air or fallback_air
+
+
+def _report_published(meta, visible):
+    published = _page_date(meta.get("article:published_time") or meta.get("article:modified_time"))
+    if published:
+        return published
+    match = _BYLINE_DATE.search(visible or "")
+    if match:
+        return _valid_iso(match[1][:4], match[1][5:7], match[1][8:10])
+    return _date_from_text((visible or "")[:1000])
+
+
+def _report_row(source_url, headline, description, published, air, series, visible=""):
+    lowered = headline.casefold()
+    text = (headline + " " + description).strip()
+    season, number = _episode_from_text(text)
+    terms = _report_terms(headline, description, visible)
+    return IndependentReport(
+        source_url, published, terms, air,
+        series, season, number, "",
+        "independent-report",
+        advertisement=("advertisement" in text.casefold() or "sponsored" in text.casefold()),
+        reused_promo=any(word in lowered.split() for word in ("promo", "promos", "trailer", "teaser", "clip")),
+        generic=not terms,
+    )
+
+
 def parse_report_page(page, source_url, context=None):
-    """Parse bounded independent-report JSON-LD into typed reports."""
+    """Parse bounded independent-report JSON-LD or ordinary HTML."""
     host = _host(source_url)
     if host not in INDEPENDENT_REPORT_HOSTS:
         return []
@@ -1229,35 +1669,47 @@ def parse_report_page(page, source_url, context=None):
     fallback_series = context.get("seriesTitle") if isinstance(context.get("seriesTitle"), str) else ""
     fallback_air = _date(context.get("originalAirDate"))
     rows = []
+    seen = set()
+
+    def add(report):
+        if not isinstance(report, IndependentReport) or report.rejection():
+            return
+        key = (report.source_url, report.original_air_date)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(report)
+
     for obj in _jsonld_objects(page):
         if not _json_types(obj).intersection({"newsarticle", "article", "reportagenewsarticle"}):
             continue
         headline = " ".join(str(obj.get("headline") or obj.get("name") or "").split())[:300]
         description = " ".join(str(obj.get("description") or obj.get("abstract") or "").split())[:MAX_PAGE_TEXT]
-        text = (headline + " " + description).strip()
-        if not text:
+        if not headline and not description:
             continue
         published = _page_date(obj.get("datePublished") or obj.get("dateModified"))
-        dates = DATE_RE.findall(text)
-        air = dates[0] if dates else fallback_air
+        air = _report_air_date(headline, description, "", fallback_air)
         if not published or not air:
             continue
-        lowered = headline.casefold()
-        season, number = _episode_from_text(text)
-        terms = normalize_clues(text)
-        report = IndependentReport(
-            source_url, published, terms, air,
-            fallback_series, season, number, "",
-            "independent-report",
-            advertisement=("advertisement" in text.casefold() or "sponsored" in text.casefold()),
-            reused_promo=any(word in lowered.split() for word in ("promo", "promos", "trailer", "teaser", "clip")),
-            generic=not terms,
-        )
-        if not report.rejection():
-            rows.append(report)
+        series = fallback_series or _series_from_report_headline(headline)
+        add(_report_row(source_url, headline, description, published, air, series))
         if len(rows) >= MAX_REPORTS:
-            break
-    return rows
+            return rows
+
+    meta = _meta_map(page)
+    headline = _strip_site_suffix(meta.get("og:title") or meta.get("twitter:title")
+                                  or _title_tag(page))
+    description = meta.get("og:description") or meta.get("description") or ""
+    visible = _visible_text(page, 2000)
+    if not headline and not description:
+        return rows
+    published = _report_published(meta, visible)
+    air = _report_air_date(headline, description, visible, fallback_air)
+    if not published or not air:
+        return rows
+    series = fallback_series or _series_from_report_headline(headline)
+    add(_report_row(source_url, headline, description, published, air, series, visible))
+    return rows[:MAX_REPORTS]
 
 
 class PublicEvidenceResearch:
@@ -1271,14 +1723,29 @@ class PublicEvidenceResearch:
     the handoff stays inconclusive rather than guessing.
     """
 
-    def __init__(self, fetch_page, source_registry=None, max_pages=MAX_SOURCE_PAGES):
+    def __init__(self, fetch_page, source_registry=None, max_pages=MAX_SOURCE_PAGES,
+                 registry_loader=None, deadline_seconds=MAX_RESEARCH_SECONDS):
         self.fetch_page = fetch_page
+        if callable(source_registry) and registry_loader is None:
+            registry_loader = source_registry
+            source_registry = None
         self.source_registry = source_registry if isinstance(source_registry, dict) else {}
+        self.registry_loader = registry_loader if callable(registry_loader) else None
         self.max_pages = max(1, min(MAX_SOURCE_PAGES, int(max_pages)))
+        self.deadline_seconds = max(1.0, float(deadline_seconds))
+
+    def _registry(self):
+        if self.registry_loader is not None:
+            try:
+                value = self.registry_loader()
+            except Exception:
+                return {}
+            return value if isinstance(value, dict) else {}
+        return self.source_registry
 
     def _urls(self, context):
         series = context.get("seriesTitle") if isinstance(context, dict) else ""
-        entry = self.source_registry.get(source_key(series)) if series else None
+        entry = self._registry().get(source_key(series)) if series else None
         if not isinstance(entry, dict):
             return [], []
         official = [url for url in entry.get("official", []) if isinstance(url, str)]
@@ -1303,17 +1770,66 @@ class PublicEvidenceResearch:
         if not isinstance(context, dict) or not context.get("seriesTitle"):
             return [], []
         official_urls, report_urls = self._urls(context)
+        deadline = time.monotonic() + self.deadline_seconds
         official = []
         for url in official_urls:
+            if time.monotonic() >= deadline:
+                break
             page = self._fetch(url, OFFICIAL_ARCHIVE_HOSTS)
             if page is not None:
                 official.extend(parse_official_page(page, url, context.get("seriesTitle", "")))
         reports = []
         for url in report_urls:
+            if time.monotonic() >= deadline:
+                break
             page = self._fetch(url, INDEPENDENT_REPORT_HOSTS)
             if page is not None:
                 reports.extend(parse_report_page(page, url, context))
         return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingClue:
+    """Bounded in-memory handoff. It never contains the raw transcript."""
+
+    job: dict
+    decision: dict
+    clues: tuple
+    queued_at: float
+    key: str
+
+
+def _sanitized_job(job, now):
+    if not isinstance(job, dict):
+        return None
+    view = {
+        "cid": job.get("cid"), "provider": job.get("provider"), "name": job.get("name"),
+        "seconds": job.get("seconds"), "deviceVerified": job.get("deviceVerified"),
+        "changed": bool(job.get("changed")), "launchID": job.get("launchID", ""),
+        "streamGeneration": job.get("streamGeneration", ""), "visitID": job.get("visitID", ""),
+        "observedAt": now, "expiresAt": None,
+        "sampleDigest": job.get("sampleDigest"), "profile": job.get("profile", "american"),
+        "activeSeconds": job.get("activeSeconds"), "hasEpisodeIdentity": bool(job.get("hasEpisodeIdentity")),
+    }
+    for key in ("launchID", "streamGeneration", "visitID", "profile"):
+        value = view.get(key)
+        if not isinstance(value, str) or len(value) > 200:
+            view[key] = "" if key != "profile" else "american"
+    for key in ("name", "provider"):
+        value = view.get(key)
+        if not isinstance(value, str) or len(value) > 200:
+            view[key] = ""
+    return view
+
+
+def _sanitized_decision(decision):
+    if not isinstance(decision, dict):
+        return None
+    result = {}
+    for key in ("outcome", "language", "confidence", "speechSeconds", "sampleSeconds"):
+        if key in decision:
+            result[key] = decision.get(key)
+    return result
 
 
 class EpisodeObserver:
@@ -1323,10 +1839,16 @@ class EpisodeObserver:
     ``ClueRequest.research_payload()``; it must return
     ``(official_episodes, independent_reports)``. It is responsible for using
     approved official archives and independent reports only.
+
+    The language worker must never wait for research. ``submit()`` extracts
+    bounded clues synchronously and returns; ``probe``, network research, the
+    post-research fresh re-probe and publication all run on this observer's own
+    bounded daemon worker. ``__call__`` remains the synchronous test surface.
     """
 
     def __init__(self, probe, research, *, enabled=DEFAULT_ENABLED, budget=None,
-                 ttl=DEFAULT_SESSION_TTL, log=None, programme=None, activity=None):
+                 ttl=DEFAULT_SESSION_TTL, log=None, programme=None, activity=None,
+                 publisher=None, publish=None):
         self.probe = probe
         self.research = research
         self.enabled = bool(enabled)
@@ -1335,7 +1857,15 @@ class EpisodeObserver:
         self.log = log or (lambda message: None)
         self.programme = programme
         self.activity = activity
+        self.publisher = publisher
+        self.publish = publish
         self._published = OrderedDict()
+        self._queue = None
+        self._worker = None
+        self._queue_lock = threading.Lock()
+        self._pending = OrderedDict()
+        self.submitted = 0
+        self.dropped = 0
 
     def _context(self, channel_id):
         if not callable(self.programme):
@@ -1362,7 +1892,7 @@ class EpisodeObserver:
         return view
 
     def _duplicate(self, binding, identity, now):
-        key = "|".join((binding.digest(), identity.broadcaster_code,
+        key = "|".join((binding.digest(), identity.broadcaster_code or "",
                         _digest(identity.series_title + "|" + identity.original_air_date)))
         expires = self._published.get(key)
         if expires is not None and now < expires:
@@ -1372,6 +1902,105 @@ class EpisodeObserver:
         while len(self._published) > 64:
             self._published.popitem(last=False)
         return False
+
+    @staticmethod
+    def _programme_coherent(before, after):
+        if before is None or after is None:
+            return before is after
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return False
+        if before.get("channelID") and after.get("channelID") and before["channelID"] != after["channelID"]:
+            return False
+        series_before = _norm_text(before.get("seriesTitle"))
+        series_after = _norm_text(after.get("seriesTitle"))
+        if series_before and series_after and series_before != series_after:
+            return False
+        for key in ("seasonNumber", "episodeNumber"):
+            left, right = before.get(key), after.get(key)
+            if type(left) is int and type(right) is int and left != right:
+                return False
+        date_before = _date(before.get("originalAirDate"))
+        date_after = _date(after.get("originalAirDate"))
+        if date_before and date_after and date_before != date_after:
+            return False
+        return True
+
+    def _publish(self, promotion, context, now):
+        if not promotion.accepted or promotion.episode is None:
+            return False
+        published = False
+        if self.publisher is not None:
+            try:
+                published = bool(self.publisher.publish(promotion, context, now))
+            except Exception as error:
+                self.log("episode publication error " + type(error).__name__)
+        if callable(self.publish):
+            try:
+                published = bool(self.publish(promotion, context, now)) or published
+            except Exception as error:
+                self.log("episode publish callback error " + type(error).__name__)
+        if published:
+            identity = promotion.episode.identity
+            self.log("EPISODE_IDENTITY series=%s date=%s code=%s confidence=%.3f sources=%d" % (
+                identity.series_title[:80], identity.original_air_date,
+                identity.broadcaster_code or "-", promotion.episode.confidence,
+                promotion.episode.corroborating_sources))
+        return published
+
+    def _evaluate(self, request, snapshot, context, job, now):
+        binding = request.binding
+        view = None
+        dedup_key = ""
+        if self.budget is not None:
+            view = self._view(binding, job)
+            dedup_key = _digest(binding.channel_id + "|" + _norm_text((context or {}).get("seriesTitle"))
+                                + "|" + "|".join(request.clues))
+            allowed, _reason = self.budget.eligible(
+                view, has_episode_identity=bool(view.get("hasEpisodeIdentity")),
+                profile=binding.profile, language=request.language,
+                language_outcome=request.language_outcome, dedup_key=dedup_key,
+                sample_seconds=request.sample_seconds)
+            if not allowed:
+                return None
+            self.budget.begin(view, dedup_key=dedup_key)
+        payload = request.research_payload()
+        if context is not None:
+            payload = dict(payload, channelID=binding.channel_id, programme=context)
+        if not callable(self.research):
+            official, reports = [], []
+        else:
+            official, reports = self.research(payload)
+        # Research is network-bound. Re-probe after it and require the same
+        # exact physical visit and a coherent programme before publishing.
+        after = time.time()
+        fresh = self.probe() if callable(self.probe) else None
+        fresh_context = context
+        if not isinstance(fresh, dict):
+            promotion = Promotion(False, "session-unprobeable")
+        elif not binding.checked(after):
+            promotion = Promotion(False, "session-expired")
+        elif not binding.matches(fresh, after):
+            promotion = Promotion(False, "session-changed")
+        else:
+            fresh_context = self._context(binding.channel_id)
+            if context is not None and not self._programme_coherent(context, fresh_context):
+                promotion = Promotion(False, "programme-changed")
+            elif (fresh_context is not None and fresh_context.get("channelID")
+                  and fresh_context.get("channelID") != binding.channel_id):
+                promotion = Promotion(False, "programme-changed")
+            elif fresh_context is not None and programme_has_episode_identity(fresh_context):
+                promotion = Promotion(False, "identity-present")
+            else:
+                promotion = promote_episode(request, official, reports, fresh, after,
+                                            programme=fresh_context)
+        if promotion.accepted and promotion.episode is not None:
+            if self._duplicate(binding, promotion.episode.identity, after):
+                promotion = Promotion(False, "duplicate-publication")
+            else:
+                self._publish(promotion, fresh_context, after)
+        if self.budget is not None and view is not None:
+            self.budget.finish(view, "promoted" if promotion.accepted else promotion.reason)
+        return promotion
 
     def __call__(self, job, decision, text):
         if not self.enabled:
@@ -1391,34 +2020,114 @@ class EpisodeObserver:
             request = build_request(text, job, decision, binding, now)
             if request is None:
                 return None
-            if self.budget is not None:
-                view = self._view(binding, job)
-                dedup_key = _digest(binding.channel_id + "|" + _norm_text((context or {}).get("seriesTitle"))
-                                    + "|" + "|".join(request.clues))
-                allowed, _reason = self.budget.eligible(
-                    view, has_episode_identity=bool(view.get("hasEpisodeIdentity")),
-                    profile=binding.profile, language=request.language,
-                    language_outcome=request.language_outcome, dedup_key=dedup_key)
-                if not allowed:
-                    return None
-                self.budget.begin(view, dedup_key=dedup_key)
-            payload = request.research_payload()
-            if context is not None:
-                payload = dict(payload, channelID=binding.channel_id, programme=context)
-            if not callable(self.research):
-                official, reports = [], []
-            else:
-                official, reports = self.research(payload)
-            promotion = promote_episode(request, official, reports, snapshot, now, programme=context)
-            if promotion.accepted and promotion.episode is not None:
-                if self._duplicate(binding, promotion.episode.identity, now):
-                    promotion = Promotion(False, "duplicate-publication")
-            if self.budget is not None:
-                self.budget.finish(view, "promoted" if promotion.accepted else promotion.reason)
-            return promotion
+            return self._evaluate(request, snapshot, context, job, now)
         except Exception as error:
             self.log("episode clue observer error " + type(error).__name__)
             return None
+
+    def _ensure_worker(self):
+        with self._queue_lock:
+            if self._queue is not None:
+                return True
+            self._queue = queue.Queue(maxsize=MAX_PENDING)
+            self._worker = threading.Thread(target=self._run, name="episode-audio-research", daemon=True)
+            self._worker.start()
+        return True
+
+    def submit(self, job, decision, text):
+        """Fast, non-blocking handoff from the language worker.
+
+        Only bounded clues survive this call. The transcript is used to extract
+        clues and is then dropped; no PCM, transcript or page body is queued.
+        """
+        if not self.enabled:
+            return None
+        try:
+            clues = extract_clues(text)
+            if len(clues) < MIN_DISTINCTIVE_CLUES:
+                return None
+            view = _sanitized_job(job, time.time())
+            decision_view = _sanitized_decision(decision)
+            if view is None or decision_view is None:
+                return None
+            if view.get("deviceVerified") is not True or view.get("changed"):
+                return None
+            if decision_view.get("outcome") != "allowed" or decision_view.get("language") not in ALLOWED_LANGUAGES:
+                return None
+            key = _digest(str(view.get("cid")) + "|" + str(view.get("visitID")) + "|" + "|".join(clues))
+            now = time.time()
+            self._prune_pending(now)
+            if key in self._pending:
+                return None
+            self._ensure_worker()
+            item = PendingClue(view, decision_view, tuple(clues), now, key)
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
+                return None
+            self._pending[key] = now
+            self.submitted += 1
+            return None
+        except Exception as error:
+            self.log("episode handoff error " + type(error).__name__)
+            return None
+
+    def _prune_pending(self, now):
+        for key, at in list(self._pending.items()):
+            if now - at > PENDING_DEDUP_SECONDS:
+                self._pending.pop(key, None)
+        while len(self._pending) > MAX_PENDING * 4:
+            self._pending.popitem(last=False)
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                self._process_pending(item)
+            except Exception as error:
+                self.log("episode worker error " + type(error).__name__)
+            finally:
+                if isinstance(item, PendingClue):
+                    self._pending.pop(item.key, None)
+                self._queue.task_done()
+
+    def _process_pending(self, item):
+        if not self.enabled:
+            return None
+        now = time.time()
+        snapshot = self.probe() if callable(self.probe) else None
+        binding = make_binding(item.job, snapshot, now, self.ttl)
+        if binding is None or not binding.visit_id:
+            return None
+        context = self._context(binding.channel_id)
+        if context is not None:
+            if context.get("channelID") and context.get("channelID") != binding.channel_id:
+                return None
+            if programme_has_episode_identity(context):
+                return None
+        request = build_request_from_clues(item.clues, item.job, item.decision, binding, now)
+        if request is None:
+            return None
+        return self._evaluate(request, snapshot, context, item.job, now)
+
+    def flush(self, timeout=5.0):
+        """Test/diagnostic barrier for the bounded worker."""
+        if self._queue is None:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return self._queue.unfinished_tasks == 0
+
+    def diagnostics(self):
+        return {"submitted": self.submitted, "dropped": self.dropped,
+                "pending": len(self._pending) if self._queue is not None else 0,
+                "publications": self.publisher.diagnostics() if self.publisher is not None else None}
 
 
 class LocalWhisperAdapter:
@@ -1439,10 +2148,14 @@ def status():
     return {"revision": REVISION, "enabled": DEFAULT_ENABLED, "active": False,
             "mode": "default-off-wired-handoff", "liveIntegration": False,
             "gatewayWired": True,
-            "reason": "Handoff is wired to the single-pass language callback but activation stays default off; no live capture, duplicate Whisper run or unattended research is active",
+            "reason": "Handoff is wired to the single-pass language callback. Module default stays off; the gateway may enable it at runtime. Research runs on a bounded observer worker and never blocks language counting.",
             "maxCandidates": MAX_CANDIDATES, "maxSampleBytes": MAX_SAMPLE_BYTES,
             "handoff": {"contract": "language_audio.Manager(on_speech=...)",
                         "defaultOff": True,
+                        "asyncSubmit": True,
+                        "postResearchReprobe": True,
+                        "publication": True,
+                        "publicationTtlSeconds": PUBLICATION_TTL,
                         "allowedProfile": "american",
                         "allowedLanguages": sorted(ALLOWED_LANGUAGES),
                         "requires": ["channelID", "launchID", "streamGeneration",
@@ -1452,6 +2165,8 @@ def status():
                         "maxSessionTtlSeconds": MAX_SESSION_TTL,
                         "maxObservationAgeSeconds": MAX_OBSERVATION_AGE,
                         "activeViewingSeconds": ACTIVE_VIEWING_SECONDS,
+                        "sampleBackedActiveSeconds": AUDIO_MIN_ACTIVE_SECONDS,
+                        "minEvidenceSampleSeconds": MIN_EVIDENCE_SAMPLE_SECONDS,
                         "maxAttempts": MAX_ATTEMPTS,
                         "cooldownSeconds": COOLDOWN_SECONDS,
                         "dedupSeconds": DEDUP_SECONDS,
@@ -1460,4 +2175,5 @@ def status():
                         "independentReportHosts": sorted(INDEPENDENT_REPORT_HOSTS),
                         "researchAttendance": "injected-reviewed-source-registry",
                         "maxSourcePages": MAX_SOURCE_PAGES,
+                        "maxResearchSeconds": MAX_RESEARCH_SECONDS,
                         "searchEnabled": False}}

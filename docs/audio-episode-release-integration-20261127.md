@@ -1,5 +1,10 @@
 # Audio episode identity — corrected core release integration (2026-11-27)
 
+> Follow-up: real public-source acceptance, optional date-only official
+> identities, post-research re-probe, bounded programme-metadata publication,
+> runtime opt-in and asynchronous research are documented in
+> [`audio-episode-real-source-20261127.md`](audio-episode-real-source-20261127.md).
+
 Isolated engineering lane that reconciles the completed audio episode handoff
 (`f3ef187`/`943a937`) with the corrected core release `404859d`
 (`Fail closed on visit ledger loss and stale probes`). This is parallel to the

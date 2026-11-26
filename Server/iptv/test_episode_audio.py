@@ -495,6 +495,20 @@ class LanguageHookTests(unittest.TestCase):
         self.manager._notify_speech(self.job, self.decision, None)
         self.assertEqual(self.seen, [])
 
+    def test_synchronous_promotion_return_is_used_and_never_logs_text(self):
+        logs = []
+        self.manager.log = logs.append
+        self.manager.on_speech = lambda job, decision, text: audio.Promotion(True, "", None)
+        self.manager._notify_speech(self.job, self.decision, ("en", NXT_TEXT))
+        self.assertTrue(any("EPISODE_IDENTITY_PROMOTED" == message for message in logs))
+        self.assertFalse(any(NXT_TEXT in message for message in logs))
+        logs.clear()
+        self.manager.on_speech = lambda job, decision, text: audio.Promotion(False, "session-changed", None)
+        self.manager._notify_speech(self.job, self.decision, ("en", NXT_TEXT))
+        self.assertTrue(any("EPISODE_IDENTITY_SKIPPED reason=session-changed" == message
+                            for message in logs))
+        self.assertFalse(any(NXT_TEXT in message for message in logs))
+
 
 OFFICIAL_PAGE = (
     '<script type="application/ld+json">{"@type":"TVEpisode","name":"June 16, 2026",'
@@ -884,6 +898,307 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
                     clock=lambda: time.time() + audio.DEDUP_SECONDS + 1)
                 self.assertTrue(fresh(self.job(returned["visitID"], generation="generation-3", wall=wall),
                                       self.decision(), NXT_TEXT).accepted)
+
+    def test_runtime_opt_in_toggles_observer_without_restart(self):
+        class FakeObserver:
+            enabled = False
+
+            def submit(self, job, decision, text):
+                return None
+
+        fake = FakeObserver()
+        with patch.object(self.g, "reload_gateway_config", return_value=False), \
+                patch.object(self.g, "episode_observer_instance", return_value=fake):
+            self.g.gateway_config = dict(self.g.gateway_config, episodeAudioEnabled=True)
+            self.g.episode_speech_callback(self.job("visit-1"), self.decision(), NXT_TEXT)
+            self.assertTrue(fake.enabled)
+            self.g.gateway_config = dict(self.g.gateway_config, episodeAudioEnabled=False)
+            self.g.episode_speech_callback(self.job("visit-1"), self.decision(), NXT_TEXT)
+            self.assertFalse(fake.enabled)
+
+    def test_status_exposes_configured_effective_and_publication(self):
+        status = self.g.episode_audio_status()
+        self.assertIn("configuredEnabled", status)
+        self.assertIn("publication", status)
+        self.assertIn("observer", status)
+
+    def test_publication_merges_only_when_no_stronger_metadata(self):
+        wall = time.time()
+        request = self.job("visit-1", wall=wall)
+        binding = audio.SessionBinding(CHANNEL, "launch-1", "generation-1",
+                                       wall - 5, wall + 50, "visit-1")
+        request = audio.ClueRequest(audio.extract_clues(NXT_TEXT), binding,
+                                    "CW Presents WWE NXT", "en", "allowed", 0.97, 21.0, 55.0,
+                                    "b" * 32)
+        promoted = audio.promote_episode(request, [nxt_official()], nxt_reports(),
+                                         current(now=wall), wall,
+                                         programme=context_row(originalAirDate="2026-06-16"))
+        self.assertTrue(promoted.accepted)
+        self.g.episode_publisher.entries.clear()
+        self.assertTrue(self.g.episode_publisher.publish(
+            promoted, context_row(originalAirDate="2026-06-16"), wall))
+        weak = {CHANNEL: {"title": "WWE NXT", "source": "provider-catalogue"}}
+        merged = self.g.merge_episode_publication(dict(weak), wall)
+        self.assertEqual(merged[CHANNEL]["episodeSource"], "local-audio-episode-identity")
+        self.assertEqual(merged[CHANNEL]["seasonNumber"], 20)
+        strong = {CHANNEL: {"title": "WWE NXT", "source": "provider-catalogue",
+                            "episodeTitle": "Guide Title", "seasonNumber": 20,
+                            "episodeNumber": 24}}
+        untouched = self.g.merge_episode_publication(dict(strong), wall)
+        self.assertEqual(untouched[CHANNEL]["episodeTitle"], "Guide Title")
+        self.assertNotIn("episodeSource", untouched[CHANNEL])
+
+
+# ---------------------------------------------------------------------------
+# Real public-source shape regressions (bounded fixtures from the 2025-11-04
+# WWE NXT archive/results pages and two independent reports). No full page or
+# transcript is stored.
+# ---------------------------------------------------------------------------
+
+WWE_ARCHIVE_URL = "https://www.wwe.com/shows/wwenxt/2025-11-04"
+WWE_RESULTS_URL = "https://www.wwe.com/shows/wwenxt/2025-11-04/results"
+WI_URL = ("https://www.wrestlinginc.com/2016429/wwe-nxt-november-4-six-woman-"
+          "tag-team-match-jevon-evans-saquon-shugars-more/")
+PWI_URL = ("https://pwinsider.com/article/201974/114-wwe-nxt-report-ricky-and-trick-"
+           "talk-ethan-and-chelsea-celebrate-grande-americano-in-action-you-dont-"
+           "want-to-be-crossing-jordan-and-more.html?p=1")
+
+WWE_ARCHIVE_HTML = (
+    "<html><head>"
+    "<title>WWE NXT: Nov. 4, 2025 | WWE</title>"
+    '<meta property="og:title" content="WWE NXT results, Nov. 4, 2025: Joe Hendry '
+    'and Thea Hail ambush Ethan Page and Chelsea Green"/>'
+    '<meta property="og:description" content="Check out everything that happened '
+    'on the Nov. 4 episode of WWE NXT."/>'
+    '<meta property="og:url" content="https://www.wwe.com/shows/wwenxt/2025-11-04"/>'
+    "</head><body><p>Tuesday, Nov 4 | 8/7 PM C</p></body></html>"
+)
+WWE_RESULTS_HTML = (
+    "<html><head>"
+    "<title>WWE NXT results: Nov. 4, 2025 | WWE</title>"
+    '<meta property="og:title" content="WWE NXT results: Nov. 4, 2025"/>'
+    '<meta property="og:description" content="Fatal Influence def. NXT Women\'s '
+    'Champion Tatum Paxley, Izzi Dame and Lola Vice - Six Woman Tag Team Match"/>'
+    "</head><body><p>Full details</p></body></html>"
+)
+WI_HTML = (
+    "<html><head>"
+    "<title>WWE NXT Results 11/4 - Six Woman Tag Team Match, Je&apos;Von Evans "
+    "Takes On Saquon Shugars &amp; More</title>"
+    '<meta property="article:published_time" content="2025-11-05T00:00:00+00:00"/>'
+    '<script type="application/ld+json">'
+    + json.dumps({
+        "@context": "http://schema.org",
+        "@type": "NewsArticle",
+        "headline": "WWE NXT Results 11/4 - Six Woman Tag Team Match, Je'Von Evans Takes On Saquon Shugars & More",
+        "description": ("This is Wrestling Inc.'s results for \"WWE NXT\" on November 4, 2025, "
+                        "with a singles match between Je'Von Evans and Saquon Shugars of DarkState!"),
+        "datePublished": "2025-11-05T00:00:00+00:00",
+        "dateModified": "2025-11-05T02:46:04+00:00",
+    })
+    + "</script></head><body><p>Welcome to Wrestling Inc.'s results for WWE NXT.</p></body></html>"
+)
+PWI_HTML = (
+    "<html><head>"
+    "<title>11/4 WWE NXT REPORT: RICKY AND TRICK TALK, ETHAN AND CHELSEA "
+    "'CELEBRATE', GRANDE AMERICANO IN ACTION | PWInsider.com</title>"
+    '<meta name="description" content=""/>'
+    "</head><body>"
+    "<p>11/4 WWE NXT REPORT: RICKY AND TRICK TALK</p>"
+    "<p>By Richard Trionfo on 2025-11-04 22:00:00</p>"
+    "<p>Match Number One: Tatum Paxley, Izzi Dame, and Lola Vice versus Jacy Jayne.</p>"
+    "</body></html>"
+)
+
+
+class RealSourceParserTests(unittest.TestCase):
+    def test_official_archive_without_jsonld_or_numbers(self):
+        rows = audio.parse_official_page(WWE_ARCHIVE_HTML, WWE_ARCHIVE_URL, "WWE NXT")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.series_title, "WWE NXT")
+        self.assertEqual(row.original_air_date, "2025-11-04")
+        self.assertIsNone(row.season_number)
+        self.assertIsNone(row.episode_number)
+        self.assertEqual(row.code(), "")
+        self.assertIn("Joe Hendry", row.episode_title)
+        self.assertTrue(row.checked())
+
+    def test_official_results_page_uses_explicit_date(self):
+        rows = audio.parse_official_page(WWE_RESULTS_HTML, WWE_RESULTS_URL, "WWE NXT")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].original_air_date, "2025-11-04")
+        self.assertIsNone(rows[0].season_number)
+        self.assertEqual(rows[0].episode_title, "Nov. 4, 2025")
+
+    def test_independent_jsonld_report_uses_show_date_not_publish_date(self):
+        rows = audio.parse_report_page(WI_HTML, WI_URL, {"seriesTitle": "WWE NXT"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].original_air_date, "2025-11-04")
+        self.assertEqual(rows[0].published_at, "2025-11-05")
+        self.assertTrue(rows[0].terms)
+        self.assertFalse(rows[0].rejection())
+
+    def test_independent_html_report_without_jsonld(self):
+        rows = audio.parse_report_page(PWI_HTML, PWI_URL, {"seriesTitle": "WWE NXT"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].original_air_date, "2025-11-04")
+        self.assertEqual(rows[0].published_at, "2025-11-04")
+        self.assertEqual(rows[0].series_title, "WWE NXT")
+        self.assertTrue(rows[0].terms)
+
+    def test_date_only_official_requires_independent_corroboration(self):
+        official = audio.parse_official_page(WWE_ARCHIVE_HTML, WWE_ARCHIVE_URL, "WWE NXT")
+        reports = (audio.parse_report_page(WI_HTML, WI_URL, {"seriesTitle": "WWE NXT"})
+                   + audio.parse_report_page(PWI_HTML, PWI_URL, {"seriesTitle": "WWE NXT"}))
+        clues = audio.extract_clues("Je'Von Evans takes on Saquon Shugars of DarkState")
+        missing = audio.corroborate_episode(clues, official, [], now=NOW)
+        self.assertFalse(missing.accepted)
+        self.assertEqual(missing.reason, "no-independent-report")
+        verified = audio.corroborate_episode(clues, official, reports, now=NOW)
+        self.assertTrue(verified.accepted)
+        self.assertEqual(verified.identity.original_air_date, "2025-11-04")
+        self.assertIsNone(verified.identity.season_number)
+        self.assertIsNone(verified.identity.episode_number)
+        self.assertEqual(verified.identity.broadcaster_code, "")
+        # A provider numbering already present in programme metadata is not
+        # contradicted merely because the official archive omitted numbers.
+        context = context_row(seasonNumber=20, episodeNumber=24, originalAirDate="2025-11-04")
+        self.assertTrue(audio.programme_matches(verified.identity, context))
+        self.assertFalse(audio.programme_matches(verified.identity,
+                                                 context_row(originalAirDate="2025-11-05")))
+
+    def test_date_only_official_still_requires_matching_clues(self):
+        official = audio.parse_official_page(WWE_ARCHIVE_HTML, WWE_ARCHIVE_URL, "WWE NXT")
+        reports = [audio.parse_report_page(WI_HTML, WI_URL, {"seriesTitle": "WWE NXT"})[0]]
+        self.assertFalse(audio.corroborate_episode(("the", "tonight"), official, reports,
+                                                   now=NOW).accepted)
+
+
+class PublicationStoreTests(unittest.TestCase):
+    def promotion(self, now=NOW, identity=None):
+        request = nxt_request(now)
+        promoted = audio.promote_episode(request, [nxt_official()], nxt_reports(), current(now), now)
+        self.assertTrue(promoted.accepted)
+        return promoted
+
+    def test_publish_is_bounded_expiring_and_contains_no_transcript_or_clues(self):
+        store = audio.PublicationStore(ttl=60, clock=lambda: NOW)
+        promoted = self.promotion()
+        context = context_row(originalAirDate="2026-06-16")
+        self.assertTrue(store.publish(promoted, context, NOW))
+        row = store.get(CHANNEL, NOW)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["episodeSource"], "local-audio-episode-identity")
+        self.assertEqual(row["seasonNumber"], 20)
+        self.assertEqual(row["episodeNumber"], 24)
+        self.assertEqual(row["originalAirDate"], "2026-06-16")
+        text = json.dumps(row)
+        self.assertNotIn("zaria", text.casefold())
+        self.assertNotIn("transcript", text.casefold())
+        self.assertNotIn("clues", text.casefold())
+        self.assertIsNone(store.get(CHANNEL, NOW + 61))
+        self.assertEqual(store.snapshot(NOW + 61), {})
+
+    def test_publish_rejects_programme_mismatch_and_never_invents_numbers(self):
+        store = audio.PublicationStore(clock=lambda: NOW)
+        promoted = self.promotion()
+        self.assertFalse(store.publish(promoted, context_row(seriesTitle="Another Show"), NOW))
+        official = audio.parse_official_page(WWE_ARCHIVE_HTML, WWE_ARCHIVE_URL, "WWE NXT")
+        reports = [audio.parse_report_page(WI_HTML, WI_URL, {"seriesTitle": "WWE NXT"})[0]]
+        request = nxt_request(now=NOW, clues=audio.extract_clues(
+            "Je'Von Evans takes on Saquon Shugars of DarkState"))
+        date_only = audio.promote_episode(request, official, reports, current(NOW), NOW,
+                                          programme=context_row(originalAirDate="2025-11-04"))
+        self.assertTrue(date_only.accepted)
+        self.assertTrue(store.publish(date_only, context_row(originalAirDate="2025-11-04"), NOW))
+        row = store.get(CHANNEL, NOW)
+        self.assertNotIn("seasonNumber", row)
+        self.assertNotIn("episodeNumber", row)
+        self.assertEqual(row["originalAirDate"], "2025-11-04")
+
+    def test_existing_stronger_metadata_is_never_replaced(self):
+        self.assertFalse(audio.programme_has_stronger_episode_metadata({"title": "WWE NXT"}))
+        self.assertTrue(audio.programme_has_stronger_episode_metadata(
+            {"title": "WWE NXT", "episodeTitle": "Guide Title"}))
+        self.assertTrue(audio.programme_has_stronger_episode_metadata(
+            {"title": "WWE NXT", "seasonNumber": 20, "episodeNumber": 24}))
+
+
+class ObserverFreshnessTests(unittest.TestCase):
+    def job(self, wall=None):
+        wall = time.time() if wall is None else wall
+        return {"cid": CHANNEL, "name": "CW Presents WWE NXT", "deviceVerified": True,
+                "changed": False, "launchID": "launch-1", "streamGeneration": "generation-1",
+                "visitID": "visit-1", "observedAt": wall - 5, "expiresAt": wall + 50,
+                "sampleDigest": "b" * 32}
+
+    def decision(self):
+        return {"outcome": "allowed", "language": "en", "confidence": 0.97,
+                "speechSeconds": 21.0, "sampleSeconds": 55.0}
+
+    def test_research_reprobes_and_rejects_a_changed_physical_visit(self):
+        wall = time.time()
+        probes = [current(now=wall), current(now=wall, visitID="visit-2")]
+        observer = audio.EpisodeObserver(
+            lambda: probes.pop(0), lambda payload: ([nxt_official()], nxt_reports()),
+            enabled=True, programme=lambda cid: context_row(originalAirDate="2026-06-16"),
+            activity=lambda cid: {"channel_id": cid, "active_seconds": 60,
+                                  "hasEpisodeIdentity": False})
+        self.assertEqual(observer(self.job(wall), self.decision(), NXT_TEXT).reason,
+                         "session-changed")
+
+    def test_research_reprobes_and_rejects_a_changed_programme(self):
+        wall = time.time()
+        contexts = [context_row(originalAirDate="2026-06-16"),
+                    context_row(seriesTitle="Another Show", originalAirDate="2026-06-16")]
+        observer = audio.EpisodeObserver(
+            lambda: current(now=wall), lambda payload: ([nxt_official()], nxt_reports()),
+            enabled=True, programme=lambda cid: contexts.pop(0),
+            activity=lambda cid: {"channel_id": cid, "active_seconds": 60,
+                                  "hasEpisodeIdentity": False})
+        self.assertEqual(observer(self.job(wall), self.decision(), NXT_TEXT).reason,
+                         "programme-changed")
+
+    def test_async_submit_does_not_retain_transcript_and_publishes(self):
+        wall = time.time()
+        payloads = []
+        publisher = audio.PublicationStore(clock=lambda: time.time())
+        observer = audio.EpisodeObserver(
+            lambda: current(now=time.time()),
+            lambda payload: payloads.append(payload) or ([nxt_official()], nxt_reports()),
+            enabled=True, budget=audio.EpisodeBudget(clock=lambda: time.time()),
+            programme=lambda cid: context_row(originalAirDate="2026-06-16"),
+            activity=lambda cid: {"channel_id": cid, "active_seconds": 60,
+                                  "hasEpisodeIdentity": False},
+            publisher=publisher)
+        self.assertIsNone(observer.submit(self.job(wall), self.decision(), NXT_TEXT))
+        self.assertTrue(observer.flush(5))
+        self.assertEqual(len(payloads), 1)
+        self.assertIn("zaria", payloads[0]["clues"])
+        self.assertNotIn("Zaria becomes", json.dumps(payloads[0]))
+        self.assertIsNotNone(publisher.get(CHANNEL))
+        self.assertEqual(observer.diagnostics()["submitted"], 1)
+
+
+class SampleBackedActiveViewingTests(unittest.TestCase):
+    def setUp(self):
+        self.now = [1000.0]
+        self.budget = audio.EpisodeBudget(clock=lambda: self.now[0])
+        self.view = {"channel_id": CHANNEL, "session_hash": "session-1"}
+
+    def eligible(self, active, sample):
+        view = dict(self.view, active_seconds=active)
+        return self.budget.eligible(
+            view, has_episode_identity=False, profile="american", language="en",
+            language_outcome="allowed", now=self.now[0], sample_seconds=sample)
+
+    def test_verified_sample_window_is_eligible_without_lowering_language_gates(self):
+        self.assertEqual(self.eligible(55, 55), (True, ""))
+        self.assertEqual(self.eligible(54, 55), (False, "inactive"))
+        self.assertEqual(self.eligible(55, 39), (False, "inactive"))
+        self.assertEqual(self.eligible(119, 0), (False, "inactive"))
+        self.assertEqual(self.eligible(120, 0), (True, ""))
 
 
 if __name__ == "__main__":

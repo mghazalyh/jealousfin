@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "series": {
+    "WWE NXT": {
+      "official": [
+        "https://www.wwe.com/shows/wwenxt/2025-11-04",
+        "https://www.wwe.com/shows/wwenxt/2025-11-04/results"
+      ],
+      "reports": [
+        "https://www.wrestlinginc.com/2016429/wwe-nxt-november-4-six-woman-tag-team-match-jevon-evans-saquon-shugars-more/",
+        "https://pwinsider.com/article/201974/114-wwe-nxt-report-ricky-and-trick-talk-ethan-and-chelsea-celebrate-grande-americano-in-action-you-dont-want-to-be-crossing-jordan-and-more.html?p=1"
+      ]
+    }
+  }
+}

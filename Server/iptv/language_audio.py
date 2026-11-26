@@ -254,7 +254,17 @@ class Manager(base.Manager):
             "sampleDigest": job.get("sampleDigest"), "profile": job.get("profile", "american"),
         }
         try:
-            self.on_speech(view, dict(decision), transcript[1])
+            result = self.on_speech(view, dict(decision), transcript[1])
+            # A synchronous observer (tests or a reviewed synchronous adapter)
+            # returns a Promotion. The gateway adapter queues the bounded clues
+            # and returns None immediately so research can never block language
+            # counting. Never log the transcript or spoken clues here.
+            accepted = getattr(result, "accepted", None)
+            reason = getattr(result, "reason", None)
+            if accepted is True:
+                self.log("EPISODE_IDENTITY_PROMOTED")
+            elif accepted is False and reason:
+                self.log("EPISODE_IDENTITY_SKIPPED reason=" + str(reason)[:48])
         except Exception as error:
             self.log("episode clue handoff error " + type(error).__name__)
 

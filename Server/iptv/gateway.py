@@ -43,6 +43,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'resourceLimit':10000,'activeProtectionSeconds':120,'sourceSelection':'round-robin','preferredHosts':{},
                  'metadataResearchEnabled':False,'metadataResearchModel':opencode_discovery.DEFAULT_MODEL,
                  'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180,'metadataResearchVariant':opencode_discovery.DEFAULT_VARIANT,
+                 'episodeAudioEnabled':False,
                  'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False,
                  'expandedManifest':None,'expandedTrialProviderIds':[],'expandedCataloguePageCount':6,'mediaEndpointAllowlist':{}}
 gateway_config=dict(CONFIG_DEFAULTS)
@@ -115,6 +116,7 @@ def validate_gateway_config(raw):
   value=result[key]
   if type(value) is not int or not lo<=value<=hi:raise ValueError('Invalid '+key)
  if type(result['metadataResearchEnabled']) is not bool:raise ValueError('Invalid metadata research toggle')
+ if type(result['episodeAudioEnabled']) is not bool:raise ValueError('Invalid episode audio toggle')
  if not isinstance(result['metadataResearchModel'],str) or not opencode_discovery.MODEL_RE.fullmatch(result['metadataResearchModel']):raise ValueError('Invalid research model')
  if result['metadataResearchVariant'] not in (None,'low','high','max'):raise ValueError('Invalid research variant')
  manifest=result['ukManifest'];ids=result['ukTrialProviderIds'];enabled=result['ukTrialEnabled']
@@ -1228,6 +1230,18 @@ def discovery_status():
   missing=[cid for cid in channels if cid not in known and sources.get(cid)]
   return dict(discovery.status(now,gateway_config['metadataResearchDailyBudget']),enabled=gateway_config['metadataResearchEnabled'],timeoutSeconds=gateway_config['metadataResearchTimeoutSeconds'],variant=gateway_config['metadataResearchVariant'],lastRun=discovery.last_run,missingProgrammeChannels=len(missing),verifiableMissingChannels=sum(opencode_discovery.supported_region(sources[cid]) for cid in missing),activeViewing=playback_activity.diagnostics(),activeResearch=research_coordinator.diagnostics(now))
 
+def merge_episode_publication(result,now=None):
+ # Bounded audio episode identity is additive only. It never replaces a
+ # provider/episode-guide title, verified numbering or an existing schedule
+ # episode, and it expires on its own independent clock.
+ now=time.time() if now is None else now
+ for cid,audio in episode_publisher.snapshot(now).items():
+  row=result.get(cid)
+  if not isinstance(row,dict):continue
+  if episode_audio.programme_has_stronger_episode_metadata(row):continue
+  merged=dict(row);merged.update(audio);result[cid]=merged
+ return result
+
 def programme_snapshot(now=None):
  now=time.time() if now is None else now
  result=guide_snapshot(now)
@@ -1252,7 +1266,7 @@ def programme_snapshot(now=None):
      if evidence.get(key):primary[key]=evidence[key]
    result[cid]=primary
  for cid,episode in episode_snapshot(now,result).items():result[cid].update(episode)
- return result
+ return merge_episode_publication(result,now)
 
 def programme_item(cid,row):
  # The provider supplies a title and an unzoned end clock, not a reliable
@@ -1785,6 +1799,7 @@ def device_language_probe():
 # second Whisper run or calls a research service while disabled.
 episode_observer=None
 episode_init_lock=threading.Lock()
+episode_publisher=episode_audio.PublicationStore()
 EPISODE_SOURCE_FILE=ROOT/'episode-sources.json'
 EPISODE_SOURCE_LIMIT=65536
 EPISODE_SOURCE_PAGES=8
@@ -1854,19 +1869,34 @@ def episode_observer_instance():
  if SOURCE_PROFILE!='american':return None
  with episode_init_lock:
   if episode_observer is None:
-   research=episode_audio.PublicEvidenceResearch(episode_research_page,load_episode_sources(),EPISODE_SOURCE_PAGES)
+   research=episode_audio.PublicEvidenceResearch(episode_research_page,registry_loader=load_episode_sources,max_pages=EPISODE_SOURCE_PAGES)
    episode_observer=episode_audio.EpisodeObserver(
-    probe=episode_probe,research=research,enabled=episode_audio.DEFAULT_ENABLED,
+    probe=episode_probe,research=research,enabled=False,
     budget=episode_audio.EpisodeBudget(),programme=current_programme_context,
-    activity=episode_active_view,log=log)
+    activity=episode_active_view,publisher=episode_publisher,log=log)
   return episode_observer
+def episode_speech_callback(job,decision,text):
+ # Fast callback from the language worker. Runtime opt-in is re-read here so a
+ # reviewed configuration revision can enable or disable the lane without a
+ # restart. submit() extracts bounded clues and returns; network research,
+ # re-probe and publication happen on the observer's own worker.
+ if SOURCE_PROFILE!='american':return None
+ reload_gateway_config()
+ observer=episode_observer_instance()
+ if observer is None:return None
+ observer.enabled=bool(gateway_config.get('episodeAudioEnabled'))
+ return observer.submit(job,decision,text)
 def episode_audio_status():
  status=episode_audio.status()
+ status['configuredEnabled']=bool(gateway_config.get('episodeAudioEnabled'))
+ status['publication']=episode_publisher.diagnostics()
  if episode_observer is None:
-  status['active']=False;status['fault']='not_started';return status
+  status['active']=False;status['fault']='not_started';status['observer']=None;return status
+ status['enabled']=bool(episode_observer.enabled)
  status['active']=bool(episode_observer.enabled)
  status['fault']=None
  status['budget']=episode_observer.budget.diagnostics() if episode_observer.budget is not None else None
+ status['observer']=episode_observer.diagnostics()
  return status
 def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence,session=None,respect_pause=True):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
@@ -2566,7 +2596,7 @@ def main():
  overlay_publisher=None
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
-  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity(),on_speech=episode_observer_instance())
+  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity(),on_speech=episode_speech_callback)
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
   pending=threading.Thread(target=language_pending_worker,args=(stop,),name='language-pending',daemon=True);pending.start()
   overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()
