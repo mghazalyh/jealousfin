@@ -25,6 +25,8 @@ import uuid
 import wave
 from pathlib import Path
 
+import language_visits
+
 REVISION = "spanish-auto-v1"
 RATE = 16000
 WIDTH = 2
@@ -414,7 +416,7 @@ class _Base:
 
 
 class _Sample:
-    __slots__ = ("cid", "provider", "name", "bases", "started", "last_tap", "probe", "probe_done")
+    __slots__ = ("cid", "provider", "name", "bases", "started", "last_tap", "probe", "probe_done", "visit")
 
     def __init__(self, cid, provider, name, now):
         self.cid = cid
@@ -425,6 +427,7 @@ class _Sample:
         self.last_tap = now
         self.probe = None
         self.probe_done = False
+        self.visit = None
 
 
 class Manager:
@@ -436,12 +439,14 @@ class Manager:
     """
 
     def __init__(self, root, model_path, on_spanish, control, probe=None, log=None,
-                 ffmpeg=None, whisper=None, threads=4):
+                 ffmpeg=None, whisper=None, threads=4, visits=None):
         self.root = Path(root)
         self.model_path = str(model_path)
         self.on_spanish = on_spanish
         self.control = control
         self.probe = probe
+        self.visits = visits
+        self._visit_results = {}
         self.log = log or (lambda message: None)
         self.ffmpeg = ffmpeg or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
         self.whisper = whisper or shutil.which("whisper-cli") or "/opt/homebrew/bin/whisper-cli"
@@ -647,6 +652,59 @@ class Manager:
         except Exception:
             return None
 
+    def _observe_visit(self, probe):
+        """Observe the actual device channel; never the sample's channel."""
+        if self.visits is None or not isinstance(probe, dict):
+            return {"visitID": "", "verified": False, "newVisit": False,
+                    "reason": "identity_unavailable"}
+        try:
+            result = self.visits.observe(
+                probe.get("channelID"), probe.get("launchID"),
+                probe.get("streamGeneration"), now=time.time())
+            return result if isinstance(result, dict) else {
+                "visitID": "", "verified": False, "newVisit": False,
+                "reason": "identity_unavailable"}
+        except Exception:
+            return {"visitID": "", "verified": False, "newVisit": False,
+                    "reason": "identity_unavailable"}
+
+    def _remember_visit_result(self, visit_id):
+        if not language_visits.is_verified(visit_id):
+            return
+        with self._lock:
+            self._visit_results[visit_id] = True
+            if len(self._visit_results) > 512:
+                for key in list(self._visit_results)[:len(self._visit_results) - 512]:
+                    self._visit_results.pop(key, None)
+
+    def _visit_counted(self, visit_id):
+        if not language_visits.is_verified(visit_id):
+            return False
+        with self._lock:
+            return bool(self._visit_results.get(visit_id))
+
+    def _suppress_duplicate_visit(self, last, visit, now):
+        """True when a new sample would be a reload/retry of one physical visit."""
+        if not isinstance(last, dict):
+            return False
+        last_visit = last.get("visitID") if isinstance(last.get("visitID"), str) else ""
+        current_visit = visit.get("visitID") if isinstance(visit, dict) else ""
+        verified_current = bool(isinstance(visit, dict) and visit.get("verified")
+                                and language_visits.is_verified(current_visit))
+        if verified_current and language_visits.is_verified(last_visit) and current_visit != last_visit:
+            # A verified departure and return inside the cooldown is a genuine
+            # new visit and must be sampled.
+            return False
+        if last.get("conclusive") or self._visit_counted(current_visit):
+            return True
+        if verified_current and language_visits.is_verified(last_visit):
+            # Same physical visit: allow a bounded retry only if the earlier
+            # sample was inconclusive.  This preserves exactly one count while
+            # giving a long visit another chance to classify.
+            return now - last.get("at", 0) < FINALIZE_COOLDOWN_SECONDS
+        # Unverified identity: fail closed with the existing cooldown.
+        return now - last.get("at", 0) < FINALIZE_COOLDOWN_SECONDS
+
     def _decode_loop(self):
         while not self._stop.is_set():
             try:
@@ -671,10 +729,19 @@ class Manager:
             self._finalize(event["cid"], "visit_gap")
             sample = None
         if sample is None:
+            probe = self._probe()
+            observed = self._observe_visit(probe)
+            visit = observed
+            if not (observed.get("verified") and observed.get("channelID") == event["cid"]):
+                visit = {"visitID": "", "verified": False, "newVisit": False,
+                         "reason": "sample_channel_unverified"}
             last = self._finalized.get(event["cid"])
-            if last and now - last < FINALIZE_COOLDOWN_SECONDS:
+            if self._suppress_duplicate_visit(last, visit, now):
                 return
             sample = _Sample(event["cid"], event["provider"], event["name"], now)
+            sample.probe = probe
+            sample.probe_done = True
+            sample.visit = visit
             self._samples[event["cid"]] = sample
         sample.last_tap = now
         if event["name"] and not sample.name:
@@ -770,6 +837,7 @@ class Manager:
             current = self._probe()
             self._probe_at = now
             self._probe_cid = current.get("channelID") if isinstance(current, dict) else None
+            self._observe_visit(current)
         verified = self._probe_cid if now - self._probe_at <= PROBE_INTERVAL_SECONDS * 3 else None
         for cid, sample in list(self._samples.items()):
             best = self._best_base(sample)
@@ -820,11 +888,16 @@ class Manager:
         sample = self._samples.pop(cid, None)
         if sample is None:
             return
-        self._finalized[cid] = time.time()
+        visit = sample.visit if isinstance(sample.visit, dict) else {}
+        visit_id = visit.get("visitID") if visit.get("verified") else ""
+        finalized = {"at": time.time(), "visitID": visit_id or "",
+                     "verified": bool(visit_id), "conclusive": False}
+        self._finalized[cid] = finalized
         if len(self._finalized) > 256:
             cutoff = time.time() - FINALIZE_COOLDOWN_SECONDS
             for key, value in list(self._finalized.items()):
-                if value < cutoff:
+                stamp = value.get("at", 0) if isinstance(value, dict) else value
+                if stamp < cutoff:
                     self._finalized.pop(key, None)
         best = self._best_base(sample)
         if best is not None and best.seconds < MIN_REPORT_SECONDS:
@@ -842,6 +915,8 @@ class Manager:
         if end_probe and end_probe.get("channelID"):
             self._probe_cid = end_probe["channelID"]
             self._probe_at = time.time()
+            # Recognise a departure even when no other channel was sampled.
+            self._observe_visit(end_probe)
         start_verified = bool(sample.probe and sample.probe.get("channelID") == cid)
         identity_conflict = bool(sample.probe and sample.probe.get("channelID") and sample.probe.get("channelID") != cid)
         changed = bool(end_probe and end_probe.get("channelID") and end_probe.get("channelID") != cid)
@@ -860,7 +935,7 @@ class Manager:
             "deviceVerified": start_verified if sample.probe else None,
             "changed": changed, "finalizeReason": reason,
             "launchID": launch_id, "streamGeneration": stream_generation,
-            "visitID": ":".join((launch_id or "no-launch", cid, stream_generation or "no-stream", "%.3f" % sample.started)),
+            "visitID": visit_id or "",
         }
         try:
             self._jobs.put_nowait(job)

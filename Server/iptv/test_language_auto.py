@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 import language_catalog
 import language_exclusions
 import language_audio
+import language_visits
 import spanish_audio as base
 
 
@@ -223,7 +224,7 @@ class LanguageSamplerTests(unittest.TestCase):
         calls = []
         pcm = pcm_bursts(5.2)
 
-        def on_exclusion(cid, provider, name, code, language_name, confidence, reason, evidence):
+        def on_exclusion(cid, provider, name, code, language_name, confidence, reason, evidence, session=None):
             calls.append({"cid": cid, "language": code, "name": language_name,
                           "confidence": confidence, "reason": reason})
             return {"changed": True, "reason": "auto_add"}
@@ -303,9 +304,9 @@ class LanguageGatewayTests(unittest.TestCase):
     def test_auto_commit_records_exact_evidence_without_observation_mode_filter(self):
         g = self.g
         self.assertTrue(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                               "auto:language_pt_dominant", self.evidence())["changed"])
+                                               "auto:language_pt_dominant", self.evidence(), respect_pause=False)["changed"])
         self.assertTrue(g.language_auto_commit(self.b, g.sources[self.b], "B", "es", "Spanish", 0.98,
-                                               "auto:language_es_dominant", self.evidence("es", "Spanish", "visit-es", lexical=0.5))["changed"])
+                                               "auto:language_es_dominant", self.evidence("es", "Spanish", "visit-es", lexical=0.5), respect_pause=False)["changed"])
         g.maybe_reload_spanish(force=True)
         self.assertEqual(g.spanish_provider_ids, set())
         state = json.loads((pathlib.Path(self.temp.name) / "language-exclusions.json").read_text())
@@ -322,10 +323,10 @@ class LanguageGatewayTests(unittest.TestCase):
         g.set_language_auto_control(enabled=True, enforcement=True, threshold=2)
         evidence = self.evidence()
         self.assertFalse(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", evidence)["enforced"])
+                                                "auto:language_pt_dominant", evidence, respect_pause=False)["enforced"])
         second = self.evidence(visit="visit-2", launch="launch-2")
         result = g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                        "auto:language_pt_dominant", second)
+                                        "auto:language_pt_dominant", second, respect_pause=False)
         self.assertTrue(result["enforced"])
         g.maybe_reload_spanish(force=True)
         self.assertIn(g.sources[self.a], g.spanish_provider_ids)
@@ -349,14 +350,14 @@ class LanguageGatewayTests(unittest.TestCase):
         self.assertIn(provider, g.spanish_provider_ids)
         self.assertEqual(g.spanish_state["entries"][provider]["language"], "es")
         self.assertEqual(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", self.evidence())["reason"], "manual_exclusion")
+                                                "auto:language_pt_dominant", self.evidence(), respect_pause=False)["reason"], "manual_exclusion")
         remove = json.dumps({"schemaVersion": 1, "action": "remove", "channelID": self.a,
                              "channelName": "Fixture A", "nonce": "manual-remove-1"})
         with patch.object(g.prototype_selector, "device_ui_trigger", return_value=remove):
             g.apply_device_spanish_request({}, "")
         self.assertNotIn(provider, g.spanish_provider_ids)
         self.assertEqual(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", self.evidence("pt", "Portuguese", "visit-2", "launch-2"))["reason"], "manual_not_spanish")
+                                                "auto:language_pt_dominant", self.evidence("pt", "Portuguese", "visit-2", "launch-2"), respect_pause=False)["reason"], "manual_not_spanish")
 
     def test_control_endpoint_preserves_evidence_and_manual_exclusions(self):
         g = self.g
@@ -367,7 +368,7 @@ class LanguageGatewayTests(unittest.TestCase):
         with patch.object(g.prototype_selector, "device_ui_trigger", return_value=add):
             g.apply_device_spanish_request({}, "")
         g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                               "auto:language_pt_dominant", self.evidence())
+                               "auto:language_pt_dominant", self.evidence(), respect_pause=False)
         g.set_spanish_auto_enabled(False)
         self.assertFalse(g.reload_spanish_auto_control(force=True))
         self.assertIn(manual_provider, g.spanish_provider_ids)
@@ -408,7 +409,7 @@ class LanguageGatewayTests(unittest.TestCase):
         self.assertFalse(g.SPANISH_AUTO_ENFORCEMENT)
         self.assertEqual(g.SPANISH_EVIDENCE_THRESHOLD, 25)
         self.assertEqual(g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                                "auto:language_pt_dominant", self.evidence())["reason"], "observation_disabled")
+                                                "auto:language_pt_dominant", self.evidence(), respect_pause=False)["reason"], "observation_disabled")
         control = g.set_language_auto_control(enabled=True, enforcement=False, threshold=13)
         self.assertEqual(control["threshold"], 13)
         self.assertTrue(g.reload_spanish_auto_control(force=True))
@@ -427,7 +428,7 @@ class LanguageGatewayTests(unittest.TestCase):
         g.maintenance_state = None
         g.maintenance_checked_at = 0.0
         result = g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese", 0.97,
-                                        "auto:language_pt_dominant", self.evidence())
+                                        "auto:language_pt_dominant", self.evidence(), respect_pause=False)
         self.assertEqual(result["reason"], "maintenance")
         state = g.spanish_classification.load_or_migrate(self.temp.name)
         self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 0)
@@ -437,7 +438,7 @@ class LanguageGatewayTests(unittest.TestCase):
         g.set_language_auto_control(enabled=True, enforcement=True, threshold=1)
         provider = g.sources[self.a]
         self.assertTrue(g.language_auto_commit(self.a, provider, "A", "pt", "Portuguese", 0.97,
-                                               "auto:language_pt_dominant", self.evidence())["enforced"])
+                                               "auto:language_pt_dominant", self.evidence(), respect_pause=False)["enforced"])
         self.assertTrue(g.spanish_excluded(self.a))
         before = g.policy_rows()
         marker = json.dumps({"schemaVersion": 2, "action": "mistaken_english", "channelID": self.a,
@@ -631,17 +632,19 @@ class LanguageEvidenceGateTests(unittest.TestCase):
     def test_visit_dedup_and_stale_session_identity(self):
         state = language_exclusions.empty()
         channel = "a" * 32
-        state, first = self.event(state, channel, "es", "Spanish", "visit-1", "launch-1", 1000)
-        state, duplicate = self.event(state, channel, "es", "Spanish", "visit-1", "launch-1", 1001)
+        visit_one = language_visits.new_visit_id()
+        visit_two = language_visits.new_visit_id()
+        visit_three = language_visits.new_visit_id()
+        state, first = self.event(state, channel, "es", "Spanish", visit_one, "launch-1", 1000)
+        state, duplicate = self.event(state, channel, "es", "Spanish", visit_one, "launch-1", 1001)
         self.assertTrue(first["changed"])
         self.assertFalse(duplicate["changed"])
         self.assertEqual(duplicate["reason"], "duplicate_visit")
-        state, reload = self.event(state, channel, "es", "Spanish", "visit-2", "launch-1", 1002)
-        self.assertFalse(reload["changed"])
-        self.assertEqual(reload["reason"], "duplicate_visit")
-        state, new_session = self.event(state, channel, "es", "Spanish", "visit-3", "launch-2", 1003)
+        state, revisit = self.event(state, channel, "es", "Spanish", visit_two, "launch-1", 1002)
+        self.assertTrue(revisit["changed"])
+        state, new_session = self.event(state, channel, "es", "Spanish", visit_three, "launch-2", 1003)
         self.assertTrue(new_session["changed"])
-        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 2)
+        self.assertEqual(language_exclusions.counts_for(state, channel, "es"), 3)
         manager = object.__new__(language_audio.Manager)
         job = {"cid": channel, "launchID": "launch-1", "streamGeneration": "stream-1"}
         self.assertTrue(manager._identity_matches(job, {"channelID": channel, "launchID": "launch-1", "streamGeneration": "stream-1"}))
@@ -663,8 +666,9 @@ class LanguageEvidenceGateTests(unittest.TestCase):
         manager.telemetry = language_audio.Manager._empty_state(manager)
         manager.log = lambda message: None
         manager._persist = lambda force=False: None
-        manager.on_exclusion = lambda *args: calls.append(args) or {"changed": True, "reason": "evidence_recorded",
-                                                                    "count": 1, "threshold": 25, "enforced": False}
+        manager.on_exclusion = lambda *args, **kwargs: calls.append(args) or {
+            "changed": True, "reason": "evidence_recorded",
+            "count": 1, "threshold": 25, "enforced": False}
         job = {"cid": "a" * 32, "provider": "nltv:us:" + "a" * 32, "name": "A", "deviceVerified": True,
                "changed": False, "launchID": "launch-1", "streamGeneration": "stream-1", "visitID": "v-1"}
         decision = {"outcome": "excluded", "reason": "language_es_dominant", "language": "es",

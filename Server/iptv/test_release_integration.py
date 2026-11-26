@@ -165,7 +165,7 @@ class ReleaseIntegration(unittest.TestCase):
                           return_value=self.probe(A)):
             info = self.g.language_auto_commit(
                 A, self.g.sources[A], "Fixture A", "pt", "Portuguese", 0.97,
-                "auto:language_pt_dominant", evidence())
+                "auto:language_pt_dominant", evidence(), respect_pause=False)
             self.assertTrue(info["changed"])
             results = self.drain()
         self.assertIn("published", results)
@@ -188,7 +188,7 @@ class ReleaseIntegration(unittest.TestCase):
                           return_value=self.probe(A)):
             self.g.language_auto_commit(
                 A, self.g.sources[A], "Fixture A", "pt", "Portuguese", 0.97,
-                "auto:language_pt_dominant", evidence())
+                "auto:language_pt_dominant", evidence(), respect_pause=False)
             self.drain()
         before = len(recorder.calls)
         with patch.object(self.g, "device_language_probe",
@@ -226,7 +226,7 @@ class ReleaseIntegration(unittest.TestCase):
                           return_value=self.probe(A)):
             self.g.language_auto_commit(
                 A, self.g.sources[A], "Fixture A", "pt", "Portuguese", 0.97,
-                "auto:language_pt_dominant", evidence())
+                "auto:language_pt_dominant", evidence(), respect_pause=False)
             results = self.drain()
         self.assertEqual(results, ["failed"])
         self.assertGreaterEqual(len(recorder.attempts), 1)
@@ -253,10 +253,10 @@ class ReleaseIntegration(unittest.TestCase):
                           return_value=self.probe(A)):
             self.assertFalse(self.g.language_auto_commit(
                 A, self.g.sources[A], "Fixture A", "pt", "Portuguese", 0.97,
-                "auto:language_pt_dominant", evidence())["enforced"])
+                "auto:language_pt_dominant", evidence(), respect_pause=False)["enforced"])
             result = self.g.language_auto_commit(
                 A, self.g.sources[A], "Fixture A", "pt", "Portuguese", 0.97,
-                "auto:language_pt_dominant", evidence(visit="visit-2", launch="launch-2"))
+                "auto:language_pt_dominant", evidence(visit="visit-2", launch="launch-2"), respect_pause=False)
             self.assertTrue(result["enforced"])
             self.drain()
             marker = json.dumps({"schemaVersion": 2, "action": "mistaken_english",
@@ -310,6 +310,49 @@ class ReleaseIntegration(unittest.TestCase):
             self.assertFalse(self.g.spanish_excluded(cid))
         self.assertTrue(self.g.spanish_excluded("d" * 32))
         self.assertEqual(before, self.g.policy_rows())
+
+
+class StagedLayoutTests(unittest.TestCase):
+    def test_final_compact_night_layout_preserves_correction_and_presentation(self):
+        path = HERE.parent.parent / "Examples" / "three-panel-night-fit-language-evidence-20261127.json"
+        layout = json.loads(path.read_text())
+        self.assertEqual(layout["revision"], "three-panel-night-fit-language-evidence-20261127")
+        presentation = layout["presentation"]
+        self.assertEqual(presentation["fullscreenControlTheme"], "night")
+        self.assertEqual(presentation["fullscreenOpacity"], 0.35)
+        self.assertEqual(presentation["fullscreenButtonHeight"], 44)
+        self.assertEqual(presentation["fullscreenIconSize"], 24)
+        self.assertTrue(presentation["fullscreenFitContent"])
+        nodes = []
+
+        def walk(items):
+            for node in items:
+                nodes.append(node)
+                walk(node.get("children", []))
+
+        for slot in layout["slots"]:
+            walk(slot["nodes"])
+        by_id = {node["id"]: node for node in nodes}
+        self.assertIn("prototype-source-switcher", by_id)
+        self.assertEqual(by_id["prototype-source-switcher"]["kind"], "web")
+        hidden = by_id["language-overlay-value"]
+        label = by_id["language-evidence"]
+        self.assertEqual(hidden["kind"], "input")
+        self.assertEqual(label["kind"], "text")
+        self.assertEqual(hidden["valueKey"], "form.languageOverlay")
+        self.assertEqual(label["valueKey"], "form.languageOverlay")
+        correction = by_id["language-mistaken"]["action"]["arguments"]["source"]
+        self.assertIn("mistaken_english", correction)
+        self.assertIn('schemaVersion:2', correction)
+        self.assertNotIn("next_channel", correction)
+        self.assertIn("schemaVersion:1", by_id["spanish-mark"]["action"]["arguments"]["source"])
+        self.assertIn('action:"add"', by_id["spanish-mark"]["action"]["arguments"]["source"])
+        self.assertIn('action:"remove"', by_id["spanish-unmark"]["action"]["arguments"]["source"])
+        html = " ".join(node.get("html", "") for node in nodes)
+        self.assertNotIn("fetch(", html)
+        self.assertNotIn("XMLHttpRequest", html)
+        commands = {node.get("action", {}).get("command") for node in nodes if node.get("action")}
+        self.assertLessEqual(commands, {"script"})
 
 
 if __name__ == "__main__":

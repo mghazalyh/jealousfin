@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import language_catalog
+import language_visits
 import spanish_audio as base
 
 REVISION = "language-auto-v1"
@@ -107,10 +108,10 @@ class Manager(base.Manager):
     """Generalized manager; sampler/decoder/AES are inherited from base."""
 
     def __init__(self, root, model_path, on_exclusion, control, probe=None, log=None,
-                 ffmpeg=None, whisper=None, threads=4):
+                 ffmpeg=None, whisper=None, threads=4, visits=None):
         self.on_exclusion = on_exclusion
         super().__init__(root, model_path, None, control, probe=probe, log=log,
-                         ffmpeg=ffmpeg, whisper=whisper, threads=threads)
+                         ffmpeg=ffmpeg, whisper=whisper, threads=threads, visits=visits)
 
     def _empty_state(self):
         return {
@@ -123,7 +124,7 @@ class Manager(base.Manager):
                 "errors": 0, "suppressed": 0, "segmentsDecoded": 0,
                 "segmentsRejected": 0, "segmentsDecrypted": 0, "keyMissing": 0,
                 "samplesFinalized": 0, "evidence": 0, "enforced": 0,
-                "duplicates": 0, "stale": 0,
+                "duplicates": 0, "stale": 0, "deferred": 0,
             },
             "languages": {},
             "last": None,
@@ -220,17 +221,32 @@ class Manager(base.Manager):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    def _identity_matches(self, job, probe):
+    def _identity_matches(self, job, probe, allow_stream_reload=False):
         if not isinstance(probe, dict) or not probe.get("channelID"):
             return False
         if probe.get("channelID") != job["cid"]:
             return False
-        for key in ("launchID", "streamGeneration"):
-            expected = job.get(key)
-            current = probe.get(key)
-            if expected and current and expected != current:
-                return False
+        expected_launch = job.get("launchID")
+        current_launch = probe.get("launchID")
+        if expected_launch and current_launch and expected_launch != current_launch:
+            return False
+        expected_stream = job.get("streamGeneration")
+        current_stream = probe.get("streamGeneration")
+        if (not allow_stream_reload and expected_stream and current_stream
+                and expected_stream != current_stream):
+            return False
         return True
+
+    def _job_is_current(self, job, probe):
+        """Reject stale jobs while allowing a reload within one physical visit."""
+        visit_id = job.get("visitID", "")
+        verified = language_visits.is_verified(visit_id)
+        if not self._identity_matches(job, probe, allow_stream_reload=verified):
+            return False
+        if not verified:
+            return True
+        visit = self._observe_visit(probe)
+        return bool(visit.get("verified") and visit.get("visitID") == visit_id)
 
     def _record_result(self, job, decision):
         outcome = decision["outcome"]
@@ -240,6 +256,7 @@ class Manager(base.Manager):
         marked = False
         evidence_recorded = False
         suppressed = False
+        deferred = False
         commit_reason = None
         count = None
         threshold = None
@@ -252,7 +269,7 @@ class Manager(base.Manager):
                 reason = "stale_channel_changed"
             else:
                 probe = self._probe()
-                if not self._identity_matches(job, probe):
+                if not self._job_is_current(job, probe):
                     outcome = "inconclusive"
                     reason = "stale_session"
             if outcome in ("excluded", "allowed", "unauthorized"):
@@ -271,11 +288,20 @@ class Manager(base.Manager):
                     "launchID": job.get("launchID", ""),
                     "streamGeneration": job.get("streamGeneration", ""),
                 }
+                session = {
+                    "launchID": job.get("launchID", ""),
+                    "streamGeneration": job.get("streamGeneration", ""),
+                    "visitID": job.get("visitID", ""),
+                    "deviceVerified": job.get("deviceVerified"),
+                    "channelChangedBeforeResult": bool(job.get("changed")),
+                    "surfPaused": job.get("surfPaused"),
+                    "surfing": job.get("surfing"),
+                }
                 try:
                     result = self.on_exclusion(
                         job["cid"], job["provider"], job["name"] or job["provider"],
                         language, language_name, decision.get("confidence", 0.0),
-                        "auto:" + reason, evidence,
+                        "auto:" + reason, evidence, session=session,
                     ) or {}
                     commit_reason = result.get("reason")
                     count = result.get("count")
@@ -289,6 +315,10 @@ class Manager(base.Manager):
                         suppressed = True
                         outcome = "inconclusive"
                         reason = "manual_not_spanish"
+                    elif commit_reason in ("deferred_paused", "deferred_uncertain"):
+                        deferred = True
+                        outcome = "deferred"
+                        reason = commit_reason
                     elif commit_reason in ("duplicate_visit", "maintenance", "observation_disabled"):
                         outcome = "inconclusive"
                         reason = commit_reason
@@ -301,6 +331,11 @@ class Manager(base.Manager):
                     commit_reason = "commit_" + type(error).__name__
                     outcome = "inconclusive"
                     reason = "commit_error"
+        conclusive = decision.get("outcome") in ("excluded", "allowed", "unauthorized")
+        if (conclusive and not deferred
+                and commit_reason in ("evidence_recorded", "auto_threshold", "already_marked",
+                                      "duplicate_visit", "manual_exclusion", "manual_not_spanish")):
+            self._remember_visit_result(job.get("visitID", ""))
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1
@@ -315,6 +350,8 @@ class Manager(base.Manager):
             elif outcome == "unauthorized":
                 counters["unauthorized"] += 1
                 counters["nonSpanish"] += 1
+            elif outcome == "deferred":
+                counters["deferred"] = counters.get("deferred", 0) + 1
             else:
                 counters["inconclusive"] += 1
             if language:
@@ -350,7 +387,11 @@ class Manager(base.Manager):
             }
             self.telemetry["last"] = last
             self.telemetry["current"] = None
-        if marked:
+        if outcome == "deferred":
+            self.log("LANGUAGE_AUTO_DEFER language=%s name=%s provider=%s channel=%s reason=%s confidence=%.3f speech=%.1fs" % (
+                language, language_name, job["provider"], job["cid"], reason,
+                decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
+        elif marked:
             self.log("LANGUAGE_AUTO_EXCLUDE language=%s name=%s provider=%s channel=%s count=%s threshold=%s confidence=%.3f speech=%.1fs" % (
                 language, language_name, job["provider"], job["cid"], str(count), str(threshold),
                 decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
@@ -393,7 +434,7 @@ class Manager(base.Manager):
             current = self.telemetry.get("current")
             last_media = self._last_media
         active = bool(not self.fault and self._enabled() and last_media and now - last_media <= base.INACTIVE_SECONDS)
-        decision_total = counters.get("excluded", 0) + counters.get("allowed", 0) + counters.get("unauthorized", 0) + counters.get("inconclusive", 0)
+        decision_total = counters.get("excluded", 0) + counters.get("allowed", 0) + counters.get("unauthorized", 0) + counters.get("inconclusive", 0) + counters.get("deferred", 0)
         return {
             "revision": REVISION,
             "enabled": bool(not self.fault and self._enabled()),

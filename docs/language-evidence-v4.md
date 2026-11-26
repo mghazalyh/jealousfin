@@ -70,16 +70,28 @@ decisions intact but stops new sampling and hides dormant automatic entries.
 
 ## Deduplication and identities
 
-- The sampler already deduplicates segment resources and has a finalize
-  cooldown. v4 adds an evidence-level duplicate-visit guard.
-- Exact identities are `visitID`, `launchID` and `streamGeneration` from the
-  device probe. The manager re-probes before committing an inference result.
-  A changed channel, launch, stream generation or unverified device discards
-  the sample as stale.
+- `Server/iptv/language_visits.py` maintains a durable, bounded physical-visit
+  ledger keyed by app `launchID`. A visit begins on the first observation of a
+  channel, continues through reloads/retries/stream-generation changes, and is
+  renewed only after a verified departure to another channel and a return.
+- A stream-generation change alone is not a new visit. Time is not identity.
+  If the launch or channel cannot be verified, the store fails closed and does
+  not invent a new count.
+- One physical visit contributes at most one conclusive automatic event, even
+  if the detected language changes during the visit. Two distinct verified
+  visits both count, including inside the old 600-second window.
+- The manager re-probes before committing an inference result. A job from a
+  visit that ended after a departure is rejected as stale; a reload inside the
+  same visit is accepted but the store deduplicates it.
 - Declared maintenance windows suppress language evidence for the listed
   channel/window.
-- Reloads inside the 600-second per-language dedup window with the same launch
-  do not add a second count. Distinct launch identities or later visits do.
+- Manual audit events, including the Mistaken English correction, never
+  suppress a later automatic visit.
+- While the user has paused or stopped rotation, excluded-language evidence is
+  written to `language-exclusions-pending.json` instead of the store and is
+  applied only after a fresh read-only status shows active rotation and no
+  pause. Allowed/unauthorized evidence is recorded normally because it never
+  changes membership or playback.
 
 ## Manual correction
 
@@ -110,6 +122,13 @@ correction. A hidden editable `input` and a native `text` node share
 `form.languageOverlay`; the gateway bridge writes that one field through the
 existing authorized `ui_set_value` command. It never resumes a manually paused
 stream, advances, reloads or resets rotation.
+
+`Examples/three-panel-night-fit-language-evidence-20261127.json` is the
+reconciled latest compact night layout from the release run directory. It
+preserves the existing 0.35 opacity night presentation, 44pt controls, 24pt
+icons, fit-content and the English/Malay switcher, and it contains both the
+manual Spanish actions and the Mistaken English correction. Install it as a
+separate staged UI revision; the older asset remains for rollback.
 
 ### Exact overlay capability blocker
 

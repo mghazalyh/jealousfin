@@ -128,7 +128,12 @@ not modified.
    removed, manual rows/decisions unchanged, policy rows byte-identical.
 3. Install `Examples/language-evidence-overlay-20261127.json` through the
    existing `install_ui_layout` command. Confirm `get_ui_layout` reports
-   `language-evidence-overlay-bridge-20261127`. No IPA/native rebuild.
+   `language-evidence-overlay-bridge-20261127`. For the reconciled compact
+   night revision from the follow-up lane, install
+   `Examples/three-panel-night-fit-language-evidence-20261127.json` instead and
+   confirm `get_ui_layout` reports
+   `three-panel-night-fit-language-evidence-20261127`; keep the prior asset for
+   rollback. No IPA/native rebuild.
 4. On the live iPad (authorized LAN only), verify:
    - the English/Malay switcher and both Spanish actions are still present and
      unchanged in layout;
@@ -195,3 +200,21 @@ not modified.
 - Audio-assisted episode evidence is deferred and must not delay this release.
 - This session did not send any live command, deploy, restart, push or mutate a
   queue. The harness owns rollout and live verification.
+
+## Pause and visit-identity follow-up (2026-11-27)
+
+The independent preflight found that release `878c276` counted a second
+automatic event after 600 seconds of continuous viewing because `visitID`
+included the sample start time, while suppressing a genuine revisit inside the
+same window. The isolated pause/visit integration lane replaces that with a
+durable physical-visit ledger (`Server/iptv/language_visits.py`) built from
+verified departure and return observations, adds pause-safe pending evidence
+from `a90f3b6`, preserves the official whisper model-path preference from
+`fc05474`, and stages the reconciled compact night layout as
+`Examples/three-panel-night-fit-language-evidence-20261127.json`.
+
+See `docs/release-pause-visit-identity-20261127.md` for the exact design,
+tests, remaining risks and rollout/rollback. The v4 store, default-off
+observation/enforcement, threshold 25 per language, manual decisions, policy,
+Favorites, Malay and health behavior are unchanged. No deployment was
+performed.

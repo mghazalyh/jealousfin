@@ -502,15 +502,48 @@ def _event_identity(provider_id, channel_id, language, visit_id, now):
     return "evt-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
-def _is_duplicate(state, provider_id, channel_id, language, visit_id, launch_id, now, dedup_seconds):
+_VERIFIED_VISIT = re.compile(r"^visit-[a-f0-9]{32}$")
+
+
+def is_verified_visit(visit_id):
+    """True when a visit identity came from the durable physical-visit ledger."""
+    return isinstance(visit_id, str) and bool(_VERIFIED_VISIT.fullmatch(visit_id))
+
+
+def _is_duplicate(state, provider_id, channel_id, visit_id, launch_id, now, dedup_seconds):
+    """Return True when this automatic sample belongs to an already-counted visit.
+
+    A physical visit contributes exactly one conclusive automatic event, even
+    when the detected language changes during the same visit.  Manual audit
+    events never suppress a later automatic visit.  Two distinct verified
+    visit identities are allowed inside any time window (a genuine revisit).
+    Unverified identities fail closed for the same launch instead of using
+    elapsed time as identity; only historical ``legacy:`` migration evidence
+    keeps a bounded replay window so it cannot block later real visits.
+    """
     for event in state["evidence"]["events"].values():
-        if event["providerID"] != provider_id or event["channelID"] != channel_id or event["language"] != language:
+        if event["source"] != "auto":
+            continue
+        if event["providerID"] != provider_id or event["channelID"] != channel_id:
             continue
         if visit_id and event["visitID"] == visit_id:
             return True
-        if dedup_seconds > 0 and 0 <= now - event["at"] < dedup_seconds:
-            if not launch_id or not event["launchID"] or event["launchID"] == launch_id:
-                return True
+        if is_verified_visit(visit_id) and is_verified_visit(event["visitID"]):
+            # Both identities are trustworthy and differ: this is a later
+            # physical visit, not a reload or repeated sample.
+            continue
+        if str(event["visitID"]).startswith("legacy:"):
+            # Migration evidence is historical; it can only suppress a replay
+            # inside the bounded window.  It must not block later real visits.
+            if dedup_seconds > 0 and 0 <= now - event["at"] < dedup_seconds:
+                if not launch_id or not event["launchID"] or event["launchID"] == launch_id:
+                    return True
+            continue
+        # At least one identity is unverified.  Do not invent a physical
+        # visit from elapsed time: fail closed for the same launch and for
+        # samples with no launch identity at all.
+        if not launch_id or not event["launchID"] or event["launchID"] == launch_id:
+            return True
     return False
 
 
@@ -573,7 +606,7 @@ def record_evidence(state, provider_id, channel_id, channel_name, language, lang
                        "outcome": outcome, "eventID": None}
 
     at = time.time() if now is None else now
-    if _is_duplicate(state, provider_id, channel_id, language, visit_id, launch_id, at, dedup_seconds):
+    if _is_duplicate(state, provider_id, channel_id, visit_id, launch_id, at, dedup_seconds):
         return state, {"changed": False, "reason": "duplicate_visit", "count": None,
                        "threshold": threshold, "enforced": False, "language": language,
                        "outcome": outcome, "eventID": None}

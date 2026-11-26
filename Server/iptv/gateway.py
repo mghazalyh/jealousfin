@@ -10,6 +10,8 @@ import source_profiles
 import prototype_selector
 import language_exclusions
 import language_audio
+import language_pending
+import language_visits
 import overlay_bridge
 spanish_classification=language_exclusions
 spanish_audio=language_audio
@@ -79,6 +81,9 @@ overlay_jobs=queue.Queue(maxsize=8)
 OVERLAY_SETTLE_SECONDS=2.0
 device_identity_cache=None
 device_identity_checked=0.0
+device_rotation_cache=None
+device_rotation_checked=0.0
+language_visit_ledger=None
 MAINTENANCE_FILE=ROOT/'maintenance-window.json'
 MAINTENANCE_IGNORED_FILE=ROOT/'maintenance-ignored.jsonl'
 maintenance_state=None
@@ -1540,6 +1545,43 @@ def spanish_excluded(cid):
  if provider in spanish_manual_provider_ids:return True
  if not reload_spanish_auto_control():return False
  return bool(SPANISH_AUTO_ENFORCEMENT and provider in spanish_auto_provider_ids)
+def device_rotation_state(force=False):
+ # Read-only device state used to avoid changing playback while the user has
+ # paused or stopped rotation. No state-changing command is issued here.
+ global device_rotation_cache,device_rotation_checked
+ now=time.monotonic()
+ if not force and now-device_rotation_checked<2:return device_rotation_cache
+ device_rotation_checked=now
+ config=prototype_selector.load_selector(ROOT)
+ if config is None:
+  device_rotation_cache=None;return None
+ token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
+ try:
+  status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
+  snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+  if not isinstance(status,dict) or not isinstance(snapshot,dict):raise ValueError('Invalid device state')
+  if type(status.get('surfPaused')) is not bool or type(status.get('surfing')) is not bool:raise ValueError('Unknown pause state')
+  device_rotation_cache={'launchID':str(status.get('launchID',''))[:160],
+   'streamGeneration':str(snapshot.get('streamGeneration',''))[:160],
+   'currentChannelID':str(snapshot.get('channelID') or status.get('currentChannelID') or ''),
+   'surfPaused':status.get('surfPaused') is True,'surfing':status.get('surfing') is True,
+   'rotationOwner':str(status.get('rotationOwner',''))[:80],'observedAt':time.time()}
+ except Exception:
+  device_rotation_cache=None
+ return device_rotation_cache
+def language_visible(cid):
+ if not spanish_excluded(cid):return True
+ entry=spanish_state['entries'].get(sources.get(cid))
+ if not entry or entry.get('source')=='manual':return False
+ state=device_rotation_state()
+ if state is None:return True
+ if state.get('surfPaused') and state.get('currentChannelID')==cid:return True
+ return False
+def language_visit_identity():
+ global language_visit_ledger
+ if language_visit_ledger is None:
+  language_visit_ledger=language_visits.Ledger(ROOT)
+ return language_visit_ledger
 def apply_device_spanish_request(config, device_token):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return
@@ -1700,8 +1742,14 @@ def resolve_whisper_model():
  candidates=[]
  explicit=os.environ.get('JEALOUSFIN_WHISPER_MODEL','')
  if explicit:candidates.append(Path(explicit))
+ official=Path.home()/'.local'/'share'/'whisper.cpp'/'models'
  home=Path.home()/'.config'/'jealousfin'/'models'
- candidates.extend([home/'ggml-small.bin',home/'ggml-base.bin',ROOT/'models'/'ggml-small.bin',ROOT/'models'/'ggml-base.bin'])
+ # Prefer the official base model now available at the standard whisper.cpp
+ # path; keep the verified small model as a fallback for multilingual edge
+ # cases and for installations that only have the larger file.
+ candidates.extend([official/'ggml-base.bin',official/'ggml-small.bin',
+                    home/'ggml-base.bin',home/'ggml-small.bin',
+                    ROOT/'models'/'ggml-base.bin',ROOT/'models'/'ggml-small.bin'])
  for path in candidates:
   try:
    if path.is_file() and path.stat().st_size>1024*1024:return path
@@ -1718,14 +1766,17 @@ def device_language_probe():
   return None
  if not isinstance(snapshot,dict):return None
  now=time.time()
+ paused=None;surfing=None
  if device_identity_cache is None or now-device_identity_checked>60:
   try:
    status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
    if isinstance(status,dict):
     device_identity_cache=str(status.get('launchID',''));device_identity_checked=now
+    paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
+    surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
   except Exception:pass
- return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration',''))}
-def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence):
+ return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration','')),'surfPaused':paused,'surfing':surfing}
+def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence,session=None,respect_pause=True):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
  if sources.get(cid)!=provider:return {'changed':False,'reason':'unknown_provider'}
@@ -1740,6 +1791,30 @@ def language_auto_commit(cid,provider,name,language,language_name,confidence,rea
   now=time.time()
   if window['start']<=now<=window['until'] and (not window.get('channelID') or window['channelID']==cid):
    return {'changed':False,'reason':'maintenance'}
+ if respect_pause and outcome=='excluded':
+  rotation=device_rotation_state()
+  current=rotation.get('currentChannelID') if rotation else None
+  if rotation is None:
+   defer_reason='deferred_uncertain'
+  elif current==cid and (rotation.get('surfPaused') is True or rotation.get('surfing') is not True):
+   defer_reason='deferred_paused'
+  else:
+   defer_reason=None
+  if defer_reason:
+   identity=session if isinstance(session,dict) else {}
+   record={'channelID':cid,'channelName':str(name or provider)[:160],'language':language,
+           'languageName':language_name,'confidence':confidence,'reason':reason,
+           'evidence':payload,
+           'launchID':str(identity.get('launchID') or payload.get('launchID') or ''),
+           'streamGeneration':str(identity.get('streamGeneration') or payload.get('streamGeneration') or ''),
+           'createdAt':time.time()}
+   try:
+    language_pending.add(ROOT,provider,record)
+    log('LANGUAGE_EXCLUSION_DEFER language='+language+' provider='+provider+' channel='+cid+' reason='+defer_reason)
+    return {'changed':False,'reason':defer_reason}
+   except (ValueError,OSError,TypeError) as error:
+    log('Language pending write rejected '+type(error).__name__)
+    return {'changed':False,'reason':'pending_'+type(error).__name__}
  try:
   with lock:
    fresh=spanish_classification.load_or_migrate(ROOT)
@@ -1761,9 +1836,62 @@ def language_auto_commit(cid,provider,name,language,language_name,confidence,rea
  except (ValueError,OSError,TypeError) as error:
   log('Language auto commit rejected '+type(error).__name__)
   return {'changed':False,'reason':'commit_'+type(error).__name__}
+def process_language_pending_once():
+ global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
+ if SOURCE_PROFILE!='american':return 0
+ if not reload_spanish_auto_control():return 0
+ try:pending=language_pending.load(ROOT)
+ except (ValueError,OSError,TypeError):return 0
+ if not pending['entries']:return 0
+ rotation=device_rotation_state(force=True)
+ if rotation is None or rotation.get('surfing') is not True or rotation.get('surfPaused') is True:return 0
+ applied=0
+ for provider,record in list(pending['entries'].items()):
+  cid=record['channelID']
+  if sources.get(cid)!=provider:
+   language_pending.remove(ROOT,provider);continue
+  payload=record['evidence'] if isinstance(record['evidence'],dict) else {}
+  outcome=payload.get('outcome','excluded')
+  if outcome!='excluded':
+   language_pending.remove(ROOT,provider);continue
+  visit_id=payload.get('visitID','')
+  launch_id=payload.get('launchID') or record.get('launchID') or ''
+  stream_generation=payload.get('streamGeneration') or record.get('streamGeneration') or ''
+  changed=False;why=None;info={}
+  try:
+   with lock:
+    fresh=spanish_classification.load_or_migrate(ROOT)
+    state,info=spanish_classification.record_evidence(
+     fresh,provider,cid,record['channelName'],record['language'],record['languageName'],
+     record['confidence'],record['reason'],payload,outcome=outcome,
+     visit_id=visit_id,launch_id=launch_id,stream_generation=stream_generation,
+     threshold=SPANISH_EVIDENCE_THRESHOLD,enforcement=SPANISH_AUTO_ENFORCEMENT)
+    changed=bool(info.get('changed'))
+    why=info.get('reason')
+    if changed:spanish_classification.atomic_write(ROOT,state)
+    spanish_state=state
+    spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids=_language_membership(state)
+    try:
+     stat=SPANISH_FILE.stat();spanish_fingerprint=(stat.st_mtime_ns,stat.st_size,stat.st_ino)
+    except OSError:spanish_fingerprint=None
+  except (ValueError,OSError,TypeError) as error:
+   log('Language pending apply rejected '+type(error).__name__);continue
+  if changed:
+   applied+=1
+   if info.get('enforced'):log('LANGUAGE_EVIDENCE_ENFORCED language='+record['language']+' provider='+provider+' channel='+cid+' count='+str(info.get('count'))+' threshold='+str(info.get('threshold')))
+   else:log('LANGUAGE_EXCLUSION_PENDING_APPLIED language='+record['language']+' provider='+provider+' channel='+cid+' count='+str(info.get('count')))
+   overlay_publish_evidence(cid,record['channelName'],record['language'],record['languageName'],record['confidence'],payload,info)
+  if changed or why in ('manual_not_spanish','manual_exclusion','already_marked','unknown_provider','duplicate_visit'):
+   language_pending.remove(ROOT,provider)
+ return applied
+def language_pending_worker(stop):
+ # Existing daemon lifecycle only; it never issues a device command.
+ while not stop.wait(5):
+  try:process_language_pending_once()
+  except Exception as error:log('Language pending worker error '+type(error).__name__)
 def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
  # Backward-compatible manual-era entry point; automatic manager uses language_auto_commit.
- return language_auto_commit(cid,provider,name,'es','Spanish',confidence,reason,evidence)
+ return language_auto_commit(cid,provider,name,'es','Spanish',confidence,reason,evidence,respect_pause=False)
 def overlay_bridge_instance():
  global overlay_bridge_state,overlay_bridge_fingerprint,overlay_bridge_fault
  if SOURCE_PROFILE!='american':return None
@@ -1912,13 +2040,13 @@ language_auto_status=spanish_auto_status
 language_auto_admin=spanish_auto_admin
 def ordered_catalogue(snapshot,include_excluded=False):
  now=time.time()
- return sorted((item for item in channels.items() if not spanish_excluded(item[0]) and (include_excluded or policy_eligible(snapshot[item[0]],now))),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
+ return sorted((item for item in channels.items() if language_visible(item[0]) and (include_excluded or policy_eligible(snapshot[item[0]],now))),key=lambda item:(snapshot[item[0]]["lastAttempt"],item[0]))
 def policy_payload(snapshot):
  with closing(sqlite3.connect((ROOT/'policy.sqlite3').as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
   days,ban=policy_penalty(db)
   row=db.execute("SELECT value FROM meta WHERE key='surf_resume'").fetchone()
   resume=json.loads(row[0]) if row else None
-  visible={cid:row for cid,row in snapshot.items() if not spanish_excluded(cid)}
+  visible={cid:row for cid,row in snapshot.items() if language_visible(cid)}
   if not isinstance(resume,dict) or resume.get('channelID') not in visible:resume=None
  return {"revision":"sqlite-policy-v2","channels":visible,"penalty":{"baseDays":days,"banAfter":ban},"resume":resume}
 def policy_event(cid,trace,action,reason):
@@ -2157,9 +2285,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (sqlite3.Error,OSError,RuntimeError,ValueError):snapshot={};ready=False
    try:language_description=spanish_classification.describe(spanish_state)
    except (ValueError,TypeError):language_description={'entries':len(spanish_provider_ids)}
+   try:language_pending_description=language_pending.describe(ROOT)
+   except (ValueError,OSError,TypeError):language_pending_description={'entries':0}
    language_status=spanish_auto_status()
    overlay_request_pump()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
@@ -2264,7 +2394,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    # The current-title feed is not a full EPG. For queries needing a real
    # time range, do not invent times; the client can use CurrentProgram.
    selected=set(','.join(q.get('ChannelIds',[])).split(','))-{''}
-   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if not spanish_excluded(cid) and (not selected or cid in selected)]
+   out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if language_visible(cid) and (not selected or cid in selected)]
    return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinCurrentOnly':True})
   if path=='/LiveTv/Recordings':return self.reply(200,{'Items':[],'TotalRecordCount':0})
   m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)
@@ -2273,7 +2403,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if n>262144:return self.reply(413,{})
    if n:self.rfile.read(n)
    cid=m[1]
-   if spanish_excluded(cid):return self.reply(409,{'JealousfinPolicyError':'excluded'})
+   if not language_visible(cid):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
@@ -2290,7 +2420,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
-   if spanish_excluded(cid) or not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
+   if not language_visible(cid) or not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    play_id=uuid.uuid4().hex
    playback_activity.issue(cid,play_id)
    playback_activity.touch(cid)
@@ -2342,8 +2472,9 @@ def main():
  overlay_publisher=None
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
-  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4)
+  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity())
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
+  pending=threading.Thread(target=language_pending_worker,args=(stop,),name='language-pending',daemon=True);pending.start()
   overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
