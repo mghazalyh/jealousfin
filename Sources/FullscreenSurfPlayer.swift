@@ -128,34 +128,14 @@ struct FullscreenSurfPlayer:View {
                 PatchableRegion("player.fullscreen.surf"){
                 HStack(spacing:8){
                     PatchableRegion("player.fullscreen.category"){
-                    Menu{
-                        ForEach(["All Channels","Favorites","Sports","Movies & Series"],id:\.self){category in
-                            Button{
-                                if model.surfing{model.startSurf(category:category)}
-                                else{model.settings.surfCategory=category;model.saveSettings()}
-                            }label:{
-                                if model.settings.surfCategory==category{Label(category,systemImage:"checkmark")}
-                                else{Text(category)}
-                            }
-                        }
-                    }label:{
-                        HStack{
-                            Label(model.settings.surfCategory,systemImage:"list.bullet").lineLimit(1)
-                            Spacer(minLength:4)
-                            Image(systemName:"chevron.down").font(.caption2)
-                        }.font(.subheadline).padding(.horizontal,8)
-                            .frame(maxWidth:.infinity,minHeight:44)
-                            .foregroundColor(palette.text)
-                            .background(palette.button).cornerRadius(9)
-                            .overlay(RoundedRectangle(cornerRadius:9).strokeBorder(palette.border,lineWidth:1))
-                    }.tint(palette.text)
-                    .accessibilityIdentifier("player.fullscreen.category")
+                        sourceSelector
                     }
                     PatchableRegion("player.fullscreen.surfToggle"){
                     Button{
                         if model.surfing{model.stopSurf()}else{model.startSurf(category:model.settings.surfCategory)}
                     }label:{Text(model.surfing ? "Stop Surf":"Start Surf").font(.subheadline).frame(minHeight:44).padding(.horizontal,10)}
                         .buttonStyle(FullscreenControlButtonStyle(palette:palette))
+                        .disabled(model.sourceTransitionBusy)
                         .accessibilityIdentifier("player.fullscreen.surfToggle")
                     }
                 }
@@ -205,6 +185,55 @@ struct FullscreenSurfPlayer:View {
             }
         default:EmptyView()
         }
+    }
+    // American/Malay are typed aliases over the existing same-origin gateway
+    // category protocol. This region stays replaceable as
+    // player.fullscreen.category; a dynamic replacement suppresses this native
+    // selector rather than rendering both.
+    private var sourceSelector:some View{
+        VStack(alignment:.leading,spacing:4){
+            HStack(spacing:6){
+                ForEach(SurfSourceIdentity.selectable,id:\.rawValue){source in
+                    sourceButton(source)
+                }
+            }
+            if model.sourceTransitionBusy{
+                HStack(spacing:6){
+                    ProgressView().scaleEffect(0.7)
+                    Text("Switching source…").font(.caption2)
+                }.foregroundColor(palette.secondary)
+                    .accessibilityIdentifier("player.fullscreen.source.busy")
+            }else if let error=model.sourceTransitionError{
+                Label(error,systemImage:"exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundColor(.orange).lineLimit(2)
+                    .accessibilityIdentifier("player.fullscreen.source.error")
+            }else{
+                Text("\(model.surfSourceChannelCount) channels • \(model.activeSurfSource.label) selected")
+                    .font(.caption2).foregroundColor(palette.secondary).lineLimit(1)
+                    .accessibilityIdentifier("player.fullscreen.source.count")
+            }
+        }
+    }
+    @ViewBuilder private func sourceButton(_ source:SurfSourceIdentity)->some View{
+        let selected=model.activeSurfSource==source
+        Button{
+            Task{await model.transitionSurfSource(to:source)}
+        }label:{
+            VStack(alignment:.leading,spacing:2){
+                HStack(spacing:4){
+                    Image(systemName:selected ? "checkmark.circle.fill":"circle")
+                    Text(source.label).font(.subheadline.bold()).lineLimit(1)
+                }
+                Text(source.categoryAlias).font(.caption2).lineLimit(1)
+            }.frame(maxWidth:.infinity,minHeight:44,alignment:.leading)
+                .padding(.horizontal,8)
+        }
+        .buttonStyle(FullscreenControlButtonStyle(palette:palette,role:selected ? .rotation:.normal))
+        .disabled(model.sourceTransitionBusy)
+        .accessibilityLabel(source.label+" source")
+        .accessibilityValue(selected ? "Selected":"Not selected")
+        .accessibilityHint(source.categoryAlias+" catalogue")
+        .accessibilityIdentifier("player.fullscreen.source."+source.rawValue)
     }
     // Local video-plane luminance overlay; no transcoding or stream reopening.
     private var brightnessControl:some View{

@@ -44,6 +44,10 @@
       "fullscreen-icon-transport-20261125": {
         "disposition": "native",
         "evidence": "Six native icon-only controls default 29pt/48pt with accessible labels, previous preserves active rotation/category/eligible policy, native confirmed favorite and actual brightness; header and programme heading independently patchable."
+      },
+      "prototype-source-switcher-live-20261126": {
+        "disposition": "native",
+        "evidence": "Native SurfSourceIdentity maps American All Channels and Malay Movies & Series to the installed same-origin gateway aliases. Fullscreen accessible two-button selector, single-flight pause_surf -> stop -> set_preferences -> refresh_catalogue -> start_surf sequence, outgoing category/Surf/pause checkpoint, catalogue readiness check and rollback. Category-scoped rotations, favorites and gateway policy are unchanged. Physical iPad acceptance is outstanding."
       }
     },
     "jellyfinAPIRevision": {
@@ -60,5 +64,10 @@
         "evidence": "Persistent Pluto XMLTV worker, reviewed explicit source IDs and primary-title agreement; verified Cinemeta episode metadata/season premiere, structured native ProgrammeEvidence and displayTitle, no expiring adapter."
       }
     }
-  }
+  },
+  "limitations": [
+    "episode-gateway-passthrough-20261126: the live Jellyfin API adapter source is not present in this repository or its historical patch archives, so adapter behavior remains unverified. Repository evidence only establishes the gateway schedule worker and native typed ProgrammeEvidence parsing; do not certify the adapter as promoted.",
+    "The native Malay source selector assumes the opt-in same-origin prototype-source-selector.json deployment for the configured iPad. Without it Movies & Series remains the normal American category. This change performed no gateway deployment or source switch.",
+    "No IPA build, package or release, gateway restart, mutating device command, or physical acceptance was performed."
+  ]
 }

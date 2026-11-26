@@ -86,3 +86,46 @@ rotation scope and history across release installation.
 ### Episode metadata promotion
 
 The temporary Beverly Hills catalogue adapter is superseded by permanent reviewed Pluto schedule matching and typed episode evidence. Native displayTitle(channelName:at:) uses season premiere year, canonical episode number and title on one line; omit duplicate series title only on normalized exact channel match. Verify current episode, next boundary, mixed channel prefix, stale/conflicting guide fallback and unchanged playback, rotation and hiatus. Unknown years are omitted. No new IPA required for the gateway's standard Name field; typed native fields take effect in a future build.
+
+### Native American/Malay source selector
+
+The fullscreen `player.fullscreen.category` region now renders a native
+American/Malay source selector instead of the reserved category menu. Both
+buttons are accessible, show the selected source, the current catalogue count,
+and a busy or error state. The native adapter is typed as
+`SurfSourceIdentity`: American stays on `All Channels` (and the existing
+Favorites/Sports paths), while Malay uses the temporary `Movies & Series`
+alias already implemented by the opt-in same-origin gateway selector. It does
+not add a host, port or gateway protocol.
+
+Selection is single-flight and follows the installed hot-switch order:
+pause Surf, stop playback, persist the target preference, refresh the
+catalogue, then start Surf on the alias. Success is reported only after the
+refreshed catalogue is ready and Surf is active. The outgoing source,
+category, Surf mode, paused state, current channel and dwell are checkpointed;
+any failure restores the previous category and Surf state and attempts the
+previous catalogue. Per-source category memory preserves an American
+Favorites/Sports path across a Malay switch, and the existing category-scoped
+rotation ledger, favorites and gateway policy are not rewritten. The selector
+is still replaceable through `player.fullscreen.category` (and its parent
+`player.fullscreen.surf`) without double rendering.
+
+Acceptance still required on the physical iPad: select Malay and American while
+playing, while paused, while stopped, during an unavailable Malay backend, and
+during a slow catalogue refresh; verify rollback returns the previous category
+and Surf state, that Favorites/Sports survive a round trip, that no duplicate
+selector appears with a replacement layout, and that accessibility labels and
+selected values are announced. This change performs no gateway deployment,
+device mutation or source switch by itself.
+
+### Outstanding evidence limitation
+
+`episode-gateway-passthrough-20261126` remains unverified as an adapter. The
+live Jellyfin API adapter source is not present in this repository or its
+historical patch archives; `get_jellyfin_api` exposes only active-revision
+metadata. Repository evidence covers the gateway schedule worker and native
+typed `ProgrammeEvidence` parsing. Native tests now pin exact gateway
+programme Name passthrough, season-year preservation, absence-of-evidence
+fallback and policy negotiation, but those tests do not certify the live
+adapter. Do not mark the adapter as promoted until its exact source and
+read-only behavior are available.

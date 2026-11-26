@@ -680,6 +680,73 @@ let decodedProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.
 check(decodedProgramme==typedProgramme,"typed programme evidence round trip")
 print("PASS: \(checks) assertions including programme evidence freshness")
 
+// Exact gateway programme passthrough: the server-owned Name is never rewritten,
+// and absent/invalid evidence must fall back without inventing episode data.
+let exactItem:[String:Any]=[
+    "Id":"episode-1","Name":"S09E17: Slipping Away (1998)","ChannelId":"beverly","ProductionYear":1990,
+    "JealousfinProgramme":[
+        "title":"Beverly Hills, 90210","source":"provider-catalogue",
+        "observedAt":programmeNow.timeIntervalSince1970,"year":1990,
+        "episodeTitle":"Slipping Away","seasonNumber":9,"episodeNumber":17,
+        "seasonYear":1998,"episodeSource":"pluto-xmltv","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+let exactProgramme=JellyfinProgrammeParser.program(exactItem)
+check(exactProgramme?.name=="S09E17: Slipping Away (1998)","gateway episode title passes through verbatim")
+check(exactProgramme?.evidence?.episodeTitle=="Slipping Away","episode title evidence preserved")
+check(exactProgramme?.evidence?.seasonNumber==9 && exactProgramme?.evidence?.episodeNumber==17,"canonical episode numbers preserved")
+check(exactProgramme?.evidence?.seasonYear==1998,"verified season year preserved")
+check(exactProgramme?.productionYear==1990,"series production year remains separate")
+check(exactProgramme?.displayTitle(channelName:"Beverly Hills 90210",at:programmeNow)=="S09E17: Slipping Away (1998)","dedicated series keeps gateway episode title and season year")
+let fallbackProgramme=JellyfinProgrammeParser.program(["Id":"plain-1","Name":"News at 9"])
+check(fallbackProgramme?.name=="News at 9" && fallbackProgramme?.evidence==nil,"absence of evidence preserves gateway title without rewriting")
+check(fallbackProgramme?.displayTitle(channelName:"News",at:programmeNow)=="News at 9","no invented episode or season year without evidence")
+let incompleteEvidence:[String:Any]=[
+    "Id":"episode-2","Name":"Incomplete episode","JealousfinProgramme":[
+        "title":"Series","source":"provider-catalogue","observedAt":programmeNow.timeIntervalSince1970,
+        "episodeTitle":"Subtitle only","episodeSource":"pluto-xmltv","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+let incompleteProgramme=JellyfinProgrammeParser.program(incompleteEvidence)
+check(incompleteProgramme?.evidence?.episodeTitle=="Subtitle only" && incompleteProgramme?.evidence?.seasonNumber==nil && incompleteProgramme?.evidence?.seasonYear==nil,"incomplete episode numbering omits season year instead of guessing")
+check(JellyfinProgrammeParser.program(["Name":"missing id"])==nil,"programme identity required")
+print("PASS: \(checks) assertions including exact gateway programme passthrough and fallback")
+
+// Source identity is a typed adapter over the existing American/Malay category
+// aliases. Rotation scopes remain category-scoped and source memory must not
+// erase Favorites/Sports when a source is switched.
+check(SurfSourceIdentity.identity(forCategory:"All Channels") == SurfSourceIdentity.american,"All Channels is American")
+check(SurfSourceIdentity.identity(forCategory:"Favorites") == SurfSourceIdentity.american,"Favorites remains an American path")
+check(SurfSourceIdentity.identity(forCategory:"Sports") == SurfSourceIdentity.american,"Sports remains an American path")
+check(SurfSourceIdentity.identity(forCategory:"Movies & Series") == SurfSourceIdentity.malay,"Movies & Series is the Malay alias")
+check(SurfSourceIdentity.american.categoryAlias=="All Channels" && SurfSourceIdentity.malay.categoryAlias=="Movies & Series","source aliases match installed gateway protocol")
+check(SurfSourceIdentity.american.mode=="all" && SurfSourceIdentity.malay.mode=="movies-series","source modes reuse existing Surf modes")
+var sourceMemory=SurfSourceCategoryMemory()
+sourceMemory.remember(category:"Favorites",for:.american)
+check(sourceMemory.category(for:.american)=="Favorites","American category memory retained")
+check(sourceMemory.category(for:.malay)=="Movies & Series","Malay always uses its alias")
+let sourceCheckpoint=SurfSourceCheckpoint(source:.american,category:"Favorites",surfing:true,paused:true,channelID:"a",remainingSeconds:42,pausedRotationSeconds:42,resumeSurf:true,at:100)
+check(sourceCheckpoint.valid,"outgoing source checkpoint validated")
+let malayPlan=try SurfSourceTransitionPlan.make(target:.malay,checkpoint:sourceCheckpoint,memory:sourceMemory)
+check(malayPlan.targetCategory=="Movies & Series","switching to Malay uses the existing alias")
+check(malayPlan.checkpoint==sourceCheckpoint,"rollback checkpoint preserves outgoing category/surf/pause state")
+check(malayPlan.memory.category(for:.american)=="Favorites","switching to Malay does not forget American Favorites")
+let malayCheckpoint=SurfSourceCheckpoint(source:.malay,category:"Movies & Series",surfing:false,paused:false,channelID:nil,remainingSeconds:0,pausedRotationSeconds:nil,resumeSurf:false,at:101)
+let backPlan=try SurfSourceTransitionPlan.make(target:.american,checkpoint:malayCheckpoint,memory:malayPlan.memory)
+check(backPlan.targetCategory=="Favorites","switching back restores the previous American category")
+check(backPlan.memory.category(for:.malay)=="Movies & Series","Malay alias remains remembered during rollback")
+let favoriteScope=SurfSourceIdentity.rotationScope(server:"server",account:"user",category:"Favorites")
+let malayScope=SurfSourceIdentity.rotationScope(server:"server",account:"user",category:"Movies & Series")
+check(favoriteScope != malayScope,"rotation ledgers are isolated by source category")
+check(SurfSourceIdentity.rotationScope(server:"server",account:"user",category:backPlan.targetCategory)==favoriteScope,"returning to American restores the original rotation scope")
+check((try? SurfSourceTransitionPlan.make(target:.american,checkpoint:sourceCheckpoint,memory:sourceMemory))==nil,"same source transition is rejected")
+let invalidSourceCheckpoint=SurfSourceCheckpoint(source:.american,category:"Movies & Series",surfing:false,paused:false,channelID:nil,remainingSeconds:0,pausedRotationSeconds:nil,resumeSurf:false,at:100)
+check(!invalidSourceCheckpoint.valid,"mismatched source/category checkpoint is rejected")
+check((try? SurfSourceTransitionPlan.make(target:.malay,checkpoint:invalidSourceCheckpoint,memory:sourceMemory))==nil,"invalid outgoing state cannot be transitioned")
+let sourceMemoryRoundTrip=try JSONCodec.decoder().decode(SurfSourceCategoryMemory.self,from:JSONCodec.encoder().encode(backPlan.memory)).checked()
+check(sourceMemoryRoundTrip.category(for:.american)=="Favorites" && sourceMemoryRoundTrip.category(for:.malay)=="Movies & Series","source category memory survives serialization")
+print("PASS: \(checks) assertions including typed source identity, transition, rollback and rotation isolation")
+
 var durableHistory=SurfRotationState()
 durableHistory.record(scope:"server-a",id:"visited")
 for i in 0..<35{durableHistory.remember(scope:"server-a",id:"channel-\(i)")}

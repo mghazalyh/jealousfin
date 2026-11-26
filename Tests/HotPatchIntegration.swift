@@ -29,7 +29,10 @@ final class JellyfinFixture:URLProtocol {
             let snapshot:[String:Any]=["revision":"sqlite-policy-v2","channels":["channel-b":row],"penalty":["baseDays":3,"banAfter":8]]
             if url.path=="/LiveTv/Channels"{
                 if URLComponents(url:url,resolvingAgainstBaseURL:false)?.queryItems?.contains(where:{$0.name=="JealousfinIncludePolicy" && $0.value=="true"})==true{
-                    object=["Items":[["Id":"channel-b","Name":"Policy fixture"]],"JealousfinPolicy":snapshot]
+                    let now=Date().timeIntervalSince1970
+                    let episode:[String:Any]=["title":"Beverly Hills, 90210","source":"provider-catalogue","observedAt":now,"year":1990,"episodeTitle":"Slipping Away","seasonNumber":9,"episodeNumber":17,"seasonYear":1998,"episodeSource":"pluto-xmltv","episodeObservedAt":now]
+                    let current:[String:Any]=["Id":"program-b","Name":"S09E17: Slipping Away (1998)","ChannelId":"channel-b","JealousfinProgramme":episode]
+                    object=["Items":[["Id":"channel-b","Name":"Policy fixture","CurrentProgram":current]],"JealousfinPolicy":snapshot]
                 }else{status=400}
             }else{object=snapshot}
         case "/Items/channel-b/PlaybackInfo":
@@ -204,6 +207,7 @@ final class TorrioConflictFixture:URLProtocol {
         try await nativePolicyClient.connect(policySettings)
         let policyCatalogue=try await nativePolicyClient.channels()
         try require(policyCatalogue.count==1 && nativePolicyClient.gatewayHealth?.revision=="sqlite-policy-v2","native full catalogue and gateway health negotiation")
+        try require(policyCatalogue[0].program?.name=="S09E17: Slipping Away (1998)" && policyCatalogue[0].program?.evidence?.episodeTitle=="Slipping Away" && policyCatalogue[0].program?.evidence?.seasonYear==1998,"gateway programme title, episode and season year pass through with policy intact")
         try await nativePolicyClient.refreshGatewayHealth()
         try require(nativePolicyClient.gatewayHealth?.penalty?.baseDays==3,"native gateway refresh")
         var excluded=false

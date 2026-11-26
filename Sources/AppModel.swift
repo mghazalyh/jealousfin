@@ -28,6 +28,8 @@ import CryptoKit
     @Published var ready=false
     @Published var fullscreenPresented=false
     @Published var fullscreenControlsVisible=true
+    @Published private(set) var sourceTransitionBusy=false
+    @Published private(set) var sourceTransitionError:String?
     @Published var metrics:[String:String]=[:]
     @Published private(set) var systemMetrics:[String:String]=[:]
     @Published private(set) var telemetryActive=false
@@ -141,6 +143,7 @@ import CryptoKit
     var healthPenalty:HealthPenaltyPolicy{jelly.gatewayHealth?.penalty ?? effectivePolicy.healthPenalty ?? HealthPenaltyPolicy()}
     private var failureRun=0
     private var rotationState=SurfRotationState()
+    private var sourceMemory=SurfSourceCategoryMemory()
     private var resumeRotationSeconds:Int?
     private var lastRotationCheckpoint=Date.distantPast
     private var startupProfiles=ChannelStartupProfiles()
@@ -150,8 +153,10 @@ import CryptoKit
     }
     private var rotationScope:String {
         let server=settings.server.trimmingCharacters(in:CharacterSet(charactersIn:"/"))
-        return [server,settings.username,settings.surfCategory].joined(separator:"|")
+        return SurfSourceIdentity.rotationScope(server:server,account:settings.username,category:settings.surfCategory)
     }
+    var activeSurfSource:SurfSourceIdentity{SurfSourceIdentity.identity(forCategory:settings.surfCategory)}
+    var surfSourceChannelCount:Int{channels.count}
     private var sustainedEvidence=SustainedPlaybackEvidence()
     private var evidencePosition:Double?
     private var evidenceTime:TimeInterval?
@@ -198,6 +203,8 @@ import CryptoKit
             disk.save(storedSettings,"settings.json")
         }
         settings=storedSettings
+        sourceMemory=disk.load(SurfSourceCategoryMemory.self,"surf-source-memory.json")?.checked() ?? SurfSourceCategoryMemory()
+        sourceMemory.remember(category:storedSettings.surfCategory,for:SurfSourceIdentity.identity(forCategory:storedSettings.surfCategory))
         controlMode=storedSettings.controlMode
         let database=TorrioDB(address:storedSettings.repositoryAddress)
         database.enabled=storedSettings.controlMode == .github
@@ -869,6 +876,109 @@ import CryptoKit
         next()
     }
     func stopSurf(){selectionTask?.cancel();selectionID=UUID();rotationSelectionPending=false;surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
+    private func currentSourceCheckpoint()->SurfSourceCheckpoint{
+        let seconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())} ?? (pausedRotationSeconds ?? resumeRotationSeconds ?? remaining)
+        return SurfSourceCheckpoint(source:activeSurfSource,category:settings.surfCategory,surfing:surfing,paused:surfPaused,channelID:current?.id,remainingSeconds:max(0,min(86400,seconds)),pausedRotationSeconds:pausedRotationSeconds,resumeSurf:settings.resumeSurf,at:Date().timeIntervalSince1970)
+    }
+    // The transition reuses the installed alias protocol in this order:
+    // pause_surf -> stop -> set_preferences -> refresh_catalogue -> start_surf.
+    // Only one transition may run, and success is reported only after the
+    // refreshed catalogue is ready and the target category has started Surf.
+    func transitionSurfSource(to target:SurfSourceIdentity) async {
+        guard !sourceTransitionBusy else{return}
+        sourceTransitionBusy=true
+        sourceTransitionError=nil
+        defer{sourceTransitionBusy=false}
+        guard target != activeSurfSource else{return}
+        let checkpoint=currentSourceCheckpoint()
+        let plan:SurfSourceTransitionPlan
+        do{plan=try SurfSourceTransitionPlan.make(target:target,checkpoint:checkpoint,memory:sourceMemory)}
+        catch{
+            let message=sanitized(error.localizedDescription)
+            sourceTransitionError=message
+            log("WARN","source","SWITCH_REJECTED",["target":target.rawValue,"reason":message])
+            return
+        }
+        guard jelly.connected,!apiChanging,!loginBusy,!patchBusy,!versionBusy,!catalogueBusy,catalogueReady,policyReady else{
+            sourceTransitionError="Catalogue or player is not ready"
+            log("WARN","source","SWITCH_NOT_READY",["target":target.rawValue])
+            return
+        }
+        // Checkpoint the outgoing category, Surf mode and paused dwell before
+        // tearing down playback. The existing rotation scope already isolates
+        // each category, so switching back restores its own ledger/checkpoint.
+        if surfing && !surfPaused && !usingSharedSurf{toggleSurfPause()}
+        saveSurfCheckpoint(force:true)
+        stop()
+        do{
+            var candidate=settings
+            candidate=try PatchablePreferences.applying(["surfCategory":plan.targetCategory],to:candidate)
+            guard disk.save(candidate,"settings.json") else{throw AppError.message("Cannot persist source selection")}
+            settings=candidate
+            sourceMemory=plan.memory
+            if !disk.save(sourceMemory,"surf-source-memory.json"){log("WARN","source","SOURCE_MEMORY_PERSIST_FAILED")}
+            let previousRefresh=lastRefresh
+            try await refresh()
+            guard catalogueReady,!channels.isEmpty,lastRefresh>previousRefresh else{throw AppError.message("Source catalogue is not ready")}
+            startSurf(category:plan.targetCategory)
+            guard surfing,settings.surfCategory==plan.targetCategory,catalogueReady else{throw AppError.message("Source Surf did not start")}
+            log("INFO","source","SWITCHED",["source":target.rawValue,"category":plan.targetCategory,"channels":String(channels.count)])
+            requestSync()
+        }catch{
+            let message=sanitized(error.localizedDescription)
+            sourceTransitionError=message
+            log("ERROR","source","SWITCH_FAILED",["source":target.rawValue,"category":plan.targetCategory,"error":message])
+            await rollbackSurfSource(plan:plan)
+            requestSync()
+        }
+    }
+    private func rollbackSurfSource(plan:SurfSourceTransitionPlan) async {
+        stop()
+        do{
+            var candidate=settings
+            candidate=try PatchablePreferences.applying(["surfCategory":plan.checkpoint.category],to:candidate)
+            guard disk.save(candidate,"settings.json") else{throw AppError.message("Cannot persist rollback category")}
+            settings=candidate
+        }catch{
+            log("ERROR","source","ROLLBACK_STATE_FAILED",["error":sanitized(error.localizedDescription)])
+        }
+        sourceMemory=plan.memory
+        if !disk.save(sourceMemory,"surf-source-memory.json"){log("WARN","source","SOURCE_MEMORY_PERSIST_FAILED")}
+        var catalogueRestored=false
+        if jelly.connected{
+            do{
+                try await refresh()
+                catalogueRestored=catalogueReady && !channels.isEmpty && settings.surfCategory==plan.checkpoint.category
+            }catch{
+                log("ERROR","source","ROLLBACK_CATALOGUE_FAILED",["error":sanitized(error.localizedDescription)])
+            }
+        }
+        if catalogueRestored{
+            if plan.checkpoint.surfing{
+                restoreSurf(category:plan.checkpoint.category)
+                if plan.checkpoint.paused,!surfPaused{
+                    surfPaused=true
+                    remaining=plan.checkpoint.remainingSeconds
+                    pausedRotationSeconds=plan.checkpoint.pausedRotationSeconds ?? plan.checkpoint.remainingSeconds
+                    nextRotation=nil
+                    saveSurfCheckpoint(force:true)
+                }
+            }else{
+                settings.resumeSurf=plan.checkpoint.resumeSurf
+                if let id=plan.checkpoint.channelID,let channel=channels.first(where:{$0.id==id}),
+                   health[id]?.eligible(at:Date()) ?? true,policyReady{
+                    open(channel)
+                }
+                _=disk.save(settings,"settings.json")
+            }
+        }else{
+            settings.resumeSurf=false
+            _=disk.save(settings,"settings.json")
+            sourceTransitionError=(sourceTransitionError ?? "Source switch failed")+"; previous catalogue could not be reloaded"
+            log("ERROR","source","ROLLBACK_INCOMPLETE",["category":plan.checkpoint.category])
+        }
+        log("INFO","source","ROLLED_BACK",["source":plan.checkpoint.source.rawValue,"category":plan.checkpoint.category,"surfing":String(plan.checkpoint.surfing),"catalogueRestored":String(catalogueRestored)])
+    }
     func toggleSurfPause(){
         guard surfing,!usingSharedSurf else{return}
         surfPaused.toggle()
@@ -1752,7 +1862,7 @@ import CryptoKit
         disk.save(list,"insights.json")
     }
     func stateSnapshot()->[String:Any]{
-        var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing || currentSharedTransport,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"surfSource":activeSurfSource.rawValue,"sourceTransitionBusy":sourceTransitionBusy,"sourceTransitionError":sourceTransitionError ?? "","rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing || currentSharedTransport,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
         snapshot["hotPatchPlatformABI"]=HotPatchPlatform.abi
         snapshot["stagedAPIRevision"]=deferredAPI?.candidate.id ?? ""
         snapshot["stagedAPIActivation"]=deferredAPI?.mode ?? ""

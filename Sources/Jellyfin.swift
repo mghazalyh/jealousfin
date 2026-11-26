@@ -137,15 +137,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         guard sharedSurfAvailable else{return nil}
         return SharedSurf.channel(for:category,in:channels)
     }
-    static func program(_ x: [String: Any]) -> Program? {
-        guard let name = x["Name"] as? String, let id = x["Id"] as? String else { return nil }
-        var evidence:ProgrammeEvidence?
-        if let raw=x["JealousfinProgramme"] as? [String:Any],
-           let data=try? JSONSerialization.data(withJSONObject:raw),data.count<=16*1024{
-            evidence=(try? JSONDecoder().decode(ProgrammeEvidence.self,from:data))?.checked()
-        }
-        return Program(id: id, name: name, start: JSONCodec.date(x["StartDate"] as? String), end: JSONCodec.date(x["EndDate"] as? String), channelID: x["ChannelId"] as? String,productionYear:ProgrammeEvidence.validYear(x["ProductionYear"] as? Int),evidence:evidence)
-    }
+    static func program(_ x: [String: Any]) -> Program? {JellyfinProgrammeParser.program(x)}
     func channels() async throws -> [Channel] {
         let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true","Fields":"Genres,Tags","JealousfinIncludePolicy":"true"])
         if let raw=a["JealousfinPolicy"] {

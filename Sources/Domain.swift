@@ -92,6 +92,20 @@ struct Program: Codable, Identifiable, Equatable {
         return min(1, max(0, Date().timeIntervalSince(a) / b.timeIntervalSince(a)))
     }
 }
+// Preserve the gateway's programme Name verbatim. Typed JealousfinProgramme
+// evidence is decoded and bounded here, but the client does not rewrite the
+// server-owned title or invent a season year when evidence is absent.
+enum JellyfinProgrammeParser{
+    static func program(_ x:[String:Any])->Program?{
+        guard let name=x["Name"] as? String,let id=x["Id"] as? String else{return nil}
+        var evidence:ProgrammeEvidence?
+        if let raw=x["JealousfinProgramme"] as? [String:Any],
+           let data=try? JSONSerialization.data(withJSONObject:raw),data.count<=16*1024{
+            evidence=(try? JSONDecoder().decode(ProgrammeEvidence.self,from:data))?.checked()
+        }
+        return Program(id:id,name:name,start:JSONCodec.date(x["StartDate"] as? String),end:JSONCodec.date(x["EndDate"] as? String),channelID:x["ChannelId"] as? String,productionYear:ProgrammeEvidence.validYear(x["ProductionYear"] as? Int),evidence:evidence)
+    }
+}
 struct Channel: Codable, Identifiable, Equatable {
     var id: String
     var name: String
@@ -148,6 +162,99 @@ enum SharedSurf {
               JellyfinAdapterRules.sameOrigin(url,origin)
         else{throw AppError.message("Invalid shared Surf ticket URL")}
         return url
+    }
+}
+// The two live source identities reuse the installed gateway's existing
+// category aliases. They add no host, port or gateway protocol: American stays
+// on All Channels (and the other native American categories), while Malay is
+// the temporary Movies & Series alias used by the opt-in same-origin selector.
+enum SurfSourceIdentity:String,Codable,CaseIterable,Equatable{
+    case american,malay
+    static let selectable:[SurfSourceIdentity]=[.american,.malay]
+    var label:String{self == .malay ? "Malay":"American"}
+    var categoryAlias:String{self == .malay ? "Movies & Series":"All Channels"}
+    var mode:String{self == .malay ? "movies-series":"all"}
+    static func identity(forCategory category:String)->SurfSourceIdentity{
+        category.trimmingCharacters(in:.whitespacesAndNewlines) == SurfSourceIdentity.malay.categoryAlias ? .malay:.american
+    }
+    static func isKnownCategory(_ category:String)->Bool{
+        ["All Channels","Favorites","Sports","Movies & Series"].contains(category)
+    }
+    static func rotationScope(server:String,account:String,category:String)->String{
+        [server,account,category].joined(separator:"|")
+    }
+}
+// Preserve the last category used by each source. Switching to Malay must not
+// forget an American Favorites/Sports rotation, and selecting American again
+// must not silently reset those paths to All Channels.
+struct SurfSourceCategoryMemory:Codable,Equatable{
+    private var categories:[String:String]=[:]
+    func checked()->Self{
+        var result=Self()
+        for (key,value) in categories{
+            guard let source=SurfSourceIdentity(rawValue:key) else{continue}
+            result.remember(category:value,for:source)
+        }
+        return result
+    }
+    func category(for source:SurfSourceIdentity)->String{
+        guard let value=categories[source.rawValue],SurfSourceIdentity.isKnownCategory(value) else{return source.categoryAlias}
+        if source == .malay{return value == SurfSourceIdentity.malay.categoryAlias ? value:source.categoryAlias}
+        return value == SurfSourceIdentity.malay.categoryAlias ? source.categoryAlias:value
+    }
+    mutating func remember(category:String,for source:SurfSourceIdentity){
+        guard SurfSourceIdentity.isKnownCategory(category) else{return}
+        if source == .malay && category != SurfSourceIdentity.malay.categoryAlias{return}
+        if source == .american && category == SurfSourceIdentity.malay.categoryAlias{return}
+        categories[source.rawValue]=category
+    }
+}
+struct SurfSourceCheckpoint:Codable,Equatable{
+    let source:SurfSourceIdentity
+    let category:String
+    let surfing:Bool
+    let paused:Bool
+    let channelID:String?
+    let remainingSeconds:Int
+    let pausedRotationSeconds:Int?
+    let resumeSurf:Bool
+    let at:Double
+    var valid:Bool{
+        guard SurfSourceIdentity.isKnownCategory(category),
+              source == SurfSourceIdentity.identity(forCategory:category),
+              (0...86400).contains(remainingSeconds),
+              pausedRotationSeconds.map({(0...86400).contains($0)}) ?? true,
+              channelID.map({!$0.isEmpty && $0.utf8.count<=128}) ?? true,
+              at.isFinite,at>=0 else{return false}
+        return true
+    }
+}
+enum SurfSourceTransitionFault:String,LocalizedError,Equatable{
+    case alreadySelected
+    case invalidCheckpoint
+    case invalidTarget
+    var errorDescription:String?{
+        switch self{
+        case .alreadySelected:return "That source is already selected"
+        case .invalidCheckpoint:return "Current source state is not safe to switch"
+        case .invalidTarget:return "Source category alias is not supported"
+        }
+    }
+}
+struct SurfSourceTransitionPlan:Equatable{
+    let checkpoint:SurfSourceCheckpoint
+    let target:SurfSourceIdentity
+    let targetCategory:String
+    let memory:SurfSourceCategoryMemory
+    static func make(target:SurfSourceIdentity,checkpoint:SurfSourceCheckpoint,memory:SurfSourceCategoryMemory)throws->Self{
+        guard checkpoint.valid else{throw SurfSourceTransitionFault.invalidCheckpoint}
+        guard target != checkpoint.source else{throw SurfSourceTransitionFault.alreadySelected}
+        var next=memory.checked()
+        next.remember(category:checkpoint.category,for:checkpoint.source)
+        let category=next.category(for:target)
+        guard SurfSourceIdentity.isKnownCategory(category),
+              SurfSourceIdentity.identity(forCategory:category) == target else{throw SurfSourceTransitionFault.invalidTarget}
+        return SurfSourceTransitionPlan(checkpoint:checkpoint,target:target,targetCategory:category,memory:next)
     }
 }
 struct HealthPenaltyPolicy:Codable,Equatable{
