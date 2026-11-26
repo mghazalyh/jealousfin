@@ -1210,13 +1210,18 @@ def policy_event(cid,trace,action,reason):
 def record_source_error(cid,url,phase,error,correlation=None):
  # Never persist stream URLs, query parameters, headers or credentials.
  host=urllib.parse.urlsplit(url).hostname if url else None
- entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation}
+ entry={'at':time.time(),'channel_id':cid,'host':host,'phase':phase,'error':error,'request_id':correlation,'category':('gateway_infrastructure' if phase in ('policy','selector') else 'upstream_http' if re.fullmatch(r'HTTP [1-5][0-9]{2}',error) else 'upstream_transport' if error in ('URLError','TimeoutError','ConnectionError','ConnectionResetError','RemoteDisconnected') else 'resolution_or_delivery_unknown')}
  with lock:
   p=ROOT/'source-errors.jsonl'
   if p.exists() and p.stat().st_size>4*1024*1024:
    os.replace(p,ROOT/'source-errors.previous.jsonl')
   with p.open('a') as f:f.write(json.dumps(entry,separators=(',',':'))+'\n')
 
+
+def record_infrastructure_error(cid,phase,error,correlation=None):
+ # Diagnostics must never prevent a fail-closed response.
+ try:record_source_error(cid,None,phase,type(error).__name__,correlation)
+ except OSError:log('infrastructure diagnostic write failed')
 
 class Server(http.server.ThreadingHTTPServer):
  daemon_threads=True
@@ -1288,7 +1293,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
   p=urllib.parse.urlsplit(self.path);path=p.path;q=urllib.parse.parse_qs(p.query)
   try:
    if self.route_prototype(path,q):return
-  except (OSError,RuntimeError,ValueError,KeyError,TypeError,http.client.HTTPException):
+  except (OSError,RuntimeError,ValueError,KeyError,TypeError,http.client.HTTPException) as error:
+   record_infrastructure_error(None,'selector',error,correlation)
    return self.reply(503,{'JealousfinPolicyError':'unavailable'})
   if SOURCE_PROFILE=='malay' and path.startswith('/malay/media/'):path=path[len('/malay'):]
   with lock:counts[path.split('/')[1] if path.startswith('/') else 'other']=counts.get(path.split('/')[1] if path.startswith('/') else 'other',0)+1
@@ -1336,7 +1342,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if not self.authorized(q):return self.reply(401,{})
   if path in ('/LiveTv/Channels','/Jealousfin/Policy'):
    try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
+    record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if path=='/Jealousfin/Policy':return self.reply(200,policy_payload(snapshot))
    include=q.get('JealousfinIncludePolicy',['false'])[0]=='true'
    with lock:out=[dict(c,UserData={'IsFavorite':cid in favorites}) for cid,c in ordered_catalogue(snapshot,include)]
@@ -1357,7 +1364,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     policy_event(cid,trace,action,reason)
     return self.reply(200,policy_payload(policy_rows()))
    except (KeyError,ValueError,TypeError):return self.reply(400,{})
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
+    record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
   if path=='/LiveTv/Programs':
    # The current-title feed is not a full EPG. For queries needing a real
    # time range, do not invent times; the client can use CurrentProgram.
@@ -1372,7 +1380,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if n:self.rfile.read(n)
    cid=m[1]
    try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
+    record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    record_attempt(cid)
    with lock:
@@ -1381,7 +1390,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except Exception as e:
     record_source_error(cid,None,'resolve','HTTP '+str(e.code) if isinstance(e,urllib.error.HTTPError) else type(e).__name__,correlation);return self.reply(502,{})
    try:snapshot=policy_rows()
-   except (sqlite3.Error,OSError,RuntimeError,ValueError):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+   except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
+    record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})
    if not policy_eligible(snapshot[cid],time.time()):return self.reply(409,{'JealousfinPolicyError':'excluded'})
    return self.reply(200,{'PlaySessionId':uuid.uuid4().hex,'MediaSources':[{'Id':cid,'TranscodingUrl':url,'SupportsTranscoding':True,'SupportsDirectPlay':False,'SupportsDirectStream':False}]})
   if path.startswith('/Sessions/Playing') or path=='/LiveStreams/Close':

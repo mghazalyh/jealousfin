@@ -130,3 +130,11 @@ with tempfile.TemporaryDirectory() as d:
     assert p.live_catalogue_ids(c,root,'malay') is None
     c.close()
 print('PASS: live membership, catalogue changes, historical retention and source-owned samples')
+
+# Read-only report distinguishes invalid bitrate sentinels and delivery evidence.
+import telemetry_report as report
+assert report.distribution([-1,0,100,300],positive=True)=={'n':2,'p10':100.0,'median':200.0,'p90':100.0}
+assert report.error_category({'phase':'policy','error':'OperationalError'})=='gateway_infrastructure'
+assert report.error_category({'phase':'media','error':'HTTP 403'})=='upstream_http'
+assert report.error_category({'phase':'resolve','error':'ValueError'})=='resolution_or_delivery_unknown'
+print('PASS: telemetry metric validity and explicit delivery evidence classification')
