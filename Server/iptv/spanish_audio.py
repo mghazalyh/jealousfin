@@ -919,13 +919,22 @@ class Manager:
             self._observe_visit(end_probe)
         start_verified = bool(sample.probe and sample.probe.get("channelID") == cid)
         identity_conflict = bool(sample.probe and sample.probe.get("channelID") and sample.probe.get("channelID") != cid)
+        start_launch = str((sample.probe or {}).get("launchID", ""))
+        end_launch = str((end_probe or {}).get("launchID", ""))
+        launch_changed = bool(start_launch and end_launch and start_launch != end_launch)
         changed = bool(end_probe and end_probe.get("channelID") and end_probe.get("channelID") != cid)
-        if identity_conflict:
+        if identity_conflict or launch_changed:
+            # A start/end probe mismatch means there is no single coherent
+            # session to attribute to this sample.  Fail closed instead of
+            # guessing which launch or channel owns the audio.
             self._record_last(cid, sample.provider, sample.name, {
-                "outcome": "inconclusive", "reason": "session_mismatch", "confidence": 0.0,
+                "outcome": "inconclusive",
+                "reason": "session_mismatch" if identity_conflict else "launch_changed",
+                "confidence": 0.0,
                 "speechSeconds": 0.0, "sampleSeconds": round(best.seconds, 2),
                 "speechCoverage": 0.0, "windows": 0, "languages": [], "lexicalMargin": None,
-            }, device_verified=False, changed=changed, marked=False, reason_detail=reason)
+            }, device_verified=False, changed=changed or launch_changed,
+                marked=False, reason_detail=reason)
             return
         launch_id = str((sample.probe or {}).get("launchID", ""))
         stream_generation = str((sample.probe or {}).get("streamGeneration", ""))

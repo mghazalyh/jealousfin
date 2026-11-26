@@ -80,6 +80,17 @@ decisions intact but stops new sampling and hides dormant automatic entries.
 - One physical visit contributes at most one conclusive automatic event, even
   if the detected language changes during the visit. Two distinct verified
   visits both count, including inside the old 600-second window.
+- Loss recovery is fail closed. A missing or corrupt ledger (recognised by a
+  durable marker and/or surviving evidence) issues `recover-` identities that
+  never count twice for the same launch. A failed durable write is journalled
+  to `language-visits.recovery.json`, downgraded to a recovery identity, and
+  replayed on restart; the next directly observed departure/return becomes a
+  normal verified visit again. Recovery never clears evidence or fabricates a
+  visit.
+- The device probe reads the launch, channel and stream freshly on every probe
+  and retries an incoherent status/snapshot pair; there is no minute-long
+  launch-ID cache. If the start and end probes disagree on the launch, the
+  sample is rejected rather than attributed to either launch.
 - The manager re-probes before committing an inference result. A job from a
   visit that ended after a departure is rejected as stale; a reload inside the
   same visit is accepted but the store deduplicates it.
@@ -90,8 +101,9 @@ decisions intact but stops new sampling and hides dormant automatic entries.
 - While the user has paused or stopped rotation, excluded-language evidence is
   written to `language-exclusions-pending.json` instead of the store and is
   applied only after a fresh read-only status shows active rotation and no
-  pause. Allowed/unauthorized evidence is recorded normally because it never
-  changes membership or playback.
+  pause. This applies even when playback is paused/stopped on a different
+  channel from the sampled one. Allowed/unauthorized evidence is recorded
+  normally because it never changes membership or playback.
 
 ## Manual correction
 

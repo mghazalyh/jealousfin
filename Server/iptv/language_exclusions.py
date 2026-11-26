@@ -28,6 +28,7 @@ import uuid
 from pathlib import Path
 
 import language_catalog
+import language_visits
 
 SCHEMA_VERSION = 4
 REVISION = "language-exclusions-v4"
@@ -515,12 +516,17 @@ def _is_duplicate(state, provider_id, channel_id, visit_id, launch_id, now, dedu
 
     A physical visit contributes exactly one conclusive automatic event, even
     when the detected language changes during the same visit.  Manual audit
-    events never suppress a later automatic visit.  Two distinct verified
+    events never suppress a later automatic visit.  Two distinct *trusted*
     visit identities are allowed inside any time window (a genuine revisit).
-    Unverified identities fail closed for the same launch instead of using
-    elapsed time as identity; only historical ``legacy:`` migration evidence
-    keeps a bounded replay window so it cannot block later real visits.
+
+    Recovery identities are deliberately weaker: they were observed while the
+    ledger history was lost or a durable write failed.  They fail closed for
+    the same launch.  Only after the ledger directly observes a departure and
+    return does it issue a trusted identity again, which may then count as a
+    later physical visit.  Historical ``legacy:`` migration evidence keeps a
+    bounded replay window so it cannot block later real visits.
     """
+    current_trusted = is_verified_visit(visit_id)
     for event in state["evidence"]["events"].values():
         if event["source"] != "auto":
             continue
@@ -528,20 +534,27 @@ def _is_duplicate(state, provider_id, channel_id, visit_id, launch_id, now, dedu
             continue
         if visit_id and event["visitID"] == visit_id:
             return True
-        if is_verified_visit(visit_id) and is_verified_visit(event["visitID"]):
+        event_visit = event["visitID"]
+        if current_trusted and is_verified_visit(event_visit):
             # Both identities are trustworthy and differ: this is a later
             # physical visit, not a reload or repeated sample.
             continue
-        if str(event["visitID"]).startswith("legacy:"):
+        if current_trusted and language_visits.is_recovery(event_visit):
+            # The ledger recorded a recovery visit, then directly observed a
+            # departure/return and issued a trusted identity.  That is a new
+            # physical visit even though it shares the launch with the
+            # uncertain recovery event.
+            continue
+        if str(event_visit).startswith("legacy:"):
             # Migration evidence is historical; it can only suppress a replay
             # inside the bounded window.  It must not block later real visits.
             if dedup_seconds > 0 and 0 <= now - event["at"] < dedup_seconds:
                 if not launch_id or not event["launchID"] or event["launchID"] == launch_id:
                     return True
             continue
-        # At least one identity is unverified.  Do not invent a physical
-        # visit from elapsed time: fail closed for the same launch and for
-        # samples with no launch identity at all.
+        # At least one identity is unverified or recovering.  Do not invent a
+        # physical visit from elapsed time: fail closed for the same launch and
+        # for samples with no launch identity at all.
         if not launch_id or not event["launchID"] or event["launchID"] == launch_id:
             return True
     return False

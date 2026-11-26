@@ -31,14 +31,21 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 REVISION = "language-visits-v1"
 FILE_NAME = "language-visits.json"
+MARKER_NAME = "language-visits.seen"
+RECOVERY_FILE = "language-visits.recovery.json"
 MAX_FILE = 512 * 1024
+MAX_RECOVERY = 64
 MAX_LAUNCHES = 8
 MAX_CHANNELS = 512
 MAX_TEXT = 200
 PERSIST_SECONDS = 30.0
 VERIFIED_PREFIX = "visit-"
+RECOVERY_PREFIX = "recover-"
 CHANNEL_ID = re.compile(r"^[a-f0-9]{32}$")
 VISIT_ID = re.compile(r"^visit-[a-f0-9]{32}$")
+RECOVERY_ID = re.compile(r"^recover-[a-f0-9]{32}$")
+IDENTITY_ID = re.compile(r"^(?:visit|recover)-[a-f0-9]{32}$")
+EVIDENCE_FILES = ("language-exclusions.json", "spanish-classification.json")
 LAUNCH_KEYS = {
     "currentChannelID", "currentVisitID", "currentStreamGeneration",
     "currentSince", "lastObservedAt", "channels",
@@ -79,8 +86,127 @@ def new_visit_id():
     return VERIFIED_PREFIX + uuid.uuid4().hex
 
 
+def new_recovery_visit_id():
+    """An identity that is observed but not proven across ledger recovery.
+
+    A missing/corrupt ledger, or a failed durable write, means the physical
+    history before this observation is unknown.  The evidence store treats
+    these identities as fail-closed for the same launch until the ledger has
+    directly observed a departure and return.
+    """
+    return RECOVERY_PREFIX + uuid.uuid4().hex
+
+
 def is_verified(visit_id):
     return isinstance(visit_id, str) and bool(VISIT_ID.fullmatch(visit_id))
+
+
+def is_recovery(visit_id):
+    return isinstance(visit_id, str) and bool(RECOVERY_ID.fullmatch(visit_id))
+
+
+def _is_identity(visit_id):
+    return isinstance(visit_id, str) and bool(IDENTITY_ID.fullmatch(visit_id))
+
+
+def _evidence_present(root):
+    return any((Path(root) / name).exists() for name in EVIDENCE_FILES)
+
+
+def _touch_marker(root):
+    """Leave a tiny durable hint that this ledger existed before.
+
+    Without it, deleting only ``language-visits.json`` looks exactly like a
+    first run and the new process would issue trustworthy identities for a
+    launch it never observed.  The marker contains no evidence or visit.
+    """
+    path = Path(root) / MARKER_NAME
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+    except OSError:
+        pass
+
+
+def _load_recovery(root):
+    path = Path(root) / RECOVERY_FILE
+    try:
+        if not path.exists() or path.stat().st_size > MAX_FILE:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+            return None
+        launches = data.get("launches")
+        state = validate(data.get("state"))
+        if not isinstance(launches, list) or len(launches) > MAX_RECOVERY:
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    ids = {value for value in launches
+           if isinstance(value, str) and 0 < len(value) <= MAX_TEXT}
+    return ids, state
+
+
+def _save_recovery(root, launches, state):
+    path = Path(root) / RECOVERY_FILE
+    values = sorted(set(launches))[:MAX_RECOVERY]
+    if not values:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    snapshot = {"schemaVersion": 1, "launches": values, "state": state}
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except (OSError, ValueError, TypeError):
+        pass
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _clear_recovery(root):
+    try:
+        (Path(root) / RECOVERY_FILE).unlink()
+    except OSError:
+        pass
+
+
+def _evidence_visits(root):
+    """Read existing automatic evidence identities without mutating anything.
+
+    Recovery can only be recognised when the ledger's own history is missing
+    or incomplete while the durable evidence store still has the visit.  This
+    is a read-only reconciliation; the evidence store remains the authority.
+    """
+    path = Path(root) / "language-exclusions.json"
+    try:
+        if not path.exists() or path.stat().st_size > 8 * 1024 * 1024:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    events = data.get("evidence", {}).get("events") if isinstance(data, dict) else None
+    if not isinstance(events, dict):
+        return {}
+    result = {}
+    for event in events.values():
+        if not isinstance(event, dict) or event.get("source") != "auto":
+            continue
+        launch_id = event.get("launchID")
+        visit_id = event.get("visitID")
+        if isinstance(launch_id, str) and launch_id and isinstance(visit_id, str) and visit_id:
+            result.setdefault(launch_id, set()).add(visit_id)
+    return result
 
 
 def validate(data):
@@ -104,7 +230,7 @@ def validate(data):
                 raise ValueError("Invalid language visit identity")
         if launch["currentChannelID"] and not CHANNEL_ID.fullmatch(launch["currentChannelID"]):
             raise ValueError("Invalid language visit current channel")
-        if launch["currentVisitID"] and not is_verified(launch["currentVisitID"]):
+        if launch["currentVisitID"] and not _is_identity(launch["currentVisitID"]):
             raise ValueError("Invalid language visit current identity")
         if not _number(launch["currentSince"]) or not _number(launch["lastObservedAt"]):
             raise ValueError("Invalid language visit time")
@@ -116,7 +242,7 @@ def validate(data):
                 raise ValueError("Invalid language visit channel")
             if not isinstance(row, dict) or set(row) != CHANNEL_KEYS:
                 raise ValueError("Invalid language visit channel record")
-            if not is_verified(row["visitID"]):
+            if not _is_identity(row["visitID"]):
                 raise ValueError("Invalid language visit channel identity")
             if row["state"] not in STATES:
                 raise ValueError("Invalid language visit channel state")
@@ -188,11 +314,48 @@ class Ledger:
         self._lock = threading.RLock()
         self._last_write = 0.0
         self.fault = None
+        self._recovery_launches = set()
+        self._recovery_pending = False
+        path = self.root / FILE_NAME
+        marker = (self.root / MARKER_NAME).exists()
         try:
+            present = path.exists()
             self.state = load(self.root)
+            if not present and (marker or _evidence_present(self.root)):
+                # The visits ledger was lost but this state directory (or its
+                # durable evidence) shows it existed before.  Do not trust
+                # fresh identities for the same launch until a departure is
+                # directly observed.
+                self._recovery_pending = True
         except (OSError, ValueError, TypeError) as error:
             self.state = empty()
             self.fault = type(error).__name__
+            self._recovery_pending = bool(marker or _evidence_present(self.root))
+        snapshot = _load_recovery(self.root)
+        if snapshot is not None:
+            recovered_launches, recovered_state = snapshot
+            for launch_id in recovered_launches:
+                row = recovered_state["launches"].get(launch_id)
+                if row is not None:
+                    # The snapshot was written after a full write failed, so it
+                    # is newer than the durable main ledger for these launches.
+                    self.state["launches"][launch_id] = row
+            self._recovery_launches.update(recovered_launches)
+        _touch_marker(self.root)
+        # A failed durable write can leave the ledger behind the evidence
+        # store even though the file itself still exists.
+        try:
+            for launch_id, visits in _evidence_visits(self.root).items():
+                launch = self.state["launches"].get(launch_id)
+                known = set()
+                if launch is not None:
+                    known.add(launch.get("currentVisitID", ""))
+                    for row in launch.get("channels", {}).values():
+                        known.add(row.get("visitID", ""))
+                if launch is None or any(visit not in known for visit in visits):
+                    self._recovery_launches.add(launch_id)
+        except (OSError, ValueError, TypeError):
+            pass
 
     def _unverified(self, reason, channel_id=None, launch_id=None):
         return {
@@ -224,33 +387,52 @@ class Ledger:
                 launch = _empty_launch()
                 state["launches"][launch_id] = launch
             previous = launch["currentChannelID"]
+            transitioned = bool(previous and previous != channel_id)
             departed = False
-            if previous and previous != channel_id:
+            if transitioned:
                 old = launch["channels"].get(previous)
                 if old is not None and old["state"] == "active":
                     old["state"] = "departed"
                     old["departedAt"] = now
                     departed = True
+            recovering = (launch_id in self._recovery_launches
+                          or is_recovery(launch.get("currentVisitID", "")))
+            if created and self._recovery_pending:
+                recovering = True
+                self._recovery_pending = False
+                self._recovery_launches.add(launch_id)
+            if recovering and transitioned:
+                # A direct observation of a different channel is proof of a
+                # departure even when the earlier ledger history is unknown.
+                # The chain is coherent again from this visit onward.
+                recovering = False
+                self._recovery_launches.discard(launch_id)
             record = launch["channels"].get(channel_id)
             new_visit = False
             if previous == channel_id and record is not None and record["state"] == "active":
                 visit_id = record["visitID"]
                 reason = "same_visit"
-            elif record is not None and record["state"] == "departed":
-                visit_id = new_visit_id()
-                new_visit = True
-                reason = "returned_after_departure"
-                record.update(visitID=visit_id, state="active", lastSeenAt=now,
-                              streamGeneration=stream_generation, departedAt=None)
             else:
-                visit_id = new_visit_id()
+                proven_return = record is not None and record["state"] == "departed"
+                if proven_return:
+                    # A departure was directly observed on an earlier call.
+                    recovering = False
+                    self._recovery_launches.discard(launch_id)
+                visit_id = new_recovery_visit_id() if recovering else new_visit_id()
                 new_visit = True
-                reason = "initial_observation" if not previous else "channel_change"
-                record = {
-                    "visitID": visit_id, "state": "active", "lastSeenAt": now,
-                    "streamGeneration": stream_generation, "departedAt": None,
-                }
-                launch["channels"][channel_id] = record
+                if proven_return:
+                    reason = "returned_after_departure"
+                    record.update(visitID=visit_id, state="active", lastSeenAt=now,
+                                  streamGeneration=stream_generation, departedAt=None)
+                else:
+                    reason = "initial_observation" if not previous else "channel_change"
+                    record = {
+                        "visitID": visit_id, "state": "active", "lastSeenAt": now,
+                        "streamGeneration": stream_generation, "departedAt": None,
+                    }
+                    launch["channels"][channel_id] = record
+            if recovering:
+                self._recovery_launches.add(launch_id)
             launch["currentChannelID"] = channel_id
             launch["currentVisitID"] = visit_id
             launch["currentStreamGeneration"] = stream_generation
@@ -269,8 +451,23 @@ class Ledger:
                     atomic_write(self.root, state)
                     self._last_write = now
                     self.fault = None
+                    if changed:
+                        # The main ledger now contains the full state.
+                        _clear_recovery(self.root)
                 except (OSError, ValueError, TypeError) as error:
                     self.fault = type(error).__name__
+                    if changed:
+                        # The new identity was not made durable.  Never let a
+                        # later process trust an unrecorded visit: downgrade
+                        # this visit and stay in recovery for the launch.
+                        self._recovery_launches.add(launch_id)
+                        if is_verified(visit_id):
+                            recovery_id = new_recovery_visit_id()
+                            record["visitID"] = recovery_id
+                            launch["currentVisitID"] = recovery_id
+                            visit_id = recovery_id
+                            self.state = state
+                        _save_recovery(self.root, self._recovery_launches, state)
             return {
                 "visitID": visit_id, "verified": True, "newVisit": new_visit,
                 "reason": reason, "channelID": channel_id, "launchID": launch_id,

@@ -79,8 +79,6 @@ overlay_bridge_fault=''
 overlay_init_lock=threading.Lock()
 overlay_jobs=queue.Queue(maxsize=8)
 OVERLAY_SETTLE_SECONDS=2.0
-device_identity_cache=None
-device_identity_checked=0.0
 device_rotation_cache=None
 device_rotation_checked=0.0
 language_visit_ledger=None
@@ -1756,26 +1754,32 @@ def resolve_whisper_model():
   except OSError:pass
  return None
 def device_language_probe():
- global device_identity_cache,device_identity_checked
+ # The launch identity must be read fresh on every probe.  Caching it for up
+ # to a minute could pair an old launch with a new channel/stream after an app
+ # restart.  The two reads must also agree on the same coherent moment; an
+ # incoherent pair is retried once and then fails closed.
  config=prototype_selector.load_selector(ROOT)
  if config is None:return None
  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
- try:
-  snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
- except Exception:
-  return None
- if not isinstance(snapshot,dict):return None
- now=time.time()
- paused=None;surfing=None
- if device_identity_cache is None or now-device_identity_checked>60:
+ for _ in range(2):
   try:
    status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
-   if isinstance(status,dict):
-    device_identity_cache=str(status.get('launchID',''));device_identity_checked=now
-    paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
-    surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
-  except Exception:pass
- return {'channelID':str(snapshot.get('channelID','')),'launchID':device_identity_cache or '','streamGeneration':str(snapshot.get('streamGeneration','')),'surfPaused':paused,'surfing':surfing}
+   if not isinstance(status,dict):return None
+   snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+   if not isinstance(snapshot,dict):return None
+  except Exception:
+   return None
+  channel_id=str(snapshot.get('channelID',''))
+  status_channel=str(status.get('currentChannelID','') or '')
+  stream_generation=str(snapshot.get('streamGeneration',''))
+  status_stream=str(status.get('streamGeneration','') or '')
+  if status_channel and channel_id and status_channel!=channel_id:continue
+  if status_stream and stream_generation and status_stream!=stream_generation:continue
+  paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
+  surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
+  return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
+          'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing}
+ return None
 def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence,session=None,respect_pause=True):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
@@ -1793,10 +1797,12 @@ def language_auto_commit(cid,provider,name,language,language_name,confidence,rea
    return {'changed':False,'reason':'maintenance'}
  if respect_pause and outcome=='excluded':
   rotation=device_rotation_state()
-  current=rotation.get('currentChannelID') if rotation else None
   if rotation is None:
    defer_reason='deferred_uncertain'
-  elif current==cid and (rotation.get('surfPaused') is True or rotation.get('surfing') is not True):
+  elif rotation.get('surfPaused') is True or rotation.get('surfing') is not True:
+   # Defer whenever the user has paused or stopped rotation, even when the
+   # device is now on a different channel from the sampled one.  A membership
+   # change must not land while playback is under the user's control.
    defer_reason='deferred_paused'
   else:
    defer_reason=None

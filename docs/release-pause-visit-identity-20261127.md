@@ -85,20 +85,31 @@ dedup key:
 - reloads, retries and repeated samples in the same visit are duplicates;
 - manual audit events (including the Mistaken English correction) never
   suppress a later automatic visit;
-- unverified identities do not create new counts from elapsed time.
+- unverified identities do not create new counts from elapsed time;
+- loss recovery is fail closed. A missing or corrupt ledger (detected by a
+  durable marker and/or surviving evidence) issues `recover-` identities, so
+  it cannot double count a same-launch visit after restart;
+- a failed durable write is downgraded to a recovery identity and journalled
+  to `language-visits.recovery.json`; restart replays that observed recovery
+  visit, and only a directly observed departure/return issues a trusted
+  identity again.
 
 The sampler also refuses to start a new sample for a visit that already has a
 conclusive automatic result. If the first sample was inconclusive, a bounded
 retry is allowed after the existing finalize cooldown. Stale inference jobs are
 rejected by re-probing the device and comparing the durable visit identity;
 a reload inside the same visit is accepted, but a job from a visit that ended
-after a departure is discarded.
+after a departure is discarded. The device probe now reads launch, channel and
+stream freshly on every call and retries an incoherent status/snapshot pair;
+there is no minute-long launch-ID cache. A start/end probe launch mismatch
+rejects the sample instead of picking either launch.
 
 ## Pause and maintenance safety
 
 - `language_auto_commit(..., respect_pause=True)` defers an excluded-language
   result while the device reports `surfPaused:true`, `surfing:false` or an
-  unreadable/uncertain state. The pending record keeps the exact evidence,
+  unreadable/uncertain state, including when the pause/stop is on a different
+  channel from the sampled one. The pending record keeps the exact evidence,
   including the physical `visitID` when available.
 - `process_language_pending_once()` applies pending evidence only after a fresh
   read-only status shows active rotation and no pause. It uses the v4
@@ -135,7 +146,7 @@ revision; no IPA/native rebuild is involved.
 
 ## Tests run locally
 
-From `Server/iptv/`, 182 tests passed:
+From `Server/iptv/`, 199 tests passed:
 
 - existing release regressions: `test_language_auto`, `test_overlay_bridge`,
   `test_release_integration`, `test_spanish_auto`, `test_gateway_policy`,
@@ -147,12 +158,16 @@ From `Server/iptv/`, 182 tests passed:
   durability, bounded pruning, exactly one count per visit across language
   changes, distinct verified visits inside the old window, manual correction
   not suppressing a later visit, stale-job rejection, long continuous visit,
-  inconclusive retry cooldown, and v3 migration idempotence on an isolated
-  fixture;
+  inconclusive retry cooldown, v3 migration idempotence on an isolated
+  fixture, missing/corrupt-ledger recovery, failed durable write recovery,
+  new-launch and observed departure/return after recovery, and start/end probe
+  launch mismatch plus same-launch stream reload;
 - new `test_language_pause`: paused deferral then active apply, pending visit
   identity not double counted, observation-disabled pending, uncertain state,
-  manual allow clears pending, visibility while paused, unknown state, and a
-  proof that only `get_status`/`get_player_snapshot` are used;
+  manual allow clears pending, visibility while paused, unknown state, pause
+  or stop on another channel deferral, fresh launch reads, status-failure
+  fail-closed behavior, incoherent status/snapshot retry, and a proof that only
+  `get_status`/`get_player_snapshot` are used;
 - new `test_surf_maintenance`: pre-existing pause, user pause/resume during
   maintenance, duplicate user events, stale launch/stream and uncertain state;
 - new staged-layout test: correction action, source switcher, hidden form key,
@@ -167,8 +182,10 @@ source was not modified.
   sampler's probe cadence) cannot be proven as a revisited visit and will be
   treated as the same visit. This is intentional fail-closed behavior.
 - If the gateway loses `language-visits.json` while the event store survives,
-  a same-launch continuous visit is treated as unverified and suppressed; it
-  will not double count, but it may undercount until the next launch.
+  a same-launch continuous visit is treated as a recovery identity and
+  suppressed; it will not double count, but it may undercount until a directly
+  observed departure/return or the next launch. The same applies to a corrupt
+  ledger and to a new visit whose durable write failed.
 - Transitional upgrade case: pre-integration events carry sample-start
   identities that cannot be proven against the new ledger. If a channel
   already has an automatic event in the current app launch, new verified
@@ -193,10 +210,12 @@ source was not modified.
 2. Deploy the gateway package. Do **not** restart or issue device commands from
    this session.
 3. Stage-copy `language-exclusions.json`, `language-auto-control.json`,
-   `language-exclusions-pending.json` (if present) and `language-visits.json`
-   (if present). Confirm v3 -> v4 migration there: automatic entries become one
-   event each, manual rows/decisions remain, policy rows are unchanged, and a
-   second migration is byte-stable.
+   `language-exclusions-pending.json` (if present), `language-visits.json`
+   (if present), and the adjacent `language-visits.seen` /
+   `language-visits.recovery.json` markers when present. Confirm v3 -> v4
+   migration there: automatic entries become one event each, manual
+   rows/decisions remain, policy rows are unchanged, and a second migration is
+   byte-stable.
 4. Install `Examples/three-panel-night-fit-language-evidence-20261127.json`
    through the existing `install_ui_layout` path and confirm `get_ui_layout`
    reports `three-panel-night-fit-language-evidence-20261127`.

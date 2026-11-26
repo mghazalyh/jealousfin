@@ -80,6 +80,32 @@ class LanguagePauseGatewayTests(unittest.TestCase):
         self.assertEqual(state["entries"][g.sources[self.a]]["language"], "pt")
         self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 1)
 
+    def test_paused_on_another_channel_defers_before_commit(self):
+        g = self.g
+        with patch.object(g, "device_rotation_state", return_value=self.rotation(self.b, True)):
+            result = g.language_auto_commit(self.a, g.sources[self.a], "A", "pt", "Portuguese",
+                                            0.97, "auto:language_pt_dominant", self.evidence("pt"))
+        self.assertEqual(result["reason"], "deferred_paused")
+        self.assertNotIn(g.sources[self.a], g.spanish_provider_ids)
+        self.assertEqual(language_pending.describe(self.temp.name)["entries"], 1)
+        state = g.spanish_classification.load_or_migrate(self.temp.name)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 0)
+        with patch.object(g, "device_rotation_state", return_value=self.rotation(self.b, False)), \
+                patch.object(g, "reload_spanish_auto_control", return_value=True):
+            self.assertEqual(g.process_language_pending_once(), 1)
+        state = g.spanish_classification.load_or_migrate(self.temp.name)
+        self.assertEqual(g.spanish_classification.counts_for(state, self.a, "pt"), 1)
+
+    def test_stopped_rotation_on_another_channel_defers_before_commit(self):
+        g = self.g
+        with patch.object(g, "device_rotation_state",
+                          return_value=self.rotation(self.b, False, surfing=False)):
+            result = g.language_auto_commit(self.a, g.sources[self.a], "A", "fr", "French",
+                                            0.97, "auto:language_fr_dominant", self.evidence("fr"))
+        self.assertEqual(result["reason"], "deferred_paused")
+        self.assertNotIn(g.sources[self.a], g.spanish_provider_ids)
+        self.assertEqual(language_pending.describe(self.temp.name)["languages"], {"fr": 1})
+
     def test_pending_visit_identity_is_preserved_and_not_double_counted(self):
         g = self.g
         visit = language_visits.new_visit_id()
@@ -168,6 +194,89 @@ class LanguagePauseGatewayTests(unittest.TestCase):
                                respect_pause=False)
         with patch.object(g, "device_rotation_state", return_value=None):
             self.assertTrue(g.language_visible(self.a))
+
+    def test_language_probe_reads_fresh_launch_within_old_cache_window(self):
+        g = self.g
+        status_calls = []
+
+        def fake(config, token, action, arguments=None):
+            if action == "get_status":
+                status_calls.append(action)
+                launch = "L1" if len(status_calls) == 1 else "L2"
+                return json.dumps({"launchID": launch, "surfPaused": False,
+                                   "surfing": True, "currentChannelID": self.a})
+            if action == "get_player_snapshot":
+                return json.dumps({"channelID": self.a, "streamGeneration": "S1"})
+            raise AssertionError("unexpected device action: " + str(action))
+
+        with patch.object(g.prototype_selector, "load_selector",
+                          return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_command", side_effect=fake):
+            first = g.device_language_probe()
+            second = g.device_language_probe()
+        self.assertEqual(first["launchID"], "L1")
+        self.assertEqual(second["launchID"], "L2")
+
+    def test_language_probe_never_reuses_launch_after_status_failure(self):
+        g = self.g
+        status_calls = []
+
+        def fake(config, token, action, arguments=None):
+            if action == "get_status":
+                status_calls.append(action)
+                if len(status_calls) > 1:
+                    raise RuntimeError("status unavailable")
+                return json.dumps({"launchID": "L1", "surfPaused": False,
+                                   "surfing": True, "currentChannelID": self.a})
+            if action == "get_player_snapshot":
+                return json.dumps({"channelID": self.a, "streamGeneration": "S1"})
+            raise AssertionError("unexpected device action: " + str(action))
+
+        with patch.object(g.prototype_selector, "load_selector",
+                          return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_command", side_effect=fake):
+            self.assertEqual(g.device_language_probe()["launchID"], "L1")
+            self.assertIsNone(g.device_language_probe())
+
+    def test_language_probe_retries_an_incoherent_status_snapshot_pair(self):
+        g = self.g
+        status_calls = []
+
+        def fake(config, token, action, arguments=None):
+            if action == "get_status":
+                status_calls.append(action)
+                if len(status_calls) == 1:
+                    return json.dumps({"launchID": "L1", "surfPaused": False,
+                                       "surfing": True, "currentChannelID": self.b})
+                return json.dumps({"launchID": "L2", "surfPaused": False,
+                                   "surfing": True, "currentChannelID": self.a})
+            if action == "get_player_snapshot":
+                return json.dumps({"channelID": self.a, "streamGeneration": "S1"})
+            raise AssertionError("unexpected device action: " + str(action))
+
+        with patch.object(g.prototype_selector, "load_selector",
+                          return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_command", side_effect=fake):
+            probe = g.device_language_probe()
+        self.assertEqual(probe["channelID"], self.a)
+        self.assertEqual(probe["launchID"], "L2")
+        self.assertEqual(len(status_calls), 2)
+
+    def test_language_probe_fails_closed_when_pairs_stay_incoherent(self):
+        g = self.g
+
+        def fake(config, token, action, arguments=None):
+            if action == "get_status":
+                return json.dumps({"launchID": "L1", "surfPaused": False,
+                                   "surfing": True, "currentChannelID": self.b})
+            if action == "get_player_snapshot":
+                return json.dumps({"channelID": self.a, "streamGeneration": "S1"})
+            raise AssertionError("unexpected device action: " + str(action))
+
+        with patch.object(g.prototype_selector, "load_selector",
+                          return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_command", side_effect=fake):
+            self.assertIsNone(g.device_language_probe())
 
     def test_rotation_state_uses_only_read_only_device_commands(self):
         g = self.g

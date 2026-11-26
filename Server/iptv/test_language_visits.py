@@ -7,8 +7,10 @@ event while a verified departure and return inside the old cooldown still
 counts.
 """
 import pathlib
+import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -170,6 +172,198 @@ class VisitStoreDedupTests(unittest.TestCase):
         state, second = self.record(state, A, second_visit, "pt", 1060)
         self.assertTrue(second["changed"])
         self.assertEqual(language_exclusions.counts_for(state, A, "pt"), 1)
+
+
+class VisitRecoveryTests(unittest.TestCase):
+    """Adversarial recovery: lost/corrupt ledger and failed durable writes.
+
+    Evidence is deliberately kept in memory, exactly like the independent
+    acceptance repro, so recovery cannot rely on the evidence file alone.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.ledger = language_visits.Ledger(self.root)
+        self.state = language_exclusions.empty()
+
+    def record(self, channel, visit, at, launch=LAUNCH, language="pt"):
+        self.state, info = language_exclusions.record_evidence(
+            self.state, "nltv:us:" + channel, channel, "Fixture", language,
+            language_catalog.language_name(language), 0.97,
+            "auto:language_" + language + "_dominant", evidence(language),
+            outcome="excluded", visit_id=visit, launch_id=launch,
+            stream_generation="stream-1", now=at, threshold=25, enforcement=False)
+        return info
+
+    def visits_path(self):
+        return self.root / "language-visits.json"
+
+    def test_clean_first_visit_remains_trusted(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(language_visits.is_verified(first["visitID"]))
+        info = self.record(A, first["visitID"], 1000)
+        self.assertTrue(info["changed"])
+
+    def test_missing_ledger_with_existing_evidence_fails_closed(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        self.visits_path().unlink()
+
+        reopened = language_visits.Ledger(self.root)
+        second = reopened.observe(A, LAUNCH, "S1", now=1601)
+        self.assertTrue(second["verified"])
+        self.assertTrue(language_visits.is_recovery(second["visitID"]))
+        self.assertFalse(language_visits.is_verified(second["visitID"]))
+        info = self.record(A, second["visitID"], 1601)
+        self.assertFalse(info["changed"])
+        self.assertEqual(info["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 1)
+        replay = self.record(A, second["visitID"], 1602)
+        self.assertEqual(replay["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 1)
+
+    def test_corrupt_ledger_with_existing_evidence_fails_closed(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        self.visits_path().write_text("{not-json")
+
+        reopened = language_visits.Ledger(self.root)
+        second = reopened.observe(A, LAUNCH, "S1", now=1601)
+        self.assertTrue(language_visits.is_recovery(second["visitID"]))
+        info = self.record(A, second["visitID"], 1601)
+        self.assertEqual(info["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 1)
+
+    def test_new_launch_after_recovery_still_counts_once(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        self.visits_path().unlink()
+
+        reopened = language_visits.Ledger(self.root)
+        suppressed = reopened.observe(A, LAUNCH, "S1", now=1601)
+        self.assertEqual(self.record(A, suppressed["visitID"], 1601)["reason"],
+                         "duplicate_visit")
+        new_launch = reopened.observe(A, "launch-2", "S2", now=1602)
+        self.assertTrue(language_visits.is_verified(new_launch["visitID"]))
+        info = self.record(A, new_launch["visitID"], 1602, launch="launch-2")
+        self.assertTrue(info["changed"])
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 2)
+        replay = self.record(A, new_launch["visitID"], 1603, launch="launch-2")
+        self.assertEqual(replay["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 2)
+
+    def test_departure_and_return_after_recovery_counts_only_the_return(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        self.visits_path().unlink()
+
+        reopened = language_visits.Ledger(self.root)
+        suppressed = reopened.observe(A, LAUNCH, "S1", now=1601)
+        self.assertEqual(self.record(A, suppressed["visitID"], 1601)["reason"],
+                         "duplicate_visit")
+        departed = reopened.observe(B, LAUNCH, "S2", now=1610)
+        self.assertTrue(language_visits.is_verified(departed["visitID"]))
+        self.record(B, departed["visitID"], 1610)
+        returned = reopened.observe(A, LAUNCH, "S3", now=1620)
+        self.assertEqual(returned["reason"], "returned_after_departure")
+        self.assertTrue(language_visits.is_verified(returned["visitID"]))
+        info = self.record(A, returned["visitID"], 1620)
+        self.assertTrue(info["changed"])
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 2)
+        replay = self.record(A, returned["visitID"], 1621)
+        self.assertEqual(replay["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 2)
+
+    def test_failed_durable_write_keeps_the_observed_recovery_visit(self):
+        first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+        self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        with patch.object(language_visits, "atomic_write", side_effect=OSError("disk full")):
+            failed = self.ledger.observe(B, LAUNCH, "S2", now=1010)
+            self.assertTrue(language_visits.is_recovery(failed["visitID"]))
+            info = self.record(B, failed["visitID"], 1010)
+            self.assertTrue(info["changed"])
+        self.assertEqual(self.ledger.fault, "OSError")
+        self.assertEqual(language_exclusions.counts_for(self.state, B, "pt"), 1)
+
+        reopened = language_visits.Ledger(self.root)
+        same = reopened.observe(B, LAUNCH, "S3", now=1600)
+        self.assertEqual(same["visitID"], failed["visitID"])
+        self.assertFalse(same["newVisit"])
+        info = self.record(B, same["visitID"], 1600)
+        self.assertEqual(info["reason"], "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, B, "pt"), 1)
+
+        reopened.observe(C, LAUNCH, "S4", now=1610)
+        back = reopened.observe(B, LAUNCH, "S5", now=1620)
+        self.assertTrue(language_visits.is_verified(back["visitID"]))
+        self.assertTrue(self.record(B, back["visitID"], 1620)["changed"])
+        self.assertEqual(language_exclusions.counts_for(self.state, B, "pt"), 2)
+
+    def test_failed_first_write_fails_closed_after_restart(self):
+        with patch.object(language_visits, "atomic_write", side_effect=OSError("disk full")):
+            first = self.ledger.observe(A, LAUNCH, "S1", now=1000)
+            self.assertTrue(language_visits.is_recovery(first["visitID"]))
+            self.assertTrue(self.record(A, first["visitID"], 1000)["changed"])
+        reopened = language_visits.Ledger(self.root)
+        again = reopened.observe(A, LAUNCH, "S2", now=1600)
+        self.assertEqual(again["visitID"], first["visitID"])
+        self.assertEqual(self.record(A, again["visitID"], 1600)["reason"],
+                         "duplicate_visit")
+        self.assertEqual(language_exclusions.counts_for(self.state, A, "pt"), 1)
+
+
+class SamplerTwoProbeMismatchTests(unittest.TestCase):
+    def manager(self, end_probe):
+        manager = object.__new__(language_audio.Manager)
+        manager.fault = None
+        manager._samples = {}
+        manager._finalized = {}
+        manager._lock = threading.RLock()
+        manager._probe_cid = None
+        manager._probe_at = 0.0
+        manager._jobs = queue.Queue()
+        manager.visits = None
+        manager.probe = lambda: end_probe
+        manager.control = lambda: True
+        manager._control_cache = (time.monotonic(), True)
+        manager.model_path = "/tmp/fixture-model.bin"
+        manager.threads = 1
+        manager.log = lambda message: None
+        manager._persist = lambda force=False: None
+        manager.on_exclusion = lambda *args, **kwargs: self.fail("mismatched sample was committed")
+        manager.telemetry = language_audio.Manager._empty_state(manager)
+        return manager
+
+    def sample(self):
+        sample = base._Sample(A, "nltv:us:" + A, "A", time.time())
+        sample.probe = {"channelID": A, "launchID": "L1", "streamGeneration": "S1"}
+        sample.visit = {"visitID": language_visits.new_visit_id(), "verified": True,
+                        "channelID": A, "launchID": "L1", "streamGeneration": "S1"}
+        part = base._Base("seg", True, time.time())
+        part.seconds = 55.0
+        sample.bases = {"seg": part}
+        return sample
+
+    def test_launch_change_between_start_and_end_probe_is_not_committed(self):
+        manager = self.manager({"channelID": A, "launchID": "L2", "streamGeneration": "S1"})
+        manager._samples[A] = self.sample()
+        manager._finalize(A, "target_reached")
+        self.assertTrue(manager._jobs.empty())
+        self.assertEqual(manager.telemetry["last"]["reason"], "launch_changed")
+        self.assertEqual(manager.telemetry["counters"]["inconclusive"], 1)
+
+    def test_stream_reload_in_same_launch_is_still_queued(self):
+        manager = self.manager({"channelID": A, "launchID": "L1", "streamGeneration": "S2"})
+        sample = self.sample()
+        manager._samples[A] = sample
+        manager._finalize(A, "target_reached")
+        self.assertFalse(manager._jobs.empty())
+        job = manager._jobs.get_nowait()
+        self.assertEqual(job["launchID"], "L1")
+        self.assertEqual(job["visitID"], sample.visit["visitID"])
+        self.assertFalse(job["changed"])
 
 
 class SamplerVisitSuppressionTests(unittest.TestCase):
