@@ -1463,7 +1463,7 @@ WEB_ORIGIN='https://jealouswin.pages.dev'
 WEB_ASSET_HOST='jealouswin.pages.dev'
 WEB_ROOT_ASSETS=frozenset(('/', '/index.html', '/main.dart.js', '/flutter.js',
  '/flutter_bootstrap.js', '/flutter_service_worker.js', '/version.json',
- '/manifest.json', '/favicon.png', '/player.js', '/hls.min.js'))
+ '/manifest.json', '/favicon.png', '/player.js', '/rtc.js', '/hls.min.js'))
 def web_asset(path):
  if path in WEB_ROOT_ASSETS:return True
  return bool(re.fullmatch(r'/(?:assets|canvaskit|icons)/(?:[A-Za-z0-9_@.+%~-]+/)*[A-Za-z0-9_@.+%~-]+',path)) and all(
