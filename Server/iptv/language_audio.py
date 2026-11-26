@@ -108,8 +108,9 @@ class Manager(base.Manager):
     """Generalized manager; sampler/decoder/AES are inherited from base."""
 
     def __init__(self, root, model_path, on_exclusion, control, probe=None, log=None,
-                 ffmpeg=None, whisper=None, threads=4, visits=None):
+                 ffmpeg=None, whisper=None, threads=4, visits=None, on_speech=None):
         self.on_exclusion = on_exclusion
+        self.on_speech = on_speech
         super().__init__(root, model_path, None, control, probe=probe, log=log,
                          ffmpeg=ffmpeg, whisper=whisper, threads=threads, visits=visits)
 
@@ -186,6 +187,7 @@ class Manager(base.Manager):
         if not self._enabled():
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
+        transcript = None
         try:
             analysis = base.analyze_speech(job["pcm"])
             if analysis["duration"] < base.MIN_SAMPLE_SECONDS or analysis["speechSeconds"] < base.MIN_SPEECH_SECONDS:
@@ -217,9 +219,44 @@ class Manager(base.Manager):
                 lexical = base.lexical_margin(transcript[1]) if transcript else (None, 0, 0)
                 decision = decide_language(analysis, window_results, lexical,
                                            transcript[0] if transcript else None)
+            self._notify_speech(job, decision, transcript)
             self._record_result(job, decision)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _notify_speech(self, job, decision, transcript):
+        """Hand off only an allowed, device-verified transient transcript.
+
+        The callback must never persist the text. It receives a sanitized job
+        view (no PCM bytes) plus the already-computed language decision. This
+        is the adapter boundary for optional local episode identification; it
+        acts on the existing single decode/transcribe pass and never starts a
+        second capture or Whisper run.
+
+        The observation time is the handoff time, not the sample start, so a
+        long sample cannot create an already-expired binding. The durable
+        ``visitID`` from the language visit ledger is passed through unchanged;
+        the observer re-probes the device and requires the same exact visit.
+        """
+        if self.on_speech is None or not transcript:
+            return
+        if not isinstance(decision, dict) or decision.get("outcome") != "allowed":
+            return
+        if job.get("deviceVerified") is not True or job.get("changed"):
+            return
+        now = time.time()
+        view = {
+            "cid": job.get("cid"), "provider": job.get("provider"), "name": job.get("name"),
+            "seconds": job.get("seconds"), "deviceVerified": job.get("deviceVerified"),
+            "changed": bool(job.get("changed")), "launchID": job.get("launchID", ""),
+            "streamGeneration": job.get("streamGeneration", ""), "visitID": job.get("visitID", ""),
+            "observedAt": now, "expiresAt": None,
+            "sampleDigest": job.get("sampleDigest"), "profile": job.get("profile", "american"),
+        }
+        try:
+            self.on_speech(view, dict(decision), transcript[1])
+        except Exception as error:
+            self.log("episode clue handoff error " + type(error).__name__)
 
     def _identity_matches(self, job, probe, allow_stream_reload=False):
         if not isinstance(probe, dict) or not probe.get("channelID"):

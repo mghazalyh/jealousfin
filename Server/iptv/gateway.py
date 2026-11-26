@@ -1780,6 +1780,94 @@ def device_language_probe():
   return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
           'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing}
  return None
+# Optional audio-assisted episode identity. It reuses the single language
+# decode/transcribe pass through on_speech; it never requests media, starts a
+# second Whisper run or calls a research service while disabled.
+episode_observer=None
+episode_init_lock=threading.Lock()
+EPISODE_SOURCE_FILE=ROOT/'episode-sources.json'
+EPISODE_SOURCE_LIMIT=65536
+EPISODE_SOURCE_PAGES=8
+def load_episode_sources():
+ # Private, reviewed registry only. Unknown fields, hosts or oversized files
+ # are ignored so an unsafe registry can never widen the source allowlist.
+ try:
+  if not EPISODE_SOURCE_FILE.exists():return {}
+  if EPISODE_SOURCE_FILE.stat().st_size>EPISODE_SOURCE_LIMIT:raise ValueError('Episode source registry too large')
+  data=json.loads(EPISODE_SOURCE_FILE.read_text())
+  if not isinstance(data,dict) or data.get('schemaVersion')!=1:raise ValueError('Invalid episode source registry')
+  series=data.get('series')
+  if not isinstance(series,dict) or len(series)>256:raise ValueError('Invalid episode source series')
+  out={}
+  for key,row in series.items():
+   if not isinstance(key,str) or not 1<=len(key)<=200 or not isinstance(row,dict) or set(row)-{'official','reports'}:continue
+   entry={}
+   for kind,hosts in (('official',episode_audio.OFFICIAL_ARCHIVE_HOSTS),('reports',episode_audio.INDEPENDENT_REPORT_HOSTS)):
+    urls=row.get(kind,[])
+    if not isinstance(urls,list) or len(urls)>EPISODE_SOURCE_PAGES:raise ValueError('Invalid episode source list')
+    valid=[]
+    for url in urls:
+     if not isinstance(url,str) or not re.fullmatch(r'https://[^\s]{1,500}',url):raise ValueError('Invalid episode source URL')
+     host=urllib.parse.urlsplit(url).hostname
+     if not isinstance(host,str) or host.lower() not in hosts:raise ValueError('Unapproved episode source host')
+     valid.append(url)
+    entry[kind]=valid
+   out[episode_audio.source_key(key)]=entry
+  return out
+ except (OSError,ValueError,TypeError):return {}
+def episode_research_page(url):
+ # Bounded read of one already-reviewed public page. Never stores the page.
+ validate(url)
+ req=urllib.request.Request(url,headers={'User-Agent':'Jealousfin-Episode-Evidence/1.0','Accept':'text/html,application/xhtml+xml'})
+ with opener.open(req,timeout=8) as f:data=f.read(episode_audio.MAX_PAGE_BYTES+1)
+ if len(data)>episode_audio.MAX_PAGE_BYTES:raise ValueError('Episode evidence page too large')
+ return data
+def current_programme_context(channel_id):
+ try:row=programme_snapshot().get(channel_id)
+ except (sqlite3.Error,OSError,RuntimeError,ValueError):return None
+ return episode_audio.programme_context(row,channel_id)
+def episode_active_view(channel_id):
+ view=playback_activity.views().get(channel_id)
+ if view is None:return None
+ try:row=programme_snapshot().get(channel_id) or {}
+ except (sqlite3.Error,OSError,RuntimeError,ValueError):row={}
+ return {'channel_id':channel_id,'session_hash':view.session_hash,
+         'active_seconds':view.active_seconds,
+         'hasEpisodeIdentity':episode_audio.programme_has_episode_identity(row)}
+def episode_probe():
+ # Fresh coherent device identity plus the durable physical visit. The visit
+ # is observed through the existing read-only ledger; no playback command is
+ # issued. Publication fails closed while the user has paused or stopped
+ # rotation, or when the visit cannot be verified. A same-launch reload keeps
+ # the same visit ID, so the audio binding treats it as one physical session.
+ probe=device_language_probe()
+ if not isinstance(probe,dict):return None
+ if probe.get('surfPaused') is not False or probe.get('surfing') is not True:return None
+ try:visit=language_visit_identity().observe(probe.get('channelID'),probe.get('launchID'),probe.get('streamGeneration'),now=time.time())
+ except Exception:return None
+ if not isinstance(visit,dict) or visit.get('verified') is not True:return None
+ visit_id=str(visit.get('visitID','') or '')
+ if not visit_id:return None
+ return dict(probe,visitID=visit_id,visitVerified=language_visits.is_verified(visit_id))
+def episode_observer_instance():
+ global episode_observer
+ if SOURCE_PROFILE!='american':return None
+ with episode_init_lock:
+  if episode_observer is None:
+   research=episode_audio.PublicEvidenceResearch(episode_research_page,load_episode_sources(),EPISODE_SOURCE_PAGES)
+   episode_observer=episode_audio.EpisodeObserver(
+    probe=episode_probe,research=research,enabled=episode_audio.DEFAULT_ENABLED,
+    budget=episode_audio.EpisodeBudget(),programme=current_programme_context,
+    activity=episode_active_view,log=log)
+  return episode_observer
+def episode_audio_status():
+ status=episode_audio.status()
+ if episode_observer is None:
+  status['active']=False;status['fault']='not_started';return status
+ status['active']=bool(episode_observer.enabled)
+ status['fault']=None
+ status['budget']=episode_observer.budget.diagnostics() if episode_observer.budget is not None else None
+ return status
 def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence,session=None,respect_pause=True):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return {'changed':False,'reason':'wrong_profile'}
@@ -2295,7 +2383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (ValueError,OSError,TypeError):language_pending_description={'entries':0}
    language_status=spanish_auto_status()
    overlay_request_pump()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio.status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
@@ -2478,7 +2566,7 @@ def main():
  overlay_publisher=None
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
-  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity())
+  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity(),on_speech=episode_observer_instance())
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
   pending=threading.Thread(target=language_pending_worker,args=(stop,),name='language-pending',daemon=True);pending.start()
   overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()
