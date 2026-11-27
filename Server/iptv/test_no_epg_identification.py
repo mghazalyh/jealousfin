@@ -9,6 +9,15 @@ from unittest.mock import patch
 import episode_audio as audio
 import test_episode_audio as fixtures
 
+def fixture_scoped_report():
+    headline="WWE NXT results: June 16, 2026: Zaria wins first-ever women's North American Championship"
+    obj={"@type":"NewsArticle","headline":headline,"description":"Results","datePublished":"2026-06-17"}
+    return ('<meta property="og:title" content="'+headline+'">'
+            +'<script type="application/ld+json">'+json.dumps(obj)+'</script>'
+            +'<article><h1>'+headline+'</h1><time datetime="2026-06-17"></time>'
+            +"<p>Zaria became the first-ever women's North American Champion.</p></article>")
+
+
 class UnknownProgrammeTests(unittest.TestCase):
     def context(self, **kwargs):
         return dict(channelID=fixtures.CHANNEL, seriesTitle="", channelName="Example channel", **kwargs)
@@ -106,7 +115,7 @@ class PublicSearchTests(unittest.TestCase):
 
     def test_unknown_title_reports_need_explicit_air_date(self):
         self.assertEqual(audio.parse_report_page(fixtures.REPORT_PAGE,fixtures.REPORT_URL,{"seriesTitle":""}),[])
-        report=fixtures.REPORT_PAGE.replace("WWE NXT results:", "WWE NXT results: June 16, 2026:")
+        report=fixture_scoped_report()
         second="https://www.pwinsider.com/article/wwe-nxt-june-16"
         pages={fixtures.OFFICIAL_URL:fixtures.OFFICIAL_PAGE,fixtures.REPORT_URL:report,second:report}
         research=audio.PublicEvidenceResearch(pages.get,provider=lambda _:([fixtures.OFFICIAL_URL],[fixtures.REPORT_URL,second]))
@@ -349,7 +358,7 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
 
     def test_unknown_evidence_cache_also_scoped_to_clues_within_session(self):
         calls=[]
-        report=fixtures.REPORT_PAGE.replace("WWE NXT results:", "WWE NXT results: June 16, 2026:")
+        report=fixture_scoped_report()
         def fetch(url):
             calls.append(url)
             return fixtures.OFFICIAL_PAGE if url==fixtures.OFFICIAL_URL else report
@@ -453,3 +462,28 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
         data=encode([completed,other])
         self.assertEqual(discovery.parse_events_detailed(data)[1]["error"],"invalid-answer")
         self.assertEqual(discovery.parse_events_detailed(data,strict_episode=True)[1]["error"],"unexpected-tool")
+
+    def test_metadata_without_matching_visible_body_cannot_supply_clues(self):
+        h="WWE NXT Results - November 4, 2025"
+        clues=["jevon evans","saquon shugars"]
+        url="https://www.pwmania.com/wwe-nxt-results-november-4-2025"
+        meta=f'<meta property="og:title" content="{h}"><meta property="og:description" content="Jevon Evans and Saquon Shugars"><meta property="article:published_time" content="2025-11-05">'
+        body=f'<article><h1>{h}</h1><time datetime="2025-11-05"></time><p>Unrelated recap.</p></article>'
+        self.assertEqual(audio.parse_report_page(meta+body,url,{"seriesTitle":""},clues=clues),[])
+        self.assertEqual(audio.parse_report_page(meta,url,{"seriesTitle":""},clues=clues),[])
+        self.assertTrue(audio.parse_report_page(meta+body.replace("Unrelated recap.","Jevon Evans and Saquon Shugars"),url,{"seriesTitle":""},clues=clues))
+
+    def test_canonical_publisher_count_and_confidence_ignore_alias_duplicates(self):
+        req=fixtures.nxt_request()
+        reports=fixtures.nxt_reports()
+        first=audio.dataclasses.replace(reports[0],source_url="https://www.pwmania.com/a")
+        alias=audio.dataclasses.replace(first,source_url="https://pwmania.com/b")
+        second=audio.dataclasses.replace(reports[1],source_url="https://www.wrestlinginc.com/c")
+        ctx={"seriesTitle":""}
+        verify=lambda rows:audio.verify_episode_content(req,[fixtures.nxt_official()],rows,fixtures.NOW,ctx)
+        self.assertFalse(verify([first,alias]).accepted)
+        normal=verify([first,second]);duplicate=verify([first,alias,second])
+        self.assertTrue(normal.accepted)
+        self.assertEqual(duplicate.corroborating_sources,2)
+        self.assertEqual(normal.matched_clue_count,duplicate.matched_clue_count)
+        self.assertEqual(audio.independent_publisher("https://www.wrestlingobserver.com/foo"),audio.independent_publisher("https://f4wonline.com/bar"))

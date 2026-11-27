@@ -242,6 +242,12 @@ def _host(url):
     return host if re.fullmatch(r"[a-z0-9.-]+", host) and "." in host else ""
 
 
+def independent_publisher(url):
+    """Canonical publisher identity, distinct from the source URL host."""
+    host = _host(url).removeprefix("www.")
+    return "f4wonline.com" if host == "wrestlingobserver.com" else host
+
+
 def _public_host(value):
     """Return a syntactically public DNS host, or an empty string.
 
@@ -1085,12 +1091,23 @@ def verify_episode_content(request, official_episodes, reports, now=None, progra
     verification = corroborate_episode(request.clues, official_episodes, reports, now=now)
     if unknown_title and verification.accepted:
         identity = verification.identity
-        matching_hosts = {("f4wonline.com" if _host(r.source_url).removeprefix("www.") == "wrestlingobserver.com" else _host(r.source_url).removeprefix("www.")) for r in reports
-                          if not r.rejection() and _norm_text(r.series_title) == _norm_text(identity.series_title)
-                          and _date(r.original_air_date) == identity.original_air_date
-                          and len(clue_matches(request.clues, r.terms)) >= MIN_DISTINCTIVE_CLUES}
-        if len(matching_hosts) < 2:
+        publisher_matches = {}
+        for r in reports:
+            if (r.rejection() or _norm_text(r.series_title) != _norm_text(identity.series_title)
+                    or _date(r.original_air_date) != identity.original_air_date):
+                continue
+            matched = len(clue_matches(request.clues, r.terms))
+            if matched < MIN_DISTINCTIVE_CLUES:
+                continue
+            publisher = independent_publisher(r.source_url)
+            publisher_matches[publisher] = max(matched, publisher_matches.get(publisher, 0))
+        if len(publisher_matches) < 2:
             return Verification(False, "no-independent-report")
+        # Do not inflate counts/confidence using aliases or several articles
+        # from one publisher; retain any numbering conflict from corroboration.
+        verification = dataclasses.replace(verification,
+            corroborating_sources=len(publisher_matches),
+            matched_clue_count=sum(publisher_matches.values()))
     if not verification.accepted or verification.identity is None:
         return verification
     if not programme_matches(verification.identity, programme):
@@ -1983,7 +2000,7 @@ def parse_report_page(page, source_url, context=None, clues=()):
     article = _single_article(page) if requested else ""
     report_meta = _meta_map(page) if requested else {}
     site_name = report_meta.get("og:site_name", "")
-    if requested and re.search(r"<article\b", _page_text(page), re.IGNORECASE):
+    if requested:
         # Reject the entire ambiguous report, including structured metadata.
         # An unrelated article cannot supply either a date or clues.
         page_headline = _report_headline(report_meta.get("og:title") or report_meta.get("twitter:title") or _title_tag(page), site_name)
@@ -2037,11 +2054,10 @@ def parse_report_page(page, source_url, context=None, clues=()):
         if requested:
             if article and not _article_matches_headline(article, _report_headline(headline, site_name)):
                 continue
-            # Structured articleBody can be stale or refer to another story.
-            # Use only the article's scoped visible body after headline/date
-            # agreement; JSON-only sources must match through their metadata.
+            # Only visible article paragraphs can corroborate audio clues.
+            # Metadata and structured articleBody establish no clue matches.
             body = _article_body(article, _report_headline(headline, site_name))
-            terms = _requested_public_terms(requested, headline, description, body)
+            terms = _requested_public_terms(requested, body)
             add(_report_row(source_url, headline, description, published, air, series, matched_terms=terms))
         else:
             add(_report_row(source_url, headline, description, published, air, series))
@@ -2066,7 +2082,7 @@ def parse_report_page(page, source_url, context=None, clues=()):
     if not published or not air:
         return rows
     series = fallback_series or _series_from_report_headline(headline)
-    terms = _requested_public_terms(requested, headline, description, _article_body(article, headline)) if requested else None
+    terms = _requested_public_terms(requested, _article_body(article, headline)) if requested else None
     add(_report_row(source_url, headline, description, published, air, series, visible, matched_terms=terms))
     return rows[:MAX_REPORTS]
 
