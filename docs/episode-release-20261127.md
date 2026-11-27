@@ -51,12 +51,14 @@ Server/iptv/gateway.py
 Server/iptv/language_audio.py
 Server/iptv/overlay_bridge.py
 Server/iptv/programme_overlay.py
+Server/iptv/prototype_selector.py
 Server/iptv/schedule_episode.py
 Server/iptv/spanish_audio.py
 Server/iptv/test_deployment_continuity.py
 Server/iptv/test_episode_audio.py
 Server/iptv/test_gateway_policy.py
 Server/iptv/test_incident_identity_overlay_20261127.py
+Server/iptv/test_incident_selector_pressure_20261127.py
 Server/iptv/test_language_pause.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
