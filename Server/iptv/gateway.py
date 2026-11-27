@@ -3584,7 +3584,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
       if base:
        crypto=segment_keys.get(rid) or {}
        key_rid=crypto.get('keyRid')
-       spanish_auto_manager.tap(cid,sources.get(cid),channels.get(cid,{}).get('Name',''),rid,base,data,rid in audio_segments,headers.get('Content-Type','application/octet-stream'),correlation,key_bytes=key_cache.get(key_rid) if key_rid else None,key_rid=key_rid,iv=crypto.get('iv'),sequence=crypto.get('sequence'))
+       spanish_auto_manager.tap(cid,sources.get(cid),channels.get(cid,{}).get('Name',''),rid,base,data,rid in audio_segments,headers.get('Content-Type','application/octet-stream'),correlation,key_bytes=key_cache.get(key_rid) if key_rid else None,key_rid=key_rid,iv=crypto.get('iv'),sequence=crypto.get('sequence'),request_started_at=started)
     if data.lstrip(b'\xef\xbb\xbf \r\n').startswith(b'#EXTM3U'):
      if len(data)>MAX_PLAYLIST:
       record_source_error(cid,url,'media','Playlist exceeds gateway limit',correlation);return self.reply(502,{})

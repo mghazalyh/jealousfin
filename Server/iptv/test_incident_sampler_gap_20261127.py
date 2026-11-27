@@ -98,6 +98,45 @@ class SamplerGapIncidentTests(unittest.TestCase):
         self.manager._decode_event(self.event("r0", wall))
         return self.manager._samples[CID]
 
+    def test_fresh_identity_restarts_sample_without_reusing_unverified_bytes(self):
+        self.probe.values = [None, status()]
+        self.audio = self.pcm(10.0)
+        original = self.first_sample()
+        self.manager._housekeeping()
+        fresh = self.manager._samples[CID]
+        self.assertIsNot(fresh, original)
+        self.assertEqual(fresh.visit["visitID"], VISIT)
+        self.assertEqual(fresh.bases[BASE].seconds, 0.0)
+        self.assertEqual(fresh.bases[BASE].seen, {"r0"})
+        epoch = fresh.recovery_after
+        wall = fresh.started
+        def event(rid, started, tapped, when):
+            result = self.event(rid, when)
+            result["requestStartedAt"] = started
+            result["tappedMonotonic"] = tapped
+            return result
+        self.manager._decode_event(event("stale", epoch - 1, epoch + 1, wall + 1))
+        self.manager._decode_event(event("r0", epoch + 1, epoch + 2, wall + 2))
+        self.assertEqual(fresh.bases[BASE].seconds, 0.0)
+        self.manager._decode_event(event("fresh", epoch + 2, epoch + 3, wall + 3))
+        self.assertEqual(fresh.bases[BASE].seconds, 10.0)
+        self.assertEqual(fresh.bases[BASE].segments, 1)
+
+    def test_unverified_gap_recovery_discards_trigger_segment(self):
+        self.probe.values = [None, status()]
+        original = self.first_sample()
+        self.manager._decode_event(self.event("r1", 1000 + spanish_audio.VISIT_GAP_SECONDS + 1))
+        fresh = self.manager._samples[CID]
+        self.assertIsNot(fresh, original)
+        self.assertEqual(fresh.bases[BASE].seconds, 0.0)
+        self.assertEqual(self.probe.calls, 2)
+
+    def test_recovery_requires_coherent_visit_and_stream(self):
+        self.probe.values = [None, status("")]
+        sample = self.first_sample()
+        self.manager._housekeeping()
+        self.assertIs(self.manager._samples[CID], sample)
+
     def test_gap_same_verified_identity_keeps_bytes_and_sample(self):
         sample = self.first_sample()
         base = sample.bases[BASE]

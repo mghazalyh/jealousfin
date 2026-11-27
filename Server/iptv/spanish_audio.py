@@ -445,7 +445,7 @@ class _Base:
 
 class _Sample:
     __slots__ = ("cid", "provider", "name", "bases", "started", "last_tap", "probe",
-                 "probe_done", "visit", "episode_only")
+                 "probe_done", "visit", "episode_only", "recovery_after")
 
     def __init__(self, cid, provider, name, now):
         self.cid = cid
@@ -458,6 +458,7 @@ class _Sample:
         self.probe_done = False
         self.visit = None
         self.episode_only = False
+        self.recovery_after = None
 
 
 class Manager:
@@ -629,7 +630,7 @@ class Manager:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def tap(self, cid, provider, name, rid, base, data, is_audio, content_type="", correlation=None,
-            key_bytes=None, key_rid=None, iv=None, sequence=None):
+            key_bytes=None, key_rid=None, iv=None, sequence=None, request_started_at=None):
         """Enqueue one already-fetched media segment. Never blocks or raises."""
         if self.fault or not cid or not provider or not base or not data:
             return
@@ -647,7 +648,8 @@ class Manager:
                 "cid": cid, "provider": provider, "name": name, "rid": rid, "base": base,
                 "data": data, "is_audio": bool(is_audio), "contentType": content_type,
                 "keyBytes": key_bytes, "keyRid": key_rid, "iv": iv, "sequence": sequence,
-                "wall": now,
+                "wall": now, "requestStartedAt": request_started_at,
+                "tappedMonotonic": time.monotonic(),
             })
         except Exception:
             with self._lock:
@@ -856,6 +858,43 @@ class Manager:
             return False
         return True
 
+    def _restart_unverified_sample(self, sample, probe, visit):
+        """Start a new verified collection epoch; never relabel previous PCM."""
+        start = sample.probe if isinstance(sample.probe, dict) else {}
+        prior = sample.visit if isinstance(sample.visit, dict) else {}
+        if (start.get("channelID") == sample.cid and start.get("launchID")
+                and start.get("streamGeneration") and prior.get("verified")
+                and language_visits.is_verified(prior.get("visitID"))):
+            return False
+        if not isinstance(probe, dict) or not isinstance(visit, dict):
+            return False
+        launch = probe.get("launchID")
+        stream = probe.get("streamGeneration")
+        if (probe.get("channelID") != sample.cid or not launch or not stream
+                or visit.get("channelID") != sample.cid
+                or visit.get("launchID") != launch
+                or visit.get("streamGeneration") != stream
+                or not visit.get("verified")
+                or not language_visits.is_verified(visit.get("visitID"))):
+            return False
+        stamp = time.time()
+        if self._suppress_duplicate_visit(sample.cid, self._finalized.get(sample.cid), visit, stamp):
+            return False
+        fresh = _Sample(sample.cid, sample.provider, sample.name, stamp)
+        fresh.probe = dict(probe)
+        fresh.probe_done = True
+        fresh.visit = dict(visit)
+        fresh.recovery_after = time.monotonic()
+        fresh.episode_only = bool(self._take_episode_retry(sample.cid, visit, stamp))
+        for key, old in sample.bases.items():
+            new = _Base(key, old.is_audio, stamp)
+            new.seen = set(old.seen)
+            fresh.bases[key] = new
+        self._samples[sample.cid] = fresh
+        self.log("LANGUAGE_SAMPLE_IDENTITY_RECOVERED channel=%s discardedSeconds=%.2f" % (
+            sample.cid, max((item.seconds for item in sample.bases.values()), default=0.0)))
+        return True
+
     def _decode_event(self, event):
         if not self._enabled():
             return
@@ -865,6 +904,13 @@ class Manager:
         gap_probe = None
         gap_observed = None
         if sample is not None:
+            if sample.recovery_after is not None:
+                request_started = event.get("requestStartedAt")
+                tapped = event.get("tappedMonotonic")
+                if (type(request_started) not in (int, float)
+                        or type(tapped) not in (int, float)
+                        or not sample.recovery_after <= request_started <= tapped):
+                    return
             if now < sample.last_tap:
                 return
             if now - sample.last_tap > VISIT_GAP_SECONDS:
@@ -876,6 +922,9 @@ class Manager:
                     if isinstance(gap_probe, dict) and gap_probe.get("channelID"):
                         self._probe_cid = gap_probe["channelID"]
                         self._probe_at = time.time()
+                elif self._restart_unverified_sample(sample, gap_probe, gap_observed):
+                    # The triggering request predates this fresh observation.
+                    return
                 else:
                     self._finalize(event["cid"], "visit_gap", end_probe=gap_probe,
                                    observed=gap_observed)
@@ -998,7 +1047,9 @@ class Manager:
             current = self._probe()
             self._probe_at = now
             self._probe_cid = current.get("channelID") if isinstance(current, dict) else None
-            self._observe_visit(current)
+            observed = self._observe_visit(current)
+            if self._probe_cid in self._samples:
+                self._restart_unverified_sample(self._samples[self._probe_cid], current, observed)
         verified = self._probe_cid if now - self._probe_at <= PROBE_INTERVAL_SECONDS * 3 else None
         for cid, sample in list(self._samples.items()):
             best = self._best_base(sample)
