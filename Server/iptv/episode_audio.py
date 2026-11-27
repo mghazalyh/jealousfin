@@ -2376,6 +2376,12 @@ def _typed_scope(page, selector):
                     _css_hides(node.get("style", "")) or
                     any(_HIDDEN_CLASS.fullmatch(str(c)) for c in classes)):
                 hidden.add(id(node))
+        # Closed disclosures and dialogs are not active semantic evidence.
+        # Exclude the entire closed details element, even its summary, rather
+        # than interpreting a disclosure label as plot or event evidence.
+        for node in soup.find_all(("details", "dialog")):
+            if not node.has_attr("open"):
+                hidden.add(id(node))
         # Match static stylesheet hiding rules before filtering the source
         # scope, including nested media rules. Ignore keyframe steps and
         # pseudo-elements, which do not hide the source element itself.

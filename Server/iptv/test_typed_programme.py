@@ -219,3 +219,13 @@ class TypedParserTests(unittest.TestCase):
         # A CSS-hidden unrelated node must not suppress a legitimate visible plot.
         html='<style>.concealed{display:none}</style>'+self.movie_html.replace(visible,'<p class="concealed">Unrelated clues</p>'+visible)
         self.assertEqual(len(audio.parse_typed_programme_page(html,self.official,self.clues,True)),1)
+
+    def test_closed_disclosure_and_dialog_are_not_plot_evidence(self):
+        visible='<p>'+self.plot+'</p>'
+        for wrapper in ('<details><summary>More</summary>'+visible+'</details>',
+                        '<dialog>'+visible+'</dialog>',
+                        '<details><summary>More</summary><details open>'+visible+'</details></details>'):
+            with self.subTest(wrapper=wrapper):
+                self.assertEqual(audio.parse_typed_programme_page(self.movie_html.replace(visible,wrapper),self.official,self.clues,True),[])
+        for tag in ('details','dialog'):
+            self.assertEqual(len(audio.parse_typed_programme_page(self.movie_html.replace(visible,'<'+tag+' open>'+visible+'</'+tag+'>'),self.official,self.clues,True)),1)
