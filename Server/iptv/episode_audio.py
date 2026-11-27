@@ -2339,6 +2339,20 @@ _HIDDEN_CLASS = re.compile(r"^(?:hidden|is-hidden|u-hidden|d-none|sr-only|visual
 _TYPED_EXCLUDED = frozenset("script style noscript nav aside footer form figure template svg".split())
 
 
+def _css_hides(value):
+    # CSS comments and escaped identifiers/values are semantically invisible.
+    # Normalize them before checking visibility declarations. This also covers
+    # comments between a property, colon, value or !important.
+    value = re.sub(r"/\*.*?\*/", "", str(value or ""), flags=re.S)
+    def decode(match):
+        if match[1]:
+            code = int(match[1],16)
+            return chr(code) if 0 < code <= 0x10ffff else "\ufffd"
+        return match[2] or ""
+    value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))", decode, value)
+    return bool(_CSS_HIDDEN_DECLARATION.search(value))
+
+
 def _typed_scope(page, selector):
     """Read a single reviewed semantic scope, never page-wide text.
 
@@ -2357,7 +2371,7 @@ def _typed_scope(page, selector):
             classes = node.get("class", [])
             if (node.name in _TYPED_EXCLUDED or node.has_attr("hidden") or
                     str(node.get("aria-hidden", "")).casefold() == "true" or
-                    _CSS_HIDDEN_DECLARATION.search(str(node.get("style", ""))) or
+                    _css_hides(node.get("style", "")) or
                     any(_HIDDEN_CLASS.fullmatch(str(c)) for c in classes)):
                 hidden.add(id(node))
         # Match static stylesheet hiding rules before filtering the source
@@ -2367,7 +2381,7 @@ def _typed_scope(page, selector):
         for style in soup.find_all("style"):
             css = re.sub(r"/\*.*?\*/", "", style.get_text(), flags=re.S)
             for rule in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
-                if _CSS_HIDDEN_DECLARATION.search(rule[2]):
+                if _css_hides(rule[2]):
                     value = rule[1].strip()
                     if re.fullmatch(r"(?:from|to|\d+(?:\.\d+)?%)", value, re.I):
                         continue

@@ -201,6 +201,10 @@ class TypedParserTests(unittest.TestCase):
             ('<style>[data-concealed="yes"]{content-visibility:hidden}</style>','<p data-concealed="yes">'+self.plot+'</p>'),
             ('','<p class="screen-reader-text">'+self.plot+'</p>'),
             ('','<p class="d-none">'+self.plot+'</p>'),
+            ('','<p style="display:/**/none">'+self.plot+'</p>'),
+            ('','<p style="visib/**/ility: hidden">'+self.plot+'</p>'),
+            ('','<p style="display: n'+chr(92)+'6f ne">'+self.plot+'</p>'),
+            ('<style>.concealed{display:/**/none}</style>','<p class="concealed">'+self.plot+'</p>'),
         ):
             with self.subTest(markup=markup):
                 self.assertEqual(audio.parse_typed_programme_page(style+self.movie_html.replace(visible,markup),self.official,self.clues,True),[])
