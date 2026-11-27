@@ -446,7 +446,8 @@ class EpisodeModelGate:
             if isinstance(failures, dict) and failures.get("rate-limit", 0):
                 self.rate_limits = min(self.rate_limits + 1, 4)
                 self.until = self.clock() + min(900, 120 * 2 ** (self.rate_limits - 1))
-            elif diagnostics.get("completedSearches", 0):
+            else:
+                # A non-rate-limited attempt breaks a consecutive streak.
                 self.rate_limits = 0
                 self.until = 0.0
             self.running = False

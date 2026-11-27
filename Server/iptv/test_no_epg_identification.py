@@ -161,6 +161,23 @@ class PublicSearchTests(unittest.TestCase):
         self.assertEqual(gate.acquire(),"")
         gate.release()
 
+    def test_non_rate_limited_attempt_breaks_consecutive_streak(self):
+        now=[100.0]
+        gate=discovery.EpisodeModelGate(lambda:now[0])
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"searchFailureCategories":{"rate-limit":1}})
+        now[0]+=120
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"completedSearches":0,"failedSearches":1,"searchFailureCategories":{"network":1}})
+        self.assertEqual(gate.snapshot()["consecutiveRateLimits"],0)
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"searchFailureCategories":{"rate-limit":1}})
+        self.assertEqual(gate.snapshot()["backoffSeconds"],120)
+        now[0]+=120
+        self.assertEqual(gate.acquire(),"")
+        gate.release()
+        self.assertEqual(gate.snapshot()["consecutiveRateLimits"],0)
+
     def test_successful_http_challenge_stops_search(self):
         calls=[];diag={}
         def fetch(q):
