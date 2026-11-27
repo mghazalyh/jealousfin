@@ -1803,6 +1803,29 @@ def _report_air_date(headline, description, visible, fallback_air=""):
     return air or fallback_air
 
 
+def _unknown_report_air_date(headline, description):
+    """Require an explicitly labelled episode date, not an incidental date."""
+    if not isinstance(headline, str) or not isinstance(description, str):
+        return ""
+    marker = r"(?:report|results|recap|review)"
+    patterns = (
+        r"\b" + marker + r"\s*(?:[:–—-]\s*)?\(?\s*(" + DATE_TOKEN + r")(?=\s*[:–—),]|\s*$)",
+        r"\b(" + DATE_TOKEN + r")\s+" + marker + r"\b",
+    )
+    matches = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, headline, re.IGNORECASE):
+            air = _date_from_text(match.group(1))
+            if air:
+                matches.append(air)
+    for match in re.finditer(r"\b(?:original air date|episode air date|originally aired)\s*:?\s*(?:on\s+)?(" + DATE_TOKEN + r")", description, re.IGNORECASE):
+        air = _date_from_text(match.group(1))
+        if air:
+            matches.append(air)
+    dates = set(matches)
+    return next(iter(dates)) if len(dates) == 1 else ""
+
+
 def _report_published(meta, visible):
     published = _page_date(meta.get("article:published_time") or meta.get("article:modified_time"))
     if published:
@@ -1857,7 +1880,7 @@ def parse_report_page(page, source_url, context=None):
             continue
         published = _page_date(obj.get("datePublished") or obj.get("dateModified"))
         air = (_report_air_date(headline, description, "", fallback_air) if fallback_series
-               else _date_from_text(headline + " " + description))
+               else _unknown_report_air_date(headline, description))
         if not published or not air:
             continue
         series = fallback_series or _series_from_report_headline(headline)
@@ -1874,7 +1897,7 @@ def parse_report_page(page, source_url, context=None):
         return rows
     published = _report_published(meta, visible)
     air = (_report_air_date(headline, description, visible, fallback_air) if fallback_series
-           else _date_from_text(headline + " " + description))
+           else _unknown_report_air_date(headline, description))
     if not published or not air:
         return rows
     series = fallback_series or _series_from_report_headline(headline)
@@ -1899,6 +1922,9 @@ def _source_context(context):
     name = context.get("channelName")
     if isinstance(name, str) and name:
         value["channelName"] = " ".join(name.split())[:120]
+    session = context.get("researchSession")
+    if isinstance(session, str) and re.fullmatch(r"[0-9a-f]{64}", session):
+        value["researchSession"] = session
     return value
 
 
@@ -1957,13 +1983,13 @@ class EpisodeSourceDiscovery:
     def _cache_key(context, clues):
         series = _norm_text(context.get("seriesTitle"))
         air = _date(context.get("originalAirDate"))
-        if air:
+        if air and series:
             return series + "|" + air
         normalized = normalize_clues(clues)
         episode = _norm_text(context.get("episodeTitle"))
         seed = "|".join((episode, "|".join(normalized)))
         scope = series or ("unknown:" + str(context.get("channelID") or context.get("channelName") or ""))
-        return scope + "|" + (_digest(seed) if seed.strip("|") else "")
+        return scope + "|" + (context.get("researchSession", "") if not series else "") + "|" + (_digest(seed) if seed.strip("|") else "")
 
     def _cache_get(self, key, now):
         entry = self._cache.get(key)
@@ -2012,6 +2038,7 @@ class EpisodeSourceDiscovery:
         if self.provider is None:
             return [], []
         payload = dict(context, clues=list(normalize_clues(clues)))
+        payload.pop("researchSession", None)
         self.provider_calls += 1
         try:
             result = self.provider(payload)
@@ -2142,7 +2169,8 @@ class EpisodeSourceDiscovery:
             return [], [], ""
         now = self.clock() if now is None else float(now)
         key = self._cache_key(context, clues)
-        cached = self._cache_get(key, now)
+        cacheable = bool(context.get("seriesTitle") or context.get("researchSession"))
+        cached = self._cache_get(key, now) if cacheable else None
         if cached is not None:
             return list(cached[0]), list(cached[1]), cached[2]
         entry = self._registry_entry(context.get("seriesTitle"))
@@ -2154,7 +2182,8 @@ class EpisodeSourceDiscovery:
             return official, reports, "registry"
         official, reports, source = self._automatic_urls(context, clues, now)
         self.lookups += 1
-        self._cache_put(key, official, reports, source, now)
+        if cacheable:
+            self._cache_put(key, official, reports, source, now)
         return official, reports, source
 
     def prefetch(self, context, clues=()):
@@ -2227,7 +2256,8 @@ class PublicEvidenceResearch:
     def _evidence_key(self, context, official_urls, report_urls):
         identity = "|".join((_norm_text(context.get("seriesTitle")),
                              _date(context.get("originalAirDate")),
-                             ",".join(official_urls), ",".join(report_urls)))
+                             context.get("researchSession", "") if not context.get("seriesTitle") else "",
+                              ",".join(official_urls), ",".join(report_urls)))
         return _digest(identity)
 
     def _cached(self, key, now):
@@ -2279,7 +2309,8 @@ class PublicEvidenceResearch:
         official_urls = official_urls[:self.max_pages]
         report_urls = report_urls[:self.max_pages]
         key = self._evidence_key(context, official_urls, report_urls)
-        cached = self._cached(key, now)
+        cacheable = not unknown_title or bool(context.get("researchSession"))
+        cached = self._cached(key, now) if cacheable else None
         if cached is not None:
             return cached
         deadline = (started if unknown_title else time.monotonic()) + self.deadline_seconds
@@ -2318,7 +2349,8 @@ class PublicEvidenceResearch:
             if len(reports) >= MAX_REPORTS:
                 reports = reports[:MAX_REPORTS]
                 break
-        self._store(key, official, reports, now)
+        if cacheable:
+            self._store(key, official, reports, now)
         return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
 
     def prefetch(self, context, clues=()):
@@ -2462,12 +2494,14 @@ class EpisodeObserver:
                 view["session_hash"] = binding.digest()
         return view
 
-    def _duplicate(self, binding, identity, now):
+    def _duplicate(self, binding, identity, now, record=False):
         key = "|".join((binding.digest(), identity.broadcaster_code or "",
                         _digest(identity.series_title + "|" + identity.original_air_date)))
         expires = self._published.get(key)
         if expires is not None and now < expires:
             return True
+        if not record:
+            return False
         self._published[key] = now + max(float(self.ttl), DEDUP_SECONDS)
         self._published.move_to_end(key)
         while len(self._published) > 64:
@@ -2611,7 +2645,10 @@ class EpisodeObserver:
         initial_activity = self._usable_activity(binding.channel_id) if unknown_title else None
         session_hash = initial_activity.get("session_hash") if initial_activity else None
         if context is not None:
-            payload = dict(payload, channelID=binding.channel_id, programme=dict(context, channelName=request.channel_name))
+            programme = dict(context, channelName=request.channel_name)
+            if unknown_title:
+                programme["researchSession"] = hashlib.sha256((binding.digest() + "|" + str(session_hash or "")).encode()).hexdigest()
+            payload = dict(payload, channelID=binding.channel_id, programme=programme)
         official, reports = [], []
         if callable(self.research):
             try:
@@ -2662,6 +2699,7 @@ class EpisodeObserver:
                 promotion = Promotion(False, "publication-failed")
                 self._diagnose("publication-failed", "publication")
             else:
+                self._duplicate(binding, promotion.episode.identity, after, record=True)
                 self._diagnose("promoted", "promoted")
         else:
             self._diagnose(promotion.reason, reason_category(promotion.reason))

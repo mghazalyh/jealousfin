@@ -131,3 +131,67 @@ class NoEPGDeadlineTests(unittest.TestCase):
         research=audio.PublicEvidenceResearch(fetch,provider=provider,deadline_seconds=1)
         self.assertEqual(research({"programme":context,"clues":list(fixtures.nxt_request().clues)}),([],[]))
         self.assertEqual(calls,[])
+
+class ReviewHardeningTests(unittest.TestCase):
+    def test_report_date_not_incidental_or_ambiguous(self):
+        self.assertEqual(audio._unknown_report_air_date("WWE NXT results: Zaria remembers June 16, 2026", ""), "")
+        self.assertEqual(audio._unknown_report_air_date("WWE NXT results: June 16, 2026: Zaria", ""), "2026-06-16")
+        self.assertEqual(audio._unknown_report_air_date("WWE NXT results: June 16, 2026: Zaria", "Original air date: June 17, 2026"), "")
+        self.assertEqual(audio._unknown_report_air_date("WWE NXT results", "Published June 16, 2026"), "")
+        self.assertEqual(audio._unknown_report_air_date("WWE NXT results", "Originally aired on June 16, 2026"), "2026-06-16")
+
+    def test_unknown_session_cache_isolated_and_not_sent_to_provider(self):
+        calls=[];fetches=[]
+        def provider(payload):
+            self.assertNotIn("researchSession",payload)
+            calls.append(payload)
+            return [fixtures.OFFICIAL_URL], [fixtures.REPORT_URL]
+        def fetch(url):
+            fetches.append(url)
+            return fixtures.OFFICIAL_PAGE if url==fixtures.OFFICIAL_URL else fixtures.REPORT_PAGE
+        research=audio.PublicEvidenceResearch(fetch,provider=provider)
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":"","researchSession":"a"*64}
+        clues=list(fixtures.nxt_request().clues)
+        def read(c):return research({"programme":c,"clues":clues})
+        read(ctx);n=len(fetches)
+        read(ctx)
+        self.assertEqual(len(fetches),n)
+        read(dict(ctx,researchSession="b"*64))
+        self.assertGreater(len(fetches),n)
+        self.assertEqual(len(calls),2)
+        read(dict(ctx,researchSession=""));read(dict(ctx,researchSession=""))
+        self.assertEqual(len(calls),4)
+
+class ReviewTimestampTests(fixtures.GatewayAudioIntegrationTests):
+    def test_invalid_timestamps_do_not_break_programme(self):
+        for start,end in [(float("nan"),1),(0,float("inf")),(-1e100,1e100),(2,1),(False,10),(0,0)]:
+            row={"title":"WWE NXT","episodeTitle":"Test episode","start":start,"end":end}
+            item=self.g.programme_item(fixtures.CHANNEL,row)
+            self.assertNotIn("StartDate",item)
+            self.assertNotIn("EndDate",item)
+        row={"title":"WWE NXT","episodeTitle":"Test episode","start":100,"end":200}
+        self.assertIn("StartDate",self.g.programme_item(fixtures.CHANNEL,row))
+
+class ReviewObserverTests(unittest.TestCase):
+    def test_failed_publication_does_not_deduplicate_and_session_hash_is_valid(self):
+        calls=[]; publications=[];wall=time.time()
+        def research(payload):
+            calls.append(payload)
+            return [fixtures.nxt_official()],fixtures.nxt_reports()
+        def publish(*args):
+            publications.append(args)
+            return len(publications)>1
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),research,enabled=True,
+            programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":"actual-session"},
+            publish=publish)
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
+             "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":32.0}
+        self.assertEqual(observer(job,decision,fixtures.NXT_TEXT).reason,"publication-failed")
+        self.assertTrue(observer(job,decision,fixtures.NXT_TEXT).accepted)
+        self.assertEqual(observer(job,decision,fixtures.NXT_TEXT).reason,"duplicate-publication")
+        self.assertEqual(len(publications),2)
+        self.assertRegex(calls[0]["programme"]["researchSession"],r"^[0-9a-f]{64}$")
+        self.assertEqual(audio._source_context(calls[0]["programme"])["researchSession"],calls[0]["programme"]["researchSession"])

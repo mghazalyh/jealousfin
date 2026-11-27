@@ -1535,9 +1535,16 @@ def programme_item(cid,row):
        'JealousfinProgramme':evidence}
  if year:item['ProductionYear']=year
  if (row.get('source')=='corroborated-external-schedule' or episode) and isinstance(row.get('start'),(int,float)) and isinstance(row.get('end'),(int,float)):
-  if row.get('source')=='corroborated-external-schedule':item['Name']='Scheduled: '+display
-  item['StartDate']=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
-  item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
+  try:
+   if type(row['start']) not in (int,float) or type(row['end']) not in (int,float) or not row['start']<row['end']:raise ValueError('invalid programme interval')
+   start=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
+   end=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
+  except (ValueError,OverflowError,OSError):
+   pass
+  else:
+   if row.get('source')=='corroborated-external-schedule':item['Name']='Scheduled: '+display
+   item['StartDate']=start
+   item['EndDate']=end
  return item
 
 def programme_retry_delay(error,failures,now=None):
