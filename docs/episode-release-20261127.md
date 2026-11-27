@@ -49,6 +49,7 @@ Server/iptv/episode_audio.py
 Server/iptv/fixtures/programme-language-existing-ipa-20261127.json
 Server/iptv/gateway.py
 Server/iptv/language_audio.py
+Server/iptv/opencode_discovery.py
 Server/iptv/overlay_bridge.py
 Server/iptv/programme_overlay.py
 Server/iptv/prototype_selector.py
@@ -64,6 +65,7 @@ Server/iptv/test_incident_selector_pressure_20261127.py
 Server/iptv/test_incident_startup_admission_pressure.py
 Server/iptv/test_language_pause.py
 Server/iptv/test_language_timing_20261128.py
+Server/iptv/test_no_epg_identification.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
 Server/iptv/test_release_integration.py
