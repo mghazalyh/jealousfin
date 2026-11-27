@@ -61,11 +61,31 @@ class FormattingTests(unittest.TestCase):
         row = {"title": "Nurse Jackie (2009)", "seasonNumber": 2,
                "episodeNumber": 3, "episodeTitle": "Candyland",
                "episodeYear": 2010, "seasonYear": 2009,
-               "seriesPremiereYear": 2009, "episodeSource": "x"}
+               "seriesPremiereYear": 2009, "episodeSource": "catalog-schedule"}
         identity = po.programme_identity(row)
         self.assertEqual(identity.episode_year, 2010)
         self.assertIn("Candyland (2010)", identity.text())
         self.assertNotIn("Candyland (2009)", identity.text())
+
+    def test_season_year_is_used_only_when_episode_year_is_absent(self):
+        row = {"title": "Nurse Jackie", "seasonNumber": 2,
+               "episodeNumber": 3, "episodeTitle": "Candyland",
+               "episodeYear": None, "seasonYear": 2010,
+               "seasonPremiereYear": 2009, "seriesPremiereYear": 2009,
+               "episodeSource": "local-audio-episode-identity"}
+        identity = po.programme_identity(row)
+        self.assertEqual(identity.episode_year, 2010)
+        self.assertIn("Candyland (2010)", identity.text())
+
+    def test_unknown_episode_provenance_never_renders_episode_identity(self):
+        row = {"title": "Nurse Jackie", "seasonNumber": 2,
+               "episodeNumber": 3, "episodeTitle": "Candyland",
+               "episodeYear": 2010, "episodeSource": "static-map"}
+        identity = po.programme_identity(row)
+        self.assertIsNone(identity.episode_title)
+        self.assertIsNone(identity.season_number)
+        self.assertIsNone(identity.episode_year)
+        self.assertEqual(identity.text(), "Nurse Jackie")
 
     def test_missing_language_is_truthful_pending_not_invented(self):
         text = po.format_combined(programme(), None, now=1001.0)
@@ -154,6 +174,18 @@ class PublisherTests(unittest.TestCase):
         calls = list(transport.calls)
         self.assertEqual(publisher.publish(scope(), "label", "e1"), "duplicate")
         self.assertEqual(transport.calls, calls)
+
+    def test_long_event_id_is_deduplicated_after_clipping(self):
+        # The combined event ID normally exceeds MAX_EVENT_ID; clipping must
+        # not defeat duplicate detection or re-write the installed fields.
+        transport = Transport()
+        publisher = po.ProgrammeOverlayPublisher(transport)
+        event_id = "scope|programme|" + "x" * 400
+        self.assertEqual(publisher.publish(scope(), "label", event_id), "published")
+        calls = list(transport.calls)
+        self.assertEqual(publisher.publish(scope(), "label", event_id), "duplicate")
+        self.assertEqual(transport.calls, calls)
+        self.assertEqual(len(publisher.last_event_id), po.MAX_EVENT_ID)
 
 
 class InstalledLayoutTests(unittest.TestCase):

@@ -175,6 +175,21 @@ class PublisherTests(unittest.TestCase):
                                                  visit="visit-2")), "published")
         self.assertIn("collecting", self.transport.calls[-1][1])
 
+    def test_exhausted_grace_window_and_newer_attempt_boundaries(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("inconclusive", 4, 4, 100.0)), "published")
+        # Exactly the 5 s grace boundary still belongs to the terminal attempt.
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 4, 4, 105.0)), "superseded")
+        # A genuinely newer attempt is allowed even inside the former grace.
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 5, 8, 106.0)), "published")
+        self.assertIn("collecting", self.transport.calls[-1][1])
+        # Outside the grace window the documented behaviour is to accept it.
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 6, 8, 112.0)), "published")
+
     def test_retryable_inconclusive_does_not_block_the_next_collecting_state(self):
         self.bridge.observe_channel(A, "Fixture English One")
         self.assertEqual(self.bridge.publish_state(

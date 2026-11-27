@@ -58,6 +58,9 @@ TRUE = "true"
 FALSE = "false"
 WAITING = "Waiting for verified programme and language evidence"
 SAFE_NATIVE_STYLES = frozenset({"normal", "headline", "caption", "prominent", "destructive", "muted"})
+ALLOWED_EPISODE_SOURCES = frozenset({
+    "pluto-xmltv", "catalog-schedule", "local-audio-episode-identity",
+})
 
 
 class OverlayError(ValueError):
@@ -237,18 +240,26 @@ def programme_identity(row: Mapping[str, Any]) -> Optional[ProgrammeIdentity]:
     number = _int(row.get("episodeNumber", row.get("episode_number")), 9999)
     if (season is None) != (number is None):
         season = number = None
+    episode = _clean(row.get("episodeTitle") or row.get("episode_title"), MAX_EPISODE)
+    source = _clean(row.get("episodeSource"), 80)
+    if source not in ALLOWED_EPISODE_SOURCES:
+        # Match the native ProgrammeEvidence allowlist: an unknown provenance
+        # must not display episode identity the client parser would drop.
+        season = number = None
+        episode = None
     year = row.get("episodeYear", row.get("episode_year"))
     if type(year) is not int or not 1888 <= year <= time.gmtime().tm_year + 1:
         year = row.get("seasonYear", row.get("season_year"))
     if type(year) is not int or not 1888 <= year <= time.gmtime().tm_year + 1:
         year = None
-    episode = _clean(row.get("episodeTitle") or row.get("episode_title"), MAX_EPISODE)
+    if episode is None and season is None:
+        year = None
     identity = ProgrammeIdentity(
         series_title=series, episode_title=episode,
         season_number=season, episode_number=number, episode_year=year,
         original_air_date=_clean(row.get("episodeOriginalAirDate") or row.get("originalAirDate"), 10),
         verification=_clean(row.get("scheduleVerification") or row.get("episodeVerification"), 80),
-        source=_clean(row.get("episodeSource") or row.get("source"), 80))
+        source=source or _clean(row.get("source"), 80))
     return identity if identity.checked() else None
 
 
@@ -357,6 +368,7 @@ class ProgrammeOverlayPublisher:
         if fingerprint != self.current_scope:
             if self.transition(scope, now) != "transitioned":
                 return self.last_status
+        event_id = _clip(str(event_id or ""), MAX_EVENT_ID)
         if text == self.last_text and event_id == self.last_event_id and fingerprint == self.current_scope:
             self.last_status = "duplicate"
             return self.last_status

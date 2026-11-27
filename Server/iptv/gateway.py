@@ -14,6 +14,8 @@ import language_pending
 import language_visits
 import overlay_bridge
 import programme_overlay
+import schedule_episode
+import schedule_evidence
 import deployment_continuity
 spanish_classification=language_exclusions
 spanish_audio=language_audio
@@ -683,6 +685,15 @@ year_errors=0
 year_last_error=None
 year_retry=OrderedDict()
 YEAR_RETRY_SECONDS=900
+# Reviewed canonical catalog rows for the exact mapping only. These are
+# identity data, never a current-schedule substitute.
+CATALOG_REFRESH=6*3600
+CATALOG_MAX_AGE=8*3600
+CATALOG_RETRY_SECONDS=300
+catalog_rows={}
+catalog_observed_at=0.0
+catalog_fault=None
+catalog_last_attempt=0.0
 
 def year_error_code(error):
  if isinstance(error,urllib.error.HTTPError):return 'HTTP '+str(error.code)
@@ -865,7 +876,8 @@ def parse_guide(data,ids,now):
   code=next((x.text for x in p.findall('episode-num') if x.get('system')=='onscreen'),'')
   match=re.fullmatch(r'S(\d{1,2})E(\d{1,4})',code or '',re.I)
   numbers=(int(match[1]),int(match[2])) if match and 0<int(match[1])<=99 and 0<int(match[2])<=9999 else None
-  rows.append((start,end,title,programme_text((p.findtext('desc') or '')[:300]),programme_text(p.findtext('sub-title')),numbers))
+  zone=(p.get('start') or '')[-5:].strip()
+  rows.append((start,end,title,programme_text((p.findtext('desc') or '')[:300]),programme_text(p.findtext('sub-title')),numbers,zone))
  return out
 def fetch_guide(url,ids,now):
  req=urllib.request.Request(validate(url),headers={'User-Agent':'Jealousfin-EPG/1.0'})
@@ -873,6 +885,65 @@ def fetch_guide(url,ids,now):
  if len(raw)>8*1024*1024:raise ValueError('Compressed guide too large')
  with gzip.GzipFile(fileobj=io.BytesIO(raw)) as f:data=f.read(40*1024*1024+1)
  return parse_guide(data,ids,now)
+def catalog_snapshot(now=None):
+ now=time.time() if now is None else now
+ with lock:
+  if not 0<=now-catalog_observed_at<=CATALOG_MAX_AGE:return {}
+  return {key:list(value) for key,value in catalog_rows.items()}
+def fetch_catalog_page(url):
+ validate(url)
+ original=urllib.parse.urlsplit(url).hostname.removeprefix('www.')
+ class CatalogRedirect(Redirect):
+  def redirect_request(self,req,fp,code,msg,headers,newurl):
+   target=urllib.parse.urljoin(req.full_url,newurl)
+   validate(target)
+   if urllib.parse.urlsplit(target).hostname.removeprefix('www.')!=original:raise ValueError('Unapproved catalog redirect')
+   return super().redirect_request(req,fp,code,msg,headers,target)
+ agent=urllib.request.build_opener(urllib.request.ProxyHandler({}),CatalogRedirect())
+ request=urllib.request.Request(url,headers={'User-Agent':'Jealousfin-Episode-Catalog/1.0','Accept':'text/html,application/json'})
+ with agent.open(request,timeout=10) as f:raw=f.read(2*1024*1024+1)
+ if len(raw)>2*1024*1024:raise ValueError('Catalog response too large')
+ return raw.decode(f.headers.get_content_charset() or 'utf-8',errors='replace')
+def catalog_worker(stop):
+ global catalog_rows,catalog_observed_at,catalog_fault,catalog_last_attempt
+ while not stop.is_set():
+  try:
+   now=time.time()
+   with lock:
+    if 0<=now-catalog_observed_at<CATALOG_REFRESH:delay=CATALOG_REFRESH-(now-catalog_observed_at)
+    elif catalog_last_attempt and now-catalog_last_attempt<CATALOG_RETRY_SECONDS:delay=CATALOG_RETRY_SECONDS-(now-catalog_last_attempt)
+    else:delay=0
+   if delay>0:
+    if stop.wait(min(delay,60)):return
+    continue
+   with lock:catalog_last_attempt=now
+   fetched={};fault=None
+   for provider_id,mapping in schedule_episode.REVIEWED_MAPPINGS.items():
+    rows=[]
+    tvmaze_id=mapping.catalog_ids.get('tvmaze')
+    if tvmaze_id:
+     try:
+      page=fetch_catalog_page('https://api.tvmaze.com/shows/'+urllib.parse.quote(tvmaze_id,safe='')+'/episodes')
+      rows.extend(schedule_episode.parse_tvmaze_episodes(page,mapping.series_title,
+       'https://api.tvmaze.com/shows/'+urllib.parse.quote(tvmaze_id,safe='')+'/episodes'))
+     except Exception as error:fault=type(error).__name__
+    tvdb_id=mapping.catalog_ids.get('tvdb')
+    if tvdb_id:
+     try:
+      page=fetch_catalog_page('https://thetvdb.com/series/'+urllib.parse.quote(tvdb_id,safe='')+'/allseasons/official')
+      rows.extend(schedule_episode.parse_tvdb_allseasons_html(page,mapping.series_title,
+       'https://thetvdb.com/series/'+urllib.parse.quote(tvdb_id,safe='')+'/allseasons/official'))
+     except Exception as error:fault=type(error).__name__
+    if rows:fetched[provider_id]=rows[:schedule_episode.MAX_EPISODES]
+   with lock:
+    if fetched:catalog_rows=fetched;catalog_observed_at=now;catalog_fault=None
+    else:catalog_fault=fault or 'empty-catalog'
+   log('episode catalog refresh '+(('ok channels='+str(len(fetched))) if fetched else ('failed '+str(catalog_fault))))
+   if stop.wait(30):return
+  except Exception as error:
+   with lock:catalog_fault=type(error).__name__
+   log('episode catalog worker '+type(error).__name__)
+   if stop.wait(300):return
 def guide_worker(stop):
  global guide_rows,guide_observed_at,guide_fault
  while not stop.is_set():
@@ -901,6 +972,26 @@ def guide_snapshot(now):
   synopses=[r[3] for r in (a[0],b[0]) if len(r)>3 and r[3]]
   episodes=[r[4] for r in (a[0],b[0]) if len(r)>4 and r[4]]
   out[cid]={'title':ta,'source':'corroborated-external-schedule','observedAt':observed,'start':max(sa,sb),'end':min(ea,eb),'guideSynopsis':' '.join(dict.fromkeys(synopses))[:600],'guideEpisode':episodes[0] if episodes else ''}
+  provider_id=sources.get(cid)
+  catalogs=catalog_snapshot(now).get(provider_id,())
+  if catalogs and provider_id in schedule_episode.REVIEWED_MAPPINGS:
+   mapped=schedule_episode.REVIEWED_MAPPINGS[provider_id]
+   events=[]
+   for index,row in enumerate((a[0],b[0])):
+    events.append(schedule_evidence.Event(
+     title=row[2],start=row[0],end=row[1],station=channels[cid]['Name'],region=mapped.region,
+     zone=(row[6] if len(row)>6 else ''),source=('i.mjh.nz/Plex' if index==0 else 'i.mjh.nz/SamsungTVPlus'),
+     format='xmltv',episode_title=(row[4] if len(row)>4 else ''),
+     season_number=(row[5][0] if len(row)>5 and row[5] else None),
+     episode_number=(row[5][1] if len(row)>5 and row[5] else None),
+     first_party=False,structured=True))
+   resolved=schedule_episode.resolve_current(now,provider_id,channels[cid]['Name'],schedule_events=events,
+                                              catalogs=catalogs,observed_at=now)
+   if resolved.accepted and isinstance(resolved.row,dict):
+    for key in ('episodeTitle','seasonNumber','episodeNumber','seasonYear','episodeSource',
+                'episodeObservedAt','episodeOriginalAirDate','scheduleVerification',
+                'scheduleEpisodeSources','episodeKind','seasonPremiereYear','seriesPremiereYear'):
+     if key in resolved.row:out[cid][key]=resolved.row[key]
  return out
 
 def episode_key(row):
@@ -1334,6 +1425,16 @@ def programme_snapshot(now=None):
    if evidence and guide_norm(evidence['title'])==guide_norm(row['title']):
     for key in ('guideSynopsis','guideEpisode'):
      if evidence.get(key):primary[key]=evidence[key]
+    # The corroborated schedule/catalog identity is additive. The guide fetch
+    # is the only source of it, so keep it on the provider row instead of
+    # discarding it below. Existing provider XMLTV episode data still wins
+    # because episode_snapshot() is applied afterwards.
+    if evidence.get('episodeSource')=='catalog-schedule':
+     for key in ('episodeTitle','seasonNumber','episodeNumber','seasonYear','episodeYear',
+                 'episodeSource','episodeObservedAt','episodeOriginalAirDate',
+                 'scheduleVerification','scheduleEpisodeSources','episodeKind',
+                 'seasonPremiereYear','seriesPremiereYear'):
+      if key in evidence and key not in primary:primary[key]=evidence[key]
    result[cid]=primary
  for cid,episode in episode_snapshot(now,result).items():result[cid].update(episode)
  return merge_episode_publication(result,now)
@@ -2199,6 +2300,16 @@ def language_pending_worker(stop):
 def spanish_auto_commit(cid,provider,name,confidence,reason,evidence):
  # Backward-compatible manual-era entry point; automatic manager uses language_auto_commit.
  return language_auto_commit(cid,provider,name,'es','Spanish',confidence,reason,evidence,respect_pause=False)
+def schedule_episode_status():
+ try:
+  base=schedule_episode.status()
+  snap=catalog_snapshot()
+  return dict(base,catalogChannels=len(snap),
+              catalogEpisodes=sum(len(rows) for rows in snap.values()),
+              catalogObservedAt=catalog_observed_at,catalogFault=catalog_fault,
+              catalogLastAttemptAt=catalog_last_attempt,
+              catalogRefreshSeconds=CATALOG_REFRESH,catalogMaxAgeSeconds=CATALOG_MAX_AGE)
+ except Exception:return {'revision':schedule_episode.REVISION,'fault':'status_unavailable'}
 def overlay_bridge_instance():
  global overlay_bridge_state,overlay_bridge_fingerprint,overlay_bridge_fault
  if SOURCE_PROFILE!='american':return None
@@ -2295,19 +2406,23 @@ def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
       and (not cached.get('streamGeneration') or cached.get('streamGeneration')==scope.stream_generation)):
    evidence=cached.get('evidence')
  language=programme_overlay.language_evidence(evidence) if isinstance(evidence,dict) else None
+ stamp=time.time() if now is None else float(now)
+ if language is not None and not language.checked(stamp):
+  # Expired evidence is not stronger than the installed live-metadata
+  # fallback, and must never switch the native node on.
+  language=None
  has_episode=bool(identity.episode_title or identity.season_number is not None)
  if not has_episode and language is None:
   # The installed 22 px fallback already shows live programme metadata. Do
   # not switch to the native combined node until there is something stronger
   # than a bare series title, and never leave an old combined label visible.
   status=bridge.status()
-  if bridge.current_scope and (status.get('publishedText') or bridge.current_scope!=scope.fingerprint()):
+  if not bridge.current_scope or status.get('publishedText') or bridge.current_scope!=scope.fingerprint():
    result=bridge.clear()
   else:
    result='fallback'
-  programme_overlay_fault=''
+  programme_overlay_fault='' if result=='fallback' else result
   return 'fallback'
- stamp=time.time() if now is None else float(now)
  text=programme_overlay.format_combined(identity,language,now=stamp)
  event_id='|'.join((scope.fingerprint(),identity.original_air_date or identity.text(),
                     language.event_id if language is not None else 'pending'))
@@ -2782,7 +2897,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (ValueError,OSError,TypeError):language_pending_description={'entries':0}
    language_status=spanish_auto_status()
    overlay_request_pump()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeLookupDeferred':episode_lookup_deferred,'episodeLookupLastError':episode_lookup_last_error,'episodeCandidateErrors':episode_candidate_errors,'episodeCandidateLastError':episode_candidate_last_error,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'programmeOverlay':overlay_combined_status(),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeLookupDeferred':episode_lookup_deferred,'episodeLookupLastError':episode_lookup_last_error,'episodeCandidateErrors':episode_candidate_errors,'episodeCandidateLastError':episode_candidate_last_error,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'programmeOverlay':overlay_combined_status(),'scheduleEpisode':schedule_episode_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
@@ -2975,6 +3090,8 @@ def main():
   episode_prefetch=threading.Thread(target=episode_source_prefetch_worker,args=(stop,),name='episode-source-prefetch',daemon=True);episode_prefetch.start()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
+ if SOURCE_PROFILE=='american':
+  catalog=threading.Thread(target=catalog_worker,args=(stop,),name='episode-catalog-refresh',daemon=True);catalog.start()
  epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()
  episodes=threading.Thread(target=episode_worker,args=(stop,),name='episode-metadata-refresh',daemon=True);episodes.start()
  regional=threading.Thread(target=regional_worker,args=(stop,),name='regional-guide-refresh',daemon=True);regional.start()

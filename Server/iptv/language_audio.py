@@ -201,7 +201,10 @@ class Manager(base.Manager):
 
     def _infer(self, job):
         if not self._enabled():
-            self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
+            if job.get("episodeOnly"):
+                self._mark_finalized_result(job, "episode-retry", True, "episode_only")
+            else:
+                self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
         transcript = None
@@ -244,6 +247,11 @@ class Manager(base.Manager):
             else:
                 self._record_result(job, decision)
         except Exception as error:
+            if job.get("episodeOnly"):
+                self._mark_finalized_result(job, "episode-retry", True, "episode_only")
+                self.log("EPISODE_RETRY_RESULT channel=%s outcome=inconclusive reason=inference_error" % (
+                    job.get("cid"),))
+                raise
             self._mark_finalized_result(job, "inconclusive", False, "inference_error")
             method = getattr(self, "_state_inconclusive", None)
             if method is not None:
@@ -287,18 +295,20 @@ class Manager(base.Manager):
             return False
         now = time.time()
         key = (cid, visit_id)
-        row = self._episode_retries.get(key)
-        if row is None:
-            row = {"attempts": 0, "requested": 0.0, "reason": ""}
-            self._episode_retries[key] = row
-        if row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
-            self.log("EPISODE_RETRY_SUPPRESSED channel=%s reason=retry_limit" % cid)
-            return False
-        row["requested"] = now
-        row["reason"] = str(reason or "")[:40]
-        while len(self._episode_retries) > 128:
-            self._episode_retries.pop(next(iter(self._episode_retries)))
-        self.log("EPISODE_RETRY_REQUEST channel=%s reason=%s" % (cid, row["reason"] or "-"))
+        with self._lock:
+            row = self._episode_retries.get(key)
+            if row is None:
+                row = {"attempts": 0, "requested": 0.0, "reason": ""}
+                self._episode_retries[key] = row
+            if row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
+                self.log("EPISODE_RETRY_SUPPRESSED channel=%s reason=retry_limit" % cid)
+                return False
+            row["requested"] = now
+            row["reason"] = str(reason or "")[:40]
+            while len(self._episode_retries) > 128:
+                self._episode_retries.pop(next(iter(self._episode_retries)))
+            label = row["reason"] or "-"
+        self.log("EPISODE_RETRY_REQUEST channel=%s reason=%s" % (cid, label))
         return True
 
     def _episode_retry_ready(self, cid, visit, now):
@@ -308,22 +318,26 @@ class Manager(base.Manager):
         rows = getattr(self, "_episode_retries", None)
         if not isinstance(rows, dict):
             return False
-        row = rows.get((cid, visit_id))
-        if row is None or row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
-            return False
-        requested = row.get("requested") or 0.0
-        return bool(requested and now - requested >= EPISODE_RETRY_SECONDS)
+        with self._lock:
+            row = rows.get((cid, visit_id))
+            if row is None or row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
+                return False
+            requested = row.get("requested") or 0.0
+            return bool(requested and now - requested >= EPISODE_RETRY_SECONDS)
 
     def _take_episode_retry(self, cid, visit, now):
         visit_id = self._verified_visit(visit)
-        if not visit_id or not self._episode_retry_ready(cid, visit, now):
+        if not visit_id:
             return False
-        row = self._episode_retries.get((cid, visit_id))
-        if row is None:
-            return False
-        row["attempts"] += 1
-        row["requested"] = 0.0
-        return True
+        with self._lock:
+            if not self._episode_retry_ready(cid, visit, now):
+                return False
+            row = self._episode_retries.get((cid, visit_id))
+            if row is None:
+                return False
+            row["attempts"] += 1
+            row["requested"] = 0.0
+            return True
 
     def _finish_episode_retry(self, job, decision):
         """Complete an episode-only sample without touching language evidence."""
@@ -516,6 +530,8 @@ class Manager(base.Manager):
         )
 
     def _state_inference(self, cid, sample, marker, seconds):
+        if getattr(sample, "episode_only", False):
+            return
         session = self._session_from_sample(sample, marker)
         self._publish_state(
             "inference", cid, sample.provider, sample.name,
@@ -527,6 +543,8 @@ class Manager(base.Manager):
         )
 
     def _state_inconclusive(self, cid, sample, marker, reason, seconds):
+        if getattr(sample, "episode_only", False):
+            return
         session = self._session_from_sample(sample, marker)
         attempts = marker.get("attempts") if isinstance(marker, dict) else None
         max_attempts = marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS) if isinstance(marker, dict) else MAX_SAME_VISIT_ATTEMPTS
@@ -552,6 +570,11 @@ class Manager(base.Manager):
         )
 
     def _record_result(self, job, decision):
+        if job.get("episodeOnly"):
+            # Safety net: an episode-only sample must never become language
+            # evidence even if a caller reaches the normal completion path.
+            self._finish_episode_retry(job, decision)
+            return
         outcome = decision["outcome"]
         reason = decision["reason"]
         language = decision.get("language")

@@ -310,7 +310,12 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(self.req('/Items/'+self.c+'/PlaybackInfo',{})[0],409)
         # Classification must not touch the health policy at all.
         self.assertEqual(g.policy_rows()[self.c],before[self.c])
-        self.assertIn('spanishClassification',self.req('/trial-status')[1])
+        status=self.req('/trial-status')[1]
+        self.assertIn('spanishClassification',status)
+        self.assertIn('probe',status['episodeAudio'])
+        self.assertEqual(status['programmeOverlay']['layoutRevision'],
+                         'programme-language-existing-ipa-20261127')
+        self.assertIn('revision',status['scheduleEpisode'])
         # Explicit removal restores membership without resetting counters.
         removed,changed=sc.apply(g.spanish_state,'remove',self.c,'Fixture C',g.sources[self.c],'nonce-remove')
         self.assertTrue(changed)
@@ -857,6 +862,97 @@ class GatewayAcceptance(unittest.TestCase):
 
 
 from test_deployment_continuity import DeploymentContinuityTests
+
+
+class ScheduleEpisodeGatewayTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = {"JEALOUSFIN_STATE_DIR": self.temp.name, "JEALOUSFIN_USERNAME": "fixture",
+               "JEALOUSFIN_PASSWORD": "fixture", "JEALOUSFIN_TOKEN": "fixture-token",
+               "JEALOUSFIN_SERVER_ID": "fixture-server", "JEALOUSFIN_BIND": "127.0.0.1"}
+        with patch.dict(os.environ, env):
+            import gateway
+            self.g = importlib.reload(gateway)
+
+    def test_corroborated_guide_and_catalog_enrich_exact_provider_only(self):
+        import schedule_episode
+        cid = "a" * 32
+        provider = "nltv:us:TinyHouseNation.us"
+        self.g.channels[cid] = {"Id": cid, "Name": "Tiny House Nation"}
+        self.g.sources[cid] = provider
+        now = 1764201600.0
+        aid, bid = self.g.GUIDE_CHANNELS["Tiny House Nation"]
+        self.g.guide_observed_at = now
+        self.g.guide_rows = (
+            {aid: [(now - 60, now + 1800, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+            {bid: [(now - 50, now + 1810, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+        )
+        self.g.catalog_observed_at = now
+        payload = json.dumps([{"name": "500 Sq. Ft. Rocky Mountain Mansion", "season": 1,
+                               "number": 5, "airdate": "2014-08-13",
+                               "summary": "Colorado wildfire 500 sq ft two offices"}])
+        tvdb = "<div>S01E05</div><div>500 Sq. Ft. Rocky Mountain Mansion</div><div>August 13, 2014</div>"
+        self.g.catalog_rows = {provider: schedule_episode.parse_tvmaze_episodes(payload, "Tiny House Nation")
+                                          + schedule_episode.parse_tvdb_allseasons_html(tvdb, "Tiny House Nation")}
+        row = self.g.guide_snapshot(now)[cid]
+        self.assertEqual(row["episodeTitle"], "500 Sq. Ft. Rocky Mountain Mansion")
+        self.assertEqual((row["seasonNumber"], row["episodeNumber"]), (1, 5))
+        self.assertEqual(row["seasonYear"], 2014)
+        self.assertEqual(row["scheduleVerification"], "corroborated-schedule")
+        # Same channel name, different distributor identity: no enrichment.
+        self.g.sources[cid] = "nltv:us:OtherTinyHouse.us"
+        self.assertNotIn(cid, self.g.guide_snapshot(now))
+
+    def seed_schedule(self, now):
+        import schedule_episode
+        cid = "a" * 32
+        provider = "nltv:us:TinyHouseNation.us"
+        self.g.channels[cid] = {"Id": cid, "Name": "Tiny House Nation"}
+        self.g.sources[cid] = provider
+        aid, bid = self.g.GUIDE_CHANNELS["Tiny House Nation"]
+        self.g.guide_rows = (
+            {aid: [(now - 60, now + 1800, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+            {bid: [(now - 50, now + 1810, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+        )
+        payload = json.dumps([{"name": "500 Sq. Ft. Rocky Mountain Mansion", "season": 1,
+                               "number": 5, "airdate": "2014-08-13",
+                               "summary": "Colorado wildfire 500 sq ft two offices"}])
+        tvdb = "<div>S01E05</div><div>500 Sq. Ft. Rocky Mountain Mansion</div><div>August 13, 2014</div>"
+        self.g.catalog_rows = {provider: schedule_episode.parse_tvmaze_episodes(
+            payload, "Tiny House Nation") + schedule_episode.parse_tvdb_allseasons_html(
+                tvdb, "Tiny House Nation")}
+        self.g.catalog_observed_at = now
+        return cid, provider
+
+    def test_cached_guide_age_does_not_disable_catalog_identity(self):
+        now = 1764201600.0
+        cid, _ = self.seed_schedule(now)
+        # The guide refreshes every 900 s; the resolver must not reject a
+        # still-active cached interval merely because the fetch is 600 s old.
+        self.g.guide_observed_at = now - 600
+        row = self.g.guide_snapshot(now)[cid]
+        self.assertEqual(row["episodeTitle"], "500 Sq. Ft. Rocky Mountain Mansion")
+        self.assertEqual(row["episodeSource"], "catalog-schedule")
+
+    def test_programme_snapshot_keeps_catalog_identity_when_provider_row_exists(self):
+        now = 1764201600.0
+        cid, _ = self.seed_schedule(now)
+        self.g.guide_observed_at = now
+        self.g.programme_rows = {cid: {"title": "Tiny House Nation"}}
+        self.g.programme_observed_at = now
+        self.g.paged_seen = set()
+        row = self.g.programme_snapshot(now)[cid]
+        self.assertEqual(row["title"], "Tiny House Nation")
+        self.assertEqual(row["episodeSource"], "catalog-schedule")
+        self.assertEqual(row["episodeTitle"], "500 Sq. Ft. Rocky Mountain Mansion")
+        self.assertEqual((row["seasonNumber"], row["episodeNumber"]), (1, 5))
+        self.assertEqual(row["seasonYear"], 2014)
+
 
 if __name__=="__main__":
     unittest.main()

@@ -709,6 +709,26 @@ let incompleteEvidence:[String:Any]=[
 ]
 let incompleteProgramme=JellyfinProgrammeParser.program(incompleteEvidence)
 check(incompleteProgramme?.evidence?.episodeTitle=="Subtitle only" && incompleteProgramme?.evidence?.seasonNumber==nil && incompleteProgramme?.evidence?.seasonYear==nil,"incomplete episode numbering omits season year instead of guessing")
+let catalogEvidence:[String:Any]=[
+    "Id":"episode-3","Name":"S01E05: 500 Sq. Ft. Rocky Mountain Mansion (2014)","JealousfinProgramme":[
+        "title":"Tiny House Nation","source":"corroborated-external-schedule","observedAt":programmeNow.timeIntervalSince1970,
+        "episodeTitle":"500 Sq. Ft. Rocky Mountain Mansion","seasonNumber":1,"episodeNumber":5,
+        "seasonYear":2014,"episodeSource":"catalog-schedule","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+let catalogProgramme=JellyfinProgrammeParser.program(catalogEvidence)
+check(catalogProgramme?.evidence?.episodeSource=="catalog-schedule" && catalogProgramme?.evidence?.seasonYear==2014,"canonical catalog schedule identity is a supported episode provenance")
+let audioEvidence:[String:Any]=[
+    "Id":"episode-4","Name":"The Mentalist","JealousfinProgramme":[
+        "title":"The Mentalist","source":"provider-catalogue","observedAt":programmeNow.timeIntervalSince1970,
+        "episodeTitle":"Forest Green","seasonNumber":6,"episodeNumber":18,
+        "seasonYear":2014,"episodeSource":"local-audio-episode-identity","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+check(JellyfinProgrammeParser.program(audioEvidence)?.evidence?.episodeSource=="local-audio-episode-identity","unique audio-clue catalog identity is a supported episode provenance")
+var unknownEvidence=catalogEvidence
+unknownEvidence["JealousfinProgramme"]=(catalogEvidence["JealousfinProgramme"] as! [String:Any]).merging(["episodeSource":"static-map"]){_,new in new}
+check(JellyfinProgrammeParser.program(unknownEvidence)?.evidence?.episodeTitle==nil,"unknown episode provenance cannot masquerade as a catalog identity")
 check(JellyfinProgrammeParser.program(["Name":"missing id"])==nil,"programme identity required")
 print("PASS: \(checks) assertions including exact gateway programme passthrough and fallback")
 

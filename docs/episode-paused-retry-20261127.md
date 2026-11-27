@@ -125,8 +125,11 @@ new visit or a genuinely newer attempt is still allowed.
 The separate `engineering/schedule-episode-discovery-20261127` worktree keeps
 its own draft `programme_overlay.py` and `style: programme` layout. This lane
 does not modify or overwrite that worktree and does not install its draft
-layout. A later merge review must reconcile the two `programme_overlay.py`
-modules and adopt the installed `headline`/Ready/Fallback ABI described here.
+layout. The release integration (`docs/episode-release-20261127.md`) has now
+reconciled the two modules: this existing-IPA `headline`/Ready/Fallback
+publisher is kept, and the schedule lane contributes only its discovery
+module, catalogue worker and guide enrichment. The rejected draft layout is
+not shipped.
 
 Deployment still requires explicit user approval. No production gateway was
 restarted, no UI layout was installed and no IPA was rebuilt or installed.

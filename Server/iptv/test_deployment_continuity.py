@@ -43,6 +43,20 @@ class DeploymentContinuityTests(unittest.TestCase):
         self.assertEqual(audit["kind"], "deployment_restart_media_handles")
         self.assertEqual(audit["staleHitCount"], 2)
 
+    def test_every_declared_startup_reason_requires_correlation(self):
+        for reason in continuity.FAILURE_REASONS:
+            with tempfile.TemporaryDirectory() as temp:
+                root = pathlib.Path(temp)
+                old = continuity.Continuity(root)
+                old.begin_generation(now=1000.0)
+                old.record_handle(self.rid, self.cid, "playlist", 1001.0)
+                active = continuity.Continuity(root)
+                active.begin_generation(now=1010.0)
+                active.stale_handle(self.rid, 1011.0)
+                active.stale_handle(self.rid, 1012.0)
+                self.assertIsNotNone(continuity.failure_ignores(
+                    root, self.cid, reason, 1013.0), reason)
+
     def test_unrelated_channel_cannot_borrow_stale_handle_evidence(self):
         active = self.restart()
         active.stale_handle(self.rid, 1011.0)
@@ -57,18 +71,59 @@ class DeploymentContinuityTests(unittest.TestCase):
             self.root, self.cid, "Video frames stalled after startup", 1012.0))
 
     def test_old_stale_hits_outside_lookback_are_rejected(self):
+        # Inside the recovery window, but the last stale hit is older than the
+        # 90 s lookback relative to the failure.
         active = self.restart()
         active.stale_handle(self.rid, 1011.0)
         active.stale_handle(self.rid, 1012.0)
         self.assertIsNone(continuity.failure_ignores(
-            self.root, self.cid, "Video frames stalled after startup", 1200.0))
+            self.root, self.cid, "Video frames stalled after startup", 1110.0))
 
     def test_failure_outside_recovery_window_is_not_suppressed(self):
+        # 1010 + 180 + 5 = 1195 is the last accepted instant. Use recent
+        # stale hits so only the window boundary can reject this failure.
+        active = self.restart()
+        active.stale_handle(self.rid, 1190.0)
+        active.stale_handle(self.rid, 1191.0)
+        self.assertIsNone(continuity.failure_ignores(
+            self.root, self.cid, "Video frames stalled after startup", 1196.0))
+
+    def test_two_distinct_stale_handles_for_the_same_channel_are_enough(self):
+        old = continuity.Continuity(self.root)
+        old.begin_generation(now=1000.0)
+        other = "e" * 32
+        old.record_handle(self.rid, self.cid, "playlist", 1001.0)
+        old.record_handle(other, self.cid, "segment", 1002.0)
+        active = continuity.Continuity(self.root)
+        active.begin_generation(now=1010.0)
+        self.assertIsNotNone(active.stale_handle(self.rid, 1011.0))
+        self.assertIsNotNone(active.stale_handle(other, 1012.0))
+        audit = continuity.failure_ignores(
+            self.root, self.cid, "playback stalled after startup", 1013.0)
+        self.assertEqual(audit["staleHitCount"], 2)
+
+    def test_pre_start_failure_cannot_be_suppressed(self):
         active = self.restart()
         active.stale_handle(self.rid, 1011.0)
         active.stale_handle(self.rid, 1012.0)
         self.assertIsNone(continuity.failure_ignores(
-            self.root, self.cid, "Video frames stalled after startup", 1010.0 + 181.0))
+            self.root, self.cid, "Video frames stalled after startup", 1004.0))
+
+    def test_future_stale_evidence_cannot_be_suppressed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            old = continuity.Continuity(root)
+            old.begin_generation(now=1000.0)
+            old.record_handle(self.rid, self.cid, "playlist", 1001.0)
+            active = continuity.Continuity(root)
+            active.begin_generation(now=1010.0)
+            # Records after the failure instant are outside the upper bound.
+            with (root / continuity.STALE_FILE).open("a", encoding="utf-8") as handle:
+                for at in (1013.0, 1014.0):
+                    handle.write(json.dumps({"c": self.cid, "h": "x", "k": "playlist",
+                                             "at": at}) + "\n")
+            self.assertIsNone(continuity.failure_ignores(
+                root, self.cid, "Video frames stalled after startup", 1012.5))
 
     def test_real_stall_reason_is_never_suppressed(self):
         active = self.restart()

@@ -977,6 +977,12 @@ class Manager:
         visit = sample.visit if isinstance(sample.visit, dict) else {}
         visit_id = visit.get("visitID") if visit.get("verified") else ""
         marker = self._finalized_marker(cid, sample, reason, now)
+        if getattr(sample, "episode_only", False):
+            # An episode-only retry must never replace the conclusive language
+            # marker that already owns this physical visit.
+            marker["conclusive"] = True
+            marker["outcome"] = "episode-retry"
+            marker["reason"] = "episode_only"
         with self._lock:
             self._finalized[cid] = marker
             if len(self._finalized) > 256:
@@ -992,6 +998,9 @@ class Manager:
             # No decodable audio is a truthful state, not a reason to hide the
             # channel behind an unbounded waiting label.  It is retried only
             # by later media events, never by a new device poll.
+            if getattr(sample, "episode_only", False):
+                self._episode_retry_end(cid, sample, marker, "no_audio")
+                return
             self._record_last(cid, sample.provider, sample.name, {
                 "outcome": "inconclusive", "reason": "no_audio", "confidence": 0.0,
                 "speechSeconds": 0.0, "sampleSeconds": 0.0,
@@ -1003,6 +1012,9 @@ class Manager:
             # A short sample is reported immediately and the same physical
             # visit may retry after a short bounded delay.  It never enters the
             # evidence store and never consumes the full finalize cooldown.
+            if getattr(sample, "episode_only", False):
+                self._episode_retry_end(cid, sample, marker, "sample_too_short")
+                return
             self._record_last(cid, sample.provider, sample.name, {
                 "outcome": "inconclusive", "reason": "sample_too_short", "confidence": 0.0,
                 "speechSeconds": 0.0, "sampleSeconds": seconds,
@@ -1011,6 +1023,9 @@ class Manager:
                 session=marker, conclusive=False)
             return
         if not self._enabled():
+            if getattr(sample, "episode_only", False):
+                self._episode_retry_end(cid, sample, marker, "observation_disabled")
+                return
             marker["reason"] = "observation_disabled"
             self._state_disabled(cid, sample, marker)
             return
@@ -1030,6 +1045,10 @@ class Manager:
             # A start/end probe mismatch means there is no single coherent
             # session to attribute to this sample.  Fail closed instead of
             # guessing which launch or channel owns the audio.
+            if getattr(sample, "episode_only", False):
+                self._episode_retry_end(cid, sample, marker,
+                                        "session_mismatch" if identity_conflict else "launch_changed")
+                return
             self._record_last(cid, sample.provider, sample.name, {
                 "outcome": "inconclusive",
                 "reason": "session_mismatch" if identity_conflict else "launch_changed",
@@ -1060,10 +1079,22 @@ class Manager:
             with self._lock:
                 marker["pending"] = False
                 self.telemetry["counters"]["errors"] += 1
+            if getattr(sample, "episode_only", False):
+                self._episode_retry_end(cid, sample, marker, "inference_unavailable")
+                return
             self._state_inconclusive(cid, sample, marker, "inference_unavailable", best.seconds)
             return
-        self._state_inference(cid, sample, marker, best.seconds)
+        if not getattr(sample, "episode_only", False):
+            self._state_inference(cid, sample, marker, best.seconds)
         self._update_current()
+
+    def _episode_retry_end(self, cid, sample, marker, reason):
+        """Close an episode-only sample without touching language evidence."""
+        self._mark_finalized_result(
+            {"cid": cid, "sampleToken": marker.get("sampleToken")},
+            "episode-retry", True, "episode_only")
+        self.log("EPISODE_RETRY_RESULT channel=%s outcome=inconclusive reason=%s" % (
+            cid, reason or "-"))
 
     def _state_inference(self, cid, sample, marker, seconds):
         """Optional adapter hook; the baseline Spanish lane has no overlay."""
@@ -1086,16 +1117,22 @@ class Manager:
                 self._infer(job)
             except Exception as error:
                 self.log("spanish auto inference error " + type(error).__name__)
-                self._mark_finalized_result(job, "inconclusive", False, "inference_error")
-                with self._lock:
-                    self.telemetry["counters"]["errors"] += 1
-                    self.telemetry["counters"]["inconclusive"] += 1
-                    self.telemetry["counters"]["tested"] += 1
+                if job.get("episodeOnly"):
+                    self._mark_finalized_result(job, "episode-retry", True, "episode_only")
+                else:
+                    self._mark_finalized_result(job, "inconclusive", False, "inference_error")
+                    with self._lock:
+                        self.telemetry["counters"]["errors"] += 1
+                        self.telemetry["counters"]["inconclusive"] += 1
+                        self.telemetry["counters"]["tested"] += 1
                 self._persist(force=True)
 
     def _infer(self, job):
         if not self._enabled():
-            self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
+            if job.get("episodeOnly"):
+                self._mark_finalized_result(job, "episode-retry", True, "episode_only")
+            else:
+                self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
         try:

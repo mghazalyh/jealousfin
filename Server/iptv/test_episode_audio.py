@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import episode_audio as audio
@@ -864,11 +865,24 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
             self.assertIsNone(self.g.episode_probe())
         for state in ({"surfPaused": False, "surfing": False},
                       {"surfPaused": None, "surfing": None},
+                      {"surfPaused": None, "surfing": True, "playing": True},
+                      {"surfPaused": False, "surfing": False, "playing": True},
                       {"surfPaused": True, "surfing": True, "playing": False}):
             with patch.object(self.g, "device_language_probe",
                               return_value=self.snapshot(**state)), \
                     patch.object(self.g, "episode_active_view", return_value=self.active_view()):
                 self.assertIsNone(self.g.episode_probe())
+        # Paused rotation with an explicit playing state still needs progress.
+        with patch.object(self.g, "device_language_probe",
+                          return_value=self.snapshot(surfPaused=True, surfing=True,
+                                                     playing=True)), \
+                patch.object(self.g, "episode_active_view", return_value=self.active_view()):
+            self.assertIsNotNone(self.g.episode_probe())
+        # Unpaused rotation does not require an ActiveViewing proof.
+        with patch.object(self.g, "device_language_probe",
+                          return_value=self.snapshot(surfPaused=False, surfing=True)), \
+                patch.object(self.g, "episode_active_view", return_value=None):
+            self.assertIsNotNone(self.g.episode_probe())
 
     def test_paused_rotation_researches_only_while_playback_progresses(self):
         self.write_registry()
@@ -1117,6 +1131,64 @@ class EpisodeRetryDiagnosticsTests(unittest.TestCase):
         self.assertEqual(manager.telemetry["languages"], {"en": 1})
         self.assertTrue(manager._finalized[CHANNEL]["conclusive"])
         self.assertEqual(len(manager._episode_retry_results), 1)
+
+    def retry_manager(self):
+        manager = object.__new__(language_audio.Manager)
+        manager._episode_retries = {}
+        manager._episode_retry_results = []
+        manager._finalized = {}
+        manager._visit_results = {}
+        manager._samples = {}
+        manager._state_published = {}
+        manager._lock = threading.RLock()
+        manager.telemetry = {"counters": {"tested": 1, "evidence": 1,
+                                          "samplesFinalized": 1, "inconclusive": 0,
+                                          "errors": 0},
+                             "languages": {"en": 1}, "current": None}
+        manager.log = lambda message: None
+        manager._persist = lambda force=False: None
+        manager._enabled = lambda: True
+        return manager
+
+    def test_episode_only_result_cannot_reach_language_counters(self):
+        manager = self.retry_manager()
+        visit = language_visits.new_visit_id()
+        manager._finalized[CHANNEL] = {"visitID": visit, "conclusive": True,
+                                       "sampleToken": "token-1", "attempts": 1,
+                                       "maxAttempts": 4}
+        manager.on_state = lambda view: (_ for _ in ()).throw(
+            AssertionError("episode-only result published a language label"))
+        before = json.loads(json.dumps(manager.telemetry))
+        manager._record_result(
+            {"cid": CHANNEL, "visitID": visit, "sampleToken": "token-1",
+             "episodeOnly": True, "provider": "p", "name": "n"},
+            {"outcome": "allowed", "reason": "allowed_language_en", "language": "en",
+             "languageName": "English", "confidence": 0.97, "sampleSeconds": 55.0,
+             "speechSeconds": 21.0, "count": 1, "threshold": 25})
+        self.assertEqual(manager.telemetry, before)
+        self.assertTrue(manager._finalized[CHANNEL]["conclusive"])
+        self.assertEqual(len(manager._episode_retry_results), 1)
+
+    def test_episode_only_short_sample_keeps_the_conclusive_visit_marker(self):
+        manager = self.retry_manager()
+        visit = language_visits.new_visit_id()
+        manager._finalized[CHANNEL] = {"visitID": visit, "conclusive": True,
+                                       "sampleToken": "token-1", "attempts": 1,
+                                       "maxAttempts": 4}
+        now = time.time()
+        sample = SimpleNamespace(
+            episode_only=True, provider="p", name="n", bases={}, started=now,
+            last_tap=now, visit={"visitID": visit, "verified": True},
+            probe={"channelID": CHANNEL, "launchID": "launch-1",
+                   "streamGeneration": "stream-1"})
+        manager._samples = {CHANNEL: sample}
+        manager._record_last = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("episode-only short sample recorded language evidence"))
+        before = json.loads(json.dumps(manager.telemetry))
+        manager._finalize(CHANNEL, "housekeeping")
+        self.assertEqual(manager.telemetry, before)
+        self.assertTrue(manager._finalized[CHANNEL]["conclusive"])
+        self.assertEqual(manager._finalized[CHANNEL]["outcome"], "episode-retry")
 
 
 # ---------------------------------------------------------------------------

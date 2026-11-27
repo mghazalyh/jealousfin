@@ -515,6 +515,28 @@ class CombinedOverlayTests(unittest.TestCase):
         ])
         self.assertNotIn((po.READY_FIELD, po.TRUE), transport.calls)
 
+    def test_stale_evidence_on_a_fresh_publisher_uses_the_safe_fallback(self):
+        # A new gateway process has no remembered scope. A stale cached
+        # language event plus a bare series title must still write the safe
+        # fallback, not leave the previous process's combined label visible.
+        transport = self.Transport()
+        publisher = self.publisher(transport)
+        self.seed_visit(A)
+        stale = dict(self.evidence(at=0.0))
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe", return_value=self.probe(A)), \
+                patch.object(self.g, "programme_snapshot",
+                             return_value={A: {"title": "Nurse Jackie"}}):
+            self.assertEqual(self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(A),
+                evidence=stale, now=5000.0), "fallback")
+        self.assertEqual(transport.calls, [
+            (po.READY_FIELD, po.FALSE),
+            (po.FALLBACK_FIELD, po.TRUE),
+            (po.FIELD, ""),
+        ])
+        self.assertNotIn((po.READY_FIELD, po.TRUE), transport.calls)
+
     def test_status_reports_existing_native_abi(self):
         status = self.g.overlay_combined_status()
         self.assertEqual(status["layoutRevision"], "programme-language-existing-ipa-20261127")
