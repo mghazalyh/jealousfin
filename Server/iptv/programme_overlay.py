@@ -120,6 +120,15 @@ class OverlayScope:
     def fingerprint(self) -> str:
         return "|".join(str(part) for part in self.identity() + (self.stream_generation,))
 
+    def visit_fingerprint(self) -> str:
+        """Physical-visit identity, ignoring stream generation.
+
+        A reload changes the stream generation but not the viewing visit.  The
+        safe fallback node is channel/visit scoped, so it does not need to be
+        rewritten for every reload inside one visit.
+        """
+        return "|".join(str(part) for part in self.identity())
+
     def matches(self, current: Any) -> bool:
         if not isinstance(current, Mapping):
             return False
@@ -298,6 +307,7 @@ class ProgrammeOverlayPublisher:
         self._clock = clock
         self._wallclock = wallclock
         self.current_scope = ""
+        self.fallback_scope = ""
         self.last_text = ""
         self.last_event_id = ""
         self.last_status = "idle"
@@ -321,13 +331,15 @@ class ProgrammeOverlayPublisher:
                 self.fault = "transport_unavailable:" + type(error).__name__
         return False
 
-    def _fallback(self, now: float, *, clear_value: bool = False) -> str:
+    def _fallback(self, now: float, *, clear_value: bool = False,
+                  visit_fingerprint: str = "") -> str:
         # Disable the combined node first, then show the live-metadata fallback.
         ready = self._write(READY_FIELD, FALSE, now)
         fallback = self._write(FALLBACK_FIELD, TRUE, now)
         cleared = True if not clear_value else self._write(FIELD, "", now)
         if ready and fallback and cleared:
             self.current_scope = ""
+            self.fallback_scope = visit_fingerprint
             self.last_text = ""
             self.last_event_id = ""
             self.last_status = "fallback"
@@ -336,6 +348,14 @@ class ProgrammeOverlayPublisher:
         self.fault = self.fault or "fallback_failed"
         self.last_status = "failed"
         return self.last_status
+
+    def _already_safe_fallback(self, visit_fingerprint: str) -> bool:
+        # A confirmed fallback for the same physical visit needs no rewrite.
+        # Stream-generation reloads stay in the same visit, so a late re-publish
+        # does not repeat three bounded device writes.
+        return (bool(visit_fingerprint) and visit_fingerprint == self.fallback_scope
+                and self.last_status == "fallback" and not self.last_text
+                and not self.fault)
 
     def transition(self, scope: OverlayScope, now: Optional[float] = None) -> str:
         if not isinstance(scope, OverlayScope) or not scope.checked():
@@ -346,8 +366,14 @@ class ProgrammeOverlayPublisher:
         if fingerprint == self.current_scope:
             self.last_status = "unchanged"
             return self.last_status
+        visit_fingerprint = scope.visit_fingerprint()
+        if self._already_safe_fallback(visit_fingerprint):
+            self.current_scope = fingerprint
+            self.last_status = "transitioned"
+            return self.last_status
         self.fault = ""
-        result = self._fallback(now, clear_value=True)
+        result = self._fallback(now, clear_value=True,
+                                visit_fingerprint=visit_fingerprint)
         if result == "fallback":
             self.current_scope = fingerprint
             self.last_status = "transitioned"
@@ -365,6 +391,7 @@ class ProgrammeOverlayPublisher:
             return self.last_status
         now = self._now(now)
         fingerprint = scope.fingerprint()
+        visit_fingerprint = scope.visit_fingerprint()
         if fingerprint != self.current_scope:
             if self.transition(scope, now) != "transitioned":
                 return self.last_status
@@ -373,7 +400,7 @@ class ProgrammeOverlayPublisher:
             self.last_status = "duplicate"
             return self.last_status
         if not self._write(FIELD, text, now):
-            self._fallback(now)
+            self._fallback(now, visit_fingerprint=visit_fingerprint)
             self.last_status = "failed"
             return self.last_status
         if callable(reprobe):
@@ -383,11 +410,11 @@ class ProgrammeOverlayPublisher:
                 current = None
             if not scope.matches(current):
                 self.fault = "scope_changed"
-                self._fallback(now)
+                self._fallback(now, visit_fingerprint=visit_fingerprint)
                 self.last_status = "scope_changed"
                 return self.last_status
         if not self._write(READY_FIELD, TRUE, now):
-            self._fallback(now)
+            self._fallback(now, visit_fingerprint=visit_fingerprint)
             self.last_status = "failed"
             return self.last_status
         if not self._write(FALLBACK_FIELD, FALSE, now):
@@ -395,11 +422,12 @@ class ProgrammeOverlayPublisher:
             # the safe fallback rather than duplicate the label.
             self.fault = "fallback_disable_failed"
             self.last_status = "fallback"
-            self._fallback(now)
+            self._fallback(now, visit_fingerprint=visit_fingerprint)
             return self.last_status
         self.last_text = text
         self.last_event_id = _clip(str(event_id or ""), MAX_EVENT_ID)
         self.current_scope = fingerprint
+        self.fallback_scope = ""
         self.fault = ""
         self.last_status = "published"
         self.published_count += 1
@@ -409,13 +437,17 @@ class ProgrammeOverlayPublisher:
         if scope is not None and (not isinstance(scope, OverlayScope) or not scope.checked()):
             return "invalid-scope"
         fingerprint = scope.fingerprint() if scope is not None else ""
-        # A confirmed empty fallback is idempotent within one exact visit.
-        # A different launch/stream or a failed prior write must reconcile again.
-        if fingerprint and fingerprint == self.current_scope and self.last_status == "fallback" and not self.last_text and not self.fault:
+        visit_fingerprint = scope.visit_fingerprint() if scope is not None else ""
+        # A confirmed empty fallback is idempotent within one physical visit.
+        # A different channel/launch/visit or a failed prior write reconciles
+        # again; a stream-generation reload does not force three more writes.
+        if fingerprint and self._already_safe_fallback(visit_fingerprint):
+            self.current_scope = fingerprint
             return "fallback"
         now = self._now(now)
         self.fault = ""
-        result = self._fallback(now, clear_value=True)
+        result = self._fallback(now, clear_value=True,
+                                visit_fingerprint=visit_fingerprint)
         if result == "fallback":
             self.current_scope = fingerprint
         return result

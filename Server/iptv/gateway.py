@@ -85,6 +85,9 @@ overlay_bridge_fault=''
 programme_overlay_bridge_state=None
 programme_overlay_bridge_fingerprint=None
 programme_overlay_fault=''
+overlay_combined_stats={'attempts':0,'published':0,'accepted':0,'fallback':0,
+                        'suppressed':0,'unavailable':0,'unverified':0,
+                        'invalid':0,'noProgramme':0,'lastResult':None,'lastReason':None}
 overlay_combined_evidence=None
 overlay_init_lock=threading.Lock()
 overlay_jobs=queue.Queue(maxsize=8)
@@ -1999,27 +2002,49 @@ def resolve_whisper_model():
    if path.is_file() and path.stat().st_size>1024*1024:return path
   except OSError:pass
  return None
+DEVICE_PROBE_WAIT_SECONDS=25.0
+DEVICE_PROBE_LOCK=threading.Lock()
+DEVICE_PROBE_CONDITION=threading.Condition(DEVICE_PROBE_LOCK)
+DEVICE_PROBE_INFLIGHT=False
+DEVICE_PROBE_VERSION=0
+DEVICE_PROBE_SHARED=None
+DEVICE_PROBE_SHARED_FAULT=''
+DEVICE_PROBE_SHARED_VERSION=-1
+DEVICE_PROBE_STATS={'probes':0,'shared':0,'failures':0,'byReason':{}}
+device_probe_fault=''
+def _device_probe_copy(value):
+ return dict(value) if isinstance(value,dict) else value
 def device_identity_pair(config,token):
  # The GET route is read-only and does not create durable command receipts.
  # New native builds provide channel and generation in a single atomic status.
  # Legacy installed IPAs need a separate player snapshot for stream identity.
- status=prototype_selector.device_status(config,token)
- if not isinstance(status,dict):raise ValueError('Invalid device state')
+ global device_probe_fault
+ try:status=prototype_selector.device_status(config,token)
+ except Exception:
+  device_probe_fault='device_status_unavailable';raise
+ if not isinstance(status,dict):
+  device_probe_fault='device_status_invalid';raise ValueError('Invalid device state')
  channel=status.get('currentChannelID');generation=status.get('streamGeneration')
  if isinstance(channel,str) and channel and isinstance(generation,str) and generation:
   return status,{'channelID':channel,'streamGeneration':generation}
- snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
- if not isinstance(snapshot,dict):raise ValueError('Invalid player snapshot')
+ try:snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+ except Exception:
+  device_probe_fault='device_snapshot_unavailable';raise
+ if not isinstance(snapshot,dict):
+  device_probe_fault='device_snapshot_invalid';raise ValueError('Invalid player snapshot')
  return status,snapshot
 
-def device_language_probe():
- # The launch identity must be read fresh on every probe.  Caching it for up
- # to a minute could pair an old launch with a new channel/stream after an app
- # restart.  The two reads must also agree on the same coherent moment; an
- # incoherent pair is retried once and then fails closed.
+def _device_language_probe_once():
+ # One coherent read: channel, launch and generation must describe the same
+ # instant.  An incoherent status/snapshot pair is retried once, then fails
+ # closed with a stable reason instead of an opaque 'device_unavailable'.
+ global device_probe_fault
+ device_probe_fault=''
  config=prototype_selector.load_selector(ROOT)
- if config is None:return None
+ if config is None:
+  device_probe_fault='device_not_configured';return None
  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
+ incoherent=False
  for _ in range(2):
   try:
    status,snapshot=device_identity_pair(config,token)
@@ -2029,15 +2054,66 @@ def device_language_probe():
   status_channel=str(status.get('currentChannelID','') or '')
   stream_generation=str(snapshot.get('streamGeneration',''))
   status_stream=str(status.get('streamGeneration','') or '')
-  if status_channel and channel_id and status_channel!=channel_id:continue
-  if status_stream and stream_generation and status_stream!=stream_generation:continue
+  if status_channel and channel_id and status_channel!=channel_id:
+   incoherent=True;continue
+  if status_stream and stream_generation and status_stream!=stream_generation:
+   incoherent=True;continue
   paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
   surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
   playing=status.get('playing') if type(status.get('playing')) is bool else None
+  device_probe_fault=''
   return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
           'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing,
           'playing':playing}
+ if incoherent:device_probe_fault='device_incoherent'
  return None
+
+def device_language_probe(share=True):
+ # Single-flight, not a launch cache.  A probe that is genuinely in flight is
+ # shared by callers that arrive while it runs; a probe that already finished
+ # is never reused.  Sequential probes therefore always read a fresh launch,
+ # while concurrent language/episode/overlay probes after a new launch collapse
+ # to one coherent read instead of several 3s/8s device calls.
+ global device_probe_fault,DEVICE_PROBE_INFLIGHT,DEVICE_PROBE_VERSION
+ global DEVICE_PROBE_SHARED,DEVICE_PROBE_SHARED_FAULT,DEVICE_PROBE_SHARED_VERSION
+ if not share:return _device_language_probe_once()
+ with DEVICE_PROBE_CONDITION:
+  if DEVICE_PROBE_INFLIGHT:
+   wait_version=DEVICE_PROBE_VERSION
+   deadline=time.monotonic()+DEVICE_PROBE_WAIT_SECONDS
+   while DEVICE_PROBE_INFLIGHT and DEVICE_PROBE_VERSION==wait_version:
+    remaining=deadline-time.monotonic()
+    if remaining<=0:break
+    DEVICE_PROBE_CONDITION.wait(remaining)
+   if (not DEVICE_PROBE_INFLIGHT
+       and DEVICE_PROBE_SHARED_VERSION==wait_version):
+    DEVICE_PROBE_STATS['shared']+=1
+    device_probe_fault=DEVICE_PROBE_SHARED_FAULT
+    return _device_probe_copy(DEVICE_PROBE_SHARED)
+  DEVICE_PROBE_VERSION+=1
+  my_version=DEVICE_PROBE_VERSION
+  DEVICE_PROBE_INFLIGHT=True
+ try:
+  value=_device_language_probe_once()
+ finally:
+  with DEVICE_PROBE_CONDITION:
+   DEVICE_PROBE_SHARED=_device_probe_copy(value)
+   DEVICE_PROBE_SHARED_FAULT=device_probe_fault
+   DEVICE_PROBE_SHARED_VERSION=my_version
+   DEVICE_PROBE_INFLIGHT=False
+   DEVICE_PROBE_CONDITION.notify_all()
+ DEVICE_PROBE_STATS['probes']+=1
+ if not isinstance(value,dict):
+  DEVICE_PROBE_STATS['failures']+=1
+  reasons=DEVICE_PROBE_STATS['byReason']
+  reasons[device_probe_fault]=(reasons.get(device_probe_fault,0)+1)
+ return value
+def device_probe_diagnostics():
+ with DEVICE_PROBE_LOCK:
+  return {'probes':DEVICE_PROBE_STATS['probes'],'shared':DEVICE_PROBE_STATS['shared'],
+          'failures':DEVICE_PROBE_STATS['failures'],
+          'byReason':dict(DEVICE_PROBE_STATS['byReason']),
+          'fault':device_probe_fault,'inFlight':DEVICE_PROBE_INFLIGHT}
 # Optional audio-assisted episode identity. It reuses the single language
 # decode/transcribe pass through on_speech; it never requests media, starts a
 # second Whisper run or calls a research service while disabled.
@@ -2162,7 +2238,9 @@ def episode_probe():
  # physical session.
  probe=device_language_probe()
  if not isinstance(probe,dict):
-  note_episode_probe('device_unavailable');return None
+  # Keep the legacy bucket for older dashboards but expose the exact read
+  # failure so a launch-time timeout is not confused with an incoherent pair.
+  note_episode_probe('device_unavailable',device_probe_fault or 'device_unavailable');return None
  if probe.get('surfing') is not True:
   note_episode_probe('rotation_stopped');return None
  if probe.get('playing') is False:
@@ -2240,6 +2318,7 @@ def episode_audio_status():
  status=episode_audio.status()
  status['configuredEnabled']=bool(gateway_config.get('episodeAudioEnabled'))
  status['probe']=dict(episode_probe_diagnostics)
+ status['deviceProbe']=device_probe_diagnostics()
  status['publication']=episode_publisher.diagnostics()
  status['sourceDiscovery']=episode_source_discovery.diagnostics() if episode_source_discovery is not None else None
  status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
@@ -2430,13 +2509,32 @@ def overlay_combined_scope(cid,name,probe=None):
   return programme_overlay.OverlayScope(cid,provider,name[:160],launch[:160],visit[:160],stream[:160])
  except (TypeError,ValueError):return None
 def _overlay_current_scope(scope):
- current=overlay_current_channel()
+ # Presentation rechecks are never served from the short probe cache: a stale
+ # visiting identity must not be able to switch the combined node on.
+ current=overlay_current_channel(fresh=True)
  if not isinstance(current,dict):return None
  visit=_overlay_visit_for(current.get('channelID'),current.get('launchID'),
                           current.get('streamGeneration'))
  return {'channelID':current.get('channelID'),'launchID':current.get('launchID'),
          'streamGeneration':current.get('streamGeneration'),'visitID':visit}
 def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
+ result=_overlay_combined_publish(cid,name,probe,evidence,now)
+ stats=overlay_combined_stats
+ stats['attempts']+=1
+ stats['lastResult']=result
+ stats['lastReason']=programme_overlay_fault or ''
+ if result=='published':
+  stats['published']+=1;stats['accepted']+=1
+ elif result in ('duplicate','unchanged'):
+  stats['accepted']+=1
+ elif result=='fallback':stats['fallback']+=1
+ elif result=='unavailable':stats['unavailable']+=1
+ elif result=='unverified':stats['unverified']+=1
+ elif result=='suppressed_channel':stats['suppressed']+=1
+ elif result=='no_programme':stats['noProgramme']+=1
+ elif result in ('invalid','invalid_scope'):stats['invalid']+=1
+ return result
+def _overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
  # Presentation only. It never rewrites Name/ProductionYear/JealousfinProgramme
  # and is allowed while surf rotation is paused as long as the exact scope is
  # still current and the caller has validated actual playback.
@@ -2498,6 +2596,7 @@ def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
 def overlay_combined_status():
  bridge=programme_overlay_instance()
  base={'configured':bridge is not None,'fault':programme_overlay_fault,
+       'stats':dict(overlay_combined_stats),
        'revision':programme_overlay.REVISION,
        'field':programme_overlay.KEY,'readyField':programme_overlay.READY_KEY,
        'fallbackField':programme_overlay.FALLBACK_KEY,
@@ -2527,7 +2626,9 @@ def overlay_publish_evidence(cid,name,language,language_name,confidence,payload,
            'phase':str(info.get('outcome') or 'recorded'),
            'confidence':confidence if type(confidence) in (int,float) else None}
  return overlay_enqueue('evidence',channelID=cid,channelName=name,
-                        streamGeneration=str((payload or {}).get('streamGeneration','')),evidence=evidence)
+   streamGeneration=str((payload or {}).get('streamGeneration','')),
+   launchID=str((payload or {}).get('launchID','') or ''),
+   visitID=str((payload or {}).get('visitID','') or ''),evidence=evidence)
 def overlay_publish_state(payload):
  if not isinstance(payload,dict):return False
  cid=payload.get('channelID');name=payload.get('channelName')
@@ -2539,7 +2640,9 @@ def overlay_publish_state(payload):
  state['eventID']='state-'+cid+'-'+str(int(float(payload.get('observedAt') or time.time())*1000))+'-'+str(payload.get('state') or 'waiting')
  state['at']=payload.get('observedAt') or time.time()
  return overlay_enqueue('state',channelID=cid,channelName=name,
-   streamGeneration=str(payload.get('streamGeneration') or ''),visitID=str(payload.get('visitID') or ''),state=state)
+   streamGeneration=str(payload.get('streamGeneration') or ''),
+   launchID=str(payload.get('launchID') or ''),
+   visitID=str(payload.get('visitID') or ''),state=state)
 def language_state_callback(payload):
  if SOURCE_PROFILE!='american':return False
  return overlay_publish_state(payload)
@@ -2554,8 +2657,8 @@ def overlay_correction_allowed(cid):
  if bridge.current_channel_id and bridge.current_channel_id!=cid:return False
  if bridge.latest_snapshot is not None and bridge.latest_snapshot.channel_id!=cid:return False
  return True
-def overlay_current_channel():
- try:probe=device_language_probe()
+def overlay_current_channel(fresh=False):
+ try:probe=device_language_probe(share=not fresh)
  except Exception:return None
  if not isinstance(probe,dict):return None
  cid=probe.get('channelID')
