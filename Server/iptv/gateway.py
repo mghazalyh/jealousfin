@@ -3319,9 +3319,9 @@ def playback_admission_foreground(path,cid,malay):
 def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=False,reconnect=False):
  started=_device_probe_now()
  key=_device_probe_key(config)
- # Foreground PlaybackInfo and the catalogue reconnect boundary may wait out a
- # shared status backoff under the existing monotonic budget.  Other background
- # consumers stay immediately fail-closed.
+ # Foreground PlaybackInfo plus the authenticated catalogue/Policy reconnect
+ # boundaries may wait out a shared status backoff under the existing monotonic
+ # budget.  Other background consumers stay immediately fail-closed.
  recover=foreground or reconnect
  if recover:
   with PLAYBACK_ADMISSION_LOCK:
@@ -3334,7 +3334,7 @@ def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=F
  if not admitted:
   # Status-only consumers must not be blocked by a snapshot/identity backoff.
   # Background callers keep the immediate fail-closed backoff response; only a
-  # foreground PlaybackInfo or catalogue reconnect may wait it out under budget.
+  # foreground PlaybackInfo or catalogue/Policy reconnect may wait it out.
   if recover and fault in ('device_probe_backoff','device_probe_rate_limited','device_probe_playback_reserved'):
    if fault=='device_probe_playback_reserved':
     with PLAYBACK_ADMISSION_LOCK:
@@ -3461,7 +3461,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if malay:
     self.proxy_malay(config,path);return True
    return False
-  if path in ('/LiveTv/Programs','/Jealousfin/Policy'):
+  if path=='/Jealousfin/Policy':
+   # Authenticated Policy polls share the bounded admission recovery already
+   # used by catalogue reconnects.  The policy snapshot is read only after a
+   # fresh category/Malay decision, so storage failures below stay immediate
+   # and are never retried here.
+   if selected_profile_admitted(config,token,reconnect=True)=='malay':
+    self.proxy_malay(config,path);return True
+   return False
+  if path=='/LiveTv/Programs':
    if selected_profile_admitted(config,token)=='malay':
     self.proxy_malay(config,path);return True
    return False

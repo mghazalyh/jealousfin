@@ -42,7 +42,7 @@ class StartupAdmissionTests(unittest.TestCase):
         # before the fresh status read.
         self.assertEqual(self.route('/LiveTv/Channels',RuntimeError('unavailable')),('rejected',[]))
 
-    def test_only_catalogue_reconnect_requests_bounded_recovery(self):
+    def test_catalogue_and_policy_request_bounded_recovery(self):
         calls=[]
         def admitted(config,token,**kwargs):
             calls.append(kwargs)
@@ -57,7 +57,7 @@ class StartupAdmissionTests(unittest.TestCase):
             self.g.Handler.route_prototype(self.handler,'/Jealousfin/Policy',{})
         self.assertEqual(calls[0].get('reconnect'),True)
         self.assertNotIn('reconnect',calls[1])
-        self.assertNotIn('reconnect',calls[2])
+        self.assertEqual(calls[2].get('reconnect'),True)
 
     def test_failed_playback_never_contacts_optional_ui(self):
         self.assertEqual(self.route('/Items/'+self.cid+'/PlaybackInfo',RuntimeError('unavailable')),('rejected',[]))

@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -326,6 +326,37 @@ class RecoveryFixture(unittest.TestCase):
             second = self.g.selected_profile_admitted(
                 self.selector, TOKEN, reconnect=True)
         self.assertEqual((first, second), ("malay", "american"))
+        self.assertEqual(len(reads), 2)
+
+    def test_policy_route_recovers_backoff_and_keeps_fresh_malay_routing(self):
+        clock = [100.0]
+        categories = ["Movies & Series", "All Channels"]
+        reads = []
+        handler = Mock()
+        handler.headers = {"Content-Length": "0"}
+        handler.client_address = (self.selector["deviceIP"], 1000)
+        handler.authorized.return_value = True
+
+        def device(config, token):
+            reads.append(1)
+            return status(categories.pop(0))
+
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK", lambda: clock[0]), \
+                patch.object(self.g, "PLAYBACK_ADMISSION_WAIT",
+                             side_effect=self.fake_wait(clock)), \
+                patch.object(self.g.prototype_selector, "load_selector",
+                             return_value=self.selector), \
+                patch.object(self.g.prototype_selector, "source_ids",
+                             return_value=set()), \
+                patch.object(self.g.prototype_selector, "device_status",
+                             side_effect=device):
+            self.arm_backoff(clock, 2.0)
+            first = self.g.Handler.route_prototype(
+                handler, "/Jealousfin/Policy", {})
+            self.arm_backoff(clock, 2.0)
+            second = self.g.Handler.route_prototype(
+                handler, "/Jealousfin/Policy", {})
+        self.assertEqual((first, second), (True, False))
         self.assertEqual(len(reads), 2)
 
     def test_catalogue_reconnect_refuses_wait_beyond_budget(self):
