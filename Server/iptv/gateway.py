@@ -649,8 +649,16 @@ episode_observed_at=0.0
 episode_fault=None
 episode_lookup_fault=None
 episode_lookup_errors=0
+episode_lookup_deferred=0
+episode_lookup_last_error=None
+episode_candidate_errors=0
+episode_candidate_last_error=None
 episode_cache=OrderedDict()
 episode_series_cache=OrderedDict()
+episode_series_faults=OrderedDict()
+EPISODE_CANDIDATE_RETRY_SECONDS=900
+EPISODE_CANDIDATE_RETRY_MAX=6*3600
+EPISODE_CANDIDATE_FAULT_LIMIT=64
 regional_programme=None
 regional_fault=None
 regional_observed_at=0.0
@@ -676,6 +684,20 @@ def year_error_code(error):
  if isinstance(error,ValueError):
   reason=str(error)
   if reason in ('Metadata response too large','Invalid metadata search','Invalid metadata response','Unsupported upstream URL','Non-public upstream address'):return reason
+ return type(error).__name__
+
+class EpisodeLookupIncomplete(ValueError):
+ def __init__(self,faults,retry_after=YEAR_RETRY_SECONDS):
+  self.faults=tuple(faults[:4]);self.retry_after=retry_after
+  super().__init__('Incomplete candidate details')
+
+def episode_error_code(error):
+ if isinstance(error,EpisodeLookupIncomplete):return 'Incomplete candidate details'
+ if isinstance(error,urllib.error.HTTPError):return 'HTTP '+str(error.code)
+ if isinstance(error,json.JSONDecodeError):return 'invalid JSON'
+ if isinstance(error,ValueError):
+  reason=str(error)
+  if reason in ('Metadata response too large','Invalid metadata search','Invalid metadata response','Invalid series search','Invalid series metadata','Episode metadata response too large','Episode metadata limit','Unsupported upstream URL','Non-public upstream address'):return reason
  return type(error).__name__
 
 def release_year(value):
@@ -939,6 +961,22 @@ def episode_guide_worker(stop):
    log('episode guide refresh failed '+reason)
   if stop.wait(delay):return
 
+def note_episode_candidate_fault(mid,error,now):
+ global episode_candidate_errors,episode_candidate_last_error
+ reason=episode_error_code(error)
+ with lock:
+  prior=episode_series_faults.get(mid)
+  delay=min((prior.get('delay') or EPISODE_CANDIDATE_RETRY_SECONDS)*2 if prior else EPISODE_CANDIDATE_RETRY_SECONDS,EPISODE_CANDIDATE_RETRY_MAX)
+  episode_series_faults[mid]={'until':now+delay,'delay':delay,'reason':reason}
+  episode_series_faults.move_to_end(mid)
+  while len(episode_series_faults)>EPISODE_CANDIDATE_FAULT_LIMIT:episode_series_faults.popitem(last=False)
+  episode_candidate_errors+=1
+  episode_candidate_last_error={'at':now,'candidate':mid,'reason':reason}
+ return reason,now+delay
+
+def clear_episode_candidate_fault(mid):
+ with lock:episode_series_faults.pop(mid,None)
+
 def fetch_episode_series(mid):
  # The entire episode catalogue is bounded, with a larger limit than ordinary
  # movie detail metadata. Keep only titles, numbers and dates in memory.
@@ -984,9 +1022,18 @@ def resolve_episode(row):
   if not isinstance(metas,list):raise ValueError('Invalid series search')
   ids=list(dict.fromkeys(m['id'] for m in metas if isinstance(m,dict) and isinstance(m.get('id'),str) and re.fullmatch(r'tt\d{5,12}',m['id']) and isinstance(m.get('name'),str) and guide_norm(m['name'])==norm))
  if not 1<=len(ids)<=4:return {}
- exact=[];named=[]
+ exact=[];named=[];faults=[]
  for mid in ids:
-  name,videos=fetch_episode_series(mid)
+  now=time.time()
+  with lock:prior=episode_series_faults.get(mid)
+  if prior and now<prior['until']:
+   faults.append((mid,prior['reason'],prior['until']));continue
+  try:name,videos=fetch_episode_series(mid)
+  except Exception as error:
+   reason,until=note_episode_candidate_fault(mid,error,now)
+   log('episode candidate deferred '+reason+' candidate='+mid)
+   faults.append((mid,reason,until));continue
+  clear_episode_candidate_fault(mid)
   if guide_norm(name)!=norm:continue
   for s,e,t,y in videos:
    if guide_norm(t)!=episode:continue
@@ -999,10 +1046,13 @@ def resolve_episode(row):
  # match across all exact series candidates. Never pick a remake by ranking.
  if len(exact)==1:return exact[0]
  if not exact and len(named)==1:return named[0]
+ if faults:
+  until=max(item[2] for item in faults)
+  raise EpisodeLookupIncomplete(faults,max(YEAR_RETRY_SECONDS,until-time.time()))
  return {}
 
 def episode_worker(stop):
- global episode_lookup_fault,episode_lookup_errors
+ global episode_lookup_fault,episode_lookup_errors,episode_lookup_deferred,episode_lookup_last_error
  load_episode_cache()
  while not stop.is_set():
   selected=None
@@ -1021,10 +1071,19 @@ def episode_worker(stop):
     try:
      value=checked_episode(resolve_episode(row));ttl=YEAR_POSITIVE_TTL if value else YEAR_NEGATIVE_TTL
      with lock:episode_lookup_fault=None
+    except EpisodeLookupIncomplete as error:
+     value={};ttl=max(YEAR_RETRY_SECONDS,error.retry_after)
+     detail=';'.join(mid+':'+reason for mid,reason,_ in error.faults[:3])
+     with lock:
+      episode_lookup_deferred+=1;episode_lookup_fault=None
+      episode_lookup_last_error={'at':time.time(),'key':key[:12],'reason':'Incomplete candidate details','candidates':detail}
+     log('episode lookup deferred Incomplete candidate details '+detail)
     except Exception as error:
-     value={};ttl=YEAR_RETRY_SECONDS
-     with lock:episode_lookup_errors+=1;episode_lookup_fault=year_error_code(error)
-     log('episode lookup deferred '+year_error_code(error))
+     reason=episode_error_code(error);value={};ttl=YEAR_RETRY_SECONDS
+     with lock:
+      episode_lookup_errors+=1;episode_lookup_fault=reason
+      episode_lookup_last_error={'at':time.time(),'key':key[:12],'reason':reason}
+     log('episode lookup deferred '+reason)
     with lock:
      episode_cache[key]={'expires':time.time()+ttl,'value':value};episode_cache.move_to_end(key)
      while len(episode_cache)>EPISODE_CACHE_LIMIT:episode_cache.popitem(last=False)
@@ -1032,8 +1091,9 @@ def episode_worker(stop):
     atomic_json(EPISODE_CACHE_FILE,snapshot)
    if stop.wait(3 if selected else 15):return
   except Exception as error:
-   with lock:episode_lookup_fault=year_error_code(error)
-   log('episode worker failed '+year_error_code(error))
+   reason=episode_error_code(error)
+   with lock:episode_lookup_fault=reason
+   log('episode worker failed '+reason)
    if stop.wait(60):return
 
 def regional_snapshot(now):
@@ -2481,7 +2541,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (ValueError,OSError,TypeError):language_pending_description={'entries':0}
    language_status=spanish_auto_status()
    overlay_request_pump()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeLookupDeferred':episode_lookup_deferred,'episodeLookupLastError':episode_lookup_last_error,'episodeCandidateErrors':episode_candidate_errors,'episodeCandidateLastError':episode_candidate_last_error,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':
