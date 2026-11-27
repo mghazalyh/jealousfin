@@ -99,11 +99,23 @@ overlay_pump_lock=threading.Lock()
 overlay_pump_pending=False
 overlay_pump_queued_at=0.0
 overlay_pump_last_request=float('-inf')
+# Every admitted pump owns a token.  A pump only clears the coalescing flag
+# when it is the owner being queued, evicted or completed.  Older in-flight
+# pumps therefore cannot release a newer queued replacement.
+overlay_pump_token=0
+overlay_pump_tokens=set()
 overlay_admission_stats={'pumpRequests':0,'pumpEnqueued':0,'pumpCoalesced':0,
  'pumpStale':0,'refreshRequests':0,'refreshEnqueued':0}
 def _overlay_admission_now():
  try:return float(OVERLAY_ADMISSION_CLOCK())
  except (TypeError,ValueError):return time.monotonic()
+def _overlay_pump_retire(token):
+ # Deterministic ownership release.  None is the legacy untracked pump used by
+ # direct enqueue callers; it never clears a tracked replacement.
+ global overlay_pump_pending
+ with overlay_pump_lock:
+  if token is not None:overlay_pump_tokens.discard(token)
+  overlay_pump_pending=bool(overlay_pump_tokens)
 episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
 device_rotation_cache=None
 device_rotation_checked=0.0
@@ -2802,7 +2814,7 @@ def overlay_combined_status():
  if bridge is None:return base
  return dict(base,**bridge.status())
 def overlay_enqueue(kind,**fields):
- global overlay_bridge_fault,overlay_pump_pending
+ global overlay_bridge_fault
  if SOURCE_PROFILE!='american':return False
  job=dict(fields,kind=kind,at=time.time())
  if kind=='refresh':
@@ -2815,8 +2827,10 @@ def overlay_enqueue(kind,**fields):
   try:evicted=overlay_jobs.get_nowait()
   except queue.Empty:pass
   # A queued pump that never runs must not strand the coalescing boolean.
+  # Retire only the evicted pump's own token so a replacement pump that is
+  # already queued keeps its pending ownership.
   if isinstance(evicted,dict) and evicted.get('kind')=='pump':
-   with overlay_pump_lock:overlay_pump_pending=False
+   _overlay_pump_retire(evicted.get('pumpToken'))
   try:overlay_jobs.put_nowait(job)
   except queue.Full:
    overlay_bridge_fault='queue_full';return False
@@ -2975,7 +2989,7 @@ def _overlay_process(job,stop):
 def overlay_worker(stop):
  # Existing daemon lifecycle only: it blocks for a triggered job and stops on
  # the shutdown sentinel. It never polls the device on its own.
- global overlay_bridge_fault,overlay_pump_pending
+ global overlay_bridge_fault
  while not stop.is_set():
   try:job=overlay_jobs.get()
   except (queue.Empty,EOFError):break
@@ -2986,11 +3000,12 @@ def overlay_worker(stop):
    log('Language overlay worker '+type(error).__name__)
   finally:
    if isinstance(job,dict) and job.get('kind')=='pump':
-    with overlay_pump_lock:overlay_pump_pending=False
+    _overlay_pump_retire(job.get('pumpToken'))
 def overlay_request_pump():
  # /trial-status is a poll boundary. Coalesce pending retry jobs so a fast
  # status consumer cannot enqueue one device probe per request.
  global overlay_pump_pending,overlay_pump_queued_at,overlay_pump_last_request
+ global overlay_pump_token
  bridge=overlay_bridge_state
  if bridge is None:return False
  try:pending=bool(bridge.status().get('pending'))
@@ -3006,10 +3021,13 @@ def overlay_request_pump():
   if now-overlay_pump_last_request<OVERLAY_PUMP_MIN_INTERVAL:
    overlay_admission_stats['pumpCoalesced']+=1;return False
   overlay_pump_last_request=now
+  overlay_pump_token+=1
+  token=overlay_pump_token
+  overlay_pump_tokens.add(token)
   overlay_pump_pending=True
   overlay_pump_queued_at=now
- if not overlay_enqueue('pump'):
-  with overlay_pump_lock:overlay_pump_pending=False
+ if not overlay_enqueue('pump',pumpToken=token):
+  _overlay_pump_retire(token)
   return False
  with overlay_pump_lock:overlay_admission_stats['pumpEnqueued']+=1
  return True

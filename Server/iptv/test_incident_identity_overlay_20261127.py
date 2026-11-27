@@ -738,6 +738,100 @@ class OverlayPumpAdmissionTests(GatewayFixture):
         self.assertEqual(self.g.overlay_jobs.qsize(),
                          self.g.overlay_jobs.maxsize)
 
+    def test_queue_full_pump_replacement_retains_pending_ownership(self):
+        clock = [100.0]
+        bridge = self.PendingBridge()
+        with patch.object(self.g, "overlay_bridge_state", bridge), \
+                patch.object(self.g, "OVERLAY_ADMISSION_CLOCK",
+                             side_effect=lambda: clock[0]):
+            self.assertTrue(self.g.overlay_request_pump())
+            while self.g.overlay_jobs.qsize() < self.g.overlay_jobs.maxsize:
+                self.assertTrue(self.g.overlay_enqueue("refresh"))
+            self.assertEqual(self.g.overlay_jobs.qsize(),
+                             self.g.overlay_jobs.maxsize)
+            clock[0] = 100.0 + self.g.OVERLAY_PUMP_QUEUE_TTL + 0.1
+            # The queue is full, so admitting the replacement evicts the older
+            # queued pump.  The replacement remains queued and must keep the
+            # coalescing flag owned until it runs.
+            self.assertTrue(self.g.overlay_request_pump())
+            with self.g.overlay_pump_lock:
+                self.assertTrue(self.g.overlay_pump_pending)
+                self.assertIn(self.g.overlay_pump_token,
+                              self.g.overlay_pump_tokens)
+                token = self.g.overlay_pump_token
+            pumps = [job for job in list(self.g.overlay_jobs.queue)
+                     if isinstance(job, dict) and job.get("kind") == "pump"]
+            self.assertEqual(len(pumps), 1)
+            self.assertEqual(pumps[0].get("pumpToken"), token)
+            self.assertEqual(self.g.overlay_jobs.qsize(),
+                             self.g.overlay_jobs.maxsize)
+        stats = dict(self.g.overlay_admission_stats)
+        self.assertEqual(stats["pumpRequests"], 2)
+        self.assertEqual(stats["pumpEnqueued"], 2)
+        self.assertEqual(stats["pumpStale"], 1)
+        self.assertEqual(stats["pumpCoalesced"], 0)
+
+    def test_inflight_pump_completion_does_not_clear_newer_pending(self):
+        clock = [100.0]
+        bridge = self.PendingBridge()
+        entered_first = threading.Event()
+        entered_replacement = threading.Event()
+        release_first = threading.Event()
+        release_replacement = threading.Event()
+        processed = []
+
+        def process(job, stop):
+            token = job.get("pumpToken")
+            processed.append(token)
+            if token == 1:
+                entered_first.set()
+                release_first.wait(2.0)
+            elif token == 2:
+                entered_replacement.set()
+                release_replacement.wait(2.0)
+
+        stop = threading.Event()
+        with patch.object(self.g, "overlay_bridge_state", bridge), \
+                patch.object(self.g, "OVERLAY_ADMISSION_CLOCK",
+                             side_effect=lambda: clock[0]), \
+                patch.object(self.g, "_overlay_process", side_effect=process):
+            worker = threading.Thread(target=self.g.overlay_worker,
+                                      args=(stop,), daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(self.g.overlay_request_pump())
+                self.assertTrue(entered_first.wait(2.0),
+                                "first pump never started")
+                clock[0] = 100.0 + self.g.OVERLAY_PUMP_QUEUE_TTL + 0.1
+                self.assertTrue(self.g.overlay_request_pump())
+                with self.g.overlay_pump_lock:
+                    self.assertTrue(self.g.overlay_pump_pending)
+                self.assertEqual(self.g.overlay_jobs.qsize(), 1)
+                release_first.set()
+                self.assertTrue(entered_replacement.wait(2.0),
+                                "replacement pump never started")
+                # The older in-flight pump has completed its ownership release;
+                # the newer queued pump still owns the pending flag.
+                with self.g.overlay_pump_lock:
+                    self.assertTrue(self.g.overlay_pump_pending)
+                release_replacement.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with self.g.overlay_pump_lock:
+                        if not self.g.overlay_pump_pending:
+                            break
+                    time.sleep(0.01)
+                with self.g.overlay_pump_lock:
+                    self.assertFalse(self.g.overlay_pump_pending)
+            finally:
+                stop.set()
+                release_first.set()
+                release_replacement.set()
+                self.g.overlay_jobs.put(None)
+                worker.join(2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(processed, [1, 2])
+
 
 class CombinedFallbackDedupTests(unittest.TestCase):
     class Transport:
