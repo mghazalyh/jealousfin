@@ -37,7 +37,7 @@ def ambiguous_probe():
 class TranscriptDecisionTests(unittest.TestCase):
     def test_window_only_inconclusive_reasons_do_not_need_a_transcript(self):
         for reason in ("ambiguous_language", "mixed_language", "insufficient_speech_windows",
-                       "low_speech_coverage", "low_language_confidence", "unknown_language"):
+                       "low_speech_coverage", "low_language_confidence"):
             self.assertFalse(spanish_audio.decision_needs_transcript(
                 {"outcome": "inconclusive", "reason": reason}), reason)
         self.assertTrue(spanish_audio.decision_needs_transcript(
@@ -105,6 +105,14 @@ class LanguageInferTimingTests(unittest.TestCase):
         transcribe.assert_called_once()
         self.assertEqual(self.results[0]["outcome"], "allowed")
         self.assertEqual(handoffs[0][1], ("en", "fixture speech"))
+
+    def test_unknown_language_retains_transcript_mismatch_diagnostic(self):
+        windows = [{"usable": True, "language": "fixture_unknown", "probability": 0.99}] * 4
+        preliminary = language_audio.decide_language(analysis(), windows, None)
+        self.assertEqual(preliminary["reason"], "unknown_language")
+        self.assertTrue(spanish_audio.decision_needs_transcript(preliminary))
+        final = language_audio.decide_language(analysis(), windows, None, "en")
+        self.assertEqual(final["reason"], "transcript_language_mismatch")
 
     def test_unknown_future_failure_retains_transcript(self):
         self.assertTrue(spanish_audio.decision_needs_transcript(

@@ -364,7 +364,7 @@ def decision_needs_transcript(decision):
     return decision.get("reason") not in {
         "sample_too_short", "insufficient_speech", "low_speech_coverage",
         "insufficient_speech_windows", "ambiguous_language", "mixed_language",
-        "low_language_confidence", "unknown_language",
+        "low_language_confidence",
     }
 
 
