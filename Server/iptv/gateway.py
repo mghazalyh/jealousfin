@@ -119,7 +119,7 @@ def _overlay_pump_retire(token):
 episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
 episode_provider_diagnostics={}
 episode_provider_diagnostics_lock=threading.Lock()
-episode_model_gate=opencode_discovery.EpisodeModelGate()
+shared_research_model_gate=opencode_discovery.EpisodeModelGate()
 device_rotation_cache=None
 device_rotation_checked=0.0
 language_visit_ledger=None
@@ -1401,13 +1401,17 @@ def discovery_worker(stop):
     model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
     variant=plan.variant if plan else gateway_config['metadataResearchVariant']
     if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
-    if not recheck:
-     if episode_model_gate.acquire():continue
-     model_acquired=True
     if recheck:
+     # Cached rechecks fetch approved schedule pages only: no model call,
+     # no search-provider quota, and no shared model lease to release.
      discovery.rechecked[cid]=now
      previous=dict(discovery.records[cid]['candidate'])
     else:
+     # Acquire BEFORE recording any attempt or setting in_flight.
+     gate_reason=shared_research_model_gate.acquire()
+     if gate_reason:
+      continue
+     model_acquired=True
      if plan:discovery.active_calls=(discovery.active_calls+[now])[-128:]
      else:discovery.calls.append(now)
      discovery.records[cid]={'at':now,'outcome':'started','candidate':opencode_discovery.normalize_result({})}
@@ -1428,7 +1432,7 @@ def discovery_worker(stop):
       raise
      finally:
       if model_acquired:
-       episode_model_gate.release(diagnostics);model_acquired=False
+       shared_research_model_gate.release(diagnostics);model_acquired=False
       with lock:discovery.last_run={'variant':variant,'seconds':round(time.monotonic()-started,3),'channelID':cid,'at':time.time()}
      candidate=opencode_discovery.normalize_result(raw)
     checked_at=time.time()
@@ -1465,7 +1469,7 @@ def discovery_worker(stop):
    with lock:discovery.in_flight=False;discovery.last_fault=type(error).__name__
    log('programme research worker '+type(error).__name__)
   finally:
-   if model_acquired:episode_model_gate.release(diagnostics)
+   if model_acquired:shared_research_model_gate.release(diagnostics)
 
 def discovery_status():
  with lock:
@@ -2470,7 +2474,7 @@ def episode_source_provider(payload):
    outcome='direct-sufficient';return official,reports
   if not opencode_discovery.available():
    outcome='provider-unavailable';return official,reports
-  gate_reason=episode_model_gate.acquire()
+  gate_reason=shared_research_model_gate.acquire()
   if gate_reason:
    outcome=gate_reason;return official,reports
   model_acquired=True
@@ -2492,7 +2496,7 @@ def episode_source_provider(payload):
    log('episode source discovery deferred '+outcome)
    return official,reports
  finally:
-  if model_acquired:episode_model_gate.release(model_diag)
+  if model_acquired:shared_research_model_gate.release(model_diag)
   # Only fixed-schema numeric and boolean telemetry; no prompts, URLs,
   # transcript, response text, channel identity or arbitrary exception strings.
   if not isinstance(model_diag,dict):model_diag={}
@@ -2506,7 +2510,7 @@ def episode_source_provider(payload):
           'directBackoff':direct_diag.get('backoff') is True,'directLeads':direct_counts,
           'directResultLinks':count(direct_diag,'resultLinks'),'directEmptyResultPages':count(direct_diag,'emptyResultPages'),
           'directApprovedResultPages':count(direct_diag,'approvedResultPages'),
-          'generalResearchInFlight':general_in_flight,'modelGate':episode_model_gate.snapshot(),
+          'generalResearchInFlight':general_in_flight,'modelGate':shared_research_model_gate.snapshot(),
           'completedSearches':count(model_diag,'completedSearches'),'failedSearches':count(model_diag,'failedSearches'),
           'searchFailureCategories':{k:count(model_diag['searchFailureCategories'],k)
               for k in opencode_discovery.EPISODE_SEARCH_FAILURE_CATEGORIES

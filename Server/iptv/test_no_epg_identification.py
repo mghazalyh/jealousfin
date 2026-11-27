@@ -381,7 +381,7 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
 
     def test_general_worker_defers_without_consuming_budget_when_model_busy(self):
         ctx=self.g
-        gate=ctx.episode_model_gate
+        gate=ctx.shared_research_model_gate
         self.assertEqual(gate.acquire(),"")
         stop=SimpleNamespace(wait=unittest.mock.Mock(side_effect=[False,True]))
         before=dict(ctx.discovery.records)
@@ -404,6 +404,32 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
                 self.assertFalse(ctx.discovery.in_flight)
         finally:
             gate.release()
+
+    def test_cached_recheck_uses_pages_not_model_during_backoff(self):
+        ctx=self.g
+        gate=ctx.shared_research_model_gate
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"searchFailureCategories":{"rate-limit":1}})
+        cid=fixtures.CHANNEL
+        candidate=ctx.opencode_discovery.normalize_result({"title":"Known show","region":"us","sources":[]})
+        ctx.discovery.records[cid]={"at":time.time(),"outcome":"unverified","candidate":candidate}
+        calls=list(ctx.discovery.calls)
+        stop=SimpleNamespace(wait=unittest.mock.Mock(side_effect=[False,True]))
+        with patch.dict(ctx.gateway_config,{"metadataResearchEnabled":True}), \
+             patch.object(ctx,"reload_gateway_config"), \
+             patch.object(ctx,"programme_observed_at",time.time()), \
+             patch.object(ctx,"programme_snapshot",return_value={}), \
+             patch.object(ctx.opencode_discovery,"available",return_value=True), \
+             patch.object(ctx.discovery,"choose_recheck",return_value=cid), \
+             patch.object(ctx.research_coordinator,"choose_active",return_value=None), \
+             patch.object(ctx.opencode_discovery,"run_model_detailed") as model, \
+             patch.object(ctx.opencode_discovery,"verify_candidate_detailed",return_value=(None,{})) as verify:
+            ctx.discovery_worker(stop)
+            verify.assert_called_once()
+            model.assert_not_called()
+        self.assertEqual(ctx.discovery.calls,calls)
+        self.assertFalse(ctx.discovery.in_flight)
+        self.assertGreater(gate.snapshot()["backoffSeconds"],0)
 
     def test_general_model_failures_classified_for_shared_backoff(self):
         data=json.dumps({"type":"tool_use","part":{"tool":"websearch","state":{"status":"error","error":"HTTP 429"}}}).encode()
