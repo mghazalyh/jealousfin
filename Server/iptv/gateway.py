@@ -119,6 +119,7 @@ def _overlay_pump_retire(token):
 episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
 episode_provider_diagnostics={}
 episode_provider_diagnostics_lock=threading.Lock()
+episode_model_gate=opencode_discovery.EpisodeModelGate()
 device_rotation_cache=None
 device_rotation_checked=0.0
 language_visit_ledger=None
@@ -2442,6 +2443,8 @@ def episode_source_provider(payload):
  direct_counts={'official':0,'reports':0}
  model_counts={'official':0,'reports':0}
  outcome='direct-error'
+ model_acquired=False
+ general_in_flight=bool(discovery.in_flight)
  try:
   direct=opencode_discovery.public_episode_search(payload,validate,diagnostics=direct_diag)
   if direct_diag.get('queries') or direct_diag.get('backoff'):
@@ -2455,6 +2458,10 @@ def episode_source_provider(payload):
    outcome='direct-sufficient';return official,reports
   if not opencode_discovery.available():
    outcome='provider-unavailable';return official,reports
+  gate_reason=episode_model_gate.acquire()
+  if gate_reason:
+   outcome=gate_reason;return official,reports
+  model_acquired=True
   try:
    timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
    prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
@@ -2473,6 +2480,7 @@ def episode_source_provider(payload):
    log('episode source discovery deferred '+outcome)
    return official,reports
  finally:
+  if model_acquired:episode_model_gate.release(model_diag)
   # Only fixed-schema numeric and boolean telemetry; no prompts, URLs,
   # transcript, response text, channel identity or arbitrary exception strings.
   if not isinstance(model_diag,dict):model_diag={}
@@ -2484,6 +2492,9 @@ def episode_source_provider(payload):
   record={'outcome':outcome,'seconds':round(elapsed,3),
           'directQueries':count(direct_diag,'queries'),'directResponses':count(direct_diag,'responses'),
           'directBackoff':direct_diag.get('backoff') is True,'directLeads':direct_counts,
+          'directResultLinks':count(direct_diag,'resultLinks'),'directEmptyResultPages':count(direct_diag,'emptyResultPages'),
+          'directApprovedResultPages':count(direct_diag,'approvedResultPages'),
+          'generalResearchInFlight':general_in_flight,'modelGate':episode_model_gate.snapshot(),
           'completedSearches':count(model_diag,'completedSearches'),'failedSearches':count(model_diag,'failedSearches'),
           'searchFailureCategories':{k:count(model_diag['searchFailureCategories'],k)
               for k in opencode_discovery.EPISODE_SEARCH_FAILURE_CATEGORIES

@@ -130,6 +130,56 @@ class PublicSearchTests(unittest.TestCase):
         self.assertLessEqual(len(normalized),audio.MAX_CLUES)
         self.assertEqual(audio.normalize_clues(normalized),normalized)
 
+    def test_unknown_direct_fallback_uses_different_clue_groups(self):
+        context={"seriesTitle":"","channelName":"Example","clues":["alex palou","marcus ericsson","indianapolis speedway","championship competition"]}
+        queries=discovery.episode_direct_search_queries(context)
+        self.assertEqual(len(queries),2)
+        self.assertIn("alex palou",queries[0])
+        self.assertIn("marcus ericsson",queries[0])
+        self.assertIn("indianapolis speedway",queries[1])
+        self.assertIn("championship competition",queries[1])
+        self.assertNotIn("alex palou",queries[1])
+        known=dict(context,seriesTitle="Known")
+        self.assertEqual(discovery.episode_direct_search_queries(known),discovery.episode_search_queries(known))
+
+    def test_model_gate_rejects_concurrent_calls_and_backs_off(self):
+        now=[100.0]
+        gate=discovery.EpisodeModelGate(lambda:now[0])
+        self.assertEqual(gate.acquire(),"")
+        self.assertEqual(gate.acquire(),"provider-busy")
+        gate.release({"searchFailureCategories":{"rate-limit":1}})
+        self.assertEqual(gate.acquire(),"provider-rate-limit-backoff")
+        self.assertEqual(gate.snapshot()["backoffSeconds"],120)
+        now[0]+=120
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"searchFailureCategories":{"rate-limit":1}})
+        self.assertEqual(gate.snapshot()["backoffSeconds"],240)
+        now[0]+=240
+        self.assertEqual(gate.acquire(),"")
+        gate.release({"completedSearches":1})
+        self.assertEqual(gate.snapshot()["consecutiveRateLimits"],0)
+        self.assertEqual(gate.acquire(),"")
+        gate.release()
+
+    def test_successful_http_challenge_stops_search(self):
+        calls=[];diag={}
+        def fetch(q):
+            calls.append(q)
+            return b'<form id="challenge-form" action="/anomaly.js"></form>'
+        result=discovery.public_episode_search(self.context,lambda x:x,fetch_page=fetch,diagnostics=diag)
+        self.assertEqual(result,{"official":[],"reports":[]})
+        self.assertEqual(len(calls),1)
+        self.assertEqual(diag["faults"],{"http-202":1})
+
+    def test_raw_result_count_distinguishes_unapproved_from_empty(self):
+        pages=iter([b'<a class="result-link" href="https://example.com/article">result</a>',b'<html></html>'])
+        diag={}
+        discovery.public_episode_search(self.context,lambda x:x,fetch_page=lambda q:next(pages),diagnostics=diag)
+        self.assertEqual(diag["resultLinks"],1)
+        self.assertEqual(diag["emptyResultPages"],1)
+        self.assertEqual(diag["approvedResultPages"],0)
+        self.assertNotIn("example.com",str(diag))
+
     def test_access_restriction_stops_second_query(self):
         calls=[];diag={}
         def fetch(q):
@@ -315,6 +365,19 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
             self.assertEqual(model.call_args.args[2],audio.UNKNOWN_PROVIDER_SECONDS)
             self.g.episode_source_provider(dict(ctx,seriesTitle="WWE NXT"))
             self.assertEqual(model.call_args.args[2],8)
+
+    def test_rate_limited_model_does_not_block_direct_leads(self):
+        ctx={"seriesTitle":"","clues":list(fixtures.nxt_request().clues)}
+        with patch.dict(self.g.gateway_config,{"episodeAudioEnabled":True}), \
+             patch.object(self.g.opencode_discovery,"public_episode_search",return_value={"official":[],"reports":[fixtures.REPORT_URL]}), \
+             patch.object(self.g.opencode_discovery,"available",return_value=True), \
+             patch.object(self.g.opencode_discovery,"run_model_detailed",side_effect=discovery.ResearchError("rate limit",{"searchFailureCategories":{"rate-limit":1}})) as model:
+            self.assertEqual(self.g.episode_source_provider(ctx),([],[fixtures.REPORT_URL]))
+            self.assertEqual(self.g.episode_source_provider(ctx),([],[fixtures.REPORT_URL]))
+            self.assertEqual(model.call_count,1)
+            diag=self.g.episode_provider_diagnostics["unknown"]["last"]
+            self.assertEqual(diag["outcome"],"provider-rate-limit-backoff")
+            self.assertGreater(diag["modelGate"]["backoffSeconds"],0)
 
     def test_unknown_provider_diagnostics_are_separate_and_sanitized(self):
         ctx={"seriesTitle":"","clues":list(fixtures.nxt_request().clues)}

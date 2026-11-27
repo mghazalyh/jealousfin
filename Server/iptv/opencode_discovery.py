@@ -393,6 +393,71 @@ def episode_search_queries(context):
     broad = " ".join(chosen)
     return tuple(dict.fromkeys(q for q in (clue_query + (" " + hint if hint else ""), broad) if q))
 
+def episode_direct_search_queries(context):
+    """Use a different independent clue pair for an unknown-title fallback."""
+    queries = episode_search_queries(context)
+    if len(queries) < 2 or context.get("seriesTitle"):
+        return queries
+    groups, used = [], set()
+    for clue in episode_audio.normalize_clues(context.get("clues")):
+        words = set(clue.split())
+        if words and not words.intersection(used):
+            groups.append(clue)
+            used.update(words)
+        if len(groups) >= 4:
+            break
+    if len(groups) >= 4:
+        second = " ".join(groups[2:4])
+    elif len(groups) == 3:
+        second = " ".join((groups[0], groups[2]))
+    else:
+        return queries
+    return tuple(dict.fromkeys((queries[0], second)))
+
+
+class EpisodeModelGate:
+    """Nonblocking episode-model lease with rate-limit cooldown.
+
+    Direct public search remains available during model backoff. The gate
+    never delays playback or waits for another research request.
+    """
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.running = False
+        self.until = 0.0
+        self.rate_limits = 0
+
+    def acquire(self):
+        with self.lock:
+            if self.clock() < self.until:
+                return "provider-rate-limit-backoff"
+            if self.running:
+                return "provider-busy"
+            self.running = True
+            return ""
+
+    def release(self, diagnostics=None):
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        failures = diagnostics.get("searchFailureCategories")
+        with self.lock:
+            if not self.running:
+                return
+            if isinstance(failures, dict) and failures.get("rate-limit", 0):
+                self.rate_limits = min(self.rate_limits + 1, 4)
+                self.until = self.clock() + min(900, 120 * 2 ** (self.rate_limits - 1))
+            elif diagnostics.get("completedSearches", 0):
+                self.rate_limits = 0
+                self.until = 0.0
+            self.running = False
+
+    def snapshot(self):
+        with self.lock:
+            return {"inFlight": self.running,
+                    "backoffSeconds": round(max(0.0, self.until - self.clock()), 3),
+                    "consecutiveRateLimits": self.rate_limits}
+
+
 def fetch_episode_search(query, validate):
     # A fixed public HTTPS endpoint with no credentials, cookies or redirects.
     class RejectRedirect(urllib.request.HTTPRedirectHandler):
@@ -409,10 +474,10 @@ def fetch_episode_search(query, validate):
 
 def public_episode_search(context, validate, fetch_page=None, diagnostics=None):
     global _EPISODE_SEARCH_BACKOFF
-    queries = episode_search_queries(context)
+    queries = episode_direct_search_queries(context)
     result = {"official": [], "reports": []}
     diag = diagnostics if isinstance(diagnostics, dict) else {}
-    diag.update(queries=0, responses=0, faults={}, backoff=False)
+    diag.update(queries=0, responses=0, faults={}, backoff=False, resultLinks=0, emptyResultPages=0, approvedResultPages=0)
     if not queries:
         return result
     with _EPISODE_SEARCH_LOCK:
@@ -425,8 +490,21 @@ def public_episode_search(context, validate, fetch_page=None, diagnostics=None):
     for q in queries[:2]:
         diag["queries"] += 1
         try:
-            leads = parse_episode_search_page(fetch(q))
+            page = fetch(q)
             diag["responses"] += 1
+            if isinstance(page, bytes) and len(page) <= EPISODE_SEARCH_LIMIT:
+                text = page.decode("utf-8", errors="replace")
+                # Recognize explicit challenge form markers even on HTTP 200.
+                if re.search(r'<form\b[^>]*(?:id=["\'](?:challenge-form|anomaly-modal)["\']|action=["\'][^"\']*anomaly\.js)', text, re.I):
+                    raise urllib.error.HTTPError("https://" + EPISODE_SEARCH_HOST, 202, "Search challenge", None, None)
+                parser = _EpisodeSearchLinks()
+                parser.feed(text)
+                diag["resultLinks"] += len(parser.links)
+                if not parser.links:
+                    diag["emptyResultPages"] += 1
+            leads = parse_episode_search_page(page)
+            if any(leads.values()):
+                diag["approvedResultPages"] += 1
         except Exception as error:
             reason = ("http-" + str(error.code) if isinstance(error, urllib.error.HTTPError)
                       else type(error).__name__)
