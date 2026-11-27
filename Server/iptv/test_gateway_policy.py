@@ -196,6 +196,27 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(projected[0]['Tags'],['Sports'])
         with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':[sid,sid]})
         with self.assertRaises(ValueError):g.validate_gateway_config({'expandedManifest':manifest,'expandedTrialProviderIds':['nltv:my:Other.my']})
+    def test_canada_independent_catalogue_and_origin(self):
+        g=self.g
+        sid='nltv:ca:Fixture.ca'
+        manifest='https://ptv3-livetv-addon.pages.dev/fixture/manifest.json'
+        cfg=g.validate_gateway_config({'canadaManifest':manifest,'canadaTrialProviderIds':[sid]})
+        g.gateway_config=cfg
+        row={'name':'Canada Fixture','genres':['Movies']}
+        g.sources[self.c]=sid
+        with patch.object(g,'catalogue',return_value={sid:row}):
+            self.assertEqual(g.canada_catalogue(cfg,True),{sid:row})
+        with patch.object(g,'catalogue',side_effect=TimeoutError):
+            self.assertEqual(g.canada_catalogue(cfg,True),{sid:row})
+            self.assertEqual(g.canada_catalogue(cfg),{})
+        with patch.object(g,'provider_json',return_value={'streams':[{'url':'https://example.com/new.m3u8'}]}) as provider,patch.object(g,'validate',side_effect=lambda url,**kwargs:url):
+            self.assertEqual(g.resolve(self.c),'https://example.com/new.m3u8')
+            provider.assert_called_once_with('/stream/tv/nltv:ca:Fixture.ca.json',manifest.rsplit('/',1)[0])
+        self.assertIn(('canada',manifest.rsplit('/',1)[0],0),g.page_plan(cfg))
+        with self.assertRaises(ValueError):g.validate_gateway_config({'canadaManifest':manifest,'canadaTrialProviderIds':[sid,sid]})
+        with self.assertRaises(ValueError):g.validate_gateway_config({'canadaManifest':manifest,'canadaTrialProviderIds':['nltv:us:Other.us']})
+        self.assertIn(sid,g.trial_cohort(cfg))
+
     def test_exact_media_endpoint_and_local_deferral(self):
         g=self.g
         g.gateway_config=g.validate_gateway_config({'mediaEndpointAllowlist':{'fixture.example':[8000]}})

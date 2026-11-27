@@ -50,7 +50,7 @@ CONFIG_DEFAULTS={'schemaVersion':1,'revision':'native-baseline','upstreamTimeout
                  'metadataResearchDailyBudget':None,'metadataResearchTimeoutSeconds':180,'metadataResearchVariant':opencode_discovery.DEFAULT_VARIANT,
                  'episodeAudioEnabled':False,
                  'ukManifest':None,'ukTrialProviderIds':[],'ukTrialEnabled':False,
-                 'expandedManifest':None,'expandedTrialProviderIds':[],'expandedCataloguePageCount':6,'mediaEndpointAllowlist':{}}
+                 'expandedManifest':None,'expandedTrialProviderIds':[],'expandedCataloguePageCount':6,'canadaManifest':None,'canadaTrialProviderIds':[],'canadaCataloguePageCount':1,'mediaEndpointAllowlist':{}}
 gateway_config=dict(CONFIG_DEFAULTS)
 config_fingerprint=None
 config_checked_at=0.0
@@ -138,6 +138,11 @@ def validate_gateway_config(raw):
  if extra is not None and (not isinstance(extra,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',extra)):raise ValueError('Invalid expanded manifest')
  if type(result['expandedCataloguePageCount']) is not int or not 1<=result['expandedCataloguePageCount']<=100:raise ValueError('Invalid expanded page count')
  if (extra is None)!=(not extra_ids) or (SOURCE_PROFILE!='american' and (extra or extra_ids)):raise ValueError('Invalid expanded trial configuration')
+ ca=result['canadaManifest'];ca_ids=result['canadaTrialProviderIds']
+ if not isinstance(ca_ids,list) or len(ca_ids)>1000 or any(not isinstance(i,str) or not re.fullmatch(r'nltv:ca:[A-Za-z0-9_.-]{1,160}',i) for i in ca_ids) or len(ca_ids)!=len(set(ca_ids)):raise ValueError('Invalid Canada trial identities')
+ if ca is not None and (not isinstance(ca,str) or not re.fullmatch(r'https://ptv3-livetv-addon\.pages\.dev/[A-Za-z0-9_-]{1,4096}/manifest\.json',ca)):raise ValueError('Invalid Canada manifest')
+ if (ca is None)!=(not ca_ids) or (SOURCE_PROFILE!='american' and (ca or ca_ids)):raise ValueError('Invalid Canada trial configuration')
+ if type(result['canadaCataloguePageCount']) is not int or not 1<=result['canadaCataloguePageCount']<=100:raise ValueError('Invalid Canada page count')
  endpoints=result['mediaEndpointAllowlist']
  if not isinstance(endpoints,dict) or len(endpoints)>256:raise ValueError('Invalid media endpoint allowlist')
  for host,ports in endpoints.items():
@@ -463,7 +468,7 @@ primary_source_ids=set()
 def expanded_cohort(config):
  return set(config['expandedTrialProviderIds'])
 def trial_cohort(config):
- return uk_cohort(config)|expanded_cohort(config)
+ return uk_cohort(config)|expanded_cohort(config)|canada_cohort(config)
 def expanded_base(config):
  url=config['expandedManifest']
  return url[:-len('/manifest.json')] if url else None
@@ -488,6 +493,36 @@ def expanded_catalogue(config,cache_fallback=False):
    if isinstance(raw,dict) and set(raw)==ids and all(isinstance(v,dict) and isinstance(v.get('name'),str) for v in raw.values()):
     expanded_manifest_status=dict(expanded_manifest_status,matched=len(raw),catalogueSource='cached')
     return raw
+  return {}
+canada_manifest_status={'observedAt':None,'channels':0,'matched':0,'fault':None}
+def canada_cohort(config):
+ return set(config.get('canadaTrialProviderIds',[]))
+def canada_base(config):
+ url=config.get('canadaManifest')
+ return url[:-len('/manifest.json')] if url else None
+def canada_catalogue(config,cache_fallback=False):
+ global canada_manifest_status
+ base=canada_base(config)
+ if base is None:return {}
+ ids=canada_cohort(config)
+ cache=ROOT/'canada-catalogue-metadata.json'
+ try:
+  raw=catalogue(base,1)
+  selected={sid:row for sid,row in raw.items() if sid in ids}
+  if set(selected)!=ids:raise ValueError('Incomplete Canada trial catalogue')
+  if cache_fallback:atomic_json(cache,{sid:{'name':row['name'],'genres':row.get('genres',[])} for sid,row in selected.items()})
+  canada_manifest_status={'observedAt':time.time(),'channels':len(raw),'matched':len(selected),'fault':None}
+  return selected
+ except Exception as error:
+  canada_manifest_status=dict(canada_manifest_status,fault=type(error).__name__)
+  log('Canada manifest refresh failed '+type(error).__name__)
+  if cache_fallback and cache.exists():
+   try:
+    raw=json.loads(cache.read_text())
+    if isinstance(raw,dict) and set(raw)==ids and all(isinstance(v,dict) and isinstance(v.get('name'),str) for v in raw.values()):
+     canada_manifest_status=dict(canada_manifest_status,matched=len(raw),catalogueSource='cached')
+     return raw
+   except (OSError,ValueError,TypeError):pass
   return {}
 def uk_trial_projection(items,config):
  # Sports is a temporary native rotation alias; never change stored genres or IDs.
@@ -1261,7 +1296,7 @@ def parse_programme(row):
   if not release_title or not end_clock or not next_title or next_clock!=end_clock:return None
  return {'title':current,'nextTitle':next_title,'providerEndClock':end_clock,'providerNextClock':next_clock}
 
-def update_programmes(raw,observed=None,expanded=None):
+def update_programmes(raw,observed=None,expanded=None,canada=None):
  global programme_rows,programme_observed_at,programme_fault
  now=time.time() if observed is None else observed
  # Metadata refresh is independent from catalogue identity, policy and playback.
@@ -1276,6 +1311,11 @@ def update_programmes(raw,observed=None,expanded=None):
  for source_id,row in (expanded_catalogue(gateway_config) if expanded is None else expanded).items():
   cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
   if sources.get(cid)==source_id and source_id not in primary_source_ids:
+   parsed=parse_programme(row)
+   if parsed:valid[cid]=parsed
+ for source_id,row in (canada_catalogue(gateway_config) if canada is None else canada).items():
+  cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
+  if sources.get(cid)==source_id:
    parsed=parse_programme(row)
    if parsed:valid[cid]=parsed
  # A UK provider fault cannot erase the original provider's metadata.
@@ -1411,7 +1451,7 @@ def programme_snapshot(now=None):
   if gateway_config['metadataResearchEnabled']:
    for cid,row in discovery.snapshot(now).items():result.setdefault(cid,row)
   provider_rows={cid:(programme_observed_at,row) for cid,row in programme_rows.items() if cid not in paged_seen and 0<=now-programme_observed_at<=PROGRAMME_MAX_AGE}
-  for origin in ('primary','expanded','uk'):
+  for origin in ('primary','expanded','uk','canada'):
    newest={}
    for (owner,page),(at,rows) in paged_programmes.items():
     if owner!=origin or not 0<=now-at<=PROGRAMME_MAX_AGE:continue
@@ -1493,7 +1533,8 @@ def programme_retry_delay(error,failures,now=None):
 def page_plan(config):
  return [('primary',None,p) for p in range(max(1,(len(primary_source_ids)+99)//100))]+[
   ('expanded',expanded_base(config),p) for p in range(config['expandedCataloguePageCount'])]+(
-  [('uk',uk_base(config),0)] if uk_base(config) else [])
+  [('uk',uk_base(config),0)] if uk_base(config) else [])+(
+  [('canada',canada_base(config),p) for p in range(config.get('canadaCataloguePageCount',1))] if canada_base(config) else [])
 
 def refresh_programme_page(origin,base,page,now=None):
  global paged_last_success,paged_origin_block_until
@@ -1506,7 +1547,7 @@ def refresh_programme_page(origin,base,page,now=None):
   rows=response.get('metas') if isinstance(response,dict) else None
   if not isinstance(rows,list) or not rows or len(rows)>100:raise ValueError('Invalid programme page')
   config=gateway_config
-  allowed=primary_source_ids if origin=='primary' else expanded_cohort(config)-primary_source_ids if origin=='expanded' else uk_cohort(config)
+  allowed=primary_source_ids if origin=='primary' else expanded_cohort(config)-primary_source_ids if origin=='expanded' else canada_cohort(config) if origin=='canada' else uk_cohort(config)
   parsed={}
   for row in rows:
    if not isinstance(row,dict) or row.get('id') not in allowed:continue
@@ -1535,16 +1576,17 @@ def refresh_programme_page(origin,base,page,now=None):
   return False
 
 def paged_refresh_status(now=None):
- global expanded_manifest_status,uk_manifest_status,programme_fault,programme_refresh_failures,programme_next_attempt
+ global expanded_manifest_status,uk_manifest_status,canada_manifest_status,programme_fault,programme_refresh_failures,programme_next_attempt
  now=time.time() if now is None else now
  with lock:
-  for origin,status in (('expanded',expanded_manifest_status),('uk',uk_manifest_status)):
+  for origin,status in (('expanded',expanded_manifest_status),('uk',uk_manifest_status),('canada',canada_manifest_status)):
    pages=[(key,at,rows) for key,(at,rows) in paged_programmes.items() if key[0]==origin]
    faults={str(k[1]*100):v for k,v in paged_faults.items() if k[0]==origin}
    fresh=[(key,at,rows) for key,at,rows in pages if 0<=now-at<=PROGRAMME_MAX_AGE]
    updated=dict(status,pageFaults=faults,freshPages=len(fresh),freshChannels=len(set().union(*(set(r) for _,_,r in fresh))),fault=next(iter(faults.values()),None) if pages or faults else status.get('fault'))
    if pages:updated['observedAt']=max(at for _,at,_ in pages)
    if origin=='expanded':expanded_manifest_status=updated
+   elif origin=='canada':canada_manifest_status=updated
    else:uk_manifest_status=updated
   primary_faults=[v for k,v in paged_faults.items() if k[0]=='primary']
   programme_fault=primary_faults[0] if primary_faults else None
@@ -1569,7 +1611,7 @@ def paged_programme_worker(stop):
 
 def programme_worker(stop):
  global programme_fault,programme_refresh_failures,programme_last_attempt,programme_next_attempt
- if expanded_base(gateway_config):return paged_programme_worker(stop)
+ if expanded_base(gateway_config) or canada_base(gateway_config):return paged_programme_worker(stop)
  delay=PROGRAMME_REFRESH
  failures=0
  while True:
@@ -1611,15 +1653,17 @@ def initialize_catalogue():
   log('catalogue fallback '+catalogue_fault)
  primary_source_ids.clear();primary_source_ids.update(raw)
  expanded=expanded_catalogue(gateway_config,cache_fallback=True)
+ canada=canada_catalogue(gateway_config,cache_fallback=True)
  raw=dict(raw)
  for sid,row in expanded.items():raw.setdefault(sid,row)
+ for sid,row in canada.items():raw.setdefault(sid,row)
  for i,(source_id,row) in enumerate(raw.items(),1):
   cid=source_profiles.channel_id(SOURCE_PROFILE,source_id)
   genres=row.get('genres',[])
   if not isinstance(genres,list):genres=[]
   channels[cid]={'Id':cid,'Name':row['name'],'ChannelNumber':str(i),'Type':'TvChannel','Genres':[v for v in genres if isinstance(v,str)],'Tags':[],'UserData':{'IsFavorite':False}}
   sources[cid]=source_id
- if fresh is not None:update_programmes(fresh,expanded=expanded)
+ if fresh is not None:update_programmes(fresh,expanded=expanded,canada=canada)
  # A pre-existing initialized database may acquire new channels. Preserve every
  # prior penalty and insert only newly discovered IDs; the observer handles initial migration.
  with closing(policy_connect(ROOT/'policy.sqlite3')) as db, db:
@@ -1637,7 +1681,9 @@ def resolve(cid):
  config=gateway_config
  path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
  bases=[None]
- if source_id in expanded_cohort(config) and expanded_base(config):
+ if source_id in canada_cohort(config) and canada_base(config):
+  bases=[canada_base(config)]
+ elif source_id in expanded_cohort(config) and expanded_base(config):
   bases=[expanded_base(config)] if source_id not in primary_source_ids or config['ukTrialEnabled'] else [expanded_base(config),None]
  elif source_id in uk_cohort(config) and uk_base(config):
   bases=[uk_base(config)] if config['ukTrialEnabled'] else [uk_base(config),None]
