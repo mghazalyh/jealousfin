@@ -1484,6 +1484,7 @@ def merge_episode_publication(result,now=None):
  now=time.time() if now is None else now
  for cid,audio in episode_publisher.snapshot(now).items():
   row=result.get(cid)
+  if audio.get("contentKind") in episode_audio.TYPED_CONTENT_KINDS and isinstance(row,dict):continue
   series=audio.get("audioSeriesTitle")
   session=audio.get("audioPlaybackSessionHash")
   if session:
@@ -1491,7 +1492,7 @@ def merge_episode_publication(result,now=None):
    if view is None or view.session_hash!=session:continue
   if not isinstance(row,dict):
    if not session or not series:continue
-   row={"title":series,"source":"local-audio-identity","observedAt":audio["episodeObservedAt"]}
+   row={"title":series,"source":"local-audio-identity","observedAt":audio.get("contentObservedAt",audio.get("episodeObservedAt"))}
   if episode_audio.programme_has_stronger_episode_metadata(row):continue
   if series and episode_audio.source_key(row.get("title"))!=episode_audio.source_key(series):continue
   merged=dict(row);merged.update({k:v for k,v in audio.items() if k not in ("audioSeriesTitle","audioPlaybackSessionHash")});result[cid]=merged
@@ -1537,10 +1538,14 @@ def programme_item(cid,row):
  # The provider supplies a title and an unzoned end clock, not a reliable
  # UTC schedule. Keep the standard programme dates absent and expose evidence.
  title=row['title']
- year=cached_year(row)
+ typed=row.get('source')=='local-audio-identity' and row.get('contentSource')=='local-audio-programme-identity' and row.get('contentKind') in episode_audio.TYPED_CONTENT_KINDS
+ year=release_year(row.get('contentReleaseYear')) if typed else cached_year(row)
  display=title if not year or title_year(title)[1] else title+' ('+str(year)+')'
+ if typed and row.get('contentKind')=='sports-event':
+  date=episode_audio._pretty_date(row.get('contentEventDate'))
+  if date:display=title+' — '+date
  evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber')}
- episode=programme_text(row.get('episodeTitle'))
+ episode=None if typed else programme_text(row.get('episodeTitle'))
  if episode:
   prefix='' if guide_norm(channels.get(cid,{}).get('Name',''))==guide_norm(title_year(title)[0]) else title_year(title)[0]+' — '
   season=row.get('seasonNumber');number=row.get('episodeNumber')
@@ -1549,6 +1554,7 @@ def programme_item(cid,row):
   display=prefix+code+episode+(f' ({season_year})' if season_year else '')
  if year:evidence['year']=year
  identity=title if not episode else title+'\0'+episode+'\0'+str(row.get('start',''))
+ if typed:identity=title+'\0'+str(row.get('contentKind'))+'\0'+str(row.get('contentReleaseYear',''))+'\0'+str(row.get('contentEventDate',''))
  item={'Id':hashlib.sha256((cid+'\0'+identity).encode()).hexdigest()[:32],
        'Name':display,'ChannelId':cid,'Type':'Program',
        'JealousfinProgramme':evidence}
@@ -2402,7 +2408,7 @@ episode_publisher=episode_audio.PublicationStore()
 EPISODE_SOURCE_FILE=ROOT/'episode-sources.json'
 EPISODE_SOURCE_LIMIT=65536
 EPISODE_SOURCE_PAGES=8
-EPISODE_SOURCE_HOSTS=episode_audio.OFFICIAL_ARCHIVE_HOSTS|episode_audio.INDEPENDENT_REPORT_HOSTS
+EPISODE_SOURCE_HOSTS=episode_audio.TYPED_OFFICIAL_HOSTS|episode_audio.TYPED_REPORT_HOSTS
 def load_episode_sources():
  # Private, reviewed registry only. Unknown fields, hosts or oversized files
  # are ignored so an unsafe registry can never widen the source allowlist.
@@ -2482,10 +2488,10 @@ def episode_source_provider(payload):
    timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
    prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
    raw,model_diag=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'],episode_leads=unknown)
-   result=opencode_discovery.normalize_episode_sources(raw)
+   result=opencode_discovery.normalize_episode_sources(raw,include_typed=unknown)
    model_counts={key:len(result[key]) for key in ('official','reports')}
    log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
-   combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
+   combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']},include_typed=unknown)
    official,reports=combined['official'],combined['reports']
    outcome='provider-leads' if official or reports else 'no-approved-search-leads'
    return official,reports
@@ -2539,7 +2545,7 @@ def episode_source_prefetch_worker(stop):
    with lock:active=[cid for cid,until in active_channels.items() if until>now]
    for cid in active[:4]:
     context=current_programme_context(cid)
-    if not context or not context.get('seriesTitle') or episode_audio.programme_has_episode_identity(context):continue
+    if not context or not context.get('seriesTitle') or episode_audio.programme_has_resolved_identity(context):continue
     observer.prefetch(context)
   except Exception as error:
    log('episode source prefetch '+type(error).__name__)
@@ -2557,7 +2563,7 @@ def episode_active_view(channel_id):
  except (sqlite3.Error,OSError,RuntimeError,ValueError):row={}
  return {'channel_id':channel_id,'session_hash':view.session_hash,
          'active_seconds':view.active_seconds,'confirmed_seconds':view.confirmed_seconds,
-         'hasEpisodeIdentity':episode_audio.programme_has_episode_identity(row)}
+         'hasEpisodeIdentity':episode_audio.programme_has_resolved_identity(row)}
 def note_episode_probe(reason=None,detail=None):
  # Short, bounded diagnostics for every early return. No audio, transcript,
  # media URL or credential is retained.

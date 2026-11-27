@@ -45,6 +45,7 @@ import time
 import urllib.error
 import urllib.parse
 from collections import OrderedDict
+from html.parser import HTMLParser
 
 REVISION = "episode-audio-evidence-20261127-v3"
 DEFAULT_ENABLED = False
@@ -83,6 +84,7 @@ NO_MATCH_REASONS = frozenset({
     "missing-official-archive", "no-independent-report", "insufficient-clue-match",
     "missing-official-air-date-match", "no-corroboration", "no-match",
     "series-mismatch", "conflicting-air-date", "ambiguous-episode",
+    "ambiguous-content", "no-typed-corroboration",
 })
 RETRYABLE_REASONS = COMMERCIAL_REASONS | NO_MATCH_REASONS
 
@@ -181,6 +183,14 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
     "theguardian.com", "www.theguardian.com", "radiotimes.com", "www.radiotimes.com",
     "digitalspy.com", "www.digitalspy.com",
 })
+
+# Typed content is a distinct evidence lane. Existing approved broadcaster
+# and editorial domains may be evaluated; additional domains require reviewed
+# source profiles. Never interpret a movie/event as an episode.
+TYPED_CONTENT_KINDS = frozenset({"series", "movie", "sports-event", "other-programme"})
+TYPED_OFFICIAL_HOSTS = OFFICIAL_ARCHIVE_HOSTS | frozenset({"amblin.com", "www.amblin.com", "indycar.com", "www.indycar.com"})
+TYPED_REPORT_HOSTS = INDEPENDENT_REPORT_HOSTS | frozenset({"screamhorrormag.com", "www.screamhorrormag.com", "theapex.racing", "www.theapex.racing", "racingnews.co", "www.racingnews.co"})
+
 
 # Reviewed, non-date-specific official archive roots. A known series can be
 # tried as a direct dated archive URL (``<root>/YYYY-MM-DD``) and as an index
@@ -888,6 +898,41 @@ class IndependentReport:
 
 
 @dataclasses.dataclass(frozen=True)
+class TypedProgrammeEvidence:
+    """A scoped public work/event identity; no episode numbering or air date."""
+    content_kind: str
+    title: str
+    source_url: str
+    terms: tuple
+    release_year: int | None = None
+    event_date: str = ""
+    published_at: str = ""
+
+    def checked(self, official):
+        if self.content_kind not in TYPED_CONTENT_KINDS:
+            return False
+        if not isinstance(self.title, str) or not 1 <= len(self.title.strip()) <= 200:
+            return False
+        if self.title != " ".join(self.title.split()):
+            return False
+        if not safe_source_url(self.source_url, TYPED_OFFICIAL_HOSTS if official else TYPED_REPORT_HOSTS, allow_query=True):
+            return False
+        if not isinstance(self.terms, tuple) or len(self.terms) > MAX_CLUES:
+            return False
+        if any(not isinstance(t, str) or not t or len(t) > 120 for t in self.terms):
+            return False
+        if self.content_kind == "sports-event":
+            if self.release_year is not None or _date(self.event_date) != self.event_date or not self.event_date:
+                return False
+        elif self.event_date or type(self.release_year) is not int or _year(self.release_year) is None:
+            return False
+        return official or bool(_date(self.published_at))
+
+    def key(self):
+        return (self.content_kind, _norm_text(self.title), self.release_year, self.event_date)
+
+
+@dataclasses.dataclass(frozen=True)
 class ContentIdentity:
     series_title: str
     season_number: int | None
@@ -897,8 +942,18 @@ class ContentIdentity:
     broadcaster_code: str
     episode_year: int | None
     series_premiere_year: int | None = None
+    content_kind: str = "episode"
+    release_year: int | None = None
+    event_date: str = ""
 
     def evidence(self):
+        if self.content_kind in TYPED_CONTENT_KINDS:
+            value = {"contentKind": self.content_kind, "contentTitle": self.series_title}
+            if self.release_year is not None:
+                value["contentReleaseYear"] = self.release_year
+            if self.event_date:
+                value["contentEventDate"] = self.event_date
+            return value
         return {"seriesTitle": self.series_title,
                 "seasonNumber": self.season_number,
                 "episodeNumber": self.episode_number,
@@ -918,6 +973,82 @@ class Verification:
     corroborating_sources: int = 0
     numbering_conflict: bool = False
     verification: str = ""
+
+
+def _typed_distinct_matches(clues, terms):
+    # Typed parsers provide only exact, scoped matches, not article prose.
+    wanted = set(normalize_clues(clues))
+    exact = wanted.intersection(terms)
+    groups, used = [], set()
+    for value in sorted(exact, key=lambda t: (-len(t.split()), -len(t), t)):
+        words = set(value.split())
+        if words and not words.intersection(used):
+            groups.append(value)
+            used.update(words)
+    return tuple(groups)
+
+
+def corroborate_typed_programme(clues, official, reports, now=None):
+    """Require one official identity and two independent matching publishers.
+
+    Film/series/special release year and sporting event date are distinct
+    facts. All sources must match the same typed key and share at least two
+    exact disjoint content clues from scoped plot/event evidence. For sport,
+    also require an event-title clue and a third independent clue group.
+    """
+    import datetime as dt
+    now = time.time() if now is None else float(now)
+    today = dt.datetime.fromtimestamp(now, dt.timezone.utc).date().isoformat()
+    candidates = {}
+    official_rows = official if isinstance(official, (tuple, list)) else ()
+    report_rows = reports if isinstance(reports, (tuple, list)) else ()
+    for item in official_rows[:MAX_OFFICIAL_EPISODES]:
+        if not isinstance(item, TypedProgrammeEvidence) or not item.checked(True):
+            continue
+        if (item.event_date and item.event_date > today) or (item.release_year is not None and item.release_year > int(today[:4])):
+            continue
+        official_matches = set(_typed_distinct_matches(clues, item.terms))
+        required = 3 if item.content_kind == "sports-event" else MIN_DISTINCTIVE_CLUES
+        if len(official_matches) < required:
+            continue
+        by_publisher = {}
+        for row in report_rows[:MAX_REPORTS]:
+            if not isinstance(row, TypedProgrammeEvidence) or not row.checked(False) or row.key() != item.key():
+                continue
+            if _date(row.published_at) > today or (item.event_date and _date(row.published_at) < item.event_date):
+                continue
+            publisher = independent_publisher(row.source_url)
+            if not publisher or publisher == independent_publisher(item.source_url):
+                continue
+            matches = set(_typed_distinct_matches(clues, row.terms)) & official_matches
+            if len(matches) < required:
+                continue
+            by_publisher.setdefault(publisher, []).append(matches)
+        groups = list(by_publisher.items())
+        valid = []
+        for i, (publisher_a, matches_a) in enumerate(groups):
+            for publisher_b, matches_b in groups[i+1:]:
+                for aa in matches_a:
+                    for bb in matches_b:
+                        shared = _typed_distinct_matches(clues, aa & bb)
+                        if len(shared) < required:
+                            continue
+                        if item.content_kind == "sports-event":
+                            title_terms = set(_typed_distinct_matches(clues, _clue_candidates(item.title)))
+                            if not title_terms.intersection(shared):
+                                continue
+                        valid.append((len(shared), publisher_a, publisher_b))
+        if not valid:
+            continue
+        count = max(v[0] for v in valid)
+        identity = ContentIdentity(item.title, None, None, "", "", "", None,
+                                   content_kind=item.content_kind, release_year=item.release_year,
+                                   event_date=item.event_date)
+        candidates[item.key()] = Verification(True, "", identity, count * 2, 2, False,
+                                             "official-and-independent-programme")
+    if len(candidates) > 1:
+        return Verification(False, "ambiguous-content")
+    return next(iter(candidates.values()), Verification(False, "no-typed-corroboration"))
 
 
 def _numbering_differs(report, official):
@@ -1057,7 +1188,7 @@ class PromotedEpisode:
     scheduled_airing: dict | None = None
 
     def evidence(self):
-        payload = {"source": "local-audio-episode-identity", "revision": REVISION,
+        payload = {"source": "local-audio-programme-identity" if self.identity.content_kind in TYPED_CONTENT_KINDS else "local-audio-episode-identity", "revision": REVISION,
                    "channelID": self.channel_id, "sampleDigest": self.sample_digest,
                    "sessionDigest": self.binding.digest(),
                    "launchDigest": _digest(self.binding.launch_id),
@@ -1128,7 +1259,10 @@ def verify_episode_content(request, official_episodes, reports, now=None, progra
     now = time.time() if now is None else float(now)
     # Unknown-title discovery needs explicit matching series identities from independent pages.
     unknown_title = isinstance(programme, dict) and not programme.get("seriesTitle")
+    typed = None
     if unknown_title:
+        if isinstance(official_episodes, (list, tuple)) and any(isinstance(r, TypedProgrammeEvidence) for r in official_episodes[:MAX_OFFICIAL_EPISODES]):
+            typed = corroborate_typed_programme(request.clues, official_episodes, reports, now)
         reports = [r for r in (reports or ()) if isinstance(r, IndependentReport) and r.series_title]
     verification = corroborate_episode(request.clues, official_episodes, reports, now=now)
     if unknown_title and verification.accepted:
@@ -1144,12 +1278,20 @@ def verify_episode_content(request, official_episodes, reports, now=None, progra
             publisher = independent_publisher(r.source_url)
             publisher_matches[publisher] = max(matched, publisher_matches.get(publisher, 0))
         if len(publisher_matches) < 2:
-            return Verification(False, "no-independent-report")
-        # Do not inflate counts/confidence using aliases or several articles
-        # from one publisher; retain any numbering conflict from corroboration.
-        verification = dataclasses.replace(verification,
-            corroborating_sources=len(publisher_matches),
-            matched_clue_count=sum(publisher_matches.values()))
+            verification = Verification(False, "no-independent-report")
+        else:
+            # Do not inflate counts/confidence using aliases or several articles
+            # from one publisher; retain any numbering conflict from corroboration.
+            verification = dataclasses.replace(verification,
+                corroborating_sources=len(publisher_matches),
+                matched_clue_count=sum(publisher_matches.values()))
+    if typed is not None:
+        if typed.reason == "ambiguous-content" or (typed.accepted and verification.accepted):
+            return Verification(False, "ambiguous-content")
+        if typed.accepted:
+            verification = typed
+        elif not verification.accepted:
+            return typed
     if not verification.accepted or verification.identity is None:
         return verification
     if not programme_matches(verification.identity, programme):
@@ -1170,7 +1312,7 @@ def promote_episode(request, official_episodes, reports, current, now=None, sche
     if not verification.accepted or verification.identity is None:
         return Promotion(False, verification.reason)
     confidence = min(0.99, 0.5 + 0.1 * verification.matched_clue_count + 0.1 * verification.corroborating_sources)
-    airing = match_scheduled_airing(verification.identity, scheduled_events, now) if scheduled_events else None
+    airing = match_scheduled_airing(verification.identity, scheduled_events, now) if scheduled_events and verification.identity.content_kind == "episode" else None
     episode = PromotedEpisode(request.binding.channel_id, request.sample_digest,
                               request.binding, verification.identity, confidence,
                               verification.matched_clue_count, verification.corroborating_sources,
@@ -1197,6 +1339,14 @@ def programme_has_episode_identity(row):
     season = row.get("seasonNumber", row.get("season_number"))
     number = row.get("episodeNumber", row.get("episode_number"))
     return type(season) is int and 1 <= season <= 99 and type(number) is int and 1 <= number <= 9999
+
+
+def programme_has_resolved_identity(row):
+    if programme_has_episode_identity(row):
+        return True
+    return bool(isinstance(row, dict) and row.get("contentKind") in TYPED_CONTENT_KINDS and
+                row.get("contentSource") == "local-audio-programme-identity" and
+                type(row.get("contentCorroboratingSources")) is int and row["contentCorroboratingSources"] >= 2)
 
 
 def _bounded_int(value, low, high):
@@ -1229,10 +1379,14 @@ def programme_context(row, channel_id=""):
                      or row.get("airDate") or row.get("air_date") or "")
     season = _bounded_int(row.get("seasonNumber", row.get("season_number")), 1, 99)
     number = _bounded_int(row.get("episodeNumber", row.get("episode_number")), 1, 9999)
-    return {"channelID": cid or "", "seriesTitle": title,
-            "seasonNumber": season, "episodeNumber": number,
-            "episodeTitle": episode_title, "originalAirDate": air_date,
-            "verified": season is not None and number is not None}
+    context = {"channelID": cid or "", "seriesTitle": title,
+               "seasonNumber": season, "episodeNumber": number,
+               "episodeTitle": episode_title, "originalAirDate": air_date,
+               "verified": season is not None and number is not None}
+    if programme_has_resolved_identity(row) and row.get("contentKind") in TYPED_CONTENT_KINDS:
+        context.update(contentKind=row["contentKind"], contentSource=row["contentSource"],
+                       contentCorroboratingSources=row["contentCorroboratingSources"], verified=True)
+    return context
 
 
 def _norm_text(value):
@@ -1252,6 +1406,11 @@ def programme_matches(identity, context):
     numbering or episode-scoped original air date. A mismatch is never promoted.
     """
     if not isinstance(identity, ContentIdentity):
+        return False
+    if identity.content_kind in TYPED_CONTENT_KINDS:
+        # A typed no-EPG identity is never used to overwrite an existing title.
+        return isinstance(context, dict) and not context.get("seriesTitle")
+    if identity.content_kind != "episode":
         return False
     if not isinstance(context, dict):
         return True
@@ -1282,7 +1441,7 @@ def programme_has_stronger_episode_metadata(row):
     """
     if not isinstance(row, dict):
         return False
-    if programme_has_episode_identity(row):
+    if programme_has_resolved_identity(row):
         return True
     if row.get("episodeTitle"):
         return True
@@ -1343,6 +1502,40 @@ class PublicationStore:
             return False
         if not CHANNEL_RE.fullmatch(str(episode.channel_id or "")):
             return False
+        if identity.content_kind in TYPED_CONTENT_KINDS:
+            if (not isinstance(context, dict) or context.get("seriesTitle") or
+                    episode.corroborating_sources < 2 or episode.verification != "official-and-independent-programme"):
+                return False
+            session = context.get("publicationSessionHash")
+            if not isinstance(session, str) or not session:
+                return False
+            if (not isinstance(identity.series_title, str) or not identity.series_title.strip() or
+                    len(identity.series_title) > 200 or identity.season_number is not None or
+                    identity.episode_number is not None or identity.episode_title or identity.original_air_date or
+                    identity.broadcaster_code or identity.episode_year is not None or identity.series_premiere_year is not None):
+                return False
+            if identity.content_kind == "sports-event":
+                if identity.release_year is not None or not identity.event_date or _date(identity.event_date) != identity.event_date:
+                    return False
+            elif identity.event_date or type(identity.release_year) is not int or _year(identity.release_year) is None:
+                return False
+            row = {"audioSeriesTitle": identity.series_title,
+                   "audioPlaybackSessionHash": session,
+                   "contentSource": "local-audio-programme-identity",
+                   "contentObservedAt": round(now, 3),
+                   "contentExpiresAt": round(now + self.ttl, 3),
+                   "contentVerification": episode.verification,
+                   "contentConfidence": round(float(episode.confidence), 3),
+                   "contentMatchCount": int(episode.matched_clue_count),
+                   "contentCorroboratingSources": int(episode.corroborating_sources),
+                   "contentVisitDigest": episode.binding.digest()}
+            row.update(identity.evidence())
+            with self._lock:
+                self._prune(now)
+                self.entries[episode.channel_id] = Publication(episode.channel_id, now + self.ttl, row)
+                self.entries.move_to_end(episode.channel_id)
+                self.published += 1
+            return True
         title = " ".join(str(identity.episode_title or "").split())[:300]
         if not title:
             title = _pretty_date(identity.original_air_date)
@@ -1387,11 +1580,12 @@ class PublicationStore:
         episode = promotion.episode
         if episode is None:
             return
+        prefix = "content" if episode.identity.content_kind in TYPED_CONTENT_KINDS else "episode"
         with self._lock:
             entry = self.entries.get(episode.channel_id)
             if (entry is not None and
-                    entry.row.get("episodeVisitDigest") == episode.binding.digest() and
-                    entry.row.get("episodeObservedAt") == round(now, 3) and
+                    entry.row.get(prefix + "VisitDigest") == episode.binding.digest() and
+                    entry.row.get(prefix + "ObservedAt") == round(now, 3) and
                     entry.row.get("audioPlaybackSessionHash") == (context or {}).get("publicationSessionHash")):
                 self.entries.pop(episode.channel_id, None)
 
@@ -2135,6 +2329,240 @@ def parse_report_page(page, source_url, context=None, clues=()):
     return rows[:MAX_REPORTS]
 
 
+
+class _TypedScope(HTMLParser):
+    """Collect visible paragraphs/headings in one explicitly selected scope."""
+    VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
+    EXCLUDED = frozenset("script style noscript nav aside footer form figure template svg".split())
+
+    def __init__(self, selector):
+        super().__init__(convert_charrefs=True)
+        self.selector = selector
+        self.stack = []
+        self.scopes = 0
+        self.rows = []
+        self.size = 0
+        self.active = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        hidden = (tag in self.EXCLUDED or "hidden" in a or a.get("aria-hidden") == "true"
+                  or bool(re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", a.get("style") or "", re.I)))
+        if tag in self.VOID:
+            if tag == "br":
+                self.handle_data(" ")
+            return
+        parent = self.stack[-1] if self.stack else (None, False, False)
+        hidden = hidden or parent[1]
+        selected = not hidden and self.selector(tag, a)
+        if selected:
+            self.scopes += 1
+        in_scope = selected or parent[2]
+        self.stack.append((tag, hidden, in_scope))
+        if not hidden and in_scope and tag in ("p", "h1", "h2", "h3", "h4", "li", "th", "td") and self.active is None:
+            self.active = (len(self.stack), tag, [])
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack)-1, -1, -1):
+            if self.stack[i][0] == tag:
+                if self.active and self.active[0] > i:
+                    _, kind, parts = self.active
+                    value = " ".join("".join(parts).split())[:2000]
+                    if value:
+                        self.rows.append((kind, value))
+                    self.active = None
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        if not self.active or not self.stack or self.stack[-1][1] or not self.stack[-1][2]:
+            return
+        if self.size < 24000:
+            data = data[:24000-self.size]
+            self.active[2].append(data)
+            self.size += len(data)
+
+
+def _typed_scope(page, selector):
+    parser = _TypedScope(selector)
+    try:
+        parser.feed(_page_text(page))
+        parser.close()
+    except (ValueError, RecursionError):
+        return []
+    return parser.rows if parser.scopes == 1 and parser.active is None else []
+
+
+def _typed_movie_year(title, paragraphs):
+    """Only explicit release statements tied to the article's named film."""
+    years = set()
+    t = re.escape(title)
+    for p in paragraphs:
+        if not re.search(r"(?<!\w)" + t + r"(?!\w)", p, re.I):
+            continue
+        patterns = (
+            r"\b(\d{4})\s*,?\s+when\s+" + t + r"\s+opened\b",
+            r"(?<!\w)" + t + r"\s+(?:was\s+released|opened|premiered)\s+in\s+(?:the\s+summer\s+of\s+)?(\d{4})\b",
+            r"\bsince\s+its\s+release,\s+" + t + r"\s+[^.!?]{1,400}[.]\s+Since\s+it['’]s\s+(?:US\s+)?release\s+in\s+(?:the\s+summer\s+of\s+)?(\d{4})\b",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, p, re.I):
+                y = _year(match[1])
+                if y:
+                    years.add(y)
+    return next(iter(years)) if len(years) == 1 else None
+
+
+
+def _typed_indy500(page, url, clues, official, meta, headline):
+    """Reviewed Indy 500 event-result profiles; no generic sports guesses."""
+    host = _host(url).removeprefix("www.")
+    path = urllib.parse.urlsplit(url).path
+    title = ""
+    event_date = ""
+    sections = []
+    published = ""
+    if official and host == "indycar.com" and path.startswith("/news/"):
+        m = re.fullmatch(r"Fantastic Five of (\d{4}): \d+(?:st|nd|rd|th) Indianapolis 500", headline, re.I)
+        if not m:
+            return []
+        rows = _typed_scope(page, lambda t,a: t == "section" and "section-article" in (a.get("class") or "").split())
+        if [_norm_text(v) for k,v in rows if k=="h1"] != [_norm_text(headline)]:
+            return []
+        race = [v for k,v in rows if k=="li" and re.fullmatch(r"Race: \d+(?:st|nd|rd|th) Indianapolis 500(?: presented by .+)?",v,re.I)]
+        dates = [v.split(":",1)[1].strip() for k,v in rows if k=="li" and v.startswith("Date:")]
+        winners = [v for k,v in rows if k=="li" and v.startswith("Winner:")]
+        if len(race)!=1 or len(dates)!=1 or len(winners)!=1 or not winners[0][7:].strip():
+            return []
+        event_date = _date_from_text(dates[0]+", "+m[1])
+        title = m[1]+" Indianapolis 500"
+        sections = [v for k,v in rows if k in ("p","li")]
+    elif not official and host == "theapex.racing":
+        m = re.fullmatch(r"Race Report: (\d{4}) Indianapolis 500\s*•\s*The Apex",headline,re.I)
+        if not m:
+            return []
+        title = m[1]+" Indianapolis 500"
+        rows = _typed_scope(page,lambda t,a:t=="article" and "category-race-report" in (a.get("class") or "").split())
+        if [_norm_text(v) for k,v in rows if k=="h1"] != [_norm_text(title)]:
+            return []
+        dates = [_date_from_text(v) for k,v in rows if k=="h2" and v.startswith("Indianapolis Motor Speedway ")]
+        if len(dates)!=1:
+            return []
+        event_date = dates[0]
+        # Only the visible completed-race top-five table, not preview, practice,
+        # schedule, historical winners, or arbitrary article paragraphs.
+        post = _typed_scope(page,lambda t,a:t=="div" and a.get("id")==m[1]+"-indianapolis-500-tab-0" and "rtbs_content" in (a.get("class") or "").split())
+        starts = [i for i,(k,v) in enumerate(post) if k=="h3" and v=="Race Top Five"]
+        if len(starts)!=1:
+            return []
+        rows2=[]
+        for k,v in post[starts[0]+1:]:
+            if k=="h3":
+                break
+            if k in ("th","td"):
+                rows2.append((k,v))
+        if [v for k,v in rows2 if k=="th"] != ["Rank","Start","Car No.","Driver","Team"]:
+            return []
+        cells=[v for k,v in rows2 if k=="td"]
+        if len(cells)!=25 or [cells[i] for i in range(0,25,5)]!=list("12345"):
+            return []
+        sections=[title]+[cells[i] for i in range(3,25,5)]
+        published=_page_date(meta.get("article:published_time"))
+    elif not official and host=="racingnews.co":
+        m=re.fullmatch(r"Indy 500 Results: (.+) \(Indycar\)",headline,re.I)
+        if not m:
+            return []
+        event_date=_date_from_text(m[1])
+        if not event_date:
+            return []
+        title=event_date[:4]+" Indianapolis 500"
+        # The visible page title and the dedicated result section must agree.
+        heads=_typed_scope(page,lambda t,a:t=="h1")
+        if [_norm_text(v) for k,v in heads if k=="h1"] != [_norm_text(headline)]:
+            return []
+        rows=_typed_scope(page,lambda t,a:t=="div" and "dynamic-entry-content" in (a.get("class") or "").split())
+        starts=[i for i,(k,v) in enumerate(rows) if k=="h4" and re.fullmatch(r"Indy 500 Race Results .+ Indycar Series",v,re.I) and _date_from_text(v)==event_date]
+        if len(starts)!=1 or not any(k=="h2" and "Indianapolis 500" in v for k,v in rows):
+            return []
+        finishers=[]
+        for k,v in rows[starts[0]+1:]:
+            if k.startswith("h"):
+                break
+            if k=="p":
+                match=re.fullmatch(r"(\d{1,2})[.]\s+(.{1,100})",v)
+                if match and int(match[1])==len(finishers)+1:
+                    finishers.append(match[2])
+                elif finishers:
+                    break
+        if len(finishers)<5:
+            return []
+        sections=[title]+finishers
+        published=_page_date(meta.get("article:published_time"))
+    else:
+        return []
+    if not event_date or event_date[:4]!=title[:4]:
+        return []
+    terms=_requested_public_terms(clues,*sections[:128])
+    row=TypedProgrammeEvidence("sports-event",title,url,terms,event_date=event_date,published_at=published)
+    return [row] if len(terms)>=3 and row.checked(official) else []
+
+
+def parse_typed_programme_page(page, url, clues, official=False):
+    """Reviewed movie profiles; unsupported content never becomes identity."""
+    host = _host(url).removeprefix("www.")
+    if not safe_source_url(url, TYPED_OFFICIAL_HOSTS if official else TYPED_REPORT_HOSTS):
+        return []
+    path = urllib.parse.urlsplit(url).path
+    meta = _meta_map(page)
+    headline = _report_headline(meta.get("og:title", ""), meta.get("og:site_name", ""))
+    if host in ("indycar.com", "theapex.racing", "racingnews.co"):
+        return _typed_indy500(page, url, clues, official, meta, headline)
+    title = ""
+    year = None
+    published = ""
+    paragraphs = []
+    if official and host == "amblin.com" and re.fullmatch(r"/movie/[a-z0-9-]+/?", path):
+        if meta.get("og:type") != "video.movie" or meta.get("og:url", "").rstrip("/") != url.rstrip("/"):
+            return []
+        match = re.fullmatch(r"(.{1,200})\s+\((\d{4})\)\s+-\s+About the Movie", headline, re.I)
+        if not match:
+            return []
+        title, year = match[1], _year(match[2])
+        rows = _typed_scope(page, lambda tag, a: tag == "div" and "description" in (a.get("class") or "").split() and "data-description" in a)
+        # The first plot paragraph is separate from subsequent production history.
+        paragraphs = [re.sub(r"\([^()]{1,120}\)", " ", p) for k,p in rows if k == "p"][:1]
+    elif not official and host == "theguardian.com" and path.startswith("/film/"):
+        match = re.fullmatch(r"(.{1,200}),\s+\d+\s+years on:\s+.+", headline, re.I)
+        if not match:
+            return []
+        title = match[1]
+        article = _single_article(page)
+        if not article or not _article_matches_headline(article, headline):
+            return []
+        rows = _typed_scope(page, lambda tag,a: tag == "article")
+        paragraphs = [p for k,p in rows if k == "p"]
+        year = _typed_movie_year(title, paragraphs)
+        published = _page_date(meta.get("article:published_time"))
+    elif not official and host == "screamhorrormag.com":
+        match = re.fullmatch(r"(.{1,200}):\s*Film Review", headline, re.I)
+        if not match:
+            return []
+        title = match[1]
+        rows = _typed_scope(page, lambda tag,a: tag == "div" and "category-film-reviews" in (a.get("class") or "").split())
+        if [_norm_text(v) for k,v in rows if k == "h1"] != [_norm_text(headline)]:
+            return []
+        paragraphs = [p for k,p in rows if k == "p"]
+        year = _typed_movie_year(title, paragraphs)
+        published = _page_date(meta.get("article:published_time"))
+    else:
+        return []
+    terms = _requested_public_terms(clues, *paragraphs[:128])
+    if not year or not terms:
+        return []
+    row = TypedProgrammeEvidence("movie", " ".join(title.split()), url, terms, release_year=year, published_at=published)
+    return [row] if row.checked(official) else []
+
+
 def _source_context(context):
     if not isinstance(context, dict):
         return {}
@@ -2280,8 +2708,9 @@ class EpisodeSourceDiscovery:
             official_raw, report_raw = result.get("official", []), result.get("reports", [])
         else:
             return [], []
-        return (self._clean_candidates(official_raw, OFFICIAL_ARCHIVE_HOSTS),
-                self._clean_candidates(report_raw, INDEPENDENT_REPORT_HOSTS))
+        unknown = not context.get("seriesTitle")
+        return (self._clean_candidates(official_raw, TYPED_OFFICIAL_HOSTS if unknown else OFFICIAL_ARCHIVE_HOSTS),
+                self._clean_candidates(report_raw, TYPED_REPORT_HOSTS if unknown else INDEPENDENT_REPORT_HOSTS))
 
     def _index_urls(self, page, root, context, deadline, clues=()):
         if page is None or time.monotonic() >= deadline:
@@ -2574,17 +3003,18 @@ class PublicEvidenceResearch:
                 if independent_publisher(url) in blocked:
                     continue
                 counts["reportAttempts"] += 1
-                page, denied = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                page, denied = self._fetch_result(url, TYPED_REPORT_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
                 counts["denied"] += int(denied)
                 counts["reportFetched"] += int(page is not None)
                 if denied:
                     blocked.add(independent_publisher(url))
                 elif page is not None:
                     reports.extend(parse_report_page(page, url, context, clues=clues))
+                    reports.extend(parse_typed_programme_page(page, url, clues))
             elif official_urls:
                 # A report's explicit air date can prioritize existing archive
                 # leads, but cannot generate a new URL or establish identity.
-                dates = {r.original_air_date for r in reports}
+                dates = {r.original_air_date for r in reports if isinstance(r, IndependentReport)}
                 def priority(url):
                     match = _URL_DATE.search(urllib.parse.urlsplit(url).path + "/")
                     return bool(match and match[1] in dates)
@@ -2594,13 +3024,14 @@ class PublicEvidenceResearch:
                 if _host(url).removeprefix("www.") in blocked:
                     continue
                 counts["officialAttempts"] += 1
-                page, denied = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                page, denied = self._fetch_result(url, TYPED_OFFICIAL_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
                 counts["denied"] += int(denied)
                 counts["officialFetched"] += int(page is not None)
                 if denied:
                     blocked.add(_host(url).removeprefix("www."))
                 elif page is not None:
                     official.extend(parse_official_page(page, url))
+                    official.extend(parse_typed_programme_page(page, url, clues, official=True))
             if len(official) >= MAX_OFFICIAL_EPISODES:
                 official_urls.clear()
             if len(reports) >= MAX_REPORTS:
@@ -2818,7 +3249,8 @@ class EpisodeObserver:
 
     def _duplicate(self, binding, identity, now, record=False, session_hash=None):
         key = "|".join((binding.digest(), str(session_hash or ""), identity.broadcaster_code or "",
-                        _digest(identity.series_title + "|" + identity.original_air_date)))
+                        _digest(identity.series_title + "|" + identity.original_air_date + "|" +
+                                identity.content_kind + "|" + str(identity.release_year or "") + "|" + identity.event_date)))
         expires = self._published.get(key)
         if expires is not None and now < expires:
             return True
@@ -2953,6 +3385,11 @@ class EpisodeObserver:
             discard()
             return False
         identity = promotion.episode.identity
+        if identity.content_kind in TYPED_CONTENT_KINDS:
+            self.log("PROGRAMME_IDENTITY kind=%s title=%s releaseYear=%s eventDate=%s confidence=%.3f sources=%d" % (
+                identity.content_kind, identity.series_title[:80], identity.release_year or "-", identity.event_date or "-",
+                promotion.episode.confidence, promotion.episode.corroborating_sources))
+            return True
         self.log("EPISODE_IDENTITY series=%s date=%s code=%s confidence=%.3f sources=%d" % (
             identity.series_title[:80], identity.original_air_date,
             identity.broadcaster_code or "-", promotion.episode.confidence,
@@ -3044,7 +3481,7 @@ class EpisodeObserver:
             elif (fresh_context is not None and fresh_context.get("channelID")
                   and fresh_context.get("channelID") != binding.channel_id):
                 promotion = Promotion(False, "programme-changed")
-            elif fresh_context is not None and programme_has_episode_identity(fresh_context):
+            elif fresh_context is not None and programme_has_resolved_identity(fresh_context):
                 promotion = Promotion(False, "identity-present")
             else:
                 try:
@@ -3116,7 +3553,7 @@ class EpisodeObserver:
                 if context.get("channelID") and context.get("channelID") != binding.channel_id:
                     self._diagnose("programme-changed", "stale")
                     return None
-                if programme_has_episode_identity(context):
+                if programme_has_resolved_identity(context):
                     self._diagnose("identity-present", "identity-present")
                     return None
             request = build_request(text, job, decision, binding, now)
@@ -3223,7 +3660,7 @@ class EpisodeObserver:
             if context.get("channelID") and context.get("channelID") != binding.channel_id:
                 self._diagnose("programme-changed", "stale")
                 return None
-            if programme_has_episode_identity(context):
+            if programme_has_resolved_identity(context):
                 self._diagnose("identity-present", "identity-present")
                 return None
         request = build_request_from_clues(item.clues, item.job, item.decision, binding, now)
