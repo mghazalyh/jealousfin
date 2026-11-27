@@ -360,10 +360,12 @@ class DeviceProbeSingleFlightDefectTests(GatewayFixture):
             self.assertIsNone(self.g.device_language_probe(share=False))
             self.assertEqual(self.g._device_probe_local_fault(),
                              "device_status_unavailable")
-            # It must not contaminate the still-running shared flight.
+            # It must not contaminate the still-running shared flight's fault,
+            # but the fresh observation is still counted in global diagnostics.
             midpoint = self.g.device_probe_diagnostics()
             self.assertEqual(midpoint["fault"], "")
-            self.assertNotIn("device_status_unavailable", midpoint["byReason"])
+            self.assertEqual(
+                midpoint["byReason"]["device_status_unavailable"], 1)
         finally:
             release.set()
             thread.join(5.0)
@@ -371,8 +373,10 @@ class DeviceProbeSingleFlightDefectTests(GatewayFixture):
         self.assertEqual(outcome["value"]["launchID"], "L-shared")
         diagnostics = self.g.device_probe_diagnostics()
         self.assertEqual(diagnostics["fault"], "")
-        self.assertNotIn("device_status_unavailable", diagnostics["byReason"])
-        self.assertEqual(diagnostics["probes"], 1)
+        self.assertEqual(
+            diagnostics["byReason"]["device_status_unavailable"], 1)
+        self.assertEqual(diagnostics["probes"], 2)
+        self.assertEqual(diagnostics["failures"], 1)
         self.assertEqual(len(reads), 2)
 
 
@@ -536,6 +540,122 @@ class DeviceProbeAdmissionBackoffTests(GatewayFixture):
             selected.assert_called_once()
             self.assertEqual(self.g.device_probe_diagnostics()["recovered"], 1)
 
+    def test_rotation_state_contains_selector_config_errors(self):
+        with patch.object(self.g.prototype_selector, "load_selector",
+                          side_effect=ValueError("invalid selector")):
+            self.assertIsNone(self.g.device_rotation_state(force=True))
+            self.assertIsNone(self.g.device_rotation_cache)
+
+
+class DeviceProbeLaneIsolationTests(GatewayFixture):
+    def start_patches(self, status_fn, command_fn=None):
+        patches = self.device_patches(status_fn, command_fn)
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_snapshot_backoff_does_not_block_status_only_routing(self):
+        clock = [100.0]
+
+        def status(config, token):
+            return dict(legacy_status())
+
+        def command(config, token, action, arguments=None):
+            raise TimeoutError("get_player_snapshot unavailable")
+
+        self.start_patches(status, command)
+        key = self.g._device_probe_key(self.selector)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]), \
+                patch.object(self.g.prototype_selector, "selected_profile",
+                             return_value="malay") as selected:
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            self.assertIn(key, self.g.DEVICE_PROBE_IDENTITY_BACKOFF)
+            self.assertEqual(self.g.DEVICE_PROBE_BACKOFF, {})
+            # Status-only routing still works while only the snapshot lane is
+            # backed off.
+            self.assertEqual(
+                self.g.selected_profile_admitted(self.selector, "token"),
+                "malay")
+            selected.assert_called_once()
+            # A healthy status read must not clear the unrelated snapshot failure.
+            self.assertIn(key, self.g.DEVICE_PROBE_IDENTITY_BACKOFF)
+
+    def test_snapshot_backoff_is_cleared_only_by_a_snapshot_success(self):
+        clock = [100.0]
+        snapshot_ok = [False]
+
+        def status(config, token):
+            return dict(legacy_status())
+
+        def command(config, token, action, arguments=None):
+            if snapshot_ok[0]:
+                return json.dumps({"channelID": A,
+                                   "streamGeneration": "stream-1"})
+            raise TimeoutError("get_player_snapshot unavailable")
+
+        self.start_patches(status, command)
+        key = self.g._device_probe_key(self.selector)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]), \
+                patch.object(self.g.prototype_selector, "selected_profile",
+                             return_value="malay"):
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            self.assertIn(key, self.g.DEVICE_PROBE_IDENTITY_BACKOFF)
+            clock[0] = 101.0
+            self.assertEqual(
+                self.g.selected_profile_admitted(self.selector, "token"),
+                "malay")
+            self.assertIn(key, self.g.DEVICE_PROBE_IDENTITY_BACKOFF)
+            clock[0] = 103.0
+            snapshot_ok[0] = True
+            value = self.g.device_language_probe(origin="episode")
+            self.assertEqual(value["channelID"], A)
+            self.assertEqual(self.g.DEVICE_PROBE_IDENTITY_BACKOFF, {})
+
+
+class DeviceProbeCountingTests(GatewayFixture):
+    def start_patches(self, status_fn, command_fn=None):
+        patches = self.device_patches(status_fn, command_fn)
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_shared_failure_counts_each_origin_once(self):
+        def status(config, token):
+            raise RuntimeError("status unavailable")
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: 100.0):
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertEqual(diagnostics["probes"], 1)
+            self.assertEqual(diagnostics["failures"], 1)
+            self.assertEqual(
+                diagnostics["byOrigin"]["episode"]["failures"], 1)
+            self.assertEqual(
+                diagnostics["byReason"]["device_status_unavailable"], 1)
+
+    def test_fresh_failure_is_included_in_probe_totals(self):
+        clock = [100.0]
+
+        def status(config, token):
+            raise RuntimeError("status unavailable")
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]):
+            self.assertIsNone(
+                self.g.device_language_probe(share=False, origin="fresh"))
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertEqual(diagnostics["probes"], 1)
+            self.assertEqual(diagnostics["failures"], 1)
+            self.assertEqual(
+                diagnostics["byOrigin"]["fresh"]["failures"], 1)
+            self.assertEqual(
+                diagnostics["byReason"]["device_status_unavailable"], 1)
+
 
 class OverlayPumpAdmissionTests(GatewayFixture):
     class PendingBridge:
@@ -595,6 +715,28 @@ class OverlayPumpAdmissionTests(GatewayFixture):
             self.assertFalse(self.g.overlay_request_pump())
         self.assertEqual(self.g.overlay_jobs.qsize(), 0)
         self.assertEqual(self.g.overlay_admission_stats["pumpRequests"], 0)
+
+    def test_refresh_enqueue_records_admission_counters(self):
+        self.assertTrue(self.g.overlay_enqueue("refresh"))
+        self.assertEqual(self.g.overlay_jobs.qsize(), 1)
+        stats = dict(self.g.overlay_admission_stats)
+        self.assertEqual(stats["refreshRequests"], 1)
+        self.assertEqual(stats["refreshEnqueued"], 1)
+
+    def test_evicting_a_queued_pump_clears_the_pending_flag(self):
+        self.assertTrue(self.g.overlay_enqueue("pump"))
+        with self.g.overlay_pump_lock:
+            self.g.overlay_pump_pending = True
+        for _ in range(self.g.overlay_jobs.maxsize - 1):
+            self.assertTrue(self.g.overlay_enqueue("refresh"))
+        self.assertEqual(self.g.overlay_jobs.qsize(),
+                         self.g.overlay_jobs.maxsize)
+        # The newest refresh evicts the oldest job, which is the queued pump.
+        self.assertTrue(self.g.overlay_enqueue("refresh"))
+        with self.g.overlay_pump_lock:
+            self.assertFalse(self.g.overlay_pump_pending)
+        self.assertEqual(self.g.overlay_jobs.qsize(),
+                         self.g.overlay_jobs.maxsize)
 
 
 class CombinedFallbackDedupTests(unittest.TestCase):

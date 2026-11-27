@@ -1797,7 +1797,10 @@ def device_rotation_state(force=False):
  now=time.monotonic()
  if not force and now-device_rotation_checked<2:return device_rotation_cache
  device_rotation_checked=now
- probe=device_language_probe(origin='rotation')
+ try:probe=device_language_probe(origin='rotation')
+ except Exception:
+  # A selector/config read error must not escape into catalogue rendering.
+  device_rotation_cache=None;return None
  if not isinstance(probe,dict):
   device_rotation_cache=None;return None
  if type(probe.get('surfPaused')) is not bool or type(probe.get('surfing')) is not bool:
@@ -2025,11 +2028,14 @@ DEVICE_PROBE_BACKOFF_BASE=2.0
 DEVICE_PROBE_BACKOFF_MAX=20.0
 DEVICE_PROBE_BACKOFF_RESET=120.0
 DEVICE_PROBE_MIN_SPACING=0.5
-DEVICE_PROBE_BACKOFF_REASONS=frozenset((
- 'device_status_unavailable','device_snapshot_unavailable',
- 'device_status_invalid','device_snapshot_invalid','device_incoherent'))
+DEVICE_PROBE_STATUS_REASONS=frozenset((
+ 'device_status_unavailable','device_status_invalid'))
+DEVICE_PROBE_IDENTITY_REASONS=frozenset((
+ 'device_snapshot_unavailable','device_snapshot_invalid','device_incoherent'))
+DEVICE_PROBE_BACKOFF_REASONS=DEVICE_PROBE_STATUS_REASONS|DEVICE_PROBE_IDENTITY_REASONS
 DEVICE_PROBE_CLOCK=time.monotonic
 DEVICE_PROBE_BACKOFF={}
+DEVICE_PROBE_IDENTITY_BACKOFF={}
 device_probe_fault=''
 DEVICE_PROBE_LOCAL=threading.local()
 def _device_probe_copy(value):
@@ -2058,44 +2064,64 @@ def _device_probe_origin(origin):
   bucket={'admitted':0,'rejected':0,'shared':0,'failures':0}
   DEVICE_PROBE_STATS['byOrigin'][name]=bucket
  return bucket
-def _device_probe_admit_locked(config,origin,fresh):
+def _device_probe_backoff_tables(lanes):
+ tables=[]
+ for lane in lanes:
+  table=DEVICE_PROBE_IDENTITY_BACKOFF if lane=='identity' else DEVICE_PROBE_BACKOFF
+  if table not in tables:tables.append(table)
+ return tables
+def _device_probe_failure_tables(reason):
+ if reason in DEVICE_PROBE_STATUS_REASONS:return (DEVICE_PROBE_BACKOFF,)
+ if reason in DEVICE_PROBE_IDENTITY_REASONS:return (DEVICE_PROBE_IDENTITY_BACKOFF,)
+ return ()
+def _device_probe_admit_locked(config,origin,fresh,lanes=('status',)):
  now=_device_probe_now();key=_device_probe_key(config)
- state=DEVICE_PROBE_BACKOFF.get(key) if key else None
- if isinstance(state,dict):
-  if now-state.get('at',0)>DEVICE_PROBE_BACKOFF_RESET:
-   DEVICE_PROBE_BACKOFF.pop(key,None);state=None
-  elif now<state.get('until',0):
-   DEVICE_PROBE_STATS['rejectedBackoff']+=1
-   _device_probe_origin(origin)['rejected']+=1
-   if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
-   _device_probe_set_local_fault('device_probe_backoff');return False
-  elif now-state.get('attemptAt',0)<DEVICE_PROBE_MIN_SPACING:
-   DEVICE_PROBE_STATS['rejectedRate']+=1
-   _device_probe_origin(origin)['rejected']+=1
-   if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
-   _device_probe_set_local_fault('device_probe_rate_limited');return False
+ for table in _device_probe_backoff_tables(lanes):
+  state=table.get(key) if key else None
+  if isinstance(state,dict):
+   if now-state.get('at',0)>DEVICE_PROBE_BACKOFF_RESET:
+    table.pop(key,None);state=None
+   elif now<state.get('until',0):
+    DEVICE_PROBE_STATS['rejectedBackoff']+=1
+    _device_probe_origin(origin)['rejected']+=1
+    if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
+    _device_probe_set_local_fault('device_probe_backoff');return False
+   elif now-state.get('attemptAt',0)<DEVICE_PROBE_MIN_SPACING:
+    DEVICE_PROBE_STATS['rejectedRate']+=1
+    _device_probe_origin(origin)['rejected']+=1
+    if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
+    _device_probe_set_local_fault('device_probe_rate_limited');return False
  DEVICE_PROBE_STATS['admitted']+=1
  _device_probe_origin(origin)['admitted']+=1
  if fresh:DEVICE_PROBE_STATS['freshAdmitted']+=1
- if isinstance(state,dict):state['attemptAt']=now
+ if key:
+  for table in _device_probe_backoff_tables(lanes):
+   state=table.get(key)
+   if isinstance(state,dict):state['attemptAt']=now
  _device_probe_set_local_fault('');return True
-def _device_probe_record_success_locked(key):
+def _device_probe_record_success_locked(key,lanes=('status','identity')):
  if not key:return
- if isinstance(DEVICE_PROBE_BACKOFF.pop(key,None),dict):
-  DEVICE_PROBE_STATS['recovered']+=1
+ for table in _device_probe_backoff_tables(lanes):
+  if isinstance(table.pop(key,None),dict):
+   DEVICE_PROBE_STATS['recovered']+=1
 def _device_probe_record_failure_locked(key,reason,origin=None):
- if not key or reason not in DEVICE_PROBE_BACKOFF_REASONS:return
- now=_device_probe_now();state=DEVICE_PROBE_BACKOFF.get(key)
- previous=state.get('failures') if isinstance(state,dict) else 0
- if type(previous) is not int or previous<0:previous=0
- failures=min(previous+1,16)
- delay=min(DEVICE_PROBE_BACKOFF_BASE*(2**(failures-1)),DEVICE_PROBE_BACKOFF_MAX)
- DEVICE_PROBE_BACKOFF[key]={'failures':failures,'until':now+delay,
-  'at':now,'attemptAt':now,'reason':reason}
- if previous==0:DEVICE_PROBE_STATS['backoffStarted']+=1
+ if not key:return
+ tables=_device_probe_failure_tables(reason)
+ if not tables:return
+ now=_device_probe_now()
+ for table in tables:
+  state=table.get(key)
+  previous=state.get('failures') if isinstance(state,dict) else 0
+  if type(previous) is not int or previous<0:previous=0
+  if isinstance(state,dict) and now-state.get('at',0)>DEVICE_PROBE_BACKOFF_RESET:previous=0
+  failures=min(previous+1,16)
+  delay=min(DEVICE_PROBE_BACKOFF_BASE*(2**(failures-1)),DEVICE_PROBE_BACKOFF_MAX)
+  table[key]={'failures':failures,'until':now+delay,
+   'at':now,'attemptAt':now,'reason':reason}
+  if previous==0:DEVICE_PROBE_STATS['backoffStarted']+=1
+  while len(table)>16:
+   table.pop(next(iter(table)))
  if origin:_device_probe_origin(origin)['failures']+=1
- while len(DEVICE_PROBE_BACKOFF)>16:
-  DEVICE_PROBE_BACKOFF.pop(next(iter(DEVICE_PROBE_BACKOFF)))
 class _DeviceProbeFlight:
  # One owner plus its exact waiters.  The completion event is the single
  # handoff point: a waiter can never mistake a newer flight for the one it
@@ -2174,13 +2200,12 @@ def _device_probe_record_completion(flight,value,fault,error,count_probe):
   if count_probe:
    DEVICE_PROBE_STATS['probes']+=1
    if isinstance(value,dict):
-    _device_probe_record_success_locked(flight.key)
+    _device_probe_record_success_locked(flight.key,('status','identity'))
    else:
     DEVICE_PROBE_STATS['failures']+=1
     reasons=DEVICE_PROBE_STATS['byReason']
     reason=flight.fault or 'device_unavailable'
     reasons[reason]=(reasons.get(reason,0)+1)
-    _device_probe_origin(flight.origin)['failures']+=1
     _device_probe_record_failure_locked(flight.key,reason,flight.origin)
   DEVICE_PROBE_CONDITION.notify_all()
 def device_language_probe(share=True,origin='unspecified'):
@@ -2197,23 +2222,34 @@ def device_language_probe(share=True,origin='unspecified'):
   # Independently fresh observation.  It owns its own thread-local fault and
   # never joins or mutates the coalesced flight.
   with DEVICE_PROBE_LOCK:
-   if not _device_probe_admit_locked(config,origin,True):return None
+   if not _device_probe_admit_locked(config,origin,True,('status','identity')):return None
   value=None;fault=''
   try:
    value=_device_language_probe_once()
    fault=_device_probe_local_fault()
   except BaseException:
+   reason=_device_probe_local_fault() or 'device_probe_exception'
    with DEVICE_PROBE_LOCK:
-    _device_probe_record_failure_locked(key,_device_probe_local_fault() or 'device_probe_exception',origin)
+    DEVICE_PROBE_STATS['probes']+=1
+    DEVICE_PROBE_STATS['failures']+=1
+    reasons=DEVICE_PROBE_STATS['byReason']
+    reasons[reason]=(reasons.get(reason,0)+1)
+    _device_probe_record_failure_locked(key,reason,origin)
    raise
   with DEVICE_PROBE_LOCK:
-   if isinstance(value,dict):_device_probe_record_success_locked(key)
-   else:_device_probe_record_failure_locked(key,fault or 'device_unavailable',origin)
+   DEVICE_PROBE_STATS['probes']+=1
+   if isinstance(value,dict):_device_probe_record_success_locked(key,('status','identity'))
+   else:
+    reason=fault or 'device_unavailable'
+    DEVICE_PROBE_STATS['failures']+=1
+    reasons=DEVICE_PROBE_STATS['byReason']
+    reasons[reason]=(reasons.get(reason,0)+1)
+    _device_probe_record_failure_locked(key,reason,origin)
   return value
  with DEVICE_PROBE_LOCK:
   flight=DEVICE_PROBE_CURRENT
   if flight is None or flight.event.is_set():
-   if not _device_probe_admit_locked(config,origin,False):return None
+   if not _device_probe_admit_locked(config,origin,False,('status','identity')):return None
    DEVICE_PROBE_VERSION+=1
    flight=_DeviceProbeFlight(DEVICE_PROBE_VERSION,key,origin)
    DEVICE_PROBE_CURRENT=flight
@@ -2251,11 +2287,12 @@ def device_language_probe(share=True,origin='unspecified'):
 def device_probe_diagnostics():
  with DEVICE_PROBE_LOCK:
   now=_device_probe_now();active=[]
-  for state in DEVICE_PROBE_BACKOFF.values():
-   if isinstance(state,dict) and now<state.get('until',0):
-    active.append(state)
-  remaining=max((state['until']-now for state in active),default=0.0)
-  failures=max((state.get('failures',0) for state in active),default=0)
+  for table in (DEVICE_PROBE_BACKOFF,DEVICE_PROBE_IDENTITY_BACKOFF):
+   for key,state in table.items():
+    if isinstance(state,dict) and now<state.get('until',0):
+     active.append((key,state))
+  remaining=max((state['until']-now for _,state in active),default=0.0)
+  failures=max((state.get('failures',0) for _,state in active),default=0)
   return {'probes':DEVICE_PROBE_STATS['probes'],'shared':DEVICE_PROBE_STATS['shared'],
           'failures':DEVICE_PROBE_STATS['failures'],
           'timeouts':DEVICE_PROBE_STATS['timeouts'],
@@ -2266,7 +2303,7 @@ def device_probe_diagnostics():
           'freshRejected':DEVICE_PROBE_STATS['freshRejected'],
           'backoffStarted':DEVICE_PROBE_STATS['backoffStarted'],
           'recovered':DEVICE_PROBE_STATS['recovered'],
-          'backoff':{'active':bool(active),'devices':len(active),
+          'backoff':{'active':bool(active),'devices':len({key for key,_ in active}),
                      'remainingSeconds':round(max(0.0,remaining),3),
                      'consecutiveFailures':failures,
                      'capSeconds':DEVICE_PROBE_BACKOFF_MAX},
@@ -2765,18 +2802,26 @@ def overlay_combined_status():
  if bridge is None:return base
  return dict(base,**bridge.status())
 def overlay_enqueue(kind,**fields):
- global overlay_bridge_fault
+ global overlay_bridge_fault,overlay_pump_pending
  if SOURCE_PROFILE!='american':return False
  job=dict(fields,kind=kind,at=time.time())
+ if kind=='refresh':
+  with overlay_pump_lock:overlay_admission_stats['refreshRequests']+=1
  try:overlay_jobs.put_nowait(job)
  except queue.Full:
   # Keep only the newest lifecycle event; the bridge is a display, never a
   # durable queue, and a stale label must not block a current one.
-  try:overlay_jobs.get_nowait()
+  evicted=None
+  try:evicted=overlay_jobs.get_nowait()
   except queue.Empty:pass
+  # A queued pump that never runs must not strand the coalescing boolean.
+  if isinstance(evicted,dict) and evicted.get('kind')=='pump':
+   with overlay_pump_lock:overlay_pump_pending=False
   try:overlay_jobs.put_nowait(job)
   except queue.Full:
    overlay_bridge_fault='queue_full';return False
+ if kind=='refresh':
+  with overlay_pump_lock:overlay_admission_stats['refreshEnqueued']+=1
  return True
 def overlay_publish_evidence(cid,name,language,language_name,confidence,payload,info):
  event_id=info.get('eventID')
@@ -3111,7 +3156,8 @@ def web_route(path,method):
 def selected_profile_admitted(config,token):
  key=_device_probe_key(config)
  with DEVICE_PROBE_LOCK:
-  if not _device_probe_admit_locked(config,'profile',True):
+  # Status-only consumers must not be blocked by a snapshot/identity backoff.
+  if not _device_probe_admit_locked(config,'profile',True,('status',)):
    raise RuntimeError('Device probe backoff')
  try:profile=prototype_selector.selected_profile(config,token)
  except Exception:
@@ -3119,7 +3165,9 @@ def selected_profile_admitted(config,token):
    _device_probe_record_failure_locked(key,'device_status_unavailable','profile')
   raise
  with DEVICE_PROBE_LOCK:
-  _device_probe_record_success_locked(key)
+  # A healthy status read clears only the status lane; it must never clear or
+  # renew an unrelated snapshot/identity failure.
+  _device_probe_record_success_locked(key,('status',))
  return profile
 class Handler(http.server.BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'
