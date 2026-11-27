@@ -103,6 +103,33 @@ class PublicSearchTests(unittest.TestCase):
         self.assertNotIn("WWE NXT",queries[1])
         self.assertEqual(discovery.episode_search_queries({"channelName":"WWE NXT"}),())
 
+    def test_distinct_names_survive_long_conversational_clues(self):
+        transcript=("We're looking at a really incredible opportunity for this particular "
+                    "combination of strategic considerations. Alex Palou passes Marcus Ericsson "
+                    "at Indianapolis Motor Speedway. The Indianapolis 500 is nearing the end.")
+        clues=audio.extract_clues(transcript)
+        self.assertIn("alex palou",clues)
+        self.assertIn("marcus ericsson",clues)
+        normalized=audio.normalize_clues(clues)
+        self.assertIn("alex palou",normalized)
+        self.assertIn("marcus ericsson",normalized)
+        queries=discovery.episode_search_queries({"seriesTitle":"","clues":clues})
+        self.assertTrue(queries)
+        self.assertIn("alex palou",queries[0])
+        self.assertIn("marcus ericsson",queries[0])
+        self.assertNotIn("strategic considerations alex",str(clues))
+        self.assertLessEqual(len(clues),audio.MAX_CLUES)
+        prompt=discovery.episode_prompt_for({"seriesTitle":"","clues":clues},clues)
+        self.assertIn("alex palou marcus ericsson",prompt)
+
+    def test_normalization_retains_independent_groups_before_variants(self):
+        groups=("distinctive conversation surrounding competition",
+                "alex palou","marcus ericsson","indianapolis motor speedway")
+        normalized=audio.normalize_clues(groups)
+        self.assertTrue(all(group in normalized for group in groups))
+        self.assertLessEqual(len(normalized),audio.MAX_CLUES)
+        self.assertEqual(audio.normalize_clues(normalized),normalized)
+
     def test_access_restriction_stops_second_query(self):
         calls=[];diag={}
         def fetch(q):
@@ -306,6 +333,18 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
             self.assertIn("known",self.g.episode_provider_diagnostics)
 
 class ConfirmedProgressTests(unittest.TestCase):
+    def test_budget_reports_initial_and_retry_counts_without_changing_limits(self):
+        budget=audio.EpisodeBudget()
+        view={"channel_id":fixtures.CHANNEL,"session_hash":"s1","active_seconds":60}
+        self.assertTrue(budget.begin(view))
+        self.assertTrue(budget.begin(view,retry=True))
+        self.assertTrue(budget.begin(view,retry=True))
+        row=budget.diagnostics()["windows"][0]
+        self.assertEqual(row["initialResearchAttempts"],1)
+        self.assertEqual(row["episodeRetryAttempts"],2)
+        self.assertEqual(row["totalResearchAttempts"],3)
+        self.assertEqual(row["attempts"],3)
+
     def test_lead_budget_does_not_relax_known_title_or_short_sample(self):
         budget=audio.EpisodeBudget()
         view={"channel_id":fixtures.CHANNEL,"session_hash":"s1","active_seconds":15}

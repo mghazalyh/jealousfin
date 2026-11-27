@@ -365,15 +365,37 @@ def _clue_candidates(value):
     """
     if not isinstance(value, str) or not value:
         return []
-    tokens = [token for token in (_clue_token(item) for item in _CLUE_TOKEN.findall(value)) if token]
-    kept = []
-    for token in tokens:
-        if len(token) < MIN_TERM_LENGTH or token in CLUE_STOPWORDS:
+    # Preserve sentence boundaries and retain capitalized multi-token names
+    # before lowercasing. Whisper punctuation is a hint, never evidence.
+    kept, names, name_run = [], [], []
+    previous_end = 0
+    def finish_name():
+        if 2 <= len(name_run) <= MAX_CLUE_TOKENS:
+            phrase = " ".join(name_run)
+            if any(token not in WEAK_SINGLE_TERMS and token not in AD_PROMO_TERMS for token in name_run):
+                names.append(phrase)
+        name_run.clear()
+    for match in _CLUE_TOKEN.finditer(value):
+        raw = match.group()
+        token = _clue_token(raw)
+        gap = value[previous_end:match.start()]
+        previous_end = match.end()
+        if re.search(r"[.!?;:\n]", gap):
             kept.append(None)
+        if not token or len(token) < MIN_TERM_LENGTH or token in CLUE_STOPWORDS:
+            kept.append(None)
+            finish_name()
+            continue
+        kept.append(token)
+        if gap.strip() or not raw[0].isupper():
+            finish_name()
+        if raw[0].isupper() and raw[0].isalpha():
+            if len(name_run) == MAX_CLUE_TOKENS:
+                finish_name()
+            name_run.append(token)
         else:
-            # Weak single terms are allowed inside a distinctive phrase but
-            # are never emitted on their own.
-            kept.append(token)
+            finish_name()
+    finish_name()
     clues = []
     run = []
     runs = []
@@ -400,8 +422,19 @@ def _clue_candidates(value):
         for token in run:
             if len(token) >= 5 and token not in WEAK_SINGLE_TERMS and token not in AD_PROMO_TERMS and token not in CLUE_STOPWORDS:
                 clues.append(token)
-    ordered = []
-    for clue in sorted(set(clues), key=lambda item: (-len(item.split()), -len(item), item)):
+    # Cover distinct lexical groups before spending the bounded clue budget
+    # on overlapping windows or single-token variants of a prior phrase.
+    # Keep the original candidate ranking as a secondary ordering.
+    ranked = list(dict.fromkeys(names + sorted(set(clues), key=lambda item: (-len(item.split()), -len(item), item))))
+    ordered, used = [], set()
+    for clue in ranked:
+        words = set(clue.split())
+        if words and not words.intersection(used):
+            ordered.append(clue)
+            used.update(words)
+        if len(ordered) >= MAX_CLUES:
+            return ordered
+    for clue in ranked:
         if clue not in ordered:
             ordered.append(clue)
         if len(ordered) >= MAX_CLUES:
@@ -420,9 +453,17 @@ def normalize_clues(values):
         values = [values]
     if not isinstance(values, (list, tuple, set)):
         return ()
+    # First retain a primary clue from each supplied group. Expanding one
+    # phrase into its component terms must not erase later independent names.
+    groups = [_clue_candidates(value) for value in list(values)[:MAX_TERMS]]
     out = []
-    for value in values:
-        for clue in _clue_candidates(value):
+    for candidates in groups:
+        if candidates and candidates[0] not in out:
+            out.append(candidates[0])
+        if len(out) >= MAX_CLUES:
+            return tuple(out)
+    for candidates in groups:
+        for clue in candidates:
             if clue not in out:
                 out.append(clue)
             if len(out) >= MAX_CLUES:
@@ -1472,7 +1513,7 @@ class EpisodeBudget:
             return False, "budget"
         return True, ""
 
-    def begin(self, view, now=None, dedup_key=""):
+    def begin(self, view, now=None, dedup_key="", retry=False):
         now = self.clock() if now is None else float(now)
         key = _session_key(view)
         if not key:
@@ -1480,9 +1521,12 @@ class EpisodeBudget:
         self._prune(now)
         row = self.windows.get(key)
         if row is None:
-            row = {"attempts": [], "last": now, "outcome": ""}
+            row = {"attempts": [], "last": now, "outcome": "",
+                   "initialResearchAttempts": 0, "episodeRetryAttempts": 0}
             self.windows[key] = row
         row["attempts"].append(now)
+        kind = "episodeRetryAttempts" if retry else "initialResearchAttempts"
+        row[kind] += 1
         row["last"] = now
         self.windows.move_to_end(key)
         self.calls.append(now)
@@ -1505,6 +1549,9 @@ class EpisodeBudget:
         rows = []
         for key, row in list(self.windows.items())[-16:]:
             rows.append({"sessionHash": _digest(key)[:12], "attempts": len(row["attempts"]),
+                         "initialResearchAttempts": row["initialResearchAttempts"],
+                         "episodeRetryAttempts": row["episodeRetryAttempts"],
+                         "totalResearchAttempts": len(row["attempts"]),
                          "lastOutcome": row["outcome"] or None,
                          "nextEligibleSeconds": max(0.0, round(self.cooldown_seconds - (now - row["last"]), 1))})
         return {"revision": REVISION, "activeSeconds": self.active_seconds,
@@ -2953,7 +3000,7 @@ class EpisodeObserver:
                     # actually progressing because _usable_activity fails closed.
                     self._schedule_retry(binding, "inactive", now)
                 return None
-            self.budget.begin(view, dedup_key=dedup_key)
+            self.budget.begin(view, dedup_key=dedup_key, retry=retry)
         payload = request.research_payload()
         if context is not None:
             programme = dict(context, channelName=request.channel_name)
