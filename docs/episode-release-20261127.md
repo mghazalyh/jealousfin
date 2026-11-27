@@ -58,6 +58,7 @@ Server/iptv/test_deployment_continuity.py
 Server/iptv/test_episode_audio.py
 Server/iptv/test_gateway_policy.py
 Server/iptv/test_incident_identity_overlay_20261127.py
+Server/iptv/test_incident_rotation_admission_recovery_20261127.py
 Server/iptv/test_incident_sampler_gap_20261127.py
 Server/iptv/test_incident_selector_pressure_20261127.py
 Server/iptv/test_incident_startup_admission_pressure.py
@@ -198,3 +199,7 @@ Verified on the integrated tree (2026-11-27):
 
 ### Playback admission callback ordering
 Optional playback callbacks run after successful profile admission; catalogue ordering and both admitted profiles remain unchanged.
+
+## Foreground English PlaybackInfo admission recovery (2026-11-27)
+
+Bounded recovery may wait out shared status backoff only for English PlaybackInfo; credential-scoped single flight and fresh category verification remain fail-closed. Reserve selector and upstream time within the monotonic budget. Background and Malay admission remain unchanged. No IPA or state migration. Live acceptance requires advancing same-launch video and fresh programme/language evidence.

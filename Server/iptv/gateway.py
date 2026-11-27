@@ -1702,11 +1702,9 @@ def initialize_catalogue():
     # The very same policy observer and strict penalty implementation apply.
     db.execute("INSERT INTO meta VALUES('seeded','1')")
     db.execute("INSERT INTO meta VALUES('seed_time',?)",(str(time.time()),))
-def resolve(cid):
- source_id=sources[cid]
- candidates=[];local_rejections=0;other_rejections=0
- config=gateway_config
- path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
+def resolve_bases(source_id,config):
+ # Exact upstream bases resolve() may try; also used to reserve request budget
+ # before a foreground PlaybackInfo admission wait.
  bases=[None]
  if source_id in canada_cohort(config) and canada_base(config):
   bases=[canada_base(config)]
@@ -1714,6 +1712,13 @@ def resolve(cid):
   bases=[expanded_base(config)] if source_id not in primary_source_ids or config['ukTrialEnabled'] else [expanded_base(config),None]
  elif source_id in uk_cohort(config) and uk_base(config):
   bases=[uk_base(config)] if config['ukTrialEnabled'] else [uk_base(config),None]
+ return bases
+def resolve(cid):
+ source_id=sources[cid]
+ candidates=[];local_rejections=0;other_rejections=0
+ config=gateway_config
+ path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
+ bases=resolve_bases(source_id,config)
  for base in bases:
   try:response=provider_json(path) if base is None else provider_json(path,base)
   except Exception:
@@ -2045,6 +2050,18 @@ DEVICE_PROBE_STATUS_REASONS=frozenset((
 DEVICE_PROBE_IDENTITY_REASONS=frozenset((
  'device_snapshot_unavailable','device_snapshot_invalid','device_incoherent'))
 DEVICE_PROBE_BACKOFF_REASONS=DEVICE_PROBE_STATUS_REASONS|DEVICE_PROBE_IDENTITY_REASONS
+# The installed native adapter sends PlaybackInfo with a verified 20 s request
+# deadline.  A foreground admission may wait out an existing status backoff,
+# but only when a fresh category read and the following upstream resolution
+# still fit inside that deadline.  Background catalogue/policy consumers never
+# take this path.
+PLAYBACK_ADMISSION_BUDGET_SECONDS=20.0
+PLAYBACK_ADMISSION_MARGIN_SECONDS=1.0
+PLAYBACK_ADMISSION_WAIT=time.sleep
+PLAYBACK_ADMISSION_LOCK=threading.Lock()
+PLAYBACK_ADMISSION_FLIGHTS={}
+PLAYBACK_ADMISSION_STATS={'started':0,'shared':0,'refused':0,'recovered':0,
+ 'failures':0,'timeouts':0}
 DEVICE_PROBE_CLOCK=time.monotonic
 DEVICE_PROBE_BACKOFF={}
 DEVICE_PROBE_IDENTITY_BACKOFF={}
@@ -2069,6 +2086,13 @@ def _device_probe_key(config):
  address=config.get('deviceIP');port=config.get('backendPort')
  if not isinstance(address,str) or not address:return ''
  return address+':'+str(port if port is not None else '')
+def _device_probe_status_remaining_locked(config,now):
+ key=_device_probe_key(config);state=DEVICE_PROBE_BACKOFF.get(key) if key else None
+ if not isinstance(state,dict):return 0.0
+ if now-state.get('at',0)>DEVICE_PROBE_BACKOFF_RESET:
+  DEVICE_PROBE_BACKOFF.pop(key,None);return 0.0
+ return max(0.0,state.get('until',0)-now,
+  state.get('attemptAt',0)+DEVICE_PROBE_MIN_SPACING-now)
 def _device_probe_origin(origin):
  name=origin if isinstance(origin,str) and origin else 'unspecified'
  bucket=DEVICE_PROBE_STATS['byOrigin'].get(name)
@@ -2322,6 +2346,9 @@ def device_probe_diagnostics():
           'byOrigin':{name:dict(bucket) for name,bucket in DEVICE_PROBE_STATS['byOrigin'].items()},
           'byReason':dict(DEVICE_PROBE_STATS['byReason']),
           'fault':device_probe_fault,'inFlight':DEVICE_PROBE_INFLIGHT}
+def playback_admission_diagnostics():
+ with PLAYBACK_ADMISSION_LOCK:
+  return dict(PLAYBACK_ADMISSION_STATS,inFlight=len(PLAYBACK_ADMISSION_FLIGHTS))
 # Optional audio-assisted episode identity. It reuses the single language
 # decode/transcribe pass through on_speech; it never requests media, starts a
 # second Whisper run or calls a research service while disabled.
@@ -3171,16 +3198,136 @@ def web_route(path,method):
   return bool(re.fullmatch(r'/Users/[^/]+/FavoriteItems/[a-f0-9]{32}',path))
  return False
 
-def selected_profile_admitted(config,token):
- key=_device_probe_key(config)
+class _PlaybackAdmissionFlight:
+ # One foreground owner plus the exact PlaybackInfo waiters that joined it.
+ # The flight is removed on completion, so a category is never cached beyond
+ # the in-flight recovery it belongs to.
+ __slots__=('event','result','error','waiters','key')
+ def __init__(self,key):
+  self.event=threading.Event();self.result=None;self.error=None
+  self.waiters=0;self.key=key
+def _playback_credential_scope(token):
+ # The flight key must distinguish credentials without storing or logging the
+ # secret itself.  A digest is sufficient for coalescing and is never returned
+ # to a client.
+ raw=token if isinstance(token,str) else ''
+ return hashlib.sha256(('jealousfin-playback:'+raw).encode('utf-8')).hexdigest()
+def _playback_flight_key(config,token):
+ return (_device_probe_key(config),_playback_credential_scope(token))
+def _playback_selector_reserve_seconds():
+ # A foreground category read is either the bounded read itself or a wait for
+ # an in-flight status observation, so reserve the larger of the two.
+ try:wait=float(prototype_selector.STATUS_WAIT_SECONDS)
+ except (AttributeError,TypeError,ValueError):wait=0.0
+ try:read=float(prototype_selector.STATUS_READ_TIMEOUT_SECONDS)
+ except (AttributeError,TypeError,ValueError):read=wait
+ return max(wait,read)
+def _playback_resolution_reserve_seconds(cid):
+ source_id=sources.get(cid) if isinstance(cid,str) else None
+ if not isinstance(source_id,str):return float(gateway_config['providerTimeoutSeconds'])
+ try:count=max(1,len(resolve_bases(source_id,gateway_config)))
+ except Exception:count=1
+ return float(gateway_config['providerTimeoutSeconds'])*count
+def _playback_admission_plan(config,cid,now=None,started=None):
+ # Wait only as long as the existing status backoff, and only when a fresh
+ # category read plus the worst-case upstream resolution still fit inside the
+ # native PlaybackInfo deadline.  Returns (wait, monotonic deadline) or None.
+ now=_device_probe_now() if now is None else now
  with DEVICE_PROBE_LOCK:
-  # Status-only consumers must not be blocked by a snapshot/identity backoff.
-  if not _device_probe_admit_locked(config,'profile',True,('status',)):
+  remaining=_device_probe_status_remaining_locked(config,now)
+ try:
+  remaining=max(remaining,prototype_selector.status_observation_remaining(config))
+ except Exception:pass
+ started=now if started is None else started
+ available=(PLAYBACK_ADMISSION_BUDGET_SECONDS-max(0.0,now-started)-
+  _playback_resolution_reserve_seconds(cid)-
+  _playback_selector_reserve_seconds()-PLAYBACK_ADMISSION_MARGIN_SECONDS)
+ if available<=0 or remaining>available:return None
+ return remaining,now+available
+def _playback_admission_wait(wait,deadline):
+ # Bounded by a real monotonic deadline; never sleeps past it.
+ while wait>0:
+  now=_device_probe_now()
+  if now>=deadline:return False
+  step=min(wait,deadline-now)
+  if step<=0:return False
+  PLAYBACK_ADMISSION_WAIT(step)
+  wait-=step
+ return _device_probe_now()<deadline
+def _playback_profile_recovery(config,token,cid,started=None):
+ key=_playback_flight_key(config,token)
+ plan=_playback_admission_plan(config,cid,started=started)
+ if plan is None:
+  with PLAYBACK_ADMISSION_LOCK:PLAYBACK_ADMISSION_STATS['refused']+=1
+  raise RuntimeError('Device probe backoff')
+ wait,deadline=plan
+ with PLAYBACK_ADMISSION_LOCK:
+  flight=PLAYBACK_ADMISSION_FLIGHTS.get(key)
+  owner=flight is None
+  if owner:
+   flight=_PlaybackAdmissionFlight(key)
+   PLAYBACK_ADMISSION_FLIGHTS[key]=flight
+   PLAYBACK_ADMISSION_STATS['started']+=1
+  else:flight.waiters+=1
+ if not owner:
+  # Never hold the admission lock while waiting; each waiter shares the same
+  # monotonic deadline and the single in-flight category read.
+  timeout=max(0.0,deadline+_playback_selector_reserve_seconds()-_device_probe_now())
+  if not flight.event.wait(timeout):
+   with PLAYBACK_ADMISSION_LOCK:PLAYBACK_ADMISSION_STATS['timeouts']+=1
    raise RuntimeError('Device probe backoff')
+  with PLAYBACK_ADMISSION_LOCK:PLAYBACK_ADMISSION_STATS['shared']+=1
+  if flight.error is not None:raise flight.error
+  return _device_probe_copy(flight.result)
+ timed_out=False
+ try:
+  if wait>0 and not _playback_admission_wait(wait,deadline):timed_out=True
+  elif _device_probe_now()>=deadline:timed_out=True
+  if timed_out:raise RuntimeError('Device probe backoff')
+  # Exactly one fresh authenticated category read after the existing backoff.
+  # The normal admission and profile checks are unchanged; nothing is cached.
+  result=selected_profile_admitted(config,token)
+ except BaseException as error:
+  with PLAYBACK_ADMISSION_LOCK:
+   if PLAYBACK_ADMISSION_FLIGHTS.get(key) is flight:
+    PLAYBACK_ADMISSION_FLIGHTS.pop(key,None)
+   if timed_out:PLAYBACK_ADMISSION_STATS['timeouts']+=1
+   else:PLAYBACK_ADMISSION_STATS['failures']+=1
+   flight.error=error;flight.event.set()
+  raise
+ with PLAYBACK_ADMISSION_LOCK:
+  if PLAYBACK_ADMISSION_FLIGHTS.get(key) is flight:
+   PLAYBACK_ADMISSION_FLIGHTS.pop(key,None)
+  PLAYBACK_ADMISSION_STATS['recovered']+=1
+  flight.result=result;flight.event.set()
+ return _device_probe_copy(result)
+def playback_admission_foreground(path,cid,malay):
+ # Recovery is restricted to English PlaybackInfo for a known catalogue
+ # channel.  The Malay proxy keeps its immediate fail-closed admission.
+ return bool(path.endswith('/PlaybackInfo') and not malay and cid in sources)
+def selected_profile_admitted(config,token,foreground=False,cid=None):
+ started=_device_probe_now()
+ key=_device_probe_key(config)
+ if foreground and prototype_selector.status_observation_remaining(config)>0:
+  return _playback_profile_recovery(config,token,cid,started)
+ with DEVICE_PROBE_LOCK:
+  admitted=_device_probe_admit_locked(config,'profile',True,('status',))
+  fault=_device_probe_local_fault()
+ if not admitted:
+  # Status-only consumers must not be blocked by a snapshot/identity backoff.
+  # Background callers keep the immediate fail-closed backoff response; only a
+  # foreground PlaybackInfo may wait it out under the request budget.
+  if foreground and fault in ('device_probe_backoff','device_probe_rate_limited'):
+   return _playback_profile_recovery(config,token,cid,started)
+  raise RuntimeError('Device probe backoff')
  try:profile=prototype_selector.selected_profile(config,token)
  except Exception:
   with DEVICE_PROBE_LOCK:
    _device_probe_record_failure_locked(key,'device_status_unavailable','profile')
+  # Retry only when the selector recorded a failed fresh status observation,
+  # never a successfully observed but invalid category.
+  if foreground and prototype_selector.status_observation_remaining(config)>0:
+   return _playback_profile_recovery(config,token,cid,started)
   raise
  with DEVICE_PROBE_LOCK:
   # A healthy status read clears only the status lane; it must never clear or
@@ -3305,7 +3452,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if cid:
    malay=cid in prototype_selector.source_ids(ROOT)
    if path.endswith('/PlaybackInfo'):
-    selected=selected_profile_admitted(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
+    token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
+    foreground=playback_admission_foreground(path,cid,malay)
+    selected=selected_profile_admitted(config,token,foreground=foreground,cid=cid)
     if (selected=='malay')!=malay:
      self.reply(409,{'JealousfinPolicyError':'excluded'});return True
     if re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):

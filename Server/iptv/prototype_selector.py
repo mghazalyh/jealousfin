@@ -22,6 +22,7 @@ NODE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 ACTION_ID = re.compile(r"^[a-z_]{1,80}$")
 STATUS_WAIT_SECONDS = 6.0
 STATUS_BACKOFF_SECONDS = 2.0
+STATUS_READ_TIMEOUT_SECONDS = 3.0
 STATUS_CLOCK = time.monotonic
 STATUS_LOCK = threading.Lock()
 STATUS_FLIGHTS = {}
@@ -60,7 +61,7 @@ def load_selector(root):
         raise ValueError("Unexpected prototype backend port")
     return data
 
-def read_response(host, port, path, method="GET", headers=None, body=None, limit=MAX_JSON, timeout=3):
+def read_response(host, port, path, method="GET", headers=None, body=None, limit=MAX_JSON, timeout=STATUS_READ_TIMEOUT_SECONDS):
     # No proxy, no redirects, no network address derived from HTTP input.
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
@@ -150,6 +151,17 @@ def status_observation_diagnostics():
                   for key, until in STATUS_BACKOFF.items() if until > now}
         return dict(STATUS_STATS, activeBackoff=active,
                     inFlight=len(STATUS_FLIGHTS))
+
+
+def status_observation_remaining(config):
+    """Seconds until this device may issue another fresh status read.
+
+    The gateway uses this only to bound a foreground recovery wait; it never
+    turns an observation into a cached category.
+    """
+    key = _status_key(config)
+    with STATUS_LOCK:
+        return max(0.0, STATUS_BACKOFF.get(key, 0.0) - STATUS_CLOCK())
 
 
 def reset_status_observations():
