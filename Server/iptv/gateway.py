@@ -92,6 +92,18 @@ overlay_combined_evidence=None
 overlay_init_lock=threading.Lock()
 overlay_jobs=queue.Queue(maxsize=8)
 OVERLAY_SETTLE_SECONDS=2.0
+OVERLAY_PUMP_MIN_INTERVAL=1.0
+OVERLAY_PUMP_QUEUE_TTL=10.0
+OVERLAY_ADMISSION_CLOCK=time.monotonic
+overlay_pump_lock=threading.Lock()
+overlay_pump_pending=False
+overlay_pump_queued_at=0.0
+overlay_pump_last_request=float('-inf')
+overlay_admission_stats={'pumpRequests':0,'pumpEnqueued':0,'pumpCoalesced':0,
+ 'pumpStale':0,'refreshRequests':0,'refreshEnqueued':0}
+def _overlay_admission_now():
+ try:return float(OVERLAY_ADMISSION_CLOCK())
+ except (TypeError,ValueError):return time.monotonic()
 episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
 device_rotation_cache=None
 device_rotation_checked=0.0
@@ -1779,27 +1791,22 @@ def spanish_excluded(cid):
  return bool(SPANISH_AUTO_ENFORCEMENT and provider in spanish_auto_provider_ids)
 def device_rotation_state(force=False):
  # Read-only device state used to avoid changing playback while the user has
- # paused or stopped rotation. No state-changing command is issued here.
+ # paused or stopped rotation. No state-changing command is issued here. It goes
+ # through the same admission/backoff path as other GET status consumers.
  global device_rotation_cache,device_rotation_checked
  now=time.monotonic()
  if not force and now-device_rotation_checked<2:return device_rotation_cache
  device_rotation_checked=now
- config=prototype_selector.load_selector(ROOT)
- if config is None:
+ probe=device_language_probe(origin='rotation')
+ if not isinstance(probe,dict):
   device_rotation_cache=None;return None
- token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
- try:
-  status,snapshot=device_identity_pair(config,token)
-  if not isinstance(status,dict) or not isinstance(snapshot,dict):raise ValueError('Invalid device state')
-  if status.get('currentChannelID') and snapshot.get('channelID') and status['currentChannelID']!=snapshot['channelID']:raise ValueError('Incoherent channel identity')
-  if type(status.get('surfPaused')) is not bool or type(status.get('surfing')) is not bool:raise ValueError('Unknown pause state')
-  device_rotation_cache={'launchID':str(status.get('launchID',''))[:160],
-   'streamGeneration':str(snapshot.get('streamGeneration',''))[:160],
-   'currentChannelID':str(snapshot.get('channelID') or status.get('currentChannelID') or ''),
-   'surfPaused':status.get('surfPaused') is True,'surfing':status.get('surfing') is True,
-   'rotationOwner':str(status.get('rotationOwner',''))[:80],'observedAt':time.time()}
- except Exception:
-  device_rotation_cache=None
+ if type(probe.get('surfPaused')) is not bool or type(probe.get('surfing')) is not bool:
+  device_rotation_cache=None;return None
+ device_rotation_cache={'launchID':str(probe.get('launchID',''))[:160],
+  'streamGeneration':str(probe.get('streamGeneration',''))[:160],
+  'currentChannelID':str(probe.get('channelID') or ''),
+  'surfPaused':probe.get('surfPaused') is True,'surfing':probe.get('surfing') is True,
+  'rotationOwner':str(probe.get('rotationOwner',''))[:80],'observedAt':time.time()}
  return device_rotation_cache
 def language_visible(cid):
  if not spanish_excluded(cid):return True
@@ -2011,7 +2018,18 @@ DEVICE_PROBE_CURRENT=None
 DEVICE_PROBE_SHARED=None
 DEVICE_PROBE_SHARED_FAULT=''
 DEVICE_PROBE_SHARED_VERSION=-1
-DEVICE_PROBE_STATS={'probes':0,'shared':0,'failures':0,'timeouts':0,'byReason':{}}
+DEVICE_PROBE_STATS={'probes':0,'shared':0,'failures':0,'timeouts':0,
+ 'admitted':0,'rejectedBackoff':0,'rejectedRate':0,'freshAdmitted':0,
+ 'freshRejected':0,'backoffStarted':0,'recovered':0,'byReason':{},'byOrigin':{}}
+DEVICE_PROBE_BACKOFF_BASE=2.0
+DEVICE_PROBE_BACKOFF_MAX=20.0
+DEVICE_PROBE_BACKOFF_RESET=120.0
+DEVICE_PROBE_MIN_SPACING=0.5
+DEVICE_PROBE_BACKOFF_REASONS=frozenset((
+ 'device_status_unavailable','device_snapshot_unavailable',
+ 'device_status_invalid','device_snapshot_invalid','device_incoherent'))
+DEVICE_PROBE_CLOCK=time.monotonic
+DEVICE_PROBE_BACKOFF={}
 device_probe_fault=''
 DEVICE_PROBE_LOCAL=threading.local()
 def _device_probe_copy(value):
@@ -2022,14 +2040,71 @@ def _device_probe_set_local_fault(reason):
  DEVICE_PROBE_LOCAL.fault=reason or ''
 def _device_probe_local_fault():
  return getattr(DEVICE_PROBE_LOCAL,'fault','')
+def _device_probe_now():
+ try:return float(DEVICE_PROBE_CLOCK())
+ except (TypeError,ValueError):return time.monotonic()
+def _device_probe_config():
+ try:return prototype_selector.load_selector(ROOT)
+ except (OSError,ValueError,TypeError):return None
+def _device_probe_key(config):
+ if not isinstance(config,dict):return ''
+ address=config.get('deviceIP');port=config.get('backendPort')
+ if not isinstance(address,str) or not address:return ''
+ return address+':'+str(port if port is not None else '')
+def _device_probe_origin(origin):
+ name=origin if isinstance(origin,str) and origin else 'unspecified'
+ bucket=DEVICE_PROBE_STATS['byOrigin'].get(name)
+ if not isinstance(bucket,dict):
+  bucket={'admitted':0,'rejected':0,'shared':0,'failures':0}
+  DEVICE_PROBE_STATS['byOrigin'][name]=bucket
+ return bucket
+def _device_probe_admit_locked(config,origin,fresh):
+ now=_device_probe_now();key=_device_probe_key(config)
+ state=DEVICE_PROBE_BACKOFF.get(key) if key else None
+ if isinstance(state,dict):
+  if now-state.get('at',0)>DEVICE_PROBE_BACKOFF_RESET:
+   DEVICE_PROBE_BACKOFF.pop(key,None);state=None
+  elif now<state.get('until',0):
+   DEVICE_PROBE_STATS['rejectedBackoff']+=1
+   _device_probe_origin(origin)['rejected']+=1
+   if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
+   _device_probe_set_local_fault('device_probe_backoff');return False
+  elif now-state.get('attemptAt',0)<DEVICE_PROBE_MIN_SPACING:
+   DEVICE_PROBE_STATS['rejectedRate']+=1
+   _device_probe_origin(origin)['rejected']+=1
+   if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
+   _device_probe_set_local_fault('device_probe_rate_limited');return False
+ DEVICE_PROBE_STATS['admitted']+=1
+ _device_probe_origin(origin)['admitted']+=1
+ if fresh:DEVICE_PROBE_STATS['freshAdmitted']+=1
+ if isinstance(state,dict):state['attemptAt']=now
+ _device_probe_set_local_fault('');return True
+def _device_probe_record_success_locked(key):
+ if not key:return
+ if isinstance(DEVICE_PROBE_BACKOFF.pop(key,None),dict):
+  DEVICE_PROBE_STATS['recovered']+=1
+def _device_probe_record_failure_locked(key,reason,origin=None):
+ if not key or reason not in DEVICE_PROBE_BACKOFF_REASONS:return
+ now=_device_probe_now();state=DEVICE_PROBE_BACKOFF.get(key)
+ previous=state.get('failures') if isinstance(state,dict) else 0
+ if type(previous) is not int or previous<0:previous=0
+ failures=min(previous+1,16)
+ delay=min(DEVICE_PROBE_BACKOFF_BASE*(2**(failures-1)),DEVICE_PROBE_BACKOFF_MAX)
+ DEVICE_PROBE_BACKOFF[key]={'failures':failures,'until':now+delay,
+  'at':now,'attemptAt':now,'reason':reason}
+ if previous==0:DEVICE_PROBE_STATS['backoffStarted']+=1
+ if origin:_device_probe_origin(origin)['failures']+=1
+ while len(DEVICE_PROBE_BACKOFF)>16:
+  DEVICE_PROBE_BACKOFF.pop(next(iter(DEVICE_PROBE_BACKOFF)))
 class _DeviceProbeFlight:
  # One owner plus its exact waiters.  The completion event is the single
  # handoff point: a waiter can never mistake a newer flight for the one it
  # joined, and a timeout never starts a duplicate owner.
- __slots__=('version','event','result','fault','exception')
- def __init__(self,version):
+ __slots__=('version','event','result','fault','exception','key','origin')
+ def __init__(self,version,key='',origin='unspecified'):
   self.version=version;self.event=threading.Event()
   self.result=None;self.fault='';self.exception=None
+  self.key=key;self.origin=origin
 def device_identity_pair(config,token):
  # The GET route is read-only and does not create durable command receipts.
  # New native builds provide channel and generation in a single atomic status.
@@ -2076,9 +2151,9 @@ def _device_language_probe_once():
   surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
   playing=status.get('playing') if type(status.get('playing')) is bool else None
   _device_probe_set_local_fault('')
-  return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
+  return {'channelID':channel_id or status_channel,'launchID':str(status.get('launchID','') or ''),
           'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing,
-          'playing':playing}
+          'playing':playing,'rotationOwner':str(status.get('rotationOwner','') or '')[:80]}
  if incoherent:_device_probe_set_local_fault('device_incoherent')
  return None
 
@@ -2098,28 +2173,49 @@ def _device_probe_record_completion(flight,value,fault,error,count_probe):
   device_probe_fault=flight.fault
   if count_probe:
    DEVICE_PROBE_STATS['probes']+=1
-   if not isinstance(value,dict):
+   if isinstance(value,dict):
+    _device_probe_record_success_locked(flight.key)
+   else:
     DEVICE_PROBE_STATS['failures']+=1
     reasons=DEVICE_PROBE_STATS['byReason']
     reason=flight.fault or 'device_unavailable'
     reasons[reason]=(reasons.get(reason,0)+1)
+    _device_probe_origin(flight.origin)['failures']+=1
+    _device_probe_record_failure_locked(flight.key,reason,flight.origin)
   DEVICE_PROBE_CONDITION.notify_all()
-def device_language_probe(share=True):
+def device_language_probe(share=True,origin='unspecified'):
  # Single-flight, not a launch cache.  A probe that is genuinely in flight is
  # shared by callers that arrive while it runs; a probe that already finished
  # is never reused.  Sequential probes therefore always read a fresh launch,
  # while concurrent language/episode/overlay probes after a new launch collapse
- # to one coherent read instead of several 3s/8s device calls.
+ # to one coherent read instead of several 3s/8s device calls.  A failed read
+ # opens a bounded per-device backoff; fresh checks never reuse the last
+ # positive identity and fail closed while that backoff is active.
  global DEVICE_PROBE_INFLIGHT,DEVICE_PROBE_VERSION,DEVICE_PROBE_CURRENT
+ config=_device_probe_config();key=_device_probe_key(config)
  if not share:
   # Independently fresh observation.  It owns its own thread-local fault and
   # never joins or mutates the coalesced flight.
-  return _device_language_probe_once()
+  with DEVICE_PROBE_LOCK:
+   if not _device_probe_admit_locked(config,origin,True):return None
+  value=None;fault=''
+  try:
+   value=_device_language_probe_once()
+   fault=_device_probe_local_fault()
+  except BaseException:
+   with DEVICE_PROBE_LOCK:
+    _device_probe_record_failure_locked(key,_device_probe_local_fault() or 'device_probe_exception',origin)
+   raise
+  with DEVICE_PROBE_LOCK:
+   if isinstance(value,dict):_device_probe_record_success_locked(key)
+   else:_device_probe_record_failure_locked(key,fault or 'device_unavailable',origin)
+  return value
  with DEVICE_PROBE_LOCK:
   flight=DEVICE_PROBE_CURRENT
   if flight is None or flight.event.is_set():
+   if not _device_probe_admit_locked(config,origin,False):return None
    DEVICE_PROBE_VERSION+=1
-   flight=_DeviceProbeFlight(DEVICE_PROBE_VERSION)
+   flight=_DeviceProbeFlight(DEVICE_PROBE_VERSION,key,origin)
    DEVICE_PROBE_CURRENT=flight
    DEVICE_PROBE_INFLIGHT=True
    owner=True
@@ -2137,6 +2233,7 @@ def device_language_probe(share=True):
    return None
   with DEVICE_PROBE_LOCK:
    DEVICE_PROBE_STATS['shared']+=1
+   _device_probe_origin(origin)['shared']+=1
    device_probe_fault=flight.fault
   _device_probe_set_local_fault(flight.fault)
   if flight.exception is not None:raise flight.exception
@@ -2153,9 +2250,27 @@ def device_language_probe(share=True):
  return value
 def device_probe_diagnostics():
  with DEVICE_PROBE_LOCK:
+  now=_device_probe_now();active=[]
+  for state in DEVICE_PROBE_BACKOFF.values():
+   if isinstance(state,dict) and now<state.get('until',0):
+    active.append(state)
+  remaining=max((state['until']-now for state in active),default=0.0)
+  failures=max((state.get('failures',0) for state in active),default=0)
   return {'probes':DEVICE_PROBE_STATS['probes'],'shared':DEVICE_PROBE_STATS['shared'],
           'failures':DEVICE_PROBE_STATS['failures'],
           'timeouts':DEVICE_PROBE_STATS['timeouts'],
+          'admitted':DEVICE_PROBE_STATS['admitted'],
+          'rejectedBackoff':DEVICE_PROBE_STATS['rejectedBackoff'],
+          'rejectedRate':DEVICE_PROBE_STATS['rejectedRate'],
+          'freshAdmitted':DEVICE_PROBE_STATS['freshAdmitted'],
+          'freshRejected':DEVICE_PROBE_STATS['freshRejected'],
+          'backoffStarted':DEVICE_PROBE_STATS['backoffStarted'],
+          'recovered':DEVICE_PROBE_STATS['recovered'],
+          'backoff':{'active':bool(active),'devices':len(active),
+                     'remainingSeconds':round(max(0.0,remaining),3),
+                     'consecutiveFailures':failures,
+                     'capSeconds':DEVICE_PROBE_BACKOFF_MAX},
+          'byOrigin':{name:dict(bucket) for name,bucket in DEVICE_PROBE_STATS['byOrigin'].items()},
           'byReason':dict(DEVICE_PROBE_STATS['byReason']),
           'fault':device_probe_fault,'inFlight':DEVICE_PROBE_INFLIGHT}
 # Optional audio-assisted episode identity. It reuses the single language
@@ -2280,7 +2395,7 @@ def episode_probe():
  # physical visit and stream generation are still required, and a same-launch
  # reload keeps the same visit ID so the audio binding treats it as one
  # physical session.
- probe=device_language_probe()
+ probe=device_language_probe(origin='episode')
  if not isinstance(probe,dict):
   # Keep the legacy bucket for older dashboards but expose the exact read
   # failure so a launch-time timeout is not confused with an incoherent pair.
@@ -2703,7 +2818,7 @@ def overlay_correction_allowed(cid):
  if bridge.latest_snapshot is not None and bridge.latest_snapshot.channel_id!=cid:return False
  return True
 def overlay_current_channel(fresh=False):
- try:probe=device_language_probe(share=not fresh)
+ try:probe=device_language_probe(share=not fresh,origin='overlay_fresh' if fresh else 'overlay')
  except Exception:return None
  if not isinstance(probe,dict):return None
  cid=probe.get('channelID')
@@ -2815,7 +2930,7 @@ def _overlay_process(job,stop):
 def overlay_worker(stop):
  # Existing daemon lifecycle only: it blocks for a triggered job and stops on
  # the shutdown sentinel. It never polls the device on its own.
- global overlay_bridge_fault
+ global overlay_bridge_fault,overlay_pump_pending
  while not stop.is_set():
   try:job=overlay_jobs.get()
   except (queue.Empty,EOFError):break
@@ -2824,13 +2939,40 @@ def overlay_worker(stop):
   except Exception as error:
    overlay_bridge_fault=type(error).__name__
    log('Language overlay worker '+type(error).__name__)
+  finally:
+   if isinstance(job,dict) and job.get('kind')=='pump':
+    with overlay_pump_lock:overlay_pump_pending=False
 def overlay_request_pump():
+ # /trial-status is a poll boundary. Coalesce pending retry jobs so a fast
+ # status consumer cannot enqueue one device probe per request.
+ global overlay_pump_pending,overlay_pump_queued_at,overlay_pump_last_request
  bridge=overlay_bridge_state
- if bridge is not None and bridge.status().get('pending'):overlay_enqueue('pump')
+ if bridge is None:return False
+ try:pending=bool(bridge.status().get('pending'))
+ except Exception:return False
+ if not pending:return False
+ with overlay_pump_lock:
+  now=_overlay_admission_now()
+  overlay_admission_stats['pumpRequests']+=1
+  if overlay_pump_pending and now-overlay_pump_queued_at<=OVERLAY_PUMP_QUEUE_TTL:
+   overlay_admission_stats['pumpCoalesced']+=1;return False
+  if overlay_pump_pending:
+   overlay_admission_stats['pumpStale']+=1
+  if now-overlay_pump_last_request<OVERLAY_PUMP_MIN_INTERVAL:
+   overlay_admission_stats['pumpCoalesced']+=1;return False
+  overlay_pump_last_request=now
+  overlay_pump_pending=True
+  overlay_pump_queued_at=now
+ if not overlay_enqueue('pump'):
+  with overlay_pump_lock:overlay_pump_pending=False
+  return False
+ with overlay_pump_lock:overlay_admission_stats['pumpEnqueued']+=1
+ return True
 def overlay_status():
  bridge=overlay_bridge_instance()
  fault=overlay_bridge_fault or (bridge.status().get('fault','') if bridge is not None else '')
- base={'configured':bridge is not None,'fault':fault,'queueDepth':overlay_jobs.qsize()}
+ base={'configured':bridge is not None,'fault':fault,'queueDepth':overlay_jobs.qsize(),
+       'admission':dict(overlay_admission_stats)}
  if bridge is None:return dict(base,revision=overlay_bridge.OVERLAY_REVISION)
  return dict(bridge.status(),**base)
 def spanish_auto_status():
@@ -2966,6 +3108,19 @@ def web_route(path,method):
   return bool(re.fullmatch(r'/Users/[^/]+/FavoriteItems/[a-f0-9]{32}',path))
  return False
 
+def selected_profile_admitted(config,token):
+ key=_device_probe_key(config)
+ with DEVICE_PROBE_LOCK:
+  if not _device_probe_admit_locked(config,'profile',True):
+   raise RuntimeError('Device probe backoff')
+ try:profile=prototype_selector.selected_profile(config,token)
+ except Exception:
+  with DEVICE_PROBE_LOCK:
+   _device_probe_record_failure_locked(key,'device_status_unavailable','profile')
+  raise
+ with DEVICE_PROBE_LOCK:
+  _device_probe_record_success_locked(key)
+ return profile
 class Handler(http.server.BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'
  def browser_origin(self):
@@ -3070,7 +3225,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    enqueue_playback_marker(config,token)
    overlay_enqueue('refresh')
   if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
-   if prototype_selector.selected_profile(config,token)=='malay':
+   if selected_profile_admitted(config,token)=='malay':
     self.proxy_malay(config,path);return True
    return False
   if path=='/Jealousfin/Policy/Event' and self.command=='POST':
@@ -3088,7 +3243,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if cid:
    malay=cid in prototype_selector.source_ids(ROOT)
    if path.endswith('/PlaybackInfo'):
-    selected=prototype_selector.selected_profile(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
+    selected=selected_profile_admitted(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
     if (selected=='malay')!=malay:
      self.reply(409,{'JealousfinPolicyError':'excluded'});return True
    if malay:

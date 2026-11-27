@@ -376,6 +376,227 @@ class DeviceProbeSingleFlightDefectTests(GatewayFixture):
         self.assertEqual(len(reads), 2)
 
 
+class DeviceProbeAdmissionBackoffTests(GatewayFixture):
+    def start_patches(self, status_fn, command_fn=None):
+        patches = self.device_patches(status_fn, command_fn)
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_failed_shared_probe_opens_backoff_and_retries_after_the_window(self):
+        clock = [100.0]
+        reads = []
+
+        def status(config, token):
+            reads.append(1)
+            if len(reads) == 1:
+                raise RuntimeError("status unavailable")
+            return dict(atomic_status(launch="L2", stream="S2"))
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]):
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertEqual(diagnostics["probes"], 1)
+            self.assertEqual(diagnostics["failures"], 1)
+            self.assertEqual(diagnostics["backoffStarted"], 1)
+            self.assertEqual(
+                diagnostics["byReason"]["device_status_unavailable"], 1)
+            self.assertTrue(diagnostics["backoff"]["active"])
+            self.assertEqual(
+                diagnostics["backoff"]["remainingSeconds"], 2.0)
+
+            clock[0] = 101.0
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            self.assertEqual(len(reads), 1)
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertEqual(diagnostics["rejectedBackoff"], 1)
+            self.assertEqual(
+                diagnostics["byOrigin"]["episode"]["rejected"], 1)
+
+            clock[0] = 103.0
+            value = self.g.device_language_probe(origin="episode")
+            self.assertEqual(value["launchID"], "L2")
+            self.assertEqual(len(reads), 2)
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertFalse(diagnostics["backoff"]["active"])
+            self.assertEqual(diagnostics["recovered"], 1)
+            self.assertEqual(
+                diagnostics["byOrigin"]["episode"]["admitted"], 2)
+
+    def test_backoff_escalates_to_the_cap_and_resets_after_a_quiet_window(self):
+        clock = [100.0]
+        failing = [True]
+
+        def status(config, token):
+            if failing[0]:
+                raise RuntimeError("status unavailable")
+            return dict(atomic_status(launch="L-reset"))
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]):
+            delays = (2.0, 4.0, 8.0, 16.0, 20.0)
+            for index, delay in enumerate(delays):
+                self.assertIsNone(self.g.device_language_probe(origin="episode"))
+                diagnostics = self.g.device_probe_diagnostics()
+                self.assertEqual(
+                    diagnostics["backoff"]["remainingSeconds"], delay)
+                if index == len(delays) - 1:
+                    self.assertEqual(
+                        diagnostics["backoff"]["consecutiveFailures"], 5)
+                else:
+                    clock[0] += delay
+
+            failing[0] = False
+            clock[0] = 251.0
+            value = self.g.device_language_probe(origin="episode")
+            self.assertEqual(value["launchID"], "L-reset")
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertFalse(diagnostics["backoff"]["active"])
+            self.assertEqual(self.g.DEVICE_PROBE_BACKOFF, {})
+
+    def test_fresh_probe_never_returns_the_previous_positive_identity(self):
+        clock = [100.0]
+        reads = []
+
+        def status(config, token):
+            reads.append(1)
+            if len(reads) == 1:
+                return dict(atomic_status(launch="L1", stream="S1"))
+            if len(reads) == 2:
+                raise RuntimeError("status unavailable")
+            return dict(atomic_status(launch="L3", stream="S3"))
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]):
+            first = self.g.device_language_probe(share=False, origin="fresh")
+            self.assertEqual(first["channelID"], A)
+            self.assertIsNone(
+                self.g.device_language_probe(share=False, origin="fresh"))
+
+            clock[0] = 100.5
+            self.assertIsNone(
+                self.g.device_language_probe(share=False, origin="fresh"))
+            self.assertEqual(len(reads), 2)
+            diagnostics = self.g.device_probe_diagnostics()
+            self.assertEqual(diagnostics["freshAdmitted"], 2)
+            self.assertEqual(diagnostics["freshRejected"], 1)
+            self.assertEqual(
+                diagnostics["byOrigin"]["fresh"]["failures"], 1)
+            self.assertTrue(diagnostics["backoff"]["active"])
+
+            clock[0] = 103.0
+            recovered = self.g.device_language_probe(share=False,
+                                                     origin="fresh")
+            self.assertEqual(recovered["launchID"], "L3")
+            self.assertEqual(self.g.device_probe_diagnostics()["recovered"], 1)
+
+    def test_rotation_state_drops_cached_identity_when_recheck_fails(self):
+        reads = []
+
+        def status(config, token):
+            reads.append(1)
+            if len(reads) == 1:
+                return dict(atomic_status(channel=A, launch="L1",
+                                          stream="S1"))
+            raise RuntimeError("status unavailable")
+
+        self.start_patches(status)
+        first = self.g.device_rotation_state(force=True)
+        self.assertEqual(first["currentChannelID"], A)
+        self.assertEqual(first["launchID"], "L1")
+        self.assertIsNone(self.g.device_rotation_state(force=True))
+        self.assertIsNone(self.g.device_rotation_cache)
+        self.assertEqual(len(reads), 2)
+
+    def test_selected_profile_fails_closed_while_backoff_is_active(self):
+        clock = [100.0]
+
+        def status(config, token):
+            raise RuntimeError("status unavailable")
+
+        self.start_patches(status)
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK",
+                          side_effect=lambda: clock[0]), \
+                patch.object(self.g.prototype_selector, "selected_profile",
+                             return_value="malay") as selected:
+            self.assertIsNone(self.g.device_language_probe(origin="episode"))
+            with self.assertRaises(RuntimeError) as raised:
+                self.g.selected_profile_admitted(self.selector, "token")
+            self.assertEqual(str(raised.exception), "Device probe backoff")
+            selected.assert_not_called()
+
+            clock[0] = 103.0
+            self.assertEqual(
+                self.g.selected_profile_admitted(self.selector, "token"),
+                "malay")
+            selected.assert_called_once()
+            self.assertEqual(self.g.device_probe_diagnostics()["recovered"], 1)
+
+
+class OverlayPumpAdmissionTests(GatewayFixture):
+    class PendingBridge:
+        def __init__(self, pending=True):
+            self.pending = pending
+
+        def status(self):
+            return {"pending": self.pending}
+
+    def test_pending_pump_requests_coalesce_then_replace_a_stale_entry(self):
+        clock = [100.0]
+        bridge = self.PendingBridge()
+        with patch.object(self.g, "overlay_bridge_state", bridge), \
+                patch.object(self.g, "OVERLAY_ADMISSION_CLOCK",
+                             side_effect=lambda: clock[0]):
+            self.assertTrue(self.g.overlay_request_pump())
+            self.assertEqual(self.g.overlay_jobs.qsize(), 1)
+            self.assertFalse(self.g.overlay_request_pump())
+            self.assertEqual(self.g.overlay_jobs.qsize(), 1)
+            clock[0] = 100.0 + self.g.OVERLAY_PUMP_QUEUE_TTL + 0.1
+            self.assertTrue(self.g.overlay_request_pump())
+            self.assertEqual(self.g.overlay_jobs.qsize(), 2)
+        stats = dict(self.g.overlay_admission_stats)
+        self.assertEqual(stats["pumpRequests"], 3)
+        self.assertEqual(stats["pumpEnqueued"], 2)
+        self.assertEqual(stats["pumpCoalesced"], 1)
+        self.assertEqual(stats["pumpStale"], 1)
+
+    def test_minimum_spacing_blocks_a_new_pump_that_is_not_pending(self):
+        clock = [100.0]
+        bridge = self.PendingBridge()
+        with patch.object(self.g, "overlay_bridge_state", bridge), \
+                patch.object(self.g, "OVERLAY_ADMISSION_CLOCK",
+                             side_effect=lambda: clock[0]):
+            self.assertTrue(self.g.overlay_request_pump())
+            with self.g.overlay_pump_lock:
+                self.g.overlay_pump_pending = False
+
+            clock[0] = 100.5
+            self.assertFalse(self.g.overlay_request_pump())
+            self.assertEqual(self.g.overlay_jobs.qsize(), 1)
+
+            clock[0] = 101.1
+            self.assertTrue(self.g.overlay_request_pump())
+            self.assertEqual(self.g.overlay_jobs.qsize(), 2)
+        stats = dict(self.g.overlay_admission_stats)
+        self.assertEqual(stats["pumpRequests"], 3)
+        self.assertEqual(stats["pumpEnqueued"], 2)
+        self.assertEqual(stats["pumpCoalesced"], 1)
+
+    def test_an_idle_bridge_does_not_record_or_enqueue_a_pump(self):
+        clock = [100.0]
+        bridge = self.PendingBridge(pending=False)
+        with patch.object(self.g, "overlay_bridge_state", bridge), \
+                patch.object(self.g, "OVERLAY_ADMISSION_CLOCK",
+                             side_effect=lambda: clock[0]):
+            self.assertFalse(self.g.overlay_request_pump())
+        self.assertEqual(self.g.overlay_jobs.qsize(), 0)
+        self.assertEqual(self.g.overlay_admission_stats["pumpRequests"], 0)
+
+
 class CombinedFallbackDedupTests(unittest.TestCase):
     class Transport:
         def __init__(self):
