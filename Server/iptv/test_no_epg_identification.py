@@ -379,6 +379,37 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
             self.assertEqual(diag["outcome"],"provider-rate-limit-backoff")
             self.assertGreater(diag["modelGate"]["backoffSeconds"],0)
 
+    def test_general_worker_defers_without_consuming_budget_when_model_busy(self):
+        ctx=self.g
+        gate=ctx.episode_model_gate
+        self.assertEqual(gate.acquire(),"")
+        stop=SimpleNamespace(wait=unittest.mock.Mock(side_effect=[False,True]))
+        before=dict(ctx.discovery.records)
+        calls=list(ctx.discovery.calls)
+        try:
+            with patch.dict(ctx.gateway_config,{"metadataResearchEnabled":True}), \
+                 patch.object(ctx,"reload_gateway_config"), \
+                 patch.object(ctx,"programme_observed_at",time.time()), \
+                 patch.object(ctx,"programme_snapshot",return_value={}), \
+                 patch.object(ctx.opencode_discovery,"available",return_value=True), \
+                 patch.object(ctx.discovery,"choose",return_value=fixtures.CHANNEL) as choose, \
+                 patch.object(ctx.discovery,"choose_recheck",return_value=None), \
+                 patch.object(ctx.research_coordinator,"choose_active",return_value=None), \
+                 patch.object(ctx.opencode_discovery,"run_model_detailed") as model:
+                ctx.discovery_worker(stop)
+                self.assertTrue(choose.called)
+                model.assert_not_called()
+                self.assertEqual(ctx.discovery.records,before)
+                self.assertEqual(ctx.discovery.calls,calls)
+                self.assertFalse(ctx.discovery.in_flight)
+        finally:
+            gate.release()
+
+    def test_general_model_failures_classified_for_shared_backoff(self):
+        data=json.dumps({"type":"tool_use","part":{"tool":"websearch","state":{"status":"error","error":"HTTP 429"}}}).encode()
+        _,d=discovery.parse_events_detailed(data,classify_search_failures=True)
+        self.assertEqual(d["searchFailureCategories"],{"rate-limit":1})
+
     def test_unknown_provider_diagnostics_are_separate_and_sanitized(self):
         ctx={"seriesTitle":"","clues":list(fixtures.nxt_request().clues)}
         with patch.dict(self.g.gateway_config,{"episodeAudioEnabled":True}), \

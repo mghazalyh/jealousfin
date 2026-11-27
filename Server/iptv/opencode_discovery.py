@@ -79,7 +79,7 @@ def _episode_search_failure(state):
     return "other"
 
 
-def parse_events_detailed(data, strict_episode=False):
+def parse_events_detailed(data, strict_episode=False, classify_search_failures=False):
     """Parse OpenCode JSON events and return bounded diagnostics, never query text."""
     fragments=[];searched=False
     diagnostics={"eventCounts":{},"toolCalls":[],"completedSearches":0,"failedSearches":0,
@@ -107,7 +107,7 @@ def parse_events_detailed(data, strict_episode=False):
                 if status=="completed":searched=True;diagnostics["completedSearches"]+=1
                 elif status=="error":
                     diagnostics["failedSearches"]+=1
-                    if strict_episode:
+                    if strict_episode or classify_search_failures:
                         failures=diagnostics.setdefault("searchFailureCategories",{})
                         category=_episode_search_failure(state)
                         failures[category]=failures.get(category,0)+1
@@ -228,7 +228,7 @@ def run_model_detailed(prompt,model,timeout,variant=DEFAULT_VARIANT,episode_lead
     try:
         data,timed_out=_run_model_process(prompt,model,timeout,variant,retain_partial=True) if episode_leads else _run_model_process(prompt,model,timeout,variant)
         diagnostics["outputBytes"]=len(data);diagnostics["timedOut"]=bool(timed_out)
-        result,parsed=parse_events_detailed(data,strict_episode=episode_leads);diagnostics.update(parsed)
+        result,parsed=parse_events_detailed(data,strict_episode=episode_leads,classify_search_failures=True);diagnostics.update(parsed)
         if episode_leads:
             leads=completed_episode_search_leads(data)
             # The final model answer is not source provenance. Even a valid
@@ -416,7 +416,7 @@ def episode_direct_search_queries(context):
 
 
 class EpisodeModelGate:
-    """Nonblocking episode-model lease with rate-limit cooldown.
+    """Shared nonblocking metadata-model lease with rate-limit cooldown.
 
     Direct public search remains available during model backoff. The gate
     never delays playback or waits for another research request.

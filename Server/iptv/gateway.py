@@ -1379,6 +1379,8 @@ def discovery_worker(stop):
  # Normal bounded gateway worker; not an external scheduled task.
  while not stop.wait(10):
   plan=None
+  model_acquired=False
+  diagnostics=None
   try:
    reload_gateway_config()
    if not gateway_config['metadataResearchEnabled'] or not opencode_discovery.available():continue
@@ -1399,6 +1401,9 @@ def discovery_worker(stop):
     model=gateway_config['metadataResearchModel'];timeout=gateway_config['metadataResearchTimeoutSeconds']
     variant=plan.variant if plan else gateway_config['metadataResearchVariant']
     if not opencode_discovery.clean(channel) or not re.fullmatch(r'nltv:[A-Za-z0-9_-]+:[A-Za-z0-9_.-]{1,160}',provider_id):continue
+    if not recheck:
+     if episode_model_gate.acquire():continue
+     model_acquired=True
     if recheck:
      discovery.rechecked[cid]=now
      previous=dict(discovery.records[cid]['candidate'])
@@ -1418,7 +1423,12 @@ def discovery_worker(stop):
               plan.attempt if plan else 1,
               discovery.records.get(cid,{}).get('candidate',{}).get('title') if plan else None)
       raw,diagnostics=opencode_discovery.run_model_detailed(prompt,model,timeout,variant)
+     except Exception as error:
+      diagnostics=getattr(error,'diagnostics',None)
+      raise
      finally:
+      if model_acquired:
+       episode_model_gate.release(diagnostics);model_acquired=False
       with lock:discovery.last_run={'variant':variant,'seconds':round(time.monotonic()-started,3),'channelID':cid,'at':time.time()}
      candidate=opencode_discovery.normalize_result(raw)
     checked_at=time.time()
@@ -1454,6 +1464,8 @@ def discovery_worker(stop):
   except Exception as error:
    with lock:discovery.in_flight=False;discovery.last_fault=type(error).__name__
    log('programme research worker '+type(error).__name__)
+  finally:
+   if model_acquired:episode_model_gate.release(diagnostics)
 
 def discovery_status():
  with lock:
