@@ -118,7 +118,7 @@ def model_args(prompt,model,work,variant=DEFAULT_VARIANT):
     if variant is not None:args.extend(["--variant",variant])
     return args+[prompt]
 
-def _run_model_process(prompt,model,timeout,variant=DEFAULT_VARIANT):
+def _run_model_process(prompt,model,timeout,variant=DEFAULT_VARIANT,retain_partial=False):
     if not available():raise RuntimeError("OpenCode unavailable")
     if not MODEL_RE.fullmatch(model):raise ValueError("Invalid OpenCode model")
     with tempfile.TemporaryDirectory(prefix="jealousfin-epg-research-") as work:
@@ -132,12 +132,20 @@ def _run_model_process(prompt,model,timeout,variant=DEFAULT_VARIANT):
                 sel.register(p.stdout,selectors.EVENT_READ)
                 while True:
                     left=deadline-time.monotonic()
-                    if left<=0 or not sel.select(left):timed_out=True;raise TimeoutError("OpenCode research deadline")
+                    if left<=0 or not sel.select(left):
+                        timed_out=True
+                        if retain_partial:break
+                        raise TimeoutError("OpenCode research deadline")
                     chunk=os.read(p.stdout.fileno(),16384)
                     if not chunk:break
                     data.extend(chunk)
                     if len(data)>MAX_OUTPUT:raise ValueError("OpenCode output limit")
-            if p.wait(timeout=max(.1,deadline-time.monotonic())):raise RuntimeError("OpenCode process failed")
+            if not timed_out:
+                try:
+                    if p.wait(timeout=max(.1,deadline-time.monotonic())):raise RuntimeError("OpenCode process failed")
+                except subprocess.TimeoutExpired:
+                    if not retain_partial:raise
+                    timed_out=True
         finally:
             if p.poll() is None:
                 try:os.killpg(p.pid,signal.SIGKILL)
@@ -146,16 +154,55 @@ def _run_model_process(prompt,model,timeout,variant=DEFAULT_VARIANT):
             p.stdout.close()
     return bytes(data),timed_out
 
+def completed_episode_search_leads(data):
+    """Return URL leads from completed public searches, not model speculation.
+
+    A timeout may occur after useful searches but before the final JSON. Only
+    complete JSON events from websearch are eligible. Other tools or a provider
+    error fail closed. All accepted URLs still require independent page reads.
+    """
+    leads={"official":[],"reports":[]}
+    if not isinstance(data,bytes) or len(data)>MAX_OUTPUT:return leads
+    for line in data.splitlines():
+        try:event=json.loads(line)
+        except (ValueError,UnicodeError):continue
+        if not isinstance(event,dict):continue
+        if event.get("type")=="error":return {"official":[],"reports":[]}
+        if event.get("type")!="tool_use":continue
+        part=event.get("part")
+        if not isinstance(part,dict) or part.get("tool")!="websearch":
+            return {"official":[],"reports":[]}
+        state=part.get("state")
+        if not isinstance(state,dict) or state.get("status")!="completed":continue
+        output=state.get("output")
+        if not isinstance(output,str):continue
+        for match in re.finditer(r"https://[^\s<>\x22\x27\x60]{1,2048}",output[:MAX_OUTPUT]):
+            url=match.group().rstrip(").,;]")
+            for family,hosts in (("official",episode_audio.OFFICIAL_ARCHIVE_HOSTS),("reports",episode_audio.INDEPENDENT_REPORT_HOSTS)):
+                clean_url=episode_audio.safe_source_url(url,hosts,allow_query=False)
+                if clean_url and clean_url not in leads[family] and len(leads[family])<episode_audio.MAX_PROVIDER_CANDIDATES:
+                    leads[family].append(clean_url)
+    return leads
+
+
 def run_model(prompt,model,timeout,variant=DEFAULT_VARIANT):
     result,_=run_model_detailed(prompt,model,timeout,variant)
     return result
 
-def run_model_detailed(prompt,model,timeout,variant=DEFAULT_VARIANT):
+def run_model_detailed(prompt,model,timeout,variant=DEFAULT_VARIANT,episode_leads=False):
     started=time.monotonic();diagnostics={"variant":variant,"model":model,"timedOut":False,"outputBytes":0,"seconds":0.0,"error":None}
     try:
-        data,timed_out=_run_model_process(prompt,model,timeout,variant)
+        data,timed_out=_run_model_process(prompt,model,timeout,variant,retain_partial=True) if episode_leads else _run_model_process(prompt,model,timeout,variant)
         diagnostics["outputBytes"]=len(data);diagnostics["timedOut"]=bool(timed_out)
         result,parsed=parse_events_detailed(data);diagnostics.update(parsed)
+        if episode_leads:
+            leads=completed_episode_search_leads(data)
+            if result is not None:
+                final=normalize_episode_sources(result)
+                result=normalize_episode_sources({key:final[key]+leads[key] for key in leads})
+            elif any(leads.values()) and parsed.get("error") not in ("unexpected-tool","opencode-error"):
+                result=leads
+            diagnostics["completedSearchLeadCounts"]={key:len(value) for key,value in leads.items()}
     except Exception as error:
         diagnostics["error"]=type(error).__name__
         diagnostics["seconds"]=round(time.monotonic()-started,3)

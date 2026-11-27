@@ -296,3 +296,82 @@ class ConfirmedProgressTests(unittest.TestCase):
                 self.assertEqual(result.accepted,expected)
                 self.assertEqual(store.get(fixtures.CHANNEL) is not None,expected)
                 if not expected:self.assertEqual(result.reason,"insufficient-confirmed-progress")
+
+class PublicArticleAndPartialSearchTests(unittest.TestCase):
+    def test_completed_search_survives_model_timeout_but_only_as_leads(self):
+        official=fixtures.WWE_ARCHIVE_URL
+        report=fixtures.WI_URL
+        def event(status,output,tool="websearch"):
+            return {"type":"tool_use","part":{"tool":tool,"state":{"status":status,"output":output}}}
+        encode=lambda rows: "\n".join(json.dumps(r) for r in rows).encode()
+        events=[event("completed",f"Result: {official} and {report} and https://www.wwe.com.evil.test/fake"),
+                event("error","https://www.pwinsider.com/fake")]
+        data=encode(events)+b"\n{truncated"
+        with patch.object(discovery,"_run_model_process",return_value=(data,True)):
+            found,diag=discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+        self.assertEqual(found,{"official":[official],"reports":[report]})
+        self.assertTrue(diag["timedOut"])
+        self.assertEqual(diag["completedSearchLeadCounts"],{"official":1,"reports":1})
+        self.assertEqual(discovery.completed_episode_search_leads(encode(events+[event("completed",official,"bash")])),{"official":[],"reports":[]})
+        self.assertEqual(discovery.completed_episode_search_leads(encode([event("error",official)])),{"official":[],"reports":[]})
+        self.assertEqual(discovery.completed_episode_search_leads(encode(events+[{"type":"error"}])),{"official":[],"reports":[]})
+        with patch.object(discovery,"_run_model_process",return_value=(data,True)):
+            with self.assertRaises(discovery.ResearchError):
+                discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1)
+
+    def test_article_body_matches_only_scoped_exact_disjoint_clues(self):
+        headline="WWE NXT Results - November 4, 2025"
+        base=f'<meta property="og:title" content="{headline}"><meta property="og:description" content="Six Woman Tag Team Match">'
+        body=f'<article><h1>{headline}</h1><time datetime="2025-11-05T04:31:21-05:00"></time><p>Je&apos;Von Evans takes on Saquon Shugars.</p></article>'
+        url="https://www.pwmania.com/wwe-nxt-results-november-4-2025"
+        clues=["jevon evans","saquon shugars"]
+        rows=audio.parse_report_page(base+body,url,{"seriesTitle":""},clues=clues)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0].original_air_date,"2025-11-04")
+        self.assertEqual(rows[0].published_at,"2025-11-05")
+        self.assertEqual(set(rows[0].terms),set(clues))
+        for bad in [body.replace("<p>","<aside><p>").replace("</p>","</p></aside>"),
+                    body.replace(headline,"Unrelated article"),
+                    body+"<article><p>other</p></article>",
+                    body.replace("Saquon Shugars","someone else"),
+                    body.replace("Saquon Shugars","SaquonShugars"),
+                    body.replace('<time datetime="2025-11-05T04:31:21-05:00"></time>',"")]:
+            self.assertEqual(audio.parse_report_page(base+bad,url,{"seriesTitle":""},clues=clues),[])
+        self.assertEqual(audio.parse_report_page(base+body,url,{"seriesTitle":""},clues=["jevon evans","jevon","evans"]),[])
+
+    def test_unknown_evidence_cache_also_scoped_to_clues_within_session(self):
+        calls=[]
+        report=fixtures.REPORT_PAGE.replace("WWE NXT results:", "WWE NXT results: June 16, 2026:")
+        def fetch(url):
+            calls.append(url)
+            return fixtures.OFFICIAL_PAGE if url==fixtures.OFFICIAL_URL else report
+        research=audio.PublicEvidenceResearch(fetch,provider=lambda _:([fixtures.OFFICIAL_URL],[fixtures.REPORT_URL]))
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":"","researchSession":"a"*64}
+        first={"programme":ctx,"clues":list(fixtures.nxt_request().clues)}
+        _,rows=research(first)
+        self.assertTrue(rows)
+        n=len(calls);research(first);self.assertEqual(len(calls),n)
+        _,other=research(dict(first,clues=["different person","unrelated plot"]))
+        self.assertGreater(len(calls),n)
+        self.assertEqual(other,[])
+
+    def test_verified_content_after_rotation_is_not_a_live_publication(self):
+        wall=time.time();switched=[False];store=audio.PublicationStore();delivered=[]
+        def research(payload):
+            switched[0]=True
+            return [fixtures.nxt_official()],fixtures.nxt_reports()
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall,visitID="visit-other" if switched[0] else "visit-1"),research,enabled=True,
+            programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":"s1"},
+            publisher=store,publish=lambda *args:delivered.append(args) or True)
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
+             "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":55.0}
+        result=observer(job,decision,fixtures.NXT_TEXT)
+        self.assertFalse(result.accepted)
+        self.assertIsNone(store.get(fixtures.CHANNEL))
+        self.assertEqual(delivered,[])
+        diag=observer.diagnostics()["contentResearch"]
+        self.assertEqual((diag["completed"],diag["verified"],diag["verifiedAfterVisit"]),(1,1,1))
+        self.assertEqual(diag["lastOutcome"],"verified")

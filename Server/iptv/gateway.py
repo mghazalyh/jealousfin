@@ -2449,7 +2449,7 @@ def episode_source_provider(payload):
   unknown=not payload.get('seriesTitle') and bool(payload.get('clues'))
   timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
   prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
-  raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'])
+  raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'],episode_leads=unknown)
   result=opencode_discovery.normalize_episode_sources(raw)
   log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
   combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
@@ -2457,7 +2457,7 @@ def episode_source_provider(payload):
  except Exception as error:
   diagnostics=getattr(error,'diagnostics',{})
   reason=diagnostics.get('error') if isinstance(diagnostics,dict) else None
-  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','timeout') else type(error).__name__
+  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','no-completed-public-search','timeout') else type(error).__name__
   log('episode source discovery deferred '+safe_reason)
   return official,reports
 def episode_source_prefetch_worker(stop):

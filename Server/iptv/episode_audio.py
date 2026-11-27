@@ -166,6 +166,7 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
     "pwinsider.com", "www.pwinsider.com",
     "wrestlinginc.com", "www.wrestlinginc.com",
     "sescoops.com", "www.sescoops.com",
+    "pwmania.com", "www.pwmania.com",
     "wrestlingobserver.com", "www.wrestlingobserver.com",
     "tvline.com", "www.tvline.com",
     "ew.com", "www.ew.com",
@@ -1072,15 +1073,11 @@ def match_scheduled_airing(identity, events, now=None, station=None):
             "observedAt": now}
 
 
-def promote_episode(request, official_episodes, reports, current, now=None, scheduled_events=None,
-                    programme=None):
-    now = time.time() if now is None else float(now)
+def verify_episode_content(request, official_episodes, reports, now=None, programme=None):
+    """Verify historical sampled content without making a live UI claim."""
     if not isinstance(request, ClueRequest):
-        return Promotion(False, "invalid-request")
-    if not request.binding.checked(now):
-        return Promotion(False, "session-expired")
-    if not request.binding.matches(current, now):
-        return Promotion(False, "session-mismatch")
+        return Verification(False, "invalid-request")
+    now = time.time() if now is None else float(now)
     # Unknown-title discovery needs explicit matching series identities from independent pages.
     unknown_title = isinstance(programme, dict) and not programme.get("seriesTitle")
     if unknown_title:
@@ -1093,11 +1090,26 @@ def promote_episode(request, official_episodes, reports, current, now=None, sche
                           and _date(r.original_air_date) == identity.original_air_date
                           and len(clue_matches(request.clues, r.terms)) >= MIN_DISTINCTIVE_CLUES}
         if len(matching_hosts) < 2:
-            return Promotion(False, "no-independent-report")
+            return Verification(False, "no-independent-report")
+    if not verification.accepted or verification.identity is None:
+        return verification
+    if not programme_matches(verification.identity, programme):
+        return Verification(False, "programme-mismatch")
+    return verification
+
+
+def promote_episode(request, official_episodes, reports, current, now=None, scheduled_events=None,
+                    programme=None):
+    now = time.time() if now is None else float(now)
+    if not isinstance(request, ClueRequest):
+        return Promotion(False, "invalid-request")
+    if not request.binding.checked(now):
+        return Promotion(False, "session-expired")
+    if not request.binding.matches(current, now):
+        return Promotion(False, "session-mismatch")
+    verification = verify_episode_content(request, official_episodes, reports, now, programme)
     if not verification.accepted or verification.identity is None:
         return Promotion(False, verification.reason)
-    if not programme_matches(verification.identity, programme):
-        return Promotion(False, "programme-mismatch")
     confidence = min(0.99, 0.5 + 0.1 * verification.matched_clue_count + 0.1 * verification.corroborating_sources)
     airing = match_scheduled_airing(verification.identity, scheduled_events, now) if scheduled_events else None
     episode = PromotedEpisode(request.binding.channel_id, request.sample_digest,
@@ -1809,6 +1821,66 @@ def _series_from_report_headline(headline):
     return _clean_series(match.group("series")) if match else ""
 
 
+def _single_article(page):
+    """Limit body evidence to a unique article, never arbitrary page chrome."""
+    text = _page_text(page)
+    if len(re.findall(r"<article\b", text, re.IGNORECASE)) != 1:
+        return ""
+    match = re.search(r"<article\b[^>]*>(.*?)</article\s*>", text, re.IGNORECASE | re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def _article_body(article, headline):
+    # Bind the article body to the same page headline. A different article's
+    # text cannot supply clues for the metadata identity.
+    headings = re.findall(r"<h1\b[^>]*>(.*?)</h1\s*>", article, re.IGNORECASE | re.DOTALL)
+    if len(headings) != 1:
+        return ""
+    heading = _norm_text(_visible_text(headings[0], 300))
+    if not heading or not _norm_text(headline).startswith(heading):
+        return ""
+    # Exclude common page chrome, related-story blocks and links. A unique
+    # article is required; generic page-wide text is not eligible.
+    body = re.sub(r"<(nav|aside|header|footer|form|figure|script|style)\b[^>]*>.*?</\1\s*>",
+                  " ", article, flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<a\b[^>]*>.*?</a\s*>", " ", body, flags=re.IGNORECASE | re.DOTALL)
+    paragraphs = re.findall(r"<p\b[^>]*>(.*?)</p\s*>", body, re.IGNORECASE | re.DOTALL)[:128]
+    return " ".join(_visible_text(p, 1000) for p in paragraphs)[:16000]
+
+
+def _article_published(article):
+    dates = set()
+    for tag in re.findall(r"<time\b[^>]{0,512}>", article, re.IGNORECASE)[:16]:
+        m = re.search(r"\bdatetime\s*=\s*['\x22]([^'\x22]+)['\x22]", tag, re.IGNORECASE)
+        if m:
+            date = _page_date(m.group(1))
+            if date:
+                dates.add(date)
+    return next(iter(dates)) if len(dates) == 1 else ""
+
+
+def _requested_public_terms(clues, *sections):
+    """Find complete requested phrases in independently fetched article text."""
+    wanted = normalize_clues(clues)
+    matched = []
+    for section in sections:
+        tokens = [_clue_token(x) for x in _CLUE_TOKEN.findall(html_module.unescape(section or "")[:16000])]
+        words = " " + " ".join(x for x in tokens if x) + " "
+        for clue in wanted:
+            if " " + clue + " " in words and clue not in matched:
+                matched.append(clue)
+    # Count independent clue groups, not a phrase and its own individual
+    # tokens. Longest exact matches take precedence over overlapping terms.
+    distinct = []
+    used = set()
+    for clue in sorted(matched, key=lambda c: (-len(c.split()), -len(c), c)):
+        tokens = set(clue.split())
+        if not tokens.intersection(used):
+            distinct.append(clue)
+            used.update(tokens)
+    return tuple(distinct[:MAX_CLUES]) if len(distinct) >= MIN_DISTINCTIVE_CLUES else ()
+
+
 def _report_terms(headline, description, visible=""):
     text = (headline + " " + description).strip()
     terms = normalize_clues(text)
@@ -1872,11 +1944,11 @@ def _report_published(meta, visible):
     return _date_from_text((visible or "")[:1000])
 
 
-def _report_row(source_url, headline, description, published, air, series, visible=""):
+def _report_row(source_url, headline, description, published, air, series, visible="", matched_terms=None):
     lowered = headline.casefold()
     text = (headline + " " + description).strip()
     season, number = _episode_from_text(text)
-    terms = _report_terms(headline, description, visible)
+    terms = _report_terms(headline, description, visible) if matched_terms is None else matched_terms
     return IndependentReport(
         source_url, published, terms, air,
         series, season, number, "",
@@ -1887,7 +1959,7 @@ def _report_row(source_url, headline, description, published, air, series, visib
     )
 
 
-def parse_report_page(page, source_url, context=None):
+def parse_report_page(page, source_url, context=None, clues=()):
     """Parse bounded independent-report JSON-LD or ordinary HTML."""
     host = _host(source_url)
     if host not in INDEPENDENT_REPORT_HOSTS:
@@ -1895,6 +1967,8 @@ def parse_report_page(page, source_url, context=None):
     context = context if isinstance(context, dict) else {}
     fallback_series = context.get("seriesTitle") if isinstance(context.get("seriesTitle"), str) else ""
     fallback_air = _date(context.get("originalAirDate"))
+    requested = normalize_clues(clues) if not fallback_series else ()
+    article = _single_article(page) if requested else ""
     rows = []
     seen = set()
 
@@ -1903,6 +1977,13 @@ def parse_report_page(page, source_url, context=None):
             return
         key = (report.source_url, report.original_air_date)
         if key in seen:
+            if requested:
+                for i, old in enumerate(rows):
+                    if ((old.source_url, old.original_air_date) == key and
+                            _norm_text(old.series_title) == _norm_text(report.series_title) and
+                            len(report.terms) > len(old.terms)):
+                        rows[i] = report
+                        break
             return
         seen.add(key)
         rows.append(report)
@@ -1920,7 +2001,14 @@ def parse_report_page(page, source_url, context=None):
         if not published or not air:
             continue
         series = fallback_series or _series_from_report_headline(headline)
-        add(_report_row(source_url, headline, description, published, air, series))
+        if requested:
+            # Only body from this same structured article object, never a
+            # different JSON-LD object's content.
+            body = _visible_text(str(obj.get("articleBody") or "")[:16000], 16000)
+            terms = _requested_public_terms(requested, headline, description, body)
+            add(_report_row(source_url, headline, description, published, air, series, matched_terms=terms))
+        else:
+            add(_report_row(source_url, headline, description, published, air, series))
         if len(rows) >= MAX_REPORTS:
             return rows
 
@@ -1931,13 +2019,19 @@ def parse_report_page(page, source_url, context=None):
     visible = _visible_text(page, 2000)
     if not headline and not description:
         return rows
-    published = _report_published(meta, visible)
+    if requested:
+        headline = html_module.unescape(headline)
+        description = html_module.unescape(description)
+        published = _page_date(meta.get("article:published_time")) or _article_published(article)
+    else:
+        published = _report_published(meta, visible)
     air = (_report_air_date(headline, description, visible, fallback_air) if fallback_series
            else _unknown_report_air_date(headline, description))
     if not published or not air:
         return rows
     series = fallback_series or _series_from_report_headline(headline)
-    add(_report_row(source_url, headline, description, published, air, series, visible))
+    terms = _requested_public_terms(requested, headline, description, _article_body(article, headline)) if requested else None
+    add(_report_row(source_url, headline, description, published, air, series, visible, matched_terms=terms))
     return rows[:MAX_REPORTS]
 
 
@@ -2292,10 +2386,11 @@ class PublicEvidenceResearch:
     def _urls(self, context, clues=()):
         return self.discovery.resolve(context, clues)[:2]
 
-    def _evidence_key(self, context, official_urls, report_urls):
+    def _evidence_key(self, context, official_urls, report_urls, clues=()):
         identity = "|".join((_norm_text(context.get("seriesTitle")),
                              _date(context.get("originalAirDate")),
                              context.get("researchSession", "") if not context.get("seriesTitle") else "",
+                             _digest("|".join(normalize_clues(clues))) if not context.get("seriesTitle") else "",
                               ",".join(official_urls), ",".join(report_urls)))
         return _digest(identity)
 
@@ -2353,7 +2448,7 @@ class PublicEvidenceResearch:
         official_urls, report_urls, _source = self.discovery.resolve(context, clues, now)
         official_urls = official_urls[:self.max_pages]
         report_urls = report_urls[:self.max_pages]
-        key = self._evidence_key(context, official_urls, report_urls)
+        key = self._evidence_key(context, official_urls, report_urls, clues)
         cacheable = not unknown_title or bool(context.get("researchSession"))
         cached = self._cached(key, now) if cacheable else None
         if cached is not None:
@@ -2390,7 +2485,7 @@ class PublicEvidenceResearch:
                 continue
             if page is None:
                 continue
-            reports.extend(parse_report_page(page, url, context))
+            reports.extend(parse_report_page(page, url, context, clues=clues if unknown_title else ()))
             if len(reports) >= MAX_REPORTS:
                 reports = reports[:MAX_REPORTS]
                 break
@@ -2499,6 +2594,8 @@ class EpisodeObserver:
                              "lastCategory": None, "lastAt": 0.0,
                              "retriesRequested": 0, "retriesAccepted": 0,
                              "retriesSuppressed": 0, "lastRetryReason": None}
+        self._diagnostics["contentResearch"] = {"completed": 0, "verified": 0, "verifiedAfterVisit": 0,
+                                                "lastOutcome": None, "lastAt": 0.0}
         self._diag_lock = threading.Lock()
 
     def _diagnose(self, reason, category=None, detail=None):
@@ -2778,6 +2875,22 @@ class EpisodeObserver:
                 except Exception as error:
                     self._diagnose("promotion-error", "research", type(error).__name__)
                     promotion = Promotion(False, "promotion-error")
+        # Source verification is a separate outcome from live delivery.
+        # Even after a rotation, evaluate the original sample's content once;
+        # never publish or save it as current programme for any other visit.
+        if unknown_title:
+            try:
+                content = verify_episode_content(request, official, reports, after, context)
+                with self._diag_lock:
+                    result = self._diagnostics["contentResearch"]
+                    result["completed"] += 1
+                    result["verified"] += int(content.accepted)
+                    result["verifiedAfterVisit"] += int(content.accepted and (
+                        not isinstance(fresh, dict) or not binding.matches(fresh, after)))
+                    result["lastOutcome"] = "verified" if content.accepted else content.reason
+                    result["lastAt"] = round(after, 3)
+            except Exception as error:
+                self._diagnose("content-verification-error", "research", type(error).__name__)
         if promotion.accepted and promotion.episode is not None:
             if self._duplicate(binding, promotion.episode.identity, after, session_hash=session_hash):
                 promotion = Promotion(False, "duplicate-publication")
@@ -2970,7 +3083,7 @@ class EpisodeObserver:
 
     def diagnostics(self):
         with self._diag_lock:
-            diagnostics = {key: (dict(value) if isinstance(value, OrderedDict) else value)
+            diagnostics = {key: (dict(value) if isinstance(value, dict) else value)
                            for key, value in self._diagnostics.items()}
         diagnostics.update({
             "submitted": self.submitted, "dropped": self.dropped,
