@@ -151,6 +151,38 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(seen["token"], "fixture-token")
         self.assertNotIn("fixture-token", repr(transport))
 
+    def state(self, phase, attempt, max_attempts, at, visit="visit-1", stream="stream-1"):
+        return {"state": phase, "reason": "sample_too_short" if phase == "inconclusive" else "collecting",
+                "sampleSeconds": 4.99, "targetSeconds": 55.0,
+                "attempt": attempt, "maxAttempts": max_attempts,
+                "visitID": visit, "streamGeneration": stream, "at": at}
+
+    def test_exhausted_retry_is_not_overwritten_by_late_collecting_state(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("inconclusive", 4, 4, 100.0)), "published")
+        calls = list(self.transport.calls)
+        # The late collecting event belongs to the same exhausted attempt and
+        # must not hide the terminal result.
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 4, 4, 101.0)), "superseded")
+        self.assertEqual(self.transport.calls, calls)
+        self.assertIn("retry limit reached", calls[-1][1])
+        self.assertEqual(self.bridge.latest_state.phase, "inconclusive")
+        # A new physical visit is a genuinely new label and is allowed.
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 1, 4, 200.0,
+                                                 visit="visit-2")), "published")
+        self.assertIn("collecting", self.transport.calls[-1][1])
+
+    def test_retryable_inconclusive_does_not_block_the_next_collecting_state(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("inconclusive", 1, 4, 100.0)), "published")
+        self.assertEqual(self.bridge.publish_state(
+            A, "Fixture English One", self.state("collecting", 2, 4, 101.0)), "published")
+        self.assertIn("collecting", self.transport.calls[-1][1])
+
     def test_duplicate_event_is_deduplicated(self):
         evidence = self.event(0)
         self.bridge.observe_channel(A, "Fixture English One")

@@ -4,6 +4,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -788,6 +789,21 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
         (self.server / "episode-sources.json").write_text("x" * (self.g.EPISODE_SOURCE_LIMIT + 1))
         self.assertEqual(self.g.load_episode_sources(), {})
 
+    def test_general_television_sources_are_not_wrestling_only(self):
+        self.assertIn("showtime.com", audio.OFFICIAL_ARCHIVE_HOSTS)
+        self.assertIn("nbc.com", audio.OFFICIAL_ARCHIVE_HOSTS)
+        self.assertIn("tvline.com", audio.INDEPENDENT_REPORT_HOSTS)
+        for url in ("https://www.showtime.com/nurse-jackie/season/1/episode/1",
+                    "https://www.nbc.com/saturday-night-live/episodes"):
+            self.assertEqual(audio.safe_source_url(
+                url, audio.OFFICIAL_ARCHIVE_HOSTS, allow_query=True), url)
+        for url in ("https://tvline.com/recaps/nurse-jackie-pilot",
+                    "https://www.avclub.com/nurse-jackie-pilot"):
+            self.assertEqual(audio.safe_source_url(
+                url, audio.INDEPENDENT_REPORT_HOSTS, allow_query=True), url)
+        self.assertFalse(audio.safe_source_url(
+            "https://example.com/nurse-jackie", audio.OFFICIAL_ARCHIVE_HOSTS, allow_query=True))
+
     def test_gateway_fixture_promotes_from_existing_callback_and_is_idempotent(self):
         self.write_registry()
         pages = {OFFICIAL_URL: OFFICIAL_PAGE, REPORT_URL: REPORT_PAGE}
@@ -828,20 +844,33 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
             self.assertEqual(observer(self.job(visit_id, wall=wall), self.decision(), NXT_TEXT).reason,
                              "programme-mismatch")
 
-    def test_probe_preserves_fresh_visit_and_fails_closed_on_pause_or_stop(self):
+    def active_view(self):
+        return {"channel_id": CHANNEL, "active_seconds": 150,
+                "hasEpisodeIdentity": False}
+
+    def test_probe_preserves_fresh_visit_and_paused_rotation_requires_playback(self):
         visit_id = self.seed_visit()
-        with patch.object(self.g, "device_language_probe", return_value=self.snapshot()):
+        with patch.object(self.g, "device_language_probe", return_value=self.snapshot()), \
+                patch.object(self.g, "episode_active_view", return_value=self.active_view()):
             probe = self.g.episode_probe()
         self.assertEqual(probe["visitID"], visit_id)
         self.assertTrue(probe["visitVerified"])
-        for state in ({"surfPaused": True, "surfing": True},
-                      {"surfPaused": False, "surfing": False},
-                      {"surfPaused": None, "surfing": None}):
+        paused = self.snapshot(surfPaused=True, surfing=True)
+        with patch.object(self.g, "device_language_probe", return_value=paused), \
+                patch.object(self.g, "episode_active_view", return_value=self.active_view()):
+            self.assertIsNotNone(self.g.episode_probe())
+        with patch.object(self.g, "device_language_probe", return_value=paused), \
+                patch.object(self.g, "episode_active_view", return_value=None):
+            self.assertIsNone(self.g.episode_probe())
+        for state in ({"surfPaused": False, "surfing": False},
+                      {"surfPaused": None, "surfing": None},
+                      {"surfPaused": True, "surfing": True, "playing": False}):
             with patch.object(self.g, "device_language_probe",
-                              return_value=self.snapshot(**state)):
+                              return_value=self.snapshot(**state)), \
+                    patch.object(self.g, "episode_active_view", return_value=self.active_view()):
                 self.assertIsNone(self.g.episode_probe())
 
-    def test_pause_blocks_audio_callback_without_research(self):
+    def test_paused_rotation_researches_only_while_playback_progresses(self):
         self.write_registry()
         wall = time.time()
         visit_id = self.seed_visit()
@@ -853,11 +882,34 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
         with patch.object(self.g, "device_language_probe", return_value=paused), \
                 patch.object(self.g, "programme_snapshot",
                              return_value={CHANNEL: {"title": "WWE NXT"}}), \
-                patch.object(self.g, "episode_active_view",
-                             return_value={"channel_id": CHANNEL, "active_seconds": 150,
-                                           "hasEpisodeIdentity": False}):
+                patch.object(self.g, "episode_active_view", return_value=self.active_view()):
+            promotion = observer(self.job(visit_id, wall=wall), self.decision(), NXT_TEXT)
+        # Paused rotation is not a presentation/scope change: research runs and
+        # the rejection is explicit rather than silently discarded.
+        self.assertFalse(promotion.accepted)
+        self.assertEqual(promotion.reason, "missing-official-archive")
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+        with patch.object(self.g, "device_language_probe", return_value=paused), \
+                patch.object(self.g, "programme_snapshot",
+                             return_value={CHANNEL: {"title": "WWE NXT"}}), \
+                patch.object(self.g, "episode_active_view", return_value=None):
             self.assertIsNone(observer(self.job(visit_id, wall=wall), self.decision(), NXT_TEXT))
         self.assertEqual(calls, [])
+        # A fresh bounded attempt with real sources publishes a new episode
+        # while rotation is still paused and playback progresses.
+        observer.budget = audio.EpisodeBudget()
+        observer._published.clear()
+        observer.research = lambda payload: ([nxt_official()], nxt_reports())
+        with patch.object(self.g, "device_language_probe", return_value=paused), \
+                patch.object(self.g, "programme_snapshot",
+                             return_value={CHANNEL: {"title": "WWE NXT",
+                                                     "airDate": "2026-06-16"}}), \
+                patch.object(self.g, "episode_active_view", return_value=self.active_view()):
+            promotion = observer(self.job(visit_id, wall=wall), self.decision(), NXT_TEXT)
+        self.assertTrue(promotion.accepted)
+        self.assertEqual(promotion.episode.identity.broadcaster_code, "S20E24")
+        self.assertIn(CHANNEL, self.g.episode_publisher.snapshot())
 
     def test_same_launch_reload_promotes_once_and_stale_visit_is_rejected(self):
         self.write_registry()
@@ -941,12 +993,130 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
         merged = self.g.merge_episode_publication(dict(weak), wall)
         self.assertEqual(merged[CHANNEL]["episodeSource"], "local-audio-episode-identity")
         self.assertEqual(merged[CHANNEL]["seasonNumber"], 20)
+        # The exact episode/original-air year is used, never the series
+        # premiere year carried by the programme title.
+        self.assertEqual(merged[CHANNEL]["episodeYear"], 2026)
         strong = {CHANNEL: {"title": "WWE NXT", "source": "provider-catalogue",
                             "episodeTitle": "Guide Title", "seasonNumber": 20,
                             "episodeNumber": 24}}
         untouched = self.g.merge_episode_publication(dict(strong), wall)
         self.assertEqual(untouched[CHANNEL]["episodeTitle"], "Guide Title")
         self.assertNotIn("episodeSource", untouched[CHANNEL])
+
+
+class EpisodeRetryDiagnosticsTests(unittest.TestCase):
+    def retry_observer(self, retry_calls, research=None, activity=None):
+        wall = time.time()
+        observer = audio.EpisodeObserver(
+            lambda: current(now=wall), research or (lambda payload: ([], [])),
+            enabled=True, budget=None,
+            programme=lambda cid: context_row(),
+            activity=activity or (lambda cid: {"channel_id": cid, "active_seconds": 150,
+                                               "hasEpisodeIdentity": False}),
+            retry=lambda binding, reason: retry_calls.append(reason) or True)
+        job = {"cid": CHANNEL, "name": "CW Presents WWE NXT", "deviceVerified": True,
+               "changed": False, "launchID": "launch-1", "streamGeneration": "generation-1",
+               "visitID": "visit-1", "observedAt": wall - 5, "expiresAt": wall + 50,
+               "sampleDigest": "b" * 32, "episodeOnly": False}
+        decision = {"outcome": "allowed", "language": "en", "confidence": 0.97,
+                    "speechSeconds": 21.0, "sampleSeconds": 55.0}
+        return observer, job, decision
+
+    def test_no_sources_is_diagnosed_and_schedules_bounded_retry(self):
+        calls = []
+        observer, job, decision = self.retry_observer(calls)
+        promotion = observer(job, decision, NXT_TEXT)
+        self.assertFalse(promotion.accepted)
+        self.assertEqual(promotion.reason, "missing-official-archive")
+        self.assertEqual(calls, ["no-match"])
+        diagnostics = observer.diagnostics()
+        self.assertEqual(diagnostics["reasons"].get("no-sources"), 1)
+        self.assertEqual(diagnostics["reasons"].get("missing-official-archive"), 1)
+        self.assertEqual(diagnostics["retriesRequested"], 1)
+        # The same visit may retry only the configured number of times.
+        observer(dict(job, episodeOnly=True), decision, NXT_TEXT)
+        observer(dict(job, episodeOnly=True), decision, NXT_TEXT)
+        self.assertLessEqual(len(calls), observer.max_retries)
+        self.assertEqual(observer.diagnostics()["reasons"].get("retry-exhausted"), 1)
+
+    def test_commercial_rejection_is_labelled_and_retried(self):
+        calls = []
+        reports = [audio.IndependentReport(
+            "https://www.pwinsider.com/article/1/nxt-results",
+            "2026-06-17", ("Zaria", "first-ever women's North American Champion"),
+            "2026-06-16", "WWE NXT", 20, 24, "S20E24", advertisement=True)]
+        observer, job, decision = self.retry_observer(
+            calls, research=lambda payload: ([nxt_official()], reports))
+        promotion = observer(job, decision, NXT_TEXT)
+        self.assertEqual(promotion.reason, "advertisement")
+        self.assertEqual(calls, ["commercial"])
+        diagnostics = observer.diagnostics()
+        self.assertEqual(diagnostics["reasons"].get("advertisement"), 1)
+        self.assertEqual(diagnostics["retriesRequested"], 1)
+
+    def test_actual_pause_never_requests_a_retry(self):
+        calls = []
+        observer, job, decision = self.retry_observer(calls, activity=lambda cid: None)
+        promotion = observer(job, decision, NXT_TEXT)
+        self.assertFalse(promotion.accepted)
+        self.assertEqual(calls, [])
+        self.assertEqual(observer.diagnostics()["reasons"].get("retry-inactive"), 1)
+
+    def test_stale_session_rejection_is_not_retried(self):
+        calls = []
+        observer, job, decision = self.retry_observer(calls)
+        wall = time.time()
+        probes = []
+
+        def probe():
+            probes.append(1)
+            value = current(now=wall)
+            if len(probes) > 1:
+                value = dict(value, visitID="visit-other")
+            return value
+
+        observer.probe = probe
+        promotion = observer(job, decision, NXT_TEXT)
+        self.assertFalse(promotion.accepted)
+        self.assertEqual(promotion.reason, "session-changed")
+        self.assertEqual(calls, [])
+
+    def test_episode_only_retry_never_counts_language_evidence_twice(self):
+        manager = object.__new__(language_audio.Manager)
+        manager._episode_retries = {}
+        manager._episode_retry_results = []
+        manager._finalized = {}
+        manager._visit_results = {}
+        manager._lock = threading.RLock()
+        manager.telemetry = {"counters": {"tested": 1, "evidence": 1}, "languages": {"en": 1}}
+        manager.log = lambda message: None
+        manager._persist = lambda force=False: None
+        visit = language_visits.new_visit_id()
+        view = {"cid": CHANNEL, "visitID": visit}
+        marker = {"visitID": visit, "conclusive": True, "at": 0.0}
+        current_visit = {"visitID": visit, "verified": True}
+        # A conclusive language marker normally suppresses another sample.
+        self.assertTrue(manager._suppress_duplicate_visit(CHANNEL, marker, current_visit, 100.0))
+        self.assertTrue(manager.request_episode_retry(view, "no-match"))
+        requested = manager._episode_retries[(CHANNEL, visit)]["requested"]
+        self.assertFalse(manager._suppress_duplicate_visit(
+            CHANNEL, marker, current_visit, requested + language_audio.EPISODE_RETRY_SECONDS))
+        self.assertFalse(manager._episode_retry_ready(CHANNEL, {"visitID": visit, "verified": True},
+                                                      requested + 1))
+        self.assertTrue(manager._episode_retry_ready(CHANNEL, {"visitID": visit, "verified": True},
+                                                     requested + language_audio.EPISODE_RETRY_SECONDS))
+        self.assertTrue(manager._take_episode_retry(CHANNEL, {"visitID": visit, "verified": True},
+                                                    requested + language_audio.EPISODE_RETRY_SECONDS))
+        manager._finalized[CHANNEL] = {"visitID": visit, "attempts": 1, "maxAttempts": 4,
+                                       "sampleToken": "token-1", "conclusive": False}
+        manager._finish_episode_retry(
+            {"cid": CHANNEL, "visitID": visit, "sampleToken": "token-1"},
+            {"outcome": "allowed", "reason": "allowed_language_en", "language": "en",
+             "sampleSeconds": 55.0})
+        self.assertEqual(manager.telemetry["counters"], {"tested": 1, "evidence": 1})
+        self.assertEqual(manager.telemetry["languages"], {"en": 1})
+        self.assertTrue(manager._finalized[CHANNEL]["conclusive"])
+        self.assertEqual(len(manager._episode_retry_results), 1)
 
 
 # ---------------------------------------------------------------------------

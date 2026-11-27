@@ -13,6 +13,7 @@ import language_audio
 import language_pending
 import language_visits
 import overlay_bridge
+import programme_overlay
 import deployment_continuity
 spanish_classification=language_exclusions
 spanish_audio=language_audio
@@ -79,9 +80,14 @@ spanish_auto_manager=None
 overlay_bridge_state=None
 overlay_bridge_fingerprint=None
 overlay_bridge_fault=''
+programme_overlay_bridge_state=None
+programme_overlay_bridge_fingerprint=None
+programme_overlay_fault=''
+overlay_combined_evidence=None
 overlay_init_lock=threading.Lock()
 overlay_jobs=queue.Queue(maxsize=8)
 OVERLAY_SETTLE_SECONDS=2.0
+episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
 device_rotation_cache=None
 device_rotation_checked=0.0
 language_visit_ledger=None
@@ -1775,7 +1781,8 @@ MAINTENANCE_KEYS={'schemaVersion','start','until','reason','launchID','channelID
 def maintenance_window(force=False):
  global maintenance_state,maintenance_fingerprint,maintenance_checked_at
  now=time.monotonic()
- if not force and now-maintenance_checked_at<2:return maintenance_state
+ # 0 is the "never checked" sentinel; some platforms start monotonic near 0.
+ if not force and maintenance_checked_at and now-maintenance_checked_at<2:return maintenance_state
  maintenance_checked_at=now
  try:
   if not MAINTENANCE_FILE.exists():
@@ -1855,8 +1862,10 @@ def device_language_probe():
   if status_stream and stream_generation and status_stream!=stream_generation:continue
   paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
   surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
+  playing=status.get('playing') if type(status.get('playing')) is bool else None
   return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
-          'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing}
+          'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing,
+          'playing':playing}
  return None
 # Optional audio-assisted episode identity. It reuses the single language
 # decode/transcribe pass through on_speech; it never requests media, starts a
@@ -1959,21 +1968,77 @@ def episode_active_view(channel_id):
  return {'channel_id':channel_id,'session_hash':view.session_hash,
          'active_seconds':view.active_seconds,
          'hasEpisodeIdentity':episode_audio.programme_has_episode_identity(row)}
+def note_episode_probe(reason=None,detail=None):
+ # Short, bounded diagnostics for every early return. No audio, transcript,
+ # media URL or credential is retained.
+ with lock:
+  episode_probe_diagnostics['checks']=episode_probe_diagnostics.get('checks',0)+1
+  if reason is None:
+   episode_probe_diagnostics['accepted']=episode_probe_diagnostics.get('accepted',0)+1
+  else:
+   rejections=episode_probe_diagnostics.setdefault('rejections',{})
+   rejections[reason]=rejections.get(reason,0)+1
+  episode_probe_diagnostics['last']={'at':round(time.time(),3),'reason':reason or 'accepted','detail':detail}
 def episode_probe():
  # Fresh coherent device identity plus the durable physical visit. The visit
  # is observed through the existing read-only ledger; no playback command is
- # issued. Publication fails closed while the user has paused or stopped
- # rotation, or when the visit cannot be verified. A same-launch reload keeps
- # the same visit ID, so the audio binding treats it as one physical session.
+ # issued. Read-only episode research/publication is allowed while surf
+ # rotation is paused only when the player is validated and real playback is
+ # still progressing. A stopped rotation, unknown pause state, actual player
+ # pause or stale/absent playback evidence fails closed. The channel, launch,
+ # physical visit and stream generation are still required, and a same-launch
+ # reload keeps the same visit ID so the audio binding treats it as one
+ # physical session.
  probe=device_language_probe()
- if not isinstance(probe,dict):return None
- if probe.get('surfPaused') is not False or probe.get('surfing') is not True:return None
+ if not isinstance(probe,dict):
+  note_episode_probe('device_unavailable');return None
+ if probe.get('surfing') is not True:
+  note_episode_probe('rotation_stopped');return None
+ if probe.get('playing') is False:
+  note_episode_probe('playback_paused');return None
+ paused=probe.get('surfPaused')
+ if paused is True:
+  # Rotation is paused but the player may still be running. The existing
+  # ActiveViewing view only exists for a non-stopped, non-paused, fresh
+  # progressing playback session, so it is the actual-playback guard.
+  if episode_active_view(probe.get('channelID')) is None:
+   note_episode_probe('playback_inactive');return None
+ elif paused is not False:
+  note_episode_probe('rotation_unknown');return None
  try:visit=language_visit_identity().observe(probe.get('channelID'),probe.get('launchID'),probe.get('streamGeneration'),now=time.time())
- except Exception:return None
- if not isinstance(visit,dict) or visit.get('verified') is not True:return None
+ except Exception:
+  note_episode_probe('visit_unavailable');return None
+ if not isinstance(visit,dict) or visit.get('verified') is not True:
+  note_episode_probe('visit_unverified');return None
  visit_id=str(visit.get('visitID','') or '')
- if not visit_id:return None
- return dict(probe,visitID=visit_id,visitVerified=language_visits.is_verified(visit_id))
+ if not visit_id:
+  note_episode_probe('visit_missing');return None
+ result=dict(probe,visitID=visit_id,visitVerified=language_visits.is_verified(visit_id))
+ note_episode_probe()
+ return result
+def episode_retry_callback(binding,reason):
+ # Ask the existing language sampler for one bounded, episode-only retry in
+ # the same physical visit. It reuses already-fetched media bytes and never
+ # records language evidence again; actual playback still has to be running.
+ manager=spanish_auto_manager
+ if manager is None or not callable(getattr(manager,'request_episode_retry',None)):
+  note_episode_probe('retry_unavailable',str(reason or ''));return False
+ try:
+  return bool(manager.request_episode_retry(
+   {'cid':binding.channel_id,'visitID':binding.visit_id,
+    'launchID':binding.launch_id,'streamGeneration':binding.stream_generation},
+   str(reason or '')))
+ except Exception as error:
+  note_episode_probe('retry_error',type(error).__name__);return False
+def episode_publication_callback(promotion,context,now):
+ # Presentation only: enqueue the existing combined label after a bounded
+ # episode identity is published. This never changes programme metadata.
+ try:
+  cid=promotion.episode.channel_id if promotion.episode is not None else ''
+ except Exception:
+  cid=''
+ if not isinstance(cid,str) or not cid:return False
+ return overlay_enqueue('combined',channelID=cid)
 def episode_observer_instance():
  global episode_observer,episode_source_discovery
  if SOURCE_PROFILE!='american':return None
@@ -1986,7 +2051,8 @@ def episode_observer_instance():
    episode_observer=episode_audio.EpisodeObserver(
     probe=episode_probe,research=research,enabled=False,
     budget=episode_audio.EpisodeBudget(),programme=current_programme_context,
-    activity=episode_active_view,publisher=episode_publisher,log=log)
+    activity=episode_active_view,publisher=episode_publisher,log=log,
+    retry=episode_retry_callback,publish=episode_publication_callback)
   return episode_observer
 def episode_speech_callback(job,decision,text):
  # Fast callback from the language worker. Runtime opt-in is re-read here so a
@@ -2002,6 +2068,7 @@ def episode_speech_callback(job,decision,text):
 def episode_audio_status():
  status=episode_audio.status()
  status['configuredEnabled']=bool(gateway_config.get('episodeAudioEnabled'))
+ status['probe']=dict(episode_probe_diagnostics)
  status['publication']=episode_publisher.diagnostics()
  status['sourceDiscovery']=episode_source_discovery.diagnostics() if episode_source_discovery is not None else None
  status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
@@ -2147,6 +2214,116 @@ def overlay_bridge_instance():
    overlay_bridge_state=overlay_bridge.OverlayBridge(transport)
    overlay_bridge_fingerprint=fingerprint
   return overlay_bridge_state
+def programme_overlay_instance():
+ # Existing installed IPA fields only. This creates no native style, no layout
+ # install and no extra device command beyond the authorized ui_set_value.
+ global programme_overlay_bridge_state,programme_overlay_bridge_fingerprint
+ if SOURCE_PROFILE!='american':return None
+ try:config=prototype_selector.load_selector(ROOT)
+ except (OSError,ValueError,TypeError):return None
+ if config is None:return None
+ fingerprint=(config['deviceIP'],config['backendPort'])
+ with overlay_init_lock:
+  if programme_overlay_bridge_state is None or fingerprint!=programme_overlay_bridge_fingerprint:
+   transport=overlay_bridge.AuthorizedDeviceTransport(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
+   programme_overlay_bridge_state=programme_overlay.ProgrammeOverlayPublisher(transport)
+   programme_overlay_bridge_fingerprint=fingerprint
+  return programme_overlay_bridge_state
+def _overlay_visit_for(cid,launch,stream):
+ if not isinstance(cid,str) or not cid:return ''
+ if not isinstance(launch,str) or not launch:return ''
+ if not isinstance(stream,str) or not stream:return ''
+ try:visit=language_visit_identity().observe(cid,launch,stream,now=time.time())
+ except Exception:return ''
+ if not isinstance(visit,dict) or visit.get('verified') is not True:return ''
+ value=visit.get('visitID')
+ return value if isinstance(value,str) else ''
+def overlay_combined_scope(cid,name,probe=None):
+ provider=sources.get(cid)
+ if not isinstance(provider,str) or not provider.startswith('nltv:'):return None
+ probe=probe if isinstance(probe,dict) else {}
+ launch=str(probe.get('launchID') or '')
+ stream=str(probe.get('streamGeneration') or '')
+ visit=str(probe.get('visitID') or '') or _overlay_visit_for(cid,launch,stream)
+ try:
+  return programme_overlay.OverlayScope(cid,provider,name[:160],launch[:160],visit[:160],stream[:160])
+ except (TypeError,ValueError):return None
+def _overlay_current_scope(scope):
+ current=overlay_current_channel()
+ if not isinstance(current,dict):return None
+ visit=_overlay_visit_for(current.get('channelID'),current.get('launchID'),
+                          current.get('streamGeneration'))
+ return {'channelID':current.get('channelID'),'launchID':current.get('launchID'),
+         'streamGeneration':current.get('streamGeneration'),'visitID':visit}
+def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
+ # Presentation only. It never rewrites Name/ProductionYear/JealousfinProgramme
+ # and is allowed while surf rotation is paused as long as the exact scope is
+ # still current and the caller has validated actual playback.
+ global programme_overlay_fault
+ if SOURCE_PROFILE!='american':return 'disabled'
+ bridge=programme_overlay_instance()
+ if bridge is None:
+  programme_overlay_fault='authorized_transport_unavailable';return 'unavailable'
+ probe=probe if isinstance(probe,dict) else None
+ if probe is None:
+  probe=overlay_current_channel()
+  if not isinstance(probe,dict):
+   programme_overlay_fault='device_unverified';return 'unverified'
+ if probe.get('channelID')!=cid:
+  programme_overlay_fault='channel_changed';return 'suppressed_channel'
+ if not isinstance(name,str) or not name:
+  row=channels.get(cid) or {};name=row.get('Name') if isinstance(row,dict) else ''
+ if not isinstance(name,str) or not name:return 'invalid'
+ scope=overlay_combined_scope(cid,name,probe)
+ if scope is None:
+  programme_overlay_fault='invalid_scope';return 'invalid_scope'
+ try:row=programme_snapshot().get(cid)
+ except (sqlite3.Error,OSError,RuntimeError,ValueError):row=None
+ if not isinstance(row,dict):
+  result=bridge.clear()
+  programme_overlay_fault='' if result=='fallback' else result
+  return 'no_programme'
+ identity=programme_overlay.programme_identity(row)
+ if identity is None:
+  result=bridge.clear()
+  programme_overlay_fault='' if result=='fallback' else result
+  return 'no_programme'
+ if not isinstance(evidence,dict):
+  cached=overlay_combined_evidence
+  if (isinstance(cached,dict) and cached.get('channelID')==cid
+      and (not cached.get('visitID') or cached.get('visitID')==scope.visit_id)
+      and (not cached.get('streamGeneration') or cached.get('streamGeneration')==scope.stream_generation)):
+   evidence=cached.get('evidence')
+ language=programme_overlay.language_evidence(evidence) if isinstance(evidence,dict) else None
+ has_episode=bool(identity.episode_title or identity.season_number is not None)
+ if not has_episode and language is None:
+  # The installed 22 px fallback already shows live programme metadata. Do
+  # not switch to the native combined node until there is something stronger
+  # than a bare series title, and never leave an old combined label visible.
+  status=bridge.status()
+  if bridge.current_scope and (status.get('publishedText') or bridge.current_scope!=scope.fingerprint()):
+   result=bridge.clear()
+  else:
+   result='fallback'
+  programme_overlay_fault=''
+  return 'fallback'
+ stamp=time.time() if now is None else float(now)
+ text=programme_overlay.format_combined(identity,language,now=stamp)
+ event_id='|'.join((scope.fingerprint(),identity.original_air_date or identity.text(),
+                    language.event_id if language is not None else 'pending'))
+ result=bridge.publish(scope,text,event_id,reprobe=lambda:_overlay_current_scope(scope))
+ programme_overlay_fault='' if result in ('published','duplicate','unchanged') else result
+ return result
+def overlay_combined_status():
+ bridge=programme_overlay_instance()
+ base={'configured':bridge is not None,'fault':programme_overlay_fault,
+       'revision':programme_overlay.REVISION,
+       'field':programme_overlay.KEY,'readyField':programme_overlay.READY_KEY,
+       'fallbackField':programme_overlay.FALLBACK_KEY,
+       'layoutRevision':'programme-language-existing-ipa-20261127',
+       'nativeAbi':'existing headline text node programme-combined-native-v1'}
+ if bridge is None:return base
+ return dict(base,**bridge.status())
 def overlay_enqueue(kind,**fields):
  global overlay_bridge_fault
  if SOURCE_PROFILE!='american':return False
@@ -2230,7 +2407,7 @@ def _overlay_settle(bridge,stop):
   if stop.wait(0.25 if status=='retry' else 0.5):break
   bridge.pump()
 def _overlay_process(job,stop):
- global overlay_bridge_fault
+ global overlay_bridge_fault,programme_overlay_fault,overlay_combined_evidence
  bridge=overlay_bridge_instance()
  if bridge is None:
   overlay_bridge_fault=overlay_bridge_fault or 'authorized_transport_unavailable'
@@ -2260,6 +2437,8 @@ def _overlay_process(job,stop):
     bridge.publish_state(cid,name,{'state':'disabled','reason':'observation_disabled',
      'at':time.time(),'observedAt':time.time()})
     result=bridge.status().get('status',result) or result
+ elif kind=='combined':
+  result=overlay_combined_publish(cid,name,probe=current)
  elif kind in ('evidence','correction','state'):
   if job.get('channelID')!=cid:
    overlay_bridge_fault='channel_changed';bridge.observe_channel(cid,name)
@@ -2274,6 +2453,14 @@ def _overlay_process(job,stop):
    overlay_bridge_fault='stale_visit';return 'stale'
   bridge.observe_channel(cid,name)
   result=bridge.publish_state(cid,name,evidence) if kind=='state' else bridge.publish_evidence(cid,name,evidence)
+  if kind in ('evidence','correction') and result not in ('suppressed_channel','stale','invalid'):
+   # Remember only the last accepted current-scope evidence so sampler state
+   # and refresh events keep the combined label coherent without inventing a
+   # new language result. The stream/visit match is checked before reuse.
+   overlay_combined_evidence={'channelID':cid,
+    'visitID':str(job.get('visitID') or evidence.get('visitID') or ''),
+    'streamGeneration':str(job.get('streamGeneration') or evidence.get('streamGeneration') or ''),
+    'evidence':dict(evidence)}
   if kind=='correction' and job.get('eventID'):
    # Retain the correction against both the original event and the corrected
    # snapshot so a delayed duplicate gesture cannot walk backwards.
@@ -2282,8 +2469,16 @@ def _overlay_process(job,stop):
  else:
   return 'unknown'
  overlay_bridge_fault=''
+ # Settle the existing language label first so a slow/unavailable combined
+ # transport can never delay it into stale_pending. The combined label is
+ # presentation only and is generated from the same scoped evidence.
  _overlay_settle(bridge,stop)
- return bridge.status().get('status',result) or result
+ result=bridge.status().get('status',result) or result
+ if kind in ('refresh','evidence','correction','state'):
+  combined_evidence=job.get('evidence') if kind in ('evidence','correction') else None
+  try:overlay_combined_publish(cid,name,probe=current,evidence=combined_evidence)
+  except Exception:programme_overlay_fault='combined_failed'
+ return result
 def overlay_worker(stop):
  # Existing daemon lifecycle only: it blocks for a triggered job and stops on
  # the shutdown sentinel. It never polls the device on its own.
@@ -2587,7 +2782,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    except (ValueError,OSError,TypeError):language_pending_description={'entries':0}
    language_status=spanish_auto_status()
    overlay_request_pump()
-   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeLookupDeferred':episode_lookup_deferred,'episodeLookupLastError':episode_lookup_last_error,'episodeCandidateErrors':episode_candidate_errors,'episodeCandidateLastError':episode_candidate_last_error,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'deliveryQuality':quality_summary()})
+   return self.reply(200,{'sourceProfile':SOURCE_PROFILE,'channels':len(channels),'requests':counts,'resources':len(resources),'policyRevision':'sqlite-policy-v2','policyReady':ready,'policyChannels':len(snapshot),'configurationRevision':gateway_config['revision'],'configurationFault':config_fault,'resourceLimit':RESOURCE_LIMIT,'segmentCacheEntries':len(segment_cache),'segmentCacheBytes':segment_cache_bytes,'favorites':len(favorites),'catalogueSource':catalogue_source,'catalogueFault':catalogue_fault,'programmeCount':len(programme_snapshot()),'programmeObservedAt':max(programme_observed_at,paged_last_success),'programmeFault':programme_fault,'programmeRefreshFailures':programme_refresh_failures,'programmeLastAttemptAt':programme_last_attempt,'programmeNextAttemptAt':programme_next_attempt,'externalProgrammeCount':len(guide_snapshot(time.time())),'externalProgrammeObservedAt':guide_observed_at,'externalProgrammeFault':guide_fault,'episodeGuideObservedAt':episode_observed_at,'episodeGuideFault':episode_fault,'episodeLookupFault':episode_lookup_fault,'episodeLookupErrors':episode_lookup_errors,'episodeLookupDeferred':episode_lookup_deferred,'episodeLookupLastError':episode_lookup_last_error,'episodeCandidateErrors':episode_candidate_errors,'episodeCandidateLastError':episode_candidate_last_error,'episodeProgrammeCount':sum(bool(r.get('episodeTitle')) for r in programme_snapshot().values()),'episodeVerifiedCount':sum(bool(r.get('episodeNumber')) for r in programme_snapshot().values()),'episodeSeasonYearCount':sum(bool(r.get('seasonYear')) for r in programme_snapshot().values()),'regionalProgrammeCount':len(regional_snapshot(time.time())),'regionalProgrammeFault':regional_fault,'regionalProgrammeObservedAt':regional_observed_at,'metadataResearch':discovery_status(),'ukManifest':dict(uk_manifest_status,trialEnabled=gateway_config['ukTrialEnabled'],cohortSize=len(uk_cohort(gateway_config))),'expandedManifest':dict(expanded_manifest_status,cohortSize=len(expanded_cohort(gateway_config))),'trialCohortSize':len(trial_cohort(gateway_config)),'programmeYearCount':sum(cached_year(row) is not None for row in programme_snapshot().values()),'programmeYearFault':year_fault,'programmeYearErrors':year_errors,'programmeYearLastError':year_last_error,'programmeYearDeferred':sum(until>time.time() for until in list(year_retry.values())),'programmeYearLastLookup':year_last_lookup,'languageExclusions':language_description,'languagePending':language_pending_description,'languageAuto':language_status,'spanishClassification':language_description,'spanishAuto':language_status,'episodeAudio':episode_audio_status(),'overlay':overlay_status(),'programmeOverlay':overlay_combined_status(),'deliveryQuality':quality_summary()})
   if path in ('/spanish-auto','/language-auto') and self.client_address[0] in (HOST,'127.0.0.1'):
    if self.command=='GET':return self.reply(200,spanish_auto_admin())
    if self.command=='POST':

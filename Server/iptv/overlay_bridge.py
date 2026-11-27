@@ -364,6 +364,7 @@ class OverlayBridge:
         self._pending: Optional[dict[str, Any]] = None
         self._last_attempt_at = float("-inf")
         self._corrected_events: set[str] = set()
+        self._terminal_states: dict[tuple, dict] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -485,6 +486,28 @@ class OverlayBridge:
         if snapshot.observed_at < self.latest_display_at:
             self.last_status = "stale"
             return self.last_status
+        scope_key = (channel_id, str(state.get("visitID") or ""),
+                     str(state.get("streamGeneration") or ""))
+        exhausted = (snapshot.phase == "inconclusive" and snapshot.attempt is not None
+                     and snapshot.max_attempts is not None
+                     and snapshot.attempt >= snapshot.max_attempts)
+        terminal = exhausted or snapshot.phase in ("no_audio", "disabled", "deferred")
+        previous = self._terminal_states.get(scope_key)
+        if not terminal and previous is not None:
+            # A late in-flight "collecting" event must not overwrite an
+            # exhausted/terminal result for the same visit and stream. A
+            # genuinely newer attempt or visit is still allowed.
+            newer_attempt = (snapshot.attempt is not None and previous.get("attempt") is not None
+                             and snapshot.attempt > previous["attempt"])
+            if not newer_attempt and snapshot.observed_at <= previous.get("at", 0.0) + 5.0:
+                self.last_status = "superseded"
+                return self.last_status
+        if terminal:
+            self._terminal_states[scope_key] = {
+                "attempt": snapshot.attempt, "at": snapshot.observed_at,
+                "phase": snapshot.phase}
+            while len(self._terminal_states) > 64:
+                self._terminal_states.pop(next(iter(self._terminal_states)))
         self.latest_state = snapshot
         self.latest_display_at = max(self.latest_display_at, snapshot.observed_at)
         self._enqueue(format_snapshot(snapshot), snapshot.event_id, channel_id, mono, immediate=False)

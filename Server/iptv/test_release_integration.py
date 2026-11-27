@@ -21,6 +21,7 @@ from unittest.mock import patch
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import overlay_bridge as ob
+import programme_overlay as po
 
 A, B, C = ("a" * 32, "b" * 32, "c" * 32)
 
@@ -90,6 +91,11 @@ class ReleaseIntegration(unittest.TestCase):
         with patch.dict(os.environ, env):
             import gateway
             self.g = importlib.reload(gateway)
+        # These tests exercise the language overlay only. Never construct the
+        # combined overlay's real authorized transport (no socket access).
+        overlay_patch = patch.object(self.g, "programme_overlay_instance", return_value=None)
+        overlay_patch.start()
+        self.addCleanup(overlay_patch.stop)
         for cid in (A, B, C):
             self.g.channels[cid] = {"Id": cid, "Name": "Fixture " + cid[0].upper(),
                                     "Type": "TvChannel"}
@@ -365,6 +371,156 @@ class ReleaseIntegration(unittest.TestCase):
             self.assertFalse(self.g.spanish_excluded(cid))
         self.assertTrue(self.g.spanish_excluded("d" * 32))
         self.assertEqual(before, self.g.policy_rows())
+
+
+class CombinedOverlayTests(unittest.TestCase):
+    """Installed-IPA combined label while rotation is paused."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = {"JEALOUSFIN_STATE_DIR": self.temp.name,
+               "JEALOUSFIN_USERNAME": "fixture", "JEALOUSFIN_PASSWORD": "fixture",
+               "JEALOUSFIN_TOKEN": "fixture-token",
+               "JEALOUSFIN_SERVER_ID": "fixture-server",
+               "JEALOUSFIN_BIND": "127.0.0.1"}
+        with patch.dict(os.environ, env):
+            import gateway
+            self.g = importlib.reload(gateway)
+        for cid, name in ((A, "Nurse Jackie"), (B, "Another Show")):
+            self.g.channels[cid] = {"Id": cid, "Name": name, "Type": "TvChannel"}
+            self.g.sources[cid] = "nltv:fixture:" + cid
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+            self.fail_fields = set()
+
+        def set_value(self, field, value):
+            self.calls.append((field, value))
+            if field in self.fail_fields:
+                raise RuntimeError("transport down")
+
+    def publisher(self, transport, retries=1):
+        return po.ProgrammeOverlayPublisher(transport, max_retries=retries)
+
+    def probe(self, cid, stream="stream-1"):
+        return {"channelID": cid, "launchID": "launch-1",
+                "streamGeneration": stream, "surfPaused": True, "surfing": True,
+                "playing": True}
+
+    def row(self, series="Nurse Jackie", episode="Pilot", year=2009):
+        return {"title": series, "episodeTitle": episode, "seasonNumber": 1,
+                "episodeNumber": 1, "episodeYear": year,
+                "episodeSource": "local-audio-episode-identity",
+                "source": "provider-catalogue"}
+
+    def evidence(self, at=999.0):
+        return {"eventID": "evt-1", "at": at, "language": "en",
+                "languageName": "English", "count": 1, "threshold": 25,
+                "phase": "allowed", "confidence": 0.9769}
+
+    def seed_visit(self, cid, stream="stream-1"):
+        return self.g.language_visit_identity().observe(cid, "launch-1", stream)["visitID"]
+
+    def test_paused_rotation_publishes_new_combined_evidence_with_scope_guards(self):
+        transport = self.Transport()
+        publisher = self.publisher(transport)
+        self.seed_visit(A)
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe", return_value=self.probe(A)), \
+                patch.object(self.g, "programme_snapshot", return_value={A: self.row()}):
+            result = self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(A),
+                evidence=self.evidence(), now=1000.0)
+        self.assertEqual(result, "published")
+        self.assertEqual(transport.calls, [
+            (po.READY_FIELD, po.FALSE),
+            (po.FALLBACK_FIELD, po.TRUE),
+            (po.FIELD, ""),
+            (po.FIELD, "Nurse Jackie — S01E01: Pilot (2009) English — 1/25 — 97.7%"),
+            (po.READY_FIELD, po.TRUE),
+            (po.FALLBACK_FIELD, po.FALSE),
+        ])
+        # A probe for another channel can never rewrite the paused label.
+        before = list(transport.calls)
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher):
+            self.assertEqual(self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(B)), "suppressed_channel")
+        self.assertEqual(transport.calls, before)
+
+    def test_scope_transition_replaces_old_label_and_prefers_fallback_on_failure(self):
+        transport = self.Transport()
+        publisher = self.publisher(transport)
+        self.seed_visit(A)
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe", return_value=self.probe(A)), \
+                patch.object(self.g, "programme_snapshot", return_value={A: self.row()}):
+            self.assertEqual(self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(A),
+                evidence=self.evidence(), now=1000.0), "published")
+        transport.calls.clear()
+        self.seed_visit(B, "stream-2")
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe",
+                             return_value=self.probe(B, "stream-2")), \
+                patch.object(self.g, "programme_snapshot", return_value={
+                    B: self.row(series="Another Show", episode="Second", year=2020)}):
+            result = self.g.overlay_combined_publish(
+                B, "Another Show", probe=self.probe(B, "stream-2"),
+                evidence=dict(self.evidence(at=1001.0), eventID="evt-2"), now=1002.0)
+        self.assertEqual(result, "published")
+        self.assertEqual(transport.calls[:3], [
+            (po.READY_FIELD, po.FALSE),
+            (po.FALLBACK_FIELD, po.TRUE),
+            (po.FIELD, ""),
+        ])
+        self.assertNotIn("Nurse Jackie", " ".join(value for _field, value in transport.calls))
+        self.assertIn("Another Show", transport.calls[-3][1])
+        # If the value write fails, Ready is never enabled.
+        transport.calls.clear()
+        transport.fail_fields.add(po.FIELD)
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe",
+                             return_value=self.probe(B, "stream-2")), \
+                patch.object(self.g, "programme_snapshot", return_value={B: self.row()}):
+            self.assertEqual(self.g.overlay_combined_publish(
+                B, "Another Show", probe=self.probe(B, "stream-2"),
+                evidence=self.evidence(at=1003.0), now=1004.0), "failed")
+        self.assertNotIn((po.READY_FIELD, po.TRUE), transport.calls)
+        self.assertIn((po.FALLBACK_FIELD, po.TRUE), transport.calls)
+
+    def test_bare_series_title_prefers_installed_fallback(self):
+        transport = self.Transport()
+        publisher = self.publisher(transport)
+        self.seed_visit(A)
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe", return_value=self.probe(A)), \
+                patch.object(self.g, "programme_snapshot", return_value={A: self.row()}):
+            self.assertEqual(self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(A),
+                evidence=self.evidence(), now=1000.0), "published")
+        transport.calls.clear()
+        with patch.object(self.g, "programme_overlay_instance", return_value=publisher), \
+                patch.object(self.g, "device_language_probe", return_value=self.probe(A)), \
+                patch.object(self.g, "programme_snapshot",
+                             return_value={A: {"title": "Nurse Jackie (2009)"}}):
+            self.assertEqual(self.g.overlay_combined_publish(
+                A, "Nurse Jackie", probe=self.probe(A), evidence=None, now=1001.0),
+                "fallback")
+        self.assertEqual(transport.calls[:3], [
+            (po.READY_FIELD, po.FALSE),
+            (po.FALLBACK_FIELD, po.TRUE),
+            (po.FIELD, ""),
+        ])
+        self.assertNotIn((po.READY_FIELD, po.TRUE), transport.calls)
+
+    def test_status_reports_existing_native_abi(self):
+        status = self.g.overlay_combined_status()
+        self.assertEqual(status["layoutRevision"], "programme-language-existing-ipa-20261127")
+        self.assertEqual(status["field"], "form.programmeOverlay")
+        self.assertEqual(status["readyField"], "form.programmeOverlayReady")
+        self.assertEqual(status["fallbackField"], "form.programmeOverlayFallback")
 
 
 class StagedLayoutTests(unittest.TestCase):
