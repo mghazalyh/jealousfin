@@ -191,3 +191,19 @@ class TypedParserTests(unittest.TestCase):
         self.assertEqual(audio.parse_typed_programme_page(official.replace("Date: Sunday, May 25","Schedule: Sunday, May 25"),official_url,clues,True),[])
         self.assertEqual(audio.parse_typed_programme_page(apex.replace("Race Top Five","Starting Grid"),apex_url,clues),[])
         self.assertEqual(audio.parse_typed_programme_page(racing.replace("Indy 500 Race Results May 25","Indy 500 Race Results May 24"),racing_url,clues),[])
+
+    def test_css_hidden_plot_is_not_evidence(self):
+        visible='<p>'+self.plot+'</p>'
+        for style,markup in (
+            ('<style>.concealed {display:none}</style>','<p class="concealed">'+self.plot+'</p>'),
+            ('<style>@media(max-width:600px){#concealed{visibility:hidden!important}}</style>','<p id="concealed">'+self.plot+'</p>'),
+            ('<style>.description .concealed {opacity:0}</style>','<div class="concealed"><p>'+self.plot+'</p></div>'),
+            ('<style>[data-concealed="yes"]{content-visibility:hidden}</style>','<p data-concealed="yes">'+self.plot+'</p>'),
+            ('','<p class="screen-reader-text">'+self.plot+'</p>'),
+            ('','<p class="d-none">'+self.plot+'</p>'),
+        ):
+            with self.subTest(markup=markup):
+                self.assertEqual(audio.parse_typed_programme_page(style+self.movie_html.replace(visible,markup),self.official,self.clues,True),[])
+        # A CSS-hidden unrelated node must not suppress a legitimate visible plot.
+        html='<style>.concealed{display:none}</style>'+self.movie_html.replace(visible,'<p class="concealed">Unrelated clues</p>'+visible)
+        self.assertEqual(len(audio.parse_typed_programme_page(html,self.official,self.clues,True)),1)

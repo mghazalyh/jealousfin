@@ -45,7 +45,6 @@ import time
 import urllib.error
 import urllib.parse
 from collections import OrderedDict
-from html.parser import HTMLParser
 
 REVISION = "episode-audio-evidence-20261127-v3"
 DEFAULT_ENABLED = False
@@ -2330,67 +2329,96 @@ def parse_report_page(page, source_url, context=None, clues=()):
 
 
 
-class _TypedScope(HTMLParser):
-    """Collect visible paragraphs/headings in one explicitly selected scope."""
-    VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
-    EXCLUDED = frozenset("script style noscript nav aside footer form figure template svg".split())
-
-    def __init__(self, selector):
-        super().__init__(convert_charrefs=True)
-        self.selector = selector
-        self.stack = []
-        self.scopes = 0
-        self.rows = []
-        self.size = 0
-        self.active = None
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        hidden = (tag in self.EXCLUDED or "hidden" in a or a.get("aria-hidden") == "true"
-                  or bool(re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", a.get("style") or "", re.I)))
-        if tag in self.VOID:
-            if tag == "br":
-                self.handle_data(" ")
-            return
-        parent = self.stack[-1] if self.stack else (None, False, False)
-        hidden = hidden or parent[1]
-        selected = not hidden and self.selector(tag, a)
-        if selected:
-            self.scopes += 1
-        in_scope = selected or parent[2]
-        self.stack.append((tag, hidden, in_scope))
-        if not hidden and in_scope and tag in ("p", "h1", "h2", "h3", "h4", "li", "th", "td") and self.active is None:
-            self.active = (len(self.stack), tag, [])
-
-    def handle_endtag(self, tag):
-        for i in range(len(self.stack)-1, -1, -1):
-            if self.stack[i][0] == tag:
-                if self.active and self.active[0] > i:
-                    _, kind, parts = self.active
-                    value = " ".join("".join(parts).split())[:2000]
-                    if value:
-                        self.rows.append((kind, value))
-                    self.active = None
-                del self.stack[i:]
-                return
-
-    def handle_data(self, data):
-        if not self.active or not self.stack or self.stack[-1][1] or not self.stack[-1][2]:
-            return
-        if self.size < 24000:
-            data = data[:24000-self.size]
-            self.active[2].append(data)
-            self.size += len(data)
+_CSS_HIDDEN_DECLARATION = re.compile(
+    r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|"
+    r"content-visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|"
+    r"font-size\s*:\s*0(?:px|em|rem|%)?)\s*(?:!important\s*)?(?:;|$)", re.I)
+_HIDDEN_CLASS = re.compile(r"^(?:hidden|is-hidden|u-hidden|d-none|sr-only|visually-hidden|"
+                           r"screen-reader(?:-text|-only)?|hide|hidden-content|"
+                           r"hide-on-[\w-]+|hidden-[\w-]+|d-[\w-]+-none)$", re.I)
+_TYPED_EXCLUDED = frozenset("script style noscript nav aside footer form figure template svg".split())
 
 
 def _typed_scope(page, selector):
-    parser = _TypedScope(selector)
+    """Read a single reviewed semantic scope, never page-wide text.
+
+    Ignore hidden HTML, embedded CSS-hidden elements (including conditional
+    rules, conservatively), and conventional externally styled hidden classes.
+    No JavaScript execution or secondary stylesheet/network requests. This is
+    static source evidence, not a claim about a rendered browser screenshot.
+    Missing parser dependencies or unsupported hiding selectors fail closed.
+    """
     try:
-        parser.feed(_page_text(page))
-        parser.close()
-    except (ValueError, RecursionError):
+        from bs4 import BeautifulSoup
+        import soupsieve
+        soup = BeautifulSoup(_page_text(page), "html.parser")
+        hidden = set()
+        for node in soup.find_all(True):
+            classes = node.get("class", [])
+            if (node.name in _TYPED_EXCLUDED or node.has_attr("hidden") or
+                    str(node.get("aria-hidden", "")).casefold() == "true" or
+                    _CSS_HIDDEN_DECLARATION.search(str(node.get("style", ""))) or
+                    any(_HIDDEN_CLASS.fullmatch(str(c)) for c in classes)):
+                hidden.add(id(node))
+        # Match static stylesheet hiding rules before filtering the source
+        # scope, including nested media rules. Ignore keyframe steps and
+        # pseudo-elements, which do not hide the source element itself.
+        rules = []
+        for style in soup.find_all("style"):
+            css = re.sub(r"/\*.*?\*/", "", style.get_text(), flags=re.S)
+            for rule in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+                if _CSS_HIDDEN_DECLARATION.search(rule[2]):
+                    value = rule[1].strip()
+                    if re.fullmatch(r"(?:from|to|\d+(?:\.\d+)?%)", value, re.I):
+                        continue
+                    rules.append(value)
+                    if len(rules) > 256:
+                        return []
+        for value in rules:
+            # Pseudo-elements cannot contain the HTML source paragraphs.
+            if re.search(r"::[\w-]+|:(?:before|after|first-letter|first-line|-ms-input-placeholder|-moz-placeholder|-webkit-input-placeholder)\b", value, re.I):
+                # Remove only individual pseudo-element selectors. A comma
+                # inside a selector is uncommon here; fail closed on ambiguous
+                # selector lists rather than accidentally dropping a hide rule.
+                if "," not in value:
+                    continue
+                if "(" in value or "[" in value:
+                    return []
+                value = ",".join(v for v in value.split(",") if not re.search(
+                    r"::[\w-]+|:(?:before|after|first-letter|first-line|-ms-input-placeholder|-moz-placeholder|-webkit-input-placeholder)\b", v,re.I))
+                if not value.strip():
+                    continue
+            for node in soupsieve.select(value,soup):
+                hidden.add(id(node))
+        def is_hidden(node):
+            return id(node) in hidden or any(id(parent) in hidden for parent in node.parents)
+        scopes = [node for node in soup.find_all(True) if not is_hidden(node) and
+                  selector(node.name,{k:" ".join(v) if isinstance(v,list) else v for k,v in node.attrs.items()})]
+        if len(scopes) != 1:
+            return []
+        rows=[]
+        size=0
+        scope=scopes[0]
+        kinds=("p","h1","h2","h3","h4","li","th","td")
+        nodes=([scope] if scope.name in kinds else [])+scope.find_all(kinds)
+        for node in nodes:
+            if is_hidden(node) or any(parent is not scope and parent.name in kinds
+                                      for parent in node.parents if parent is not scope and any(ancestor is scope for ancestor in parent.parents)):
+                continue
+            parts=[str(t) for t in node.find_all(string=True) if not is_hidden(t.parent)
+                   and type(t).__name__ == "NavigableString"]
+            value=" ".join(" ".join(parts).split())[:2000]
+            if value:
+                size+=len(value)
+                if size>24000:
+                    break
+                rows.append((node.name,value))
+        return rows
+    except (ImportError, ValueError, TypeError, RecursionError, RuntimeError):
         return []
-    return parser.rows if parser.scopes == 1 and parser.active is None else []
+    except Exception:
+        # Malformed HTML/unsupported CSS must never contribute evidence.
+        return []
 
 
 def _typed_movie_year(title, paragraphs):
