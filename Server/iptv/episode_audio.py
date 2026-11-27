@@ -2329,10 +2329,12 @@ def parse_report_page(page, source_url, context=None, clues=()):
 
 
 
+# CSS numeric zero may use a sign, fractional notation, exponent, or unit.
+_CSS_ZERO = r"[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?"
 _CSS_HIDDEN_DECLARATION = re.compile(
     r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|"
-    r"content-visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|"
-    r"font-size\s*:\s*0(?:px|em|rem|%)?)\s*(?:!important\s*)?(?:;|$)", re.I)
+    r"content-visibility\s*:\s*hidden|opacity\s*:\s*" + _CSS_ZERO + r"%?|"
+    r"font-size\s*:\s*" + _CSS_ZERO + r"(?:[a-z]+|%)?)\s*(?:!important\s*)?(?:;|$)", re.I)
 _HIDDEN_CLASS = re.compile(r"^(?:hidden|is-hidden|u-hidden|d-none|sr-only|visually-hidden|"
                            r"screen-reader(?:-text|-only)?|hide|hidden-content|"
                            r"hide-on-[\w-]+|hidden-[\w-]+|d-[\w-]+-none)$", re.I)
