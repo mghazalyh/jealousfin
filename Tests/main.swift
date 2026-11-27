@@ -709,6 +709,26 @@ let incompleteEvidence:[String:Any]=[
 ]
 let incompleteProgramme=JellyfinProgrammeParser.program(incompleteEvidence)
 check(incompleteProgramme?.evidence?.episodeTitle=="Subtitle only" && incompleteProgramme?.evidence?.seasonNumber==nil && incompleteProgramme?.evidence?.seasonYear==nil,"incomplete episode numbering omits season year instead of guessing")
+let catalogEvidence:[String:Any]=[
+    "Id":"episode-3","Name":"S01E05: 500 Sq. Ft. Rocky Mountain Mansion (2014)","JealousfinProgramme":[
+        "title":"Tiny House Nation","source":"corroborated-external-schedule","observedAt":programmeNow.timeIntervalSince1970,
+        "episodeTitle":"500 Sq. Ft. Rocky Mountain Mansion","seasonNumber":1,"episodeNumber":5,
+        "seasonYear":2014,"episodeSource":"catalog-schedule","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+let catalogProgramme=JellyfinProgrammeParser.program(catalogEvidence)
+check(catalogProgramme?.evidence?.episodeSource=="catalog-schedule" && catalogProgramme?.evidence?.seasonYear==2014,"canonical catalog schedule identity is a supported episode provenance")
+let audioEvidence:[String:Any]=[
+    "Id":"episode-4","Name":"The Mentalist","JealousfinProgramme":[
+        "title":"The Mentalist","source":"provider-catalogue","observedAt":programmeNow.timeIntervalSince1970,
+        "episodeTitle":"Forest Green","seasonNumber":6,"episodeNumber":18,
+        "seasonYear":2014,"episodeSource":"audio-clue-catalog","episodeObservedAt":programmeNow.timeIntervalSince1970
+    ] as [String:Any]
+]
+check(JellyfinProgrammeParser.program(audioEvidence)?.evidence?.episodeSource=="audio-clue-catalog","unique audio-clue catalog identity is a supported episode provenance")
+var unknownEvidence=catalogEvidence
+unknownEvidence["JealousfinProgramme"]=(catalogEvidence["JealousfinProgramme"] as! [String:Any]).merging(["episodeSource":"static-map"]){_,new in new}
+check(JellyfinProgrammeParser.program(unknownEvidence)?.evidence?.episodeTitle==nil,"unknown episode provenance cannot masquerade as a catalog identity")
 check(JellyfinProgrammeParser.program(["Name":"missing id"])==nil,"programme identity required")
 print("PASS: \(checks) assertions including exact gateway programme passthrough and fallback")
 
@@ -768,6 +788,8 @@ check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligibl
 check(!SurfCommandSemantics.retainOnlyChannel(reason:"rotation-deadline",eligible:["a","b"],current:"a",healthy:true),"normal rotation with alternatives remains intact")
 print("PASS: \(checks) assertions including durable recent history and sole-channel retention")
 
+let programmeStyleLayout=try DynamicUILayout(schemaVersion:1,revision:"programme-style-fixture",slots:[DynamicUISlot(location:"player.fullscreen.programmeTitle",nodes:[DynamicUINode(id:"programme-label",kind:"text",style:"programme",valueKey:"form.programmeOverlay",defaultValue:"Waiting")])],pages:[]).checked()
+check(programmeStyleLayout.slots[0].nodes[0].style=="programme","native programme style is valid and bound to the gateway-managed field")
 let brightnessDefaults=DynamicPresentation()
 check(brightnessDefaults.resolvedVideoBrightnessRange == -20...10,"expanded native brightness default")
 check(brightnessDefaults.clampedVideoBrightness(-30) == -20,"default negative brightness clamp")

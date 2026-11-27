@@ -858,5 +858,49 @@ class GatewayAcceptance(unittest.TestCase):
 
 from test_deployment_continuity import DeploymentContinuityTests
 
+
+class ScheduleEpisodeGatewayTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = {"JEALOUSFIN_STATE_DIR": self.temp.name, "JEALOUSFIN_USERNAME": "fixture",
+               "JEALOUSFIN_PASSWORD": "fixture", "JEALOUSFIN_TOKEN": "fixture-token",
+               "JEALOUSFIN_SERVER_ID": "fixture-server", "JEALOUSFIN_BIND": "127.0.0.1"}
+        with patch.dict(os.environ, env):
+            import gateway
+            self.g = importlib.reload(gateway)
+
+    def test_corroborated_guide_and_catalog_enrich_exact_provider_only(self):
+        import schedule_episode
+        cid = "a" * 32
+        provider = "nltv:us:TinyHouseNation.us"
+        self.g.channels[cid] = {"Id": cid, "Name": "Tiny House Nation"}
+        self.g.sources[cid] = provider
+        now = 1764201600.0
+        aid, bid = self.g.GUIDE_CHANNELS["Tiny House Nation"]
+        self.g.guide_observed_at = now
+        self.g.guide_rows = (
+            {aid: [(now - 60, now + 1800, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+            {bid: [(now - 50, now + 1810, "Tiny House Nation", "desc",
+                    "500 Sq. Ft. Rocky Mountain Mansion", (1, 5), "-0500")]},
+        )
+        self.g.catalog_observed_at = now
+        payload = json.dumps([{"name": "500 Sq. Ft. Rocky Mountain Mansion", "season": 1,
+                               "number": 5, "airdate": "2014-08-13",
+                               "summary": "Colorado wildfire 500 sq ft two offices"}])
+        tvdb = "<div>S01E05</div><div>500 Sq. Ft. Rocky Mountain Mansion</div><div>August 13, 2014</div>"
+        self.g.catalog_rows = {provider: schedule_episode.parse_tvmaze_episodes(payload, "Tiny House Nation")
+                                          + schedule_episode.parse_tvdb_allseasons_html(tvdb, "Tiny House Nation")}
+        row = self.g.guide_snapshot(now)[cid]
+        self.assertEqual(row["episodeTitle"], "500 Sq. Ft. Rocky Mountain Mansion")
+        self.assertEqual((row["seasonNumber"], row["episodeNumber"]), (1, 5))
+        self.assertEqual(row["seasonYear"], 2014)
+        self.assertEqual(row["scheduleVerification"], "corroborated-schedule")
+        # Same channel name, different distributor identity: no enrichment.
+        self.g.sources[cid] = "nltv:us:OtherTinyHouse.us"
+        self.assertNotIn(cid, self.g.guide_snapshot(now))
+
+
 if __name__=="__main__":
     unittest.main()

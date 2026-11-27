@@ -82,7 +82,7 @@ LAYOUT_COMMANDS = {
 }
 EDITABLE_KINDS = {"input", "toggle", "picker", "slider", "segmented", "menu"}
 CONTAINER_KINDS = {"card", "vstack", "hstack", "disclosure", "scroll", "searchList", "table", "barChart"}
-STYLES = {"normal", "headline", "caption", "prominent", "destructive", "muted"}
+STYLES = {"normal", "headline", "caption", "programme", "prominent", "destructive", "muted"}
 
 
 class OverlayError(ValueError):

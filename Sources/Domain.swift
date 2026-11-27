@@ -41,7 +41,11 @@ struct ProgrammeEvidence: Codable, Equatable {
         result.providerNextClock=Self.clean(providerNextClock,maximum:16)
         result.year=Self.validYear(year)
         result.episodeTitle=Self.clean(episodeTitle,maximum:300)
-        if episodeSource != "pluto-xmltv" || result.episodeTitle==nil || episodeObservedAt.map({$0.isFinite && $0>0}) != true{
+        // Existing XMLTV, canonical catalog/schedule and corroborated audio
+        // clue identities are the only accepted episode provenance. Unknown
+        // sources never become a season/year guess.
+        let allowedEpisodeSources=["pluto-xmltv","catalog-schedule","audio-clue-catalog"]
+        if !allowedEpisodeSources.contains(episodeSource ?? "") || result.episodeTitle==nil || episodeObservedAt.map({$0.isFinite && $0>0}) != true{
             result.episodeTitle=nil;result.episodeSource=nil;result.episodeObservedAt=nil
         }
         if result.episodeTitle==nil || !(seasonNumber.map{(1...99).contains($0)} ?? false) || !(episodeNumber.map{(1...9999).contains($0)} ?? false){

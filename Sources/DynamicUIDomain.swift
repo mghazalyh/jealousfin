@@ -166,7 +166,7 @@ struct DynamicUILayout: Codable, Equatable {
                 count+=1
                 guard count<=250,Self.validID(n.id),seen.insert(n.id).inserted,Self.kinds.contains(n.kind),
                     (n.title?.count ?? 0)<=512,(n.detail?.count ?? 0)<=2048,(n.symbol?.count ?? 0)<=100,
-                    ["normal","headline","caption","prominent","destructive","muted"].contains(n.style ?? "normal"),
+                    ["normal","headline","caption","programme","prominent","destructive","muted"].contains(n.style ?? "normal"),
                     (n.defaultValue?.utf8.count ?? 0)<=4096
                 else{throw AppError.message("Invalid or duplicate UI node \(n.id)")}
                 for binding in [n.valueKey,n.visibleWhen,n.enabledWhen].compactMap({$0}){

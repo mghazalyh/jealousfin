@@ -77,6 +77,7 @@ struct DynamicUINodeView:View{
     private var font:Font {
         switch node.style{
         case "headline":return .headline
+        case "programme":return .system(size:22,weight:.semibold,design:.default)
         case "caption":return .caption
         default:return .body
         }
