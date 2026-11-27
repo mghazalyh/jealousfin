@@ -88,6 +88,7 @@ docs/incident-identity-overlay-20261127.md
 docs/incident-overlay-post-pressure-20261127.md
 docs/incident-probe-concurrency-20261127.md
 docs/schedule-episode-discovery-20261127.md
+Server/iptv/test_typed_programme.py
 ```
 
 No generated artifact, credential, registry, transcript, page body, audio
@@ -214,3 +215,42 @@ Foreground recovery reserves the next status admission, accounts for elapsed ini
 Catalogue reconnect now uses bounded fresh-profile recovery before the synchronous manual-classification callback; policy/programme polling remains fail-closed without waiting.
 
 Language inference skips full transcription only for known terminal window-only failures. Conclusive and lexical-dependent decisions retain transcription and episode handoff.
+
+
+## No-EPG typed evidence extension (2026-11-28)
+
+Typed content has distinct evidence fields for movie release year, sports event date,
+series, and other programme release year; television episode fields retain their
+existing meaning. Two independent publishers and the official archive must agree
+on the typed key and disjoint requested clues. The typed path cannot overwrite
+existing programme metadata and requires a current playback session.
+
+Reviewed, narrow public-source profiles:
+- Amblin creator archive: film title and explicit release year in movie metadata;
+  first scoped plot paragraph. Amblin's creator archive is not represented as the
+  original distributing studio.
+- The Guardian film retrospective: matching article headline and explicit
+  film-specific release-year statement.
+- Scream Horror Magazine film review: matching review headline, scoped review
+  and explicit release-year statement. Distinct editorial publishers.
+- IndyCar official retrospective: labelled race, date and winner; explicit
+  year in the event headline, not the publication date.
+- The Apex race report: actual date heading and completed-race top-five table.
+- Racing News: matching dated results headline and classified finishers section.
+  The two results publications are distinct from IndyCar and each other.
+  These motorsports profiles currently cover the Indianapolis 500 family,
+  not arbitrary racing or other sports. Other series and other programme types
+  have evidence architecture and fixtures only; no reviewed real-source
+  parser yet.
+
+Scope parsing uses the installed BeautifulSoup/SoupSieve packages, with fail-closed
+behavior if missing or if hiding selectors are unsupported. It excludes inline
+hidden elements, hidden classes and embedded stylesheet hiding rules. This is
+static semantic source evidence; externally loaded CSS and dynamic visual
+rendering are not fetched or asserted. No secondary stylesheet or script
+requests, raw page storage or browser execution are introduced.
+
+Historical public source proof (fixture clues, not live device acceptance):
+Jaws (1975), Amblin/Guardian/Scream; 2025 Indianapolis 500 (2025-05-25),
+IndyCar/The Apex/Racing News. Verification against actual media and native
+display remains a separate acceptance gate.
