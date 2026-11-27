@@ -413,3 +413,26 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
         with patch.object(discovery,"_run_model_process",return_value=(raw,True)):
             with self.assertRaises(discovery.ResearchError):
                 discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+
+    def test_model_final_json_cannot_add_unobserved_urls(self):
+        official=fixtures.OFFICIAL_URL
+        report=fixtures.REPORT_URL
+        invented="https://www.wwe.com/invented"
+        final={"official":[invented],"reports":["https://www.pwinsider.com/invented"]}
+        encode=lambda rows: "\n".join(json.dumps(r) for r in rows).encode()
+        completed=lambda output:{"type":"tool_use","part":{"tool":"websearch","state":{"status":"completed","output":output}}}
+        answer={"type":"text","part":{"text":json.dumps(final)}}
+        with patch.object(discovery,"_run_model_process",return_value=(encode([completed(official+" "+report),answer]),False)):
+            result,diag=discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+        self.assertEqual(result,{"official":[official],"reports":[report]})
+        self.assertFalse(diag["partialResult"])
+        with patch.object(discovery,"_run_model_process",return_value=(encode([completed("https://example.org/no"),answer]),False)):
+            with self.assertRaises(discovery.ResearchError) as caught:
+                discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+        self.assertEqual(caught.exception.diagnostics["error"],"no-approved-search-leads")
+        with patch.object(discovery,"_run_model_process",return_value=(encode([completed(official),answer,{"type":"tool_use","part":{"tool":"bash"}}]),False)):
+            with self.assertRaises(discovery.ResearchError):
+                discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+        with patch.object(discovery,"_run_model_process",return_value=(encode([completed(official),answer]),False)):
+            result,diag=discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1)
+        self.assertEqual(result,final)

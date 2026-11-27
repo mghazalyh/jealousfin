@@ -202,15 +202,19 @@ def run_model_detailed(prompt,model,timeout,variant=DEFAULT_VARIANT,episode_lead
         result,parsed=parse_events_detailed(data);diagnostics.update(parsed)
         if episode_leads:
             leads=completed_episode_search_leads(data)
-            if result is not None:
-                final=normalize_episode_sources(result)
-                result=normalize_episode_sources({key:final[key]+leads[key] for key in leads})
-            elif any(leads.values()) and parsed.get("error") not in ("unexpected-tool","opencode-error"):
+            # The final model answer is not source provenance. Even a valid
+            # JSON response may contain invented URLs. Only URLs observed in
+            # completed public search tool output are eligible in this lane.
+            if parsed.get("error") in ("unexpected-tool","opencode-error"):
+                result=None
+            elif any(leads.values()):
+                diagnostics["partialResult"]=bool(timed_out or result is None)
                 result=leads
-                diagnostics["partialResult"]=True
                 diagnostics["error"]=None
-            elif timed_out and parsed.get("error") not in ("unexpected-tool","opencode-error"):
-                diagnostics["error"]="no-completed-public-search" if not parsed.get("completedSearches") else "timeout-no-approved-leads"
+            else:
+                result=None
+                diagnostics["error"]=("no-completed-public-search" if not parsed.get("completedSearches")
+                                      else "timeout-no-approved-leads" if timed_out else "no-approved-search-leads")
             diagnostics["completedSearchLeadCounts"]={key:len(value) for key,value in leads.items()}
     except Exception as error:
         diagnostics["error"]=type(error).__name__
