@@ -56,6 +56,7 @@ Server/iptv/spanish_audio.py
 Server/iptv/test_deployment_continuity.py
 Server/iptv/test_episode_audio.py
 Server/iptv/test_gateway_policy.py
+Server/iptv/test_incident_identity_overlay_20261127.py
 Server/iptv/test_language_pause.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
@@ -73,6 +74,8 @@ Tests/RuntimeSmoke.swift
 Tests/main.swift
 docs/episode-paused-retry-20261127.md
 docs/episode-release-20261127.md
+docs/incident-identity-overlay-20261127.md
+docs/incident-probe-concurrency-20261127.md
 docs/schedule-episode-discovery-20261127.md
 ```
 
