@@ -1305,6 +1305,19 @@ class PublicationStore:
             self.published += 1
         return True
 
+    def discard_publication(self, promotion, context, now):
+        """Remove only this exact failed publication, never a newer visit."""
+        episode = promotion.episode
+        if episode is None:
+            return
+        with self._lock:
+            entry = self.entries.get(episode.channel_id)
+            if (entry is not None and
+                    entry.row.get("episodeVisitDigest") == episode.binding.digest() and
+                    entry.row.get("episodeObservedAt") == round(now, 3) and
+                    entry.row.get("audioPlaybackSessionHash") == (context or {}).get("publicationSessionHash")):
+                self.entries.pop(episode.channel_id, None)
+
     def snapshot(self, now=None):
         now = self.clock() if now is None else float(now)
         with self._lock:
@@ -1822,6 +1835,15 @@ def _unknown_report_air_date(headline, description):
         air = _date_from_text(match.group(1))
         if air:
             matches.append(air)
+    series = _series_from_report_headline(headline)
+    if series:
+        series_pattern = re.escape(series)
+        text = description
+        # Publisher text may use typographic quotes around the exact series.
+        for match in re.finditer(r"\b(?:results|report|recap|review)\s+(?:for|of)\s+[“\x22‘\x27]?" + series_pattern + r"[”\x22’\x27]?\s+on\s+(" + DATE_TOKEN + r")", text, re.IGNORECASE):
+            air = _date_from_text(match.group(1))
+            if air:
+                matches.append(air)
     dates = set(matches)
     return next(iter(dates)) if len(dates) == 1 else ""
 
@@ -2494,8 +2516,8 @@ class EpisodeObserver:
                 view["session_hash"] = binding.digest()
         return view
 
-    def _duplicate(self, binding, identity, now, record=False):
-        key = "|".join((binding.digest(), identity.broadcaster_code or "",
+    def _duplicate(self, binding, identity, now, record=False, session_hash=None):
+        key = "|".join((binding.digest(), str(session_hash or ""), identity.broadcaster_code or "",
                         _digest(identity.series_title + "|" + identity.original_air_date)))
         expires = self._published.get(key)
         if expires is not None and now < expires:
@@ -2594,26 +2616,43 @@ class EpisodeObserver:
     def _publish(self, promotion, context, now):
         if not promotion.accepted or promotion.episode is None:
             return False
-        published = False
-        sink = self.publisher is not None
+        session = (context or {}).get("publicationSessionHash")
+        def same_session():
+            return not session or (self._usable_activity(promotion.episode.channel_id) or {}).get("session_hash") == session
+        def discard():
+            if isinstance(self.publisher, PublicationStore):
+                self.publisher.discard_publication(promotion, context, now)
+        if not same_session():
+            return False
         if self.publisher is not None:
             try:
-                published = bool(self.publisher.publish(promotion, context, now))
+                if not self.publisher.publish(promotion, context, now):
+                    return False
             except Exception as error:
+                discard()
                 self.log("episode publication error " + type(error).__name__)
-        if callable(self.publish) and (self.publisher is None or published):
-            sink = True
+                return False
+        if not same_session():
+            discard()
+            return False
+        if callable(self.publish):
             try:
-                published = bool(self.publish(promotion, context, now)) or published
+                delivered = bool(self.publish(promotion, context, now))
             except Exception as error:
                 self.log("episode publish callback error " + type(error).__name__)
-        if published or not sink:
-            identity = promotion.episode.identity
-            self.log("EPISODE_IDENTITY series=%s date=%s code=%s confidence=%.3f sources=%d" % (
-                identity.series_title[:80], identity.original_air_date,
-                identity.broadcaster_code or "-", promotion.episode.confidence,
-                promotion.episode.corroborating_sources))
-        return bool(published or not sink)
+                delivered = False
+            if not delivered:
+                discard()
+                return False
+        if not same_session():
+            discard()
+            return False
+        identity = promotion.episode.identity
+        self.log("EPISODE_IDENTITY series=%s date=%s code=%s confidence=%.3f sources=%d" % (
+            identity.series_title[:80], identity.original_air_date,
+            identity.broadcaster_code or "-", promotion.episode.confidence,
+            promotion.episode.corroborating_sources))
+        return True
 
     def _evaluate(self, request, snapshot, context, job, now, retry=False):
         binding = request.binding
@@ -2688,7 +2727,7 @@ class EpisodeObserver:
                     self._diagnose("promotion-error", "research", type(error).__name__)
                     promotion = Promotion(False, "promotion-error")
         if promotion.accepted and promotion.episode is not None:
-            if self._duplicate(binding, promotion.episode.identity, after):
+            if self._duplicate(binding, promotion.episode.identity, after, session_hash=session_hash):
                 promotion = Promotion(False, "duplicate-publication")
                 self._diagnose("duplicate-publication", "duplicate")
             elif unknown_title and (not session_hash or not fresh_context or
@@ -2699,7 +2738,7 @@ class EpisodeObserver:
                 promotion = Promotion(False, "publication-failed")
                 self._diagnose("publication-failed", "publication")
             else:
-                self._duplicate(binding, promotion.episode.identity, after, record=True)
+                self._duplicate(binding, promotion.episode.identity, after, record=True, session_hash=session_hash)
                 self._diagnose("promoted", "promoted")
         else:
             self._diagnose(promotion.reason, reason_category(promotion.reason))

@@ -195,3 +195,45 @@ class ReviewObserverTests(unittest.TestCase):
         self.assertEqual(len(publications),2)
         self.assertRegex(calls[0]["programme"]["researchSession"],r"^[0-9a-f]{64}$")
         self.assertEqual(audio._source_context(calls[0]["programme"])["researchSession"],calls[0]["programme"]["researchSession"])
+
+    def test_session_change_during_callback_discards_only_failed_publication(self):
+        wall=time.time();session=["session-a"];calls=[]
+        store=audio.PublicationStore()
+        def delivery(*args):
+            calls.append(args)
+            if len(calls)==1:session[0]="session-b"
+            return True
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),
+            lambda _:([fixtures.nxt_official()],fixtures.nxt_reports()),enabled=True,
+            programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":session[0]},
+            publisher=store,publish=delivery)
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
+             "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":32.0}
+        self.assertEqual(observer(job,decision,fixtures.NXT_TEXT).reason,"publication-failed")
+        self.assertIsNone(store.get(fixtures.CHANNEL))
+        self.assertTrue(observer(job,decision,fixtures.NXT_TEXT).accepted)
+        self.assertEqual(store.get(fixtures.CHANNEL)["audioPlaybackSessionHash"],"session-b")
+        session[0]="session-c"
+        self.assertTrue(observer(job,decision,fixtures.NXT_TEXT).accepted)
+        self.assertEqual(store.get(fixtures.CHANNEL)["audioPlaybackSessionHash"],"session-c")
+
+    def test_primary_store_success_does_not_hide_delivery_failure(self):
+        wall=time.time();store=audio.PublicationStore()
+        request=fixtures.nxt_request(wall)
+        context={"channelID":fixtures.CHANNEL,"seriesTitle":"","publicationSessionHash":"session-a"}
+        promotion=audio.promote_episode(request,[fixtures.nxt_official()],fixtures.nxt_reports(),fixtures.current(wall),wall,programme=context)
+        self.assertTrue(promotion.accepted)
+        observer=audio.EpisodeObserver(None,None,activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":"session-a"},publisher=store,publish=lambda *args:False)
+        self.assertFalse(observer._publish(promotion,context,wall))
+        self.assertIsNone(store.get(fixtures.CHANNEL))
+        observer.publish=lambda *args:True
+        self.assertTrue(observer._publish(promotion,context,wall))
+        self.assertIsNotNone(store.get(fixtures.CHANNEL))
+
+    def test_exact_series_description_air_date(self):
+        headline="WWE NXT Results 11/4 - Six Woman Tag Team Match"
+        self.assertEqual(audio._unknown_report_air_date(headline,"This is Wrestling Inc.’s results for “WWE NXT” on November 4, 2025, with a singles match"),"2025-11-04")
+        self.assertEqual(audio._unknown_report_air_date(headline,"Results for WWE Raw on November 4, 2025"),"")
