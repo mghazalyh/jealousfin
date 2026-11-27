@@ -52,6 +52,7 @@ Server/iptv/language_audio.py
 Server/iptv/opencode_discovery.py
 Server/iptv/overlay_bridge.py
 Server/iptv/programme_overlay.py
+Server/iptv/programme_research.py
 Server/iptv/prototype_selector.py
 Server/iptv/schedule_episode.py
 Server/iptv/spanish_audio.py
@@ -68,6 +69,7 @@ Server/iptv/test_language_timing_20261128.py
 Server/iptv/test_no_epg_identification.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
+Server/iptv/test_programme_research.py
 Server/iptv/test_release_integration.py
 Server/iptv/test_release_readiness.py
 Server/iptv/test_schedule_episode.py
