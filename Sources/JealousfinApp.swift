@@ -140,6 +140,7 @@ struct PlaybackView:View{
                     Color.black.aspectRatio(16/9,contentMode:.fit)
                 }else{
                     PlayerSurface(player:model.player,onReady:{if !model.fullscreenPresented{model.presentationReady($0)}},showsControls:model.presentationConfiguration.nativePlaybackControls ?? false,gravity:model.presentationConfiguration.videoGravity ?? "fit",allowsPiP:model.presentationConfiguration.pictureInPictureAllowed ?? true,automaticPiP:model.presentationConfiguration.automaticPictureInPicture ?? false,brightness:model.videoBrightness)
+                    .id(model.presentationEpoch)
                         .aspectRatio(16/9,contentMode:.fit)
                 }
                 Button{

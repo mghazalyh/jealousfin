@@ -1786,9 +1786,9 @@ def device_rotation_state(force=False):
   device_rotation_cache=None;return None
  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
  try:
-  status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
-  snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+  status,snapshot=device_identity_pair(config,token)
   if not isinstance(status,dict) or not isinstance(snapshot,dict):raise ValueError('Invalid device state')
+  if status.get('currentChannelID') and snapshot.get('channelID') and status['currentChannelID']!=snapshot['channelID']:raise ValueError('Incoherent channel identity')
   if type(status.get('surfPaused')) is not bool or type(status.get('surfing')) is not bool:raise ValueError('Unknown pause state')
   device_rotation_cache={'launchID':str(status.get('launchID',''))[:160],
    'streamGeneration':str(snapshot.get('streamGeneration',''))[:160],
@@ -1999,6 +1999,19 @@ def resolve_whisper_model():
    if path.is_file() and path.stat().st_size>1024*1024:return path
   except OSError:pass
  return None
+def device_identity_pair(config,token):
+ # The GET route is read-only and does not create durable command receipts.
+ # New native builds provide channel and generation in a single atomic status.
+ # Legacy installed IPAs need a separate player snapshot for stream identity.
+ status=prototype_selector.device_status(config,token)
+ if not isinstance(status,dict):raise ValueError('Invalid device state')
+ channel=status.get('currentChannelID');generation=status.get('streamGeneration')
+ if isinstance(channel,str) and channel and isinstance(generation,str) and generation:
+  return status,{'channelID':channel,'streamGeneration':generation}
+ snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
+ if not isinstance(snapshot,dict):raise ValueError('Invalid player snapshot')
+ return status,snapshot
+
 def device_language_probe():
  # The launch identity must be read fresh on every probe.  Caching it for up
  # to a minute could pair an old launch with a new channel/stream after an app
@@ -2009,10 +2022,7 @@ def device_language_probe():
  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
  for _ in range(2):
   try:
-   status=json.loads(prototype_selector.device_command(config,token,'get_status',{}))
-   if not isinstance(status,dict):return None
-   snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
-   if not isinstance(snapshot,dict):return None
+   status,snapshot=device_identity_pair(config,token)
   except Exception:
    return None
   channel_id=str(snapshot.get('channelID',''))
@@ -2451,12 +2461,12 @@ def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
  try:row=programme_snapshot().get(cid)
  except (sqlite3.Error,OSError,RuntimeError,ValueError):row=None
  if not isinstance(row,dict):
-  result=bridge.clear()
+  result=bridge.clear(scope=scope)
   programme_overlay_fault='' if result=='fallback' else result
   return 'no_programme'
  identity=programme_overlay.programme_identity(row)
  if identity is None:
-  result=bridge.clear()
+  result=bridge.clear(scope=scope)
   programme_overlay_fault='' if result=='fallback' else result
   return 'no_programme'
  if not isinstance(evidence,dict):
@@ -2476,11 +2486,7 @@ def overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
   # The installed 22 px fallback already shows live programme metadata. Do
   # not switch to the native combined node until there is something stronger
   # than a bare series title, and never leave an old combined label visible.
-  status=bridge.status()
-  if not bridge.current_scope or status.get('publishedText') or bridge.current_scope!=scope.fingerprint():
-   result=bridge.clear()
-  else:
-   result='fallback'
+  result=bridge.clear(scope=scope)
   programme_overlay_fault='' if result=='fallback' else result
   return 'fallback'
  text=programme_overlay.format_combined(identity,language,now=stamp)

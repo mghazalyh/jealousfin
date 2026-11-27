@@ -3,6 +3,8 @@ import Foundation
 @MainActor final class Disk {
     let root: URL
     private(set) var error: String?
+    private var diagnosticCount:Int?
+    private var batchCount:Int?
     init(root override:URL? = nil) {
         root = override ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
         do { try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true) } catch { self.error="Cannot create app storage" }
@@ -14,27 +16,62 @@ import Foundation
         catch { self.error="Cannot read \(name)"; return nil }
     }
     @discardableResult func save<T:Encodable>(_ object:T,_ name:String) -> Bool {
-        do { try JSONCodec.encoder().encode(object).write(to:root.appendingPathComponent(name),options:.atomic); return true }
+        let url=root.appendingPathComponent(name)
+        let isEvent=name.hasPrefix("event-"),isBatch=name.hasPrefix("batch-")
+        let existed=(isEvent || isBatch) && FileManager.default.fileExists(atPath:url.path)
+        do {
+            try JSONCodec.encoder().encode(object).write(to:url,options:.atomic)
+            if !existed {if isEvent{diagnosticCount=diagnosticCount.map{$0+1}};if isBatch{batchCount=batchCount.map{$0+1}}}
+            return true
+        }
         catch { self.error="Cannot write \(name)"; return false }
     }
     func files(prefix:String) -> [URL] {
         let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)) ?? []
         return files.filter{$0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension=="json"}.sorted{$0.lastPathComponent<$1.lastPathComponent}
     }
-    // Only diagnostic events are pruned. Receipts, health, patches and queued
-    // batches are deliberately excluded. Order by creation time, not UUID.
-    func trimDiagnosticEvents(maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int){
-        let candidates=files(prefix:"event-").compactMap{url->(URL,Int,Date)? in
-            guard let v=try? url.resourceValues(forKeys:[.fileSizeKey,.creationDateKey]),let bytes=v.fileSize else{return nil}
+    func queuedCount(prefix:String)->Int {
+        if prefix=="event-" {if let n=diagnosticCount{return n};let n=files(prefix:prefix).count;diagnosticCount=n;return n}
+        if prefix=="batch-" {if let n=batchCount{return n};let n=files(prefix:prefix).count;batchCount=n;return n}
+        return files(prefix:prefix).count
+    }
+    // Only immutable diagnostic events are pruned. Receipts, health, patches
+    // and queued batches are deliberately excluded. The worker never accesses
+    // actor-isolated state. Directory attributes are prefetched in one scan.
+    private nonisolated static func pruneEvents(root:URL,maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int,failed:Bool){
+        let fm=FileManager()
+        let keys:[URLResourceKey]=[.fileSizeKey,.creationDateKey,.isRegularFileKey]
+        guard let files=try? fm.contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{return(0,0,true)}
+        let candidates=files.compactMap{url->(URL,Int,Date)? in
+            guard url.lastPathComponent.hasPrefix("event-"),url.pathExtension=="json",
+                  let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile==true,let bytes=v.fileSize else{return nil}
             return (url,bytes,v.creationDate ?? .distantPast)
-        }.sorted{$0.2<$1.2}
-        var count=candidates.count,total=candidates.reduce(0){$0+$1.1},removed=0,bytes=0
-        for entry in candidates {
+        }.sorted{a,b in a.2==b.2 ? a.0.lastPathComponent<b.0.lastPathComponent:a.2<b.2}
+        var count=candidates.count,total=candidates.reduce(0){$0+$1.1},removed=0,bytes=0,failed=false
+        for entry in candidates{
             guard count>maxCount || total>maxBytes else{break}
-            do{try FileManager.default.removeItem(at:entry.0);count-=1;total-=entry.1;removed+=1;bytes+=entry.1}
-            catch{self.error="Diagnostic retention cleanup failed"}
+            do{try fm.removeItem(at:entry.0);count-=1;total-=entry.1;removed+=1;bytes+=entry.1}
+            catch{failed=true}
         }
-        return(removed,bytes)
+        return(removed,bytes,failed)
+    }
+    func trimDiagnosticEvents(maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int){
+        let result=Self.pruneEvents(root:root,maxCount:maxCount,maxBytes:maxBytes)
+        diagnosticCount=diagnosticCount.map{max(0,$0-result.removed)}
+        if result.failed{error="Diagnostic retention cleanup failed";diagnosticCount=nil}
+        return(result.removed,result.bytes)
+    }
+    func trimDiagnosticEventsAsync(maxCount:Int,maxBytes:Int)async->(removed:Int,bytes:Int){
+        // The caller serializes retention with telemetry upload. Concurrent
+        // log appends have unique names and update the cached count on MainActor.
+        let directory=root,hadCount=diagnosticCount != nil
+        let result=await Task.detached(priority:.utility){
+            Self.pruneEvents(root:directory,maxCount:maxCount,maxBytes:maxBytes)
+        }.value
+        if hadCount && !result.failed{diagnosticCount=diagnosticCount.map{max(0,$0-result.removed)}}
+        else{diagnosticCount=nil}
+        if result.failed{error="Diagnostic retention cleanup failed"}
+        return(result.removed,result.bytes)
     }
     func quarantineUnreadableConfigurationTrial()throws{
         let path=root.appendingPathComponent("hot-config-trial.json")
@@ -66,7 +103,13 @@ import Foundation
         }
         guard save(candidate,"hot-config.json") else{throw AppError.message("Cannot activate configuration")}
     }
-    func remove(_ url:URL) { do { try FileManager.default.removeItem(at:url) } catch { self.error="Cannot remove uploaded batch" } }
+    func remove(_ url:URL) {
+        do {
+            try FileManager.default.removeItem(at:url)
+            if url.lastPathComponent.hasPrefix("event-"){diagnosticCount=diagnosticCount.map{max(0,$0-1)}}
+            if url.lastPathComponent.hasPrefix("batch-"){batchCount=batchCount.map{max(0,$0-1)}}
+        } catch { self.error="Cannot remove uploaded batch" }
+    }
 }
 struct GitFile {
     var sha: String

@@ -132,6 +132,21 @@ class PublisherTests(unittest.TestCase):
             (po.FALLBACK_FIELD, po.FALSE),
         ])
 
+    def test_same_visit_fallback_is_idempotent(self):
+        transport = Transport()
+        publisher = po.ProgrammeOverlayPublisher(transport)
+        first = scope()
+        self.assertEqual(publisher.clear(scope=first), "fallback")
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(publisher.clear(scope=first), "fallback")
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(publisher.status()["fallbacks"], 1)
+        second = scope(channel_id="b" * 32, channel_name="Fixture Two")
+        self.assertEqual(publisher.clear(scope=second), "fallback")
+        self.assertEqual(len(transport.calls), 6)
+        self.assertEqual(publisher.publish(second, "Verified label", "e2"), "published")
+        self.assertEqual(len(transport.calls), 9)
+
     def test_reprobe_scope_change_prefers_fallback_and_never_shows_stale(self):
         transport = Transport()
         publisher = po.ProgrammeOverlayPublisher(transport)

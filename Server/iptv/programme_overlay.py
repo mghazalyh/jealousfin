@@ -405,10 +405,20 @@ class ProgrammeOverlayPublisher:
         self.published_count += 1
         return self.last_status
 
-    def clear(self, now: Optional[float] = None) -> str:
+    def clear(self, now: Optional[float] = None, *, scope: Optional[OverlayScope] = None) -> str:
+        if scope is not None and (not isinstance(scope, OverlayScope) or not scope.checked()):
+            return "invalid-scope"
+        fingerprint = scope.fingerprint() if scope is not None else ""
+        # A confirmed empty fallback is idempotent within one exact visit.
+        # A different launch/stream or a failed prior write must reconcile again.
+        if fingerprint and fingerprint == self.current_scope and self.last_status == "fallback" and not self.last_text and not self.fault:
+            return "fallback"
         now = self._now(now)
         self.fault = ""
-        return self._fallback(now, clear_value=True)
+        result = self._fallback(now, clear_value=True)
+        if result == "fallback":
+            self.current_scope = fingerprint
+        return result
 
     def status(self) -> dict:
         return {"revision": REVISION, "field": KEY, "readyField": READY_KEY,

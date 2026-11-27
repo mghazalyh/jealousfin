@@ -119,6 +119,9 @@ final class LANServer {
                         self.respond(c,"200 OK",Data("{\"service\":\"Jealousfin\",\"status\":\"reachable\"}".utf8));return
                     }
                     guard let handler=self.queryHandler else{self.respond(c,"404 Not Found",self.errorBody("Unknown route"));return}
+                    self.queue.asyncAfter(deadline:.now()+10){[weak self,weak c] in
+                        if let c=c{self?.finish(c)}
+                    }
                     handler(path){[weak self] status,output in self?.respond(c,status,output)}
                 }else{self.respond(c,"404 Not Found",self.errorBody("Unknown route"))}
             }

@@ -695,6 +695,19 @@ struct VideoEvidence {
     }
 }
 
+// Decoded frame evidence is separate from an active presentation surface.
+struct PresentationRecoveryGate {
+    private(set) var attempted=false
+    mutating func shouldRecreate(decoded:Bool,visible:Bool,ready:Bool)->Bool {
+        guard decoded,visible,!ready,!attempted else{return false}
+        attempted=true
+        return true
+    }
+    func accepts(decoded:Bool,visible:Bool,ready:Bool)->Bool {
+        decoded && (!visible || ready)
+    }
+}
+
 struct TelemetryCadence {
     let interval: TimeInterval
     private(set) var lastSample: TimeInterval?

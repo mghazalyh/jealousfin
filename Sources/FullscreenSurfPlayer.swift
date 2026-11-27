@@ -17,6 +17,7 @@ struct FullscreenSurfPlayer:View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 PlayerSurface(player:model.player,onReady:{if model.fullscreenPresented{model.presentationReady($0)}},showsControls:presentation.nativePlaybackControls ?? false,gravity:presentation.videoGravity ?? "fit",allowsPiP:presentation.pictureInPictureAllowed ?? true,automaticPiP:presentation.automaticPictureInPicture ?? false,brightness:model.videoBrightness)
+                    .id(model.presentationEpoch)
                     .ignoresSafeArea()
                     .accessibilityLabel("Fullscreen video")
                     .overlay{

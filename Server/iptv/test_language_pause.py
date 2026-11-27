@@ -211,6 +211,7 @@ class LanguagePauseGatewayTests(unittest.TestCase):
 
         with patch.object(g.prototype_selector, "load_selector",
                           return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", side_effect=lambda config, token: json.loads(fake(config, token, "get_status", {}))), \
                 patch.object(g.prototype_selector, "device_command", side_effect=fake):
             first = g.device_language_probe()
             second = g.device_language_probe()
@@ -234,6 +235,7 @@ class LanguagePauseGatewayTests(unittest.TestCase):
 
         with patch.object(g.prototype_selector, "load_selector",
                           return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", side_effect=lambda config, token: json.loads(fake(config, token, "get_status", {}))), \
                 patch.object(g.prototype_selector, "device_command", side_effect=fake):
             self.assertEqual(g.device_language_probe()["launchID"], "L1")
             self.assertIsNone(g.device_language_probe())
@@ -256,6 +258,7 @@ class LanguagePauseGatewayTests(unittest.TestCase):
 
         with patch.object(g.prototype_selector, "load_selector",
                           return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", side_effect=lambda config, token: json.loads(fake(config, token, "get_status", {}))), \
                 patch.object(g.prototype_selector, "device_command", side_effect=fake):
             probe = g.device_language_probe()
         self.assertEqual(probe["channelID"], self.a)
@@ -275,6 +278,7 @@ class LanguagePauseGatewayTests(unittest.TestCase):
 
         with patch.object(g.prototype_selector, "load_selector",
                           return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", side_effect=lambda config, token: json.loads(fake(config, token, "get_status", {}))), \
                 patch.object(g.prototype_selector, "device_command", side_effect=fake):
             self.assertIsNone(g.device_language_probe())
 
@@ -290,6 +294,7 @@ class LanguagePauseGatewayTests(unittest.TestCase):
                 return json.dumps({"channelID": self.a, "streamGeneration": "S1"})
             raise AssertionError("unexpected state-changing device action: " + str(action))
         with patch.object(g.prototype_selector, "load_selector", return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", side_effect=lambda config, token: json.loads(fake(config, token, "get_status", {}))), \
                 patch.object(g.prototype_selector, "device_command", side_effect=fake):
             g.device_rotation_cache = None
             g.device_rotation_checked = 0.0
@@ -300,6 +305,16 @@ class LanguagePauseGatewayTests(unittest.TestCase):
             self.assertNotIn(forbidden, calls)
         self.assertTrue(state["surfPaused"])
         self.assertEqual(state["currentChannelID"], self.a)
+
+    def test_atomic_status_avoids_player_snapshot_command(self):
+        g = self.g
+        status = {"launchID": "L1", "currentChannelID": self.a, "streamGeneration": "S1", "surfPaused": False, "surfing": True, "playing": True}
+        with patch.object(g.prototype_selector, "load_selector", return_value={"deviceIP": "192.168.31.82", "backendPort": 18797}), \
+                patch.object(g.prototype_selector, "device_status", return_value=status) as read, \
+                patch.object(g.prototype_selector, "device_command", side_effect=AssertionError("unexpected command")):
+            self.assertEqual(g.device_language_probe()["streamGeneration"], "S1")
+            self.assertEqual(g.device_rotation_state(force=True)["currentChannelID"], self.a)
+        self.assertEqual(read.call_count, 2)
 
     def test_auto_commit_does_not_issue_device_commands(self):
         g = self.g

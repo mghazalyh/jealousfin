@@ -26,6 +26,7 @@ import CryptoKit
     @Published var playing=false
     @Published var remaining=0
     @Published var ready=false
+    @Published private(set) var presentationEpoch=0
     @Published var fullscreenPresented=false
     @Published var fullscreenControlsVisible=true
     @Published private(set) var sourceTransitionBusy=false
@@ -87,6 +88,8 @@ import CryptoKit
     private var lastResourceCPU:UInt64?
     private var lastResourceTime:TimeInterval?
     private var lastRetention=Date.distantPast
+    private var retentionTask:Task<Void,Never>?
+    private var stallObservationResumedAt:Date?
     private var lastTrialRollbackAttempt=Date.distantPast
     private var lastPlayerEventAccess=Date.distantPast
     private var diagnosticEventsPruned=0
@@ -134,6 +137,7 @@ import CryptoKit
     private var lastSync=Date.distantPast
     private var lastLogin=Date.distantPast
     private var lastHeartbeat=Date.distantPast
+    private var heartbeatArchiveIdentity:[String:String]?
     private var videoOutput:AVPlayerItemVideoOutput?
     private var startUptime:TimeInterval=0
     private var startedSession=false
@@ -1172,7 +1176,7 @@ import CryptoKit
         status="Opening \(channel.name)"
         tab=1
         if !keepSurf{lastRotationReason="manual-open"}
-        lastVideoFrameAt=nil
+        lastVideoFrameAt=nil;stallObservationResumedAt=nil
         log("INFO","player","OPEN",["channelID":channel.id,"name":channel.name])
         if keepSurf{saveSurfCheckpoint(force:true)}
         work=Task{[weak self] in
@@ -1201,6 +1205,7 @@ import CryptoKit
     }
     private func attempt(_ channel:Channel,generation g:UUID) async {
         var errorReason="Startup timeout"
+        var localTimingFault=false
         var failureCategory=PlaybackFailureCategory.timeout
         let policy=effectivePolicy
         player.automaticallyWaitsToMinimizeStalling=policy.automaticallyWaits
@@ -1253,18 +1258,30 @@ import CryptoKit
                 log("INFO","player","PLAYBACK_ATTEMPT_POLICY",["format":candidate.segmentContainer,"forceEncode":String(candidate.forceEncode),"startupSeconds":String(startup),"attempt":String(attemptIndex),"runtime":activePatchID,"adapter":jellyfinAPIRevision])
                 let output=AVPlayerItemVideoOutput(pixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA])
                 item.add(output);videoOutput=output
+                ready=false
+                output.suppressesPlayerRendering=false
                 player.replaceCurrentItem(with:item)
                 if !intentionallyPaused {player.play()}
-                ready=false;lastPosition=position
+                lastPosition=position
                 let attemptStarted=ProcessInfo.processInfo.systemUptime
                 var profileEligible = !intentionallyPaused
                 var deadline=Date().addingTimeInterval(Double(startup))
                 let hardDeadline=deadline.addingTimeInterval(Double(policy.adaptiveStartupExtraSeconds ?? 5))
                 var firstPosition:Double?
                 var evidence=VideoEvidence()
+                var presentationRecovery=PresentationRecoveryGate()
+                var lastSampleUptime=ProcessInfo.processInfo.systemUptime
                 while Date()<deadline && g==generation && !Task.isCancelled {
                     try? await Task.sleep(nanoseconds:500_000_000)
                     guard g==generation,!Task.isCancelled else{return}
+                    let sampleUptime=ProcessInfo.processInfo.systemUptime
+                    let sampleGap=sampleUptime-lastSampleUptime
+                    lastSampleUptime=sampleUptime
+                    if !intentionallyPaused && sampleGap>5 {
+                        localTimingFault=true;profileEligible=false
+                        firstPosition=nil;evidence=VideoEvidence()
+                        log("WARN","validator","STARTUP_OBSERVATION_GAP",["seconds":String(format:"%.2f",sampleGap),"channelID":channel.id])
+                    }
                     if intentionallyPaused {
                         profileEligible=false
                         firstPosition=nil
@@ -1286,8 +1303,15 @@ import CryptoKit
                         if evidence.frameCount>0,let first=firstPosition,p>first+0.15,deadline.timeIntervalSinceNow<1,deadline<hardDeadline{
                             deadline=min(hardDeadline,Date().addingTimeInterval(Double(policy.validationSeconds)))
                         }
-                        if let first=firstPosition,evidence.qualifies(progress:p-first,monotonic:ProcessInfo.processInfo.systemUptime),
-                           p-first>=Double(policy.validationSeconds),evidence.frameCount>=policy.minimumFrames {
+                        let visible=UIApplication.shared.applicationState == .active && (fullscreenPresented || tab==1)
+                        let decoded=firstPosition.map{first in evidence.qualifies(progress:p-first,monotonic:ProcessInfo.processInfo.systemUptime) && p-first>=Double(policy.validationSeconds) && evidence.frameCount>=policy.minimumFrames} ?? false
+                        if presentationRecovery.shouldRecreate(decoded:decoded,visible:visible,ready:ready){
+                            presentationEpoch &+= 1
+                            deadline=max(deadline,min(hardDeadline,Date().addingTimeInterval(3)))
+                            log("WARN","renderer","PRESENTATION_RECREATED",["channelID":channel.id,"attempt":String(attemptIndex)])
+                            continue
+                        }
+                        if let first=firstPosition,presentationRecovery.accepts(decoded:decoded,visible:visible,ready:ready) {
                             guard g==generation,!Task.isCancelled else{return}
                             validated=true;playing=true;lastSuccess=Date();lastAdvance=Date();lastVideoFrameAt=Date();lastPosition=p;failureRun=0;evidencePosition=p;evidenceTime=ProcessInfo.processInfo.systemUptime
                             status="Playing \(channel.name)"
@@ -1313,6 +1337,12 @@ import CryptoKit
                     } else if !intentionallyPaused {firstPosition=nil}
                 }
                 if g != generation || Task.isCancelled {return}
+                if presentationRecovery.attempted && !ready && UIApplication.shared.applicationState == .active && (fullscreenPresented || tab==1){
+                    log("WARN","renderer","PRESENTATION_UNAVAILABLE",["channelID":channel.id,"decodedSamples":String(evidence.frameCount)])
+                    // Retry the current visit through the existing bounded attempt
+                    // path, without treating local presentation failure as source failure.
+                    localTimingFault=true;errorReason="Video presentation unavailable"
+                }
                 let access=item.accessLog()?.events.last
                 log("WARN","validator","STARTUP_DIAGNOSTICS",["channelID":channel.id,"itemStatus":String(item.status.rawValue),"timeControl":String(player.timeControlStatus.rawValue),"waiting":player.reasonForWaitingToPlay?.rawValue ?? "none","clock":String(position),"bytes":String(access?.numberOfBytesTransferred ?? 0),"errorCodes":item.errorLog()?.events.map{String($0.errorStatusCode)}.joined(separator:",") ?? ""])
                 if let event=item.errorLog()?.events.last,(400...599).contains(event.errorStatusCode) {
@@ -1362,10 +1392,10 @@ import CryptoKit
         // Legacy mode corroborates source failures; strict mode records completed failures.
         let recentSuccess=lastSuccess.map{Date().timeIntervalSince($0)<600} ?? false
         let foreground=UIApplication.shared.applicationState == .active
-        let confirmed=PlaybackFailurePolicy.confirms(serverHealthy:serverOK,recentSuccess:recentSuccess,consecutiveFailures:failureRun,reason:errorReason,paused:intentionallyPaused || !foreground,strict:strictChannelHiatus)
+        let confirmed = !localTimingFault && PlaybackFailurePolicy.confirms(serverHealthy:serverOK,recentSuccess:recentSuccess,consecutiveFailures:failureRun,reason:errorReason,paused:intentionallyPaused || !foreground,strict:strictChannelHiatus)
         lastPlayerError=errorReason
         if settings.validation && !engineeringOwnsPlayback && !channel.isSurf && confirmed {appendHealth(channel,"failure",errorReason)}
-        log(confirmed ? "ERROR":"WARN","validator",confirmed ? "CHANNEL_FAILED":"FAILURE_UNCONFIRMED",["channelID":channel.id,"reason":errorReason,"serverHealthy":strict ? "not-probed":String(serverOK),"recentSuccess":String(recentSuccess),"category":failureCategory.rawValue,"terminal":String(!intentionallyPaused && foreground)])
+        log(confirmed ? "ERROR":"WARN","validator",confirmed ? "CHANNEL_FAILED":"FAILURE_UNCONFIRMED",["channelID":channel.id,"reason":errorReason,"serverHealthy":strict ? "not-probed":String(serverOK),"recentSuccess":String(recentSuccess),"category":failureCategory.rawValue,"terminal":String(!localTimingFault && !intentionallyPaused && foreground)])
         status=confirmed ? "Channel failed; validation recorded":"Playback failure needs diagnosis"
         playing=false;validated=false
         if surfing && !surfPaused && serverOK && (strictChannelHiatus || failureRun<3) {nextRotation=Date().addingTimeInterval(Double(policy.terminalAdvanceDelaySeconds ?? 2))}
@@ -1541,8 +1571,8 @@ import CryptoKit
             "surfing":String(surfing),
             "syncStatus":sanitized(syncStatus),
             "lanStatus":lanStatus,
-            "queuedEvents":String(disk.files(prefix:"event-").count),
-            "queuedBatches":String(disk.files(prefix:"batch-").count)
+            "queuedEvents":String(disk.queuedCount(prefix:"event-")),
+            "queuedBatches":String(disk.queuedCount(prefix:"batch-"))
         ]
         var footprint:UInt64=0,cpu:UInt64=0
         let resourceFlags=jf_process_resources(&footprint,&cpu)
@@ -1583,9 +1613,13 @@ import CryptoKit
         if persist{log("INFO","telemetry","SYSTEM_SAMPLE",fields)}
     }
     private func publishHeartbeat(now:Date){
-        if apiReady,policyReady,!apiChanging,!patchBusy,!versionBusy{capturePatchArchive(reason:"heartbeat-reconciliation")}
+        let identity=currentApplicationIdentity()
+        if apiReady,policyReady,!apiChanging,!patchBusy,!versionBusy,heartbeatArchiveIdentity != identity || patchArchiveFault != nil {
+            capturePatchArchive(reason:"heartbeat-reconciliation")
+            if patchArchiveFault==nil{heartbeatArchiveIdentity=identity}
+        }
         lastHeartbeat=now
-        log("INFO","app","HEARTBEAT",["launchID":launchID,"status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.files(prefix:"event-").count)])
+        log("INFO","app","HEARTBEAT",["launchID":launchID,"status":status,"channel":current?.id ?? "","surf":String(surfing),"eligible":String(eligibleChannels.count),"pendingEvents":String(disk.queuedCount(prefix:"event-"))])
         recalculateInsights()
     }
     private func tick() async {
@@ -1603,11 +1637,17 @@ import CryptoKit
             do{try finishConfigurationTrial(accept:false,reason:"expired")}
             catch{configurationFault="Trial rollback failed; native recovery required"}
         }
-        if now.timeIntervalSince(lastRetention)>60 {
+        if now.timeIntervalSince(lastRetention)>60,retentionTask==nil,syncTask==nil,!repositoryChanging {
             lastRetention=now
-            let trimmed=disk.trimDiagnosticEvents(maxCount:operational.eventRetentionCount ?? 5000,maxBytes:(operational.eventRetentionMiB ?? 32)*1024*1024)
-            diagnosticEventsPruned+=trimmed.removed;diagnosticBytesPruned+=trimmed.bytes
-            if trimmed.removed>0{log("WARN","storage","DIAGNOSTICS_PRUNED",["count":String(trimmed.removed),"bytes":String(trimmed.bytes)])}
+            let count=operational.eventRetentionCount ?? 5000,bytes=(operational.eventRetentionMiB ?? 32)*1024*1024
+            retentionTask=Task{[weak self] in
+                guard let self=self else{return}
+                let started=ProcessInfo.processInfo.systemUptime
+                let trimmed=await self.disk.trimDiagnosticEventsAsync(maxCount:count,maxBytes:bytes)
+                self.diagnosticEventsPruned+=trimmed.removed;self.diagnosticBytesPruned+=trimmed.bytes
+                if trimmed.removed>0{self.log("WARN","storage","DIAGNOSTICS_PRUNED",["count":String(trimmed.removed),"bytes":String(trimmed.bytes),"workerMs":String(Int((ProcessInfo.processInfo.systemUptime-started)*1000))])}
+                self.retentionTask=nil
+            }
         }
         if versionBusy || versionRecoveryFailed{
             if now.timeIntervalSince(lastHeartbeat)>Double(operational.heartbeatSeconds ?? 30){publishHeartbeat(now:now)}
@@ -1620,7 +1660,12 @@ import CryptoKit
             Task{await pollGatewayHealth()}
         }
         let elapsed=now.timeIntervalSince(lastTick);lastTick=now
-        if elapsed>5 {log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])}
+        if elapsed>5 {
+            log("WARN","lifecycle","TICK_GAP",["seconds":String(format:"%.1f",elapsed)])
+            // A missed sampling window cannot prove a source stall. Resume
+            // observation from this instant; do not reset the rotation dwell.
+            stallObservationResumedAt=Date()
+        }
         // Evaluate real media progress before rotation. A stalled stream must
         // not be marked successful merely because its wall-clock timer expired.
         if validated,let previous=evidencePosition,let sample=evidenceTime {
@@ -1639,8 +1684,9 @@ import CryptoKit
                 let sample=videoSampleTime(output)
                 if output.hasNewPixelBuffer(forItemTime:sample),output.copyPixelBuffer(forItemTime:sample,itemTimeForDisplay:nil) != nil{lastVideoFrameAt=now}
             }
-            let frozenVideo=UIApplication.shared.applicationState == .active && lastVideoFrameAt.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)}==true
-            if item.status == .failed || frozenVideo || (lastAdvance.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)} ?? false) {
+            let observationContinuous=stallObservationResumedAt.map{now.timeIntervalSince($0)>=Double(effectivePolicy.stallSeconds)} ?? true
+            let frozenVideo=observationContinuous && UIApplication.shared.applicationState == .active && lastVideoFrameAt.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)}==true
+            if item.status == .failed || frozenVideo || (observationContinuous && (lastAdvance.map{now.timeIntervalSince($0)>Double(effectivePolicy.stallSeconds)} ?? false)) {
                 log("WARN","recovery","PLAYBACK_STALLED",["position":String(p),"terminal":String(UIApplication.shared.applicationState == .active)])
                 if let c=current {
                     if strictChannelHiatus,settings.validation,!engineeringOwnsPlayback,!c.isSurf,
@@ -1753,6 +1799,9 @@ import CryptoKit
         }
     }
     private func uploadTelemetry() async throws {
+        // Serialize retention with telemetry batching, without blocking playback.
+        await retentionTask?.value
+        try Task.checkCancellation()
         // Persist immutable batches before deleting their source records.
         for url in disk.files(prefix:"batch-").prefix(5) {
             let b=try Data(contentsOf:url)
@@ -1863,6 +1912,7 @@ import CryptoKit
     }
     func stateSnapshot()->[String:Any]{
         var snapshot:[String:Any]=["schemaVersion":1,"deviceID":deviceID,"controlMode":controlMode.rawValue,"lanStatus":lanStatus,"cloudSyncStatus":syncStatus,"timestamp":ISO8601DateFormatter().string(from:Date()),"status":status,"currentChannel":current?.name ?? "","currentChannelID":current?.id ?? "","surfing":surfing,"surfPaused":surfPaused,"surfSource":activeSurfSource.rawValue,"sourceTransitionBusy":sourceTransitionBusy,"sourceTransitionError":sourceTransitionError ?? "","rotationOwner":SurfCommandSemantics.rotationOwner(surfing:surfing || currentSharedTransport,shared:usingSharedSurf),"surfRotationControllable":surfing && !usingSharedSurf,"rotationMinutes":settings.rotationMinutes,"remainingSeconds":remaining,"channels":channels.count,"eligible":eligibleChannels.count,"hiatus":hiatus.count,"banned":banned.count,"playing":playing,"fullscreenPresented":fullscreenPresented,"fullscreenControlsVisible":fullscreenControlsVisible,"catalogueReady":catalogueReady,"lastPlayerError":lastPlayerError ?? "","metrics":metrics,"systemMetrics":systemMetrics,"telemetryActive":telemetryActive,"telemetryLastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","launchID":launchID,"runtimePatch":activePatchID,"runtimeABI":2,"runtimeReady":policyReady,"jellyfinAPIABI":1,"jellyfinAPIRevision":jellyfinAPIRevision,"jellyfinAPIReady":apiReady,"jellyfinAPIFault":jellyfinAPIFault ?? "","bundledBaselineRevision":bundledBaselineRevision,"bundledBaselineDigest":BundledPatchBaseline.digest,"patchArchiveID":patchArchiveID ?? "","patchArchiveFault":patchArchiveFault ?? "","patchVersionCount":patchVersions.count,"patchVersionHead":patchArchiveID ?? "","patchVersionBusy":versionBusy,"patchRecoveryBlocked":versionRecoveryFailed,"uiABI":1,"uiRevision":dynamicUI.active?.revision ?? "native-baseline","uiPages":dynamicUI.active?.pages.map(\.id) ?? [],"pendingDecisions":decisions.records.filter{!$0.terminal}.count,"decisionABI":1,"campaignID":campaign?.plan.id ?? "","campaignState":campaign?.state ?? "idle","campaignCycle":campaign?.cycle ?? 0,"campaignStep":campaign?.stepIndex ?? 0,"insights":insights.map{["priority":$0.priority,"title":$0.title]},"actions":Self.actions]
+        snapshot["streamGeneration"]=generation.uuidString
         snapshot["hotPatchPlatformABI"]=HotPatchPlatform.abi
         snapshot["stagedAPIRevision"]=deferredAPI?.candidate.id ?? ""
         snapshot["stagedAPIActivation"]=deferredAPI?.mode ?? ""
@@ -1938,6 +1988,14 @@ import CryptoKit
         if c.action=="set_control_mode" && origin != "lan"{return Receipt(id:c.id,action:c.action,status:"failed",result:"Select control mode on device or LAN")}
         guard validID(c.id),c.schemaVersion==1 else{return Receipt(id:c.id,action:c.action,status:"failed",result:"Invalid command ID or schema")}
         if pending.contains(c.id){return Receipt(id:c.id,action:c.action,status:"running",result:"Command already executing")}
+        if origin=="lan",["get_status","get_player_snapshot","get_hot_configuration"].contains(c.action){
+            do{
+                if let expiry=c.expiresAt,expiry<Date(){throw AppError.message("Command expired")}
+                let output=try await dispatch(c.action,args:c.arguments ?? [:])
+                guard output.utf8.count<=524288 else{throw AppError.message("Response too large")}
+                return Receipt(id:c.id,action:c.action,status:"succeeded",result:output)
+            }catch{return Receipt(id:c.id,action:c.action,status:"failed",result:sanitized(error.localizedDescription))}
+        }
         if let previous=disk.load(Receipt.self,"receipt-\(c.id).json"){return previous}
         // A durable started receipt prevents replay after an interrupted mutation.
         let started=Receipt(id:c.id,action:c.action,status:"interrupted",result:"Execution started; outcome not yet recorded")

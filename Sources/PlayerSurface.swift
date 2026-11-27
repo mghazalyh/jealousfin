@@ -20,6 +20,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
         var boundsObservation:NSKeyValueObservation?
         let brightnessLayer=UIView()
         var level=0
+        var active=true
         @MainActor func applyBrightness(_ vc:AVPlayerViewController){
             guard let overlay=vc.contentOverlayView else{return}
             if brightnessLayer.superview !== overlay{
@@ -44,12 +45,19 @@ struct PlayerSurface: UIViewControllerRepresentable {
         c.allowsPictureInPicturePlayback=allowsPiP
         c.canStartPictureInPictureAutomaticallyFromInline=allowsPiP && automaticPiP
         context.coordinator.observation=c.observe(\.isReadyForDisplay,options:[.initial,.new]){ [weak coordinator=context.coordinator] vc,_ in
-            let ready=vc.isReadyForDisplay
-            DispatchQueue.main.async { coordinator?.callback(ready);coordinator?.applyBrightness(vc) }
+            let item=vc.player?.currentItem
+            DispatchQueue.main.async {
+                guard let coordinator=coordinator,coordinator.active,vc.player?.currentItem === item else{return}
+                coordinator.callback(vc.isReadyForDisplay)
+                coordinator.applyBrightness(vc)
+            }
         }
         context.coordinator.level=min(20,max(-25,brightness))
         context.coordinator.boundsObservation=c.observe(\.videoBounds,options:[.new]){[weak coordinator=context.coordinator] vc,_ in
-            DispatchQueue.main.async{coordinator?.applyBrightness(vc)}
+            DispatchQueue.main.async{
+                guard let coordinator=coordinator,coordinator.active else{return}
+                coordinator.applyBrightness(vc)
+            }
         }
         context.coordinator.applyBrightness(c)
         return c
@@ -65,6 +73,7 @@ struct PlayerSurface: UIViewControllerRepresentable {
         context.coordinator.applyBrightness(uiViewController)
     }
     static func dismantleUIViewController(_ uiViewController:AVPlayerViewController,coordinator:Coordinator){
+        coordinator.active=false
         coordinator.observation?.invalidate()
         coordinator.observation=nil
         coordinator.boundsObservation?.invalidate()
