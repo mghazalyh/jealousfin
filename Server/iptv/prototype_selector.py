@@ -4,6 +4,7 @@ The existing Movies & Series category is temporarily reserved for the Malay
 pool on one explicitly configured iPad. All Channels retains the old American
 scope. The gateway never accepts a client-supplied upstream host or port.
 """
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -33,9 +34,10 @@ STATUS_STATS = {"reads": 0, "shared": 0, "timeouts": 0, "failures": 0, "backoffR
 class _StatusFlight:
     """One owner plus the exact callers that joined its in-flight read."""
 
-    __slots__ = ("event", "status", "error", "waiters")
+    __slots__ = ("event", "status", "error", "waiters", "credential_scope")
 
-    def __init__(self):
+    def __init__(self, credential_scope):
+        self.credential_scope = credential_scope
         self.event = threading.Event()
         self.status = None
         self.error = None
@@ -97,6 +99,7 @@ def observe_device_status(config, device_token=""):
     """
     key = _status_key(config)
     now = STATUS_CLOCK()
+    scope = hashlib.sha256(device_token.encode('utf-8')).digest()
     with STATUS_LOCK:
         until = STATUS_BACKOFF.get(key, 0.0)
         if now < until:
@@ -105,8 +108,10 @@ def observe_device_status(config, device_token=""):
         flight = STATUS_FLIGHTS.get(key)
         owner = flight is None
         if owner:
-            flight = _StatusFlight()
+            flight = _StatusFlight(scope)
             STATUS_FLIGHTS[key] = flight
+        elif flight.credential_scope != scope:
+            raise RuntimeError('Prototype device status credential scope mismatch')
     if not owner:
         with STATUS_LOCK:
             flight.waiters += 1

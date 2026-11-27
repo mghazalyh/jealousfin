@@ -73,6 +73,31 @@ class SelectorPressureTests(unittest.TestCase):
         self.assertEqual(len(reads), 1)
         self.assertEqual(ps.status_observation_diagnostics()["shared"], 7)
 
+    def test_different_credentials_cannot_join_authenticated_observation(self):
+        entered = threading.Event()
+        release = threading.Event()
+        results = []
+        def fake_status(config, token):
+            entered.set()
+            self.assertTrue(release.wait(2.0))
+            return status("All Channels")
+        with patch.object(ps, "device_status", side_effect=fake_status) as read:
+            owner = threading.Thread(target=lambda: results.append(
+                ps.selected_profile(CFG, "fixture-owner")))
+            owner.start()
+            try:
+                self.assertTrue(entered.wait(2.0))
+                with self.assertRaisesRegex(RuntimeError, "credential scope"):
+                    ps.selected_profile(CFG, "fixture-other")
+                self.assertEqual(read.call_count, 1)
+            finally:
+                release.set()
+                owner.join(3.0)
+            self.assertFalse(owner.is_alive())
+            self.assertEqual(results, ["american"])
+            self.assertEqual(ps.selected_profile(CFG, "fixture-other"), "american")
+            self.assertEqual(read.call_count, 2)
+
     def test_waiter_timeout_fails_closed_without_duplicate_read(self):
         entered = threading.Event()
         release = threading.Event()

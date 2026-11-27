@@ -139,6 +139,20 @@ class RecoveryFixture(unittest.TestCase):
                 self.selector, TOKEN, foreground=True, cid=CID), "american")
             recovery.assert_called_once_with(self.selector, TOKEN, CID, 100.0)
 
+    def test_foreground_reservation_defers_background_probe(self):
+        key = self.g._playback_flight_key(self.selector, TOKEN)
+        self.g.PLAYBACK_ADMISSION_FLIGHTS[key] = self.g._PlaybackAdmissionFlight(key)
+        try:
+            with patch.object(ps, "selected_profile", return_value="american") as read:
+                with self.assertRaises(RuntimeError):
+                    self.g.selected_profile_admitted(self.selector, TOKEN)
+                read.assert_not_called()
+                self.assertEqual(self.g.selected_profile_admitted(
+                    self.selector, TOKEN, _recovery=True), "american")
+                read.assert_called_once()
+        finally:
+            self.g.PLAYBACK_ADMISSION_FLIGHTS.pop(key, None)
+
     def test_background_consumer_stays_fail_closed_and_does_not_wait(self):
         clock = [100.0]
         selected = []

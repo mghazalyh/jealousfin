@@ -2112,6 +2112,15 @@ def _device_probe_failure_tables(reason):
  return ()
 def _device_probe_admit_locked(config,origin,fresh,lanes=('status',)):
  now=_device_probe_now();key=_device_probe_key(config)
+ # A bounded foreground recovery owns the next status admission. Do not
+ # start new competing identity/profile reads during its existing wait.
+ if origin!='playback-recovery' and 'status' in lanes:
+  with PLAYBACK_ADMISSION_LOCK:
+   reserved=any(flight_key[0]==key for flight_key in PLAYBACK_ADMISSION_FLIGHTS)
+  if reserved:
+   _device_probe_origin(origin)['rejected']+=1
+   if fresh:DEVICE_PROBE_STATS['freshRejected']+=1
+   _device_probe_set_local_fault('device_probe_playback_reserved');return False
  for table in _device_probe_backoff_tables(lanes):
   state=table.get(key) if key else None
   if isinstance(state,dict):
@@ -3286,7 +3295,9 @@ def _playback_profile_recovery(config,token,cid,started=None):
   if timed_out:raise RuntimeError('Device probe backoff')
   # Exactly one fresh authenticated category read after the existing backoff.
   # The normal admission and profile checks are unchanged; nothing is cached.
-  result=selected_profile_admitted(config,token)
+  result=selected_profile_admitted(config,token,_recovery=True)
+  if _device_probe_now()>=deadline+_playback_selector_reserve_seconds():
+   timed_out=True;raise RuntimeError('Playback admission deadline exceeded')
  except BaseException as error:
   with PLAYBACK_ADMISSION_LOCK:
    if PLAYBACK_ADMISSION_FLIGHTS.get(key) is flight:
@@ -3305,19 +3316,26 @@ def playback_admission_foreground(path,cid,malay):
  # Recovery is restricted to English PlaybackInfo for a known catalogue
  # channel.  The Malay proxy keeps its immediate fail-closed admission.
  return bool(path.endswith('/PlaybackInfo') and not malay and cid in sources)
-def selected_profile_admitted(config,token,foreground=False,cid=None):
+def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=False):
  started=_device_probe_now()
  key=_device_probe_key(config)
- if foreground and prototype_selector.status_observation_remaining(config)>0:
-  return _playback_profile_recovery(config,token,cid,started)
+ if foreground:
+  with PLAYBACK_ADMISSION_LOCK:
+   reserved=_playback_flight_key(config,token) in PLAYBACK_ADMISSION_FLIGHTS
+  if reserved or prototype_selector.status_observation_remaining(config)>0:
+   return _playback_profile_recovery(config,token,cid,started)
  with DEVICE_PROBE_LOCK:
-  admitted=_device_probe_admit_locked(config,'profile',True,('status',))
+  admitted=_device_probe_admit_locked(config,'playback-recovery' if _recovery else 'profile',True,('status',))
   fault=_device_probe_local_fault()
  if not admitted:
   # Status-only consumers must not be blocked by a snapshot/identity backoff.
   # Background callers keep the immediate fail-closed backoff response; only a
   # foreground PlaybackInfo may wait it out under the request budget.
-  if foreground and fault in ('device_probe_backoff','device_probe_rate_limited'):
+  if foreground and fault in ('device_probe_backoff','device_probe_rate_limited','device_probe_playback_reserved'):
+   if fault=='device_probe_playback_reserved':
+    with PLAYBACK_ADMISSION_LOCK:
+     same_scope=_playback_flight_key(config,token) in PLAYBACK_ADMISSION_FLIGHTS
+    if not same_scope:raise RuntimeError('Device probe backoff')
    return _playback_profile_recovery(config,token,cid,started)
   raise RuntimeError('Device probe backoff')
  try:profile=prototype_selector.selected_profile(config,token)
