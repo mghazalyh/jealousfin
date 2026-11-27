@@ -383,3 +383,33 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
         diag=observer.diagnostics()["contentResearch"]
         self.assertEqual((diag["completed"],diag["verified"],diag["verifiedAfterVisit"]),(1,1,1))
         self.assertEqual(diag["lastOutcome"],"verified")
+
+    def test_publication_dates_must_agree_and_json_body_is_not_unscoped_evidence(self):
+        h="WWE NXT Results - November 4, 2025"
+        clues=["jevon evans","saquon shugars"]
+        url="https://www.pwmania.com/wwe-nxt-results-november-4-2025"
+        meta=f'<meta property="og:title" content="{h}"><meta property="og:description" content="Results"><meta property="article:published_time" content="2025-11-05">'
+        body=f'<article><h1>{h}</h1><time datetime="2025-11-05T04:31:21-05:00"></time><p>Je&apos;Von Evans takes on Saquon Shugars.</p></article>'
+        parse=lambda page:audio.parse_report_page(page,url,{"seriesTitle":""},clues=clues)
+        self.assertTrue(parse(meta+body))
+        self.assertEqual(parse(meta+body.replace("2025-11-05T","2025-11-06T")),[])
+        self.assertEqual(parse(meta+body.replace("</article>",'<time datetime="2025-11-06"></time></article>')),[])
+        obj={"@type":"NewsArticle","headline":h,"description":"Results","datePublished":"2025-11-05","articleBody":"Je'Von Evans takes on Saquon Shugars"}
+        structured=lambda x:'<script type="application/ld+json">'+json.dumps(x)+'</script>'
+        self.assertEqual(parse(structured(obj)),[])
+        self.assertEqual(parse(meta+body.replace("Je&apos;Von Evans takes on Saquon Shugars.","Unrelated details.")+structured(obj)),[])
+        self.assertEqual(parse(meta+body+structured(dict(obj,datePublished="2025-11-06"))),[])
+        self.assertTrue(parse(meta+body+structured(obj)))
+
+    def test_timeout_diagnostics_distinguish_no_search_and_no_approved_leads(self):
+        for events,reason in [([], "no-completed-public-search"),([{"type":"tool_use","part":{"tool":"websearch","state":{"status":"completed","output":"https://example.org/no"}}}],"timeout-no-approved-leads")]:
+            raw="\n".join(json.dumps(x) for x in events).encode()
+            with patch.object(discovery,"_run_model_process",return_value=(raw,True)):
+                with self.assertRaises(discovery.ResearchError) as caught:
+                    discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)
+                self.assertEqual(caught.exception.diagnostics["error"],reason)
+        # An unexpected tool must fail closed even if earlier results are useful.
+        raw="\n".join(json.dumps(x) for x in [{"type":"tool_use","part":{"tool":"websearch","state":{"status":"completed","output":fixtures.OFFICIAL_URL}}},{"type":"tool_use","part":{"tool":"bash","state":{"status":"error"}}}]).encode()
+        with patch.object(discovery,"_run_model_process",return_value=(raw,True)):
+            with self.assertRaises(discovery.ResearchError):
+                discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1,episode_leads=True)

@@ -1860,7 +1860,7 @@ def _article_body(article, headline):
     return " ".join(_visible_text(p, 1000) for p in paragraphs)[:16000]
 
 
-def _article_published(article):
+def _article_publication_dates(article):
     dates = set()
     for tag in re.findall(r"<time\b[^>]{0,512}>", article, re.IGNORECASE)[:16]:
         m = re.search(r"\bdatetime\s*=\s*['\x22]([^'\x22]+)['\x22]", tag, re.IGNORECASE)
@@ -1868,7 +1868,7 @@ def _article_published(article):
             date = _page_date(m.group(1))
             if date:
                 dates.add(date)
-    return next(iter(dates)) if len(dates) == 1 else ""
+    return dates
 
 
 def _requested_public_terms(clues, *sections):
@@ -1989,6 +1989,17 @@ def parse_report_page(page, source_url, context=None, clues=()):
         page_headline = _report_headline(report_meta.get("og:title") or report_meta.get("twitter:title") or _title_tag(page), site_name)
         if not article or not _article_matches_headline(article, page_headline):
             return []
+    # Publication dates and episode air dates are separate facts. Explicit
+    # dates from different representations of the same article must agree.
+    page_dates = _article_publication_dates(article) if requested else set()
+    if requested and report_meta.get("article:published_time"):
+        meta_date = _page_date(report_meta["article:published_time"])
+        if not meta_date:
+            return []
+        page_dates.add(meta_date)
+    if len(page_dates) > 1:
+        return []
+    page_published = next(iter(page_dates), "")
     rows = []
     seen = set()
 
@@ -2015,7 +2026,9 @@ def parse_report_page(page, source_url, context=None, clues=()):
         description = " ".join(str(obj.get("description") or obj.get("abstract") or "").split())[:MAX_PAGE_TEXT]
         if not headline and not description:
             continue
-        published = _page_date(obj.get("datePublished") or obj.get("dateModified"))
+        published = _page_date(obj.get("datePublished") if requested else (obj.get("datePublished") or obj.get("dateModified")))
+        if requested and page_published and published and published != page_published:
+            return []
         air = (_report_air_date(headline, description, "", fallback_air) if fallback_series
                else _unknown_report_air_date(headline, description))
         if not published or not air:
@@ -2024,9 +2037,10 @@ def parse_report_page(page, source_url, context=None, clues=()):
         if requested:
             if article and not _article_matches_headline(article, _report_headline(headline, site_name)):
                 continue
-            # Only body from this same structured article object, never a
-            # different JSON-LD object's content.
-            body = _visible_text(str(obj.get("articleBody") or "")[:16000], 16000)
+            # Structured articleBody can be stale or refer to another story.
+            # Use only the article's scoped visible body after headline/date
+            # agreement; JSON-only sources must match through their metadata.
+            body = _article_body(article, _report_headline(headline, site_name))
             terms = _requested_public_terms(requested, headline, description, body)
             add(_report_row(source_url, headline, description, published, air, series, matched_terms=terms))
         else:
@@ -2044,7 +2058,7 @@ def parse_report_page(page, source_url, context=None, clues=()):
     if requested:
         headline = _report_headline(headline, site_name)
         description = html_module.unescape(description)
-        published = _page_date(meta.get("article:published_time")) or _article_published(article)
+        published = page_published
     else:
         published = _report_published(meta, visible)
     air = (_report_air_date(headline, description, visible, fallback_air) if fallback_series

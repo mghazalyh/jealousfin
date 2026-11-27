@@ -2457,7 +2457,7 @@ def episode_source_provider(payload):
  except Exception as error:
   diagnostics=getattr(error,'diagnostics',{})
   reason=diagnostics.get('error') if isinstance(diagnostics,dict) else None
-  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','no-completed-public-search','timeout') else type(error).__name__
+  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','no-completed-public-search','timeout-no-approved-leads','timeout') else type(error).__name__
   log('episode source discovery deferred '+safe_reason)
   return official,reports
 def episode_source_prefetch_worker(stop):
