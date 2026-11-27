@@ -58,6 +58,7 @@ Server/iptv/test_deployment_continuity.py
 Server/iptv/test_episode_audio.py
 Server/iptv/test_gateway_policy.py
 Server/iptv/test_incident_identity_overlay_20261127.py
+Server/iptv/test_incident_sampler_gap_20261127.py
 Server/iptv/test_incident_selector_pressure_20261127.py
 Server/iptv/test_language_pause.py
 Server/iptv/test_overlay_bridge.py
