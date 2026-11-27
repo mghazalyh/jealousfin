@@ -1830,14 +1830,26 @@ def _single_article(page):
     return match.group(1) if match else ""
 
 
+def _report_headline(value, site_name=""):
+    title = _strip_site_suffix(html_module.unescape(value or ""))
+    site_name = html_module.unescape(site_name or "").strip()
+    if site_name:
+        title = re.sub(r"\s+[-–—]\s+" + re.escape(site_name) + r"$", "", title, flags=re.IGNORECASE)
+    return title.strip()
+
+
+def _article_matches_headline(article, headline):
+    headings = re.findall(r"<h1\b[^>]*>(.*?)</h1\s*>", article, re.IGNORECASE | re.DOTALL)
+    if len(headings) != 1:
+        return False
+    heading = _norm_text(_visible_text(headings[0], 300))
+    return bool(heading and heading == _norm_text(headline))
+
+
 def _article_body(article, headline):
     # Bind the article body to the same page headline. A different article's
     # text cannot supply clues for the metadata identity.
-    headings = re.findall(r"<h1\b[^>]*>(.*?)</h1\s*>", article, re.IGNORECASE | re.DOTALL)
-    if len(headings) != 1:
-        return ""
-    heading = _norm_text(_visible_text(headings[0], 300))
-    if not heading or not _norm_text(headline).startswith(heading):
+    if not _article_matches_headline(article, headline):
         return ""
     # Exclude common page chrome, related-story blocks and links. A unique
     # article is required; generic page-wide text is not eligible.
@@ -1969,6 +1981,14 @@ def parse_report_page(page, source_url, context=None, clues=()):
     fallback_air = _date(context.get("originalAirDate"))
     requested = normalize_clues(clues) if not fallback_series else ()
     article = _single_article(page) if requested else ""
+    report_meta = _meta_map(page) if requested else {}
+    site_name = report_meta.get("og:site_name", "")
+    if requested and re.search(r"<article\b", _page_text(page), re.IGNORECASE):
+        # Reject the entire ambiguous report, including structured metadata.
+        # An unrelated article cannot supply either a date or clues.
+        page_headline = _report_headline(report_meta.get("og:title") or report_meta.get("twitter:title") or _title_tag(page), site_name)
+        if not article or not _article_matches_headline(article, page_headline):
+            return []
     rows = []
     seen = set()
 
@@ -2002,6 +2022,8 @@ def parse_report_page(page, source_url, context=None, clues=()):
             continue
         series = fallback_series or _series_from_report_headline(headline)
         if requested:
+            if article and not _article_matches_headline(article, _report_headline(headline, site_name)):
+                continue
             # Only body from this same structured article object, never a
             # different JSON-LD object's content.
             body = _visible_text(str(obj.get("articleBody") or "")[:16000], 16000)
@@ -2020,7 +2042,7 @@ def parse_report_page(page, source_url, context=None, clues=()):
     if not headline and not description:
         return rows
     if requested:
-        headline = html_module.unescape(headline)
+        headline = _report_headline(headline, site_name)
         description = html_module.unescape(description)
         published = _page_date(meta.get("article:published_time")) or _article_published(article)
     else:

@@ -338,6 +338,14 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
                     body.replace('<time datetime="2025-11-05T04:31:21-05:00"></time>',"")]:
             self.assertEqual(audio.parse_report_page(base+bad,url,{"seriesTitle":""},clues=clues),[])
         self.assertEqual(audio.parse_report_page(base+body,url,{"seriesTitle":""},clues=["jevon evans","jevon","evans"]),[])
+        # Metadata contains both clues and explicit dates, but a mismatched
+        # page body must still reject the entire source.
+        rich=base.replace("Six Woman Tag Team Match","Je'Von Evans takes on Saquon Shugars.")
+        unrelated=body.replace(headline,"Other report")
+        self.assertEqual(audio.parse_report_page(rich+unrelated,url,{"seriesTitle":""},clues=clues),[])
+        self.assertEqual(audio.parse_report_page(rich+body.replace(headline,"WWE NXT Results"),url,{"seriesTitle":""},clues=clues),[])
+        self.assertEqual(audio.parse_report_page(rich+body+"<article><h1>Other</h1></article>",url,{"seriesTitle":""},clues=clues),[])
+
 
     def test_unknown_evidence_cache_also_scoped_to_clues_within_session(self):
         calls=[]
