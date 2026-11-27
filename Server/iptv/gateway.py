@@ -2170,6 +2170,21 @@ def overlay_publish_evidence(cid,name,language,language_name,confidence,payload,
            'confidence':confidence if type(confidence) in (int,float) else None}
  return overlay_enqueue('evidence',channelID=cid,channelName=name,
                         streamGeneration=str((payload or {}).get('streamGeneration','')),evidence=evidence)
+def overlay_publish_state(payload):
+ if not isinstance(payload,dict):return False
+ cid=payload.get('channelID');name=payload.get('channelName')
+ if not isinstance(cid,str) or not cid:return False
+ if not isinstance(name,str) or not name:
+  row=channels.get(cid) or {};name=row.get('Name') if isinstance(row,dict) else ''
+ if not isinstance(name,str) or not name:return False
+ state=dict(payload)
+ state['eventID']='state-'+cid+'-'+str(int(float(payload.get('observedAt') or time.time())*1000))+'-'+str(payload.get('state') or 'waiting')
+ state['at']=payload.get('observedAt') or time.time()
+ return overlay_enqueue('state',channelID=cid,channelName=name,
+   streamGeneration=str(payload.get('streamGeneration') or ''),visitID=str(payload.get('visitID') or ''),state=state)
+def language_state_callback(payload):
+ if SOURCE_PROFILE!='american':return False
+ return overlay_publish_state(payload)
 def overlay_publish_correction(cid,name,event_id,count,threshold):
  if not isinstance(event_id,str) or not event_id:return False
  evidence={'eventID':event_id+':corrected','at':time.time(),'language':'en','languageName':'English',
@@ -2189,7 +2204,21 @@ def overlay_current_channel():
  if not isinstance(cid,str) or cid not in channels:return None
  name=channels[cid].get('Name')
  if not isinstance(name,str) or not name:return None
- return {'channelID':cid,'channelName':name,'streamGeneration':str(probe.get('streamGeneration') or '')}
+ return {'channelID':cid,'channelName':name,'launchID':str(probe.get('launchID') or ''),
+         'streamGeneration':str(probe.get('streamGeneration') or '')}
+def _overlay_visit_matches(visit_id,current):
+ # Only a durable verified visit can be compared. Unverified legacy/test
+ # identities keep the existing channel/stream gate and never invent a visit.
+ if not language_visits.is_verified(visit_id):return True
+ if not isinstance(current,dict):return False
+ launch=current.get('launchID')
+ if not isinstance(launch,str) or not launch:return False
+ try:
+  observed=language_visit_identity().observe(current.get('channelID'),launch,
+   current.get('streamGeneration'),now=time.time())
+ except Exception:return False
+ return bool(isinstance(observed,dict) and observed.get('verified') is True
+             and observed.get('visitID')==visit_id)
 def _overlay_settle(bridge,stop):
  # Retries stay inside one lifecycle job and are strictly time-bounded; there
  # is no periodic timer or extra schedule.
@@ -2221,18 +2250,35 @@ def _overlay_process(job,stop):
  cid=current['channelID'];name=current['channelName']
  if kind=='refresh':
   result=bridge.observe_channel(cid,name)
- elif kind in ('evidence','correction'):
+  # The existing catalogue/playback boundary is the only trigger here; this
+  # does not add a timer or a device poll. A disabled detector with no current
+  # evidence is reported truthfully instead of an unbounded waiting label.
+  if spanish_auto_manager is not None and bridge.latest_snapshot is None:
+   try:enabled=bool(spanish_auto_manager.status().get('enabled'))
+   except Exception:enabled=False
+   if not enabled:
+    bridge.publish_state(cid,name,{'state':'disabled','reason':'observation_disabled',
+     'at':time.time(),'observedAt':time.time()})
+    result=bridge.status().get('status',result) or result
+ elif kind in ('evidence','correction','state'):
   if job.get('channelID')!=cid:
    overlay_bridge_fault='channel_changed';bridge.observe_channel(cid,name)
    return 'suppressed_channel'
-  evidence=job.get('evidence')
+  evidence=job.get('state') if kind=='state' else job.get('evidence')
   if not isinstance(evidence,dict):return 'invalid'
   stream=job.get('streamGeneration') or '';probe_stream=current['streamGeneration']
   if stream and probe_stream and stream!=probe_stream:
    overlay_bridge_fault='stale_stream_generation';return 'stale'
+  visit_id=job.get('visitID') or evidence.get('visitID') or ''
+  if not _overlay_visit_matches(visit_id,current):
+   overlay_bridge_fault='stale_visit';return 'stale'
   bridge.observe_channel(cid,name)
-  if kind=='correction' and job.get('eventID'):bridge.confirm_correction(job['eventID'])
-  result=bridge.publish_evidence(cid,name,evidence)
+  result=bridge.publish_state(cid,name,evidence) if kind=='state' else bridge.publish_evidence(cid,name,evidence)
+  if kind=='correction' and job.get('eventID'):
+   # Retain the correction against both the original event and the corrected
+   # snapshot so a delayed duplicate gesture cannot walk backwards.
+   bridge.confirm_correction(job['eventID'])
+   bridge.confirm_correction()
  else:
   return 'unknown'
  overlay_bridge_fault=''
@@ -2727,7 +2773,7 @@ def main():
  overlay_publisher=None
  if SOURCE_PROFILE=='american':
   model=resolve_whisper_model()
-  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity(),on_speech=episode_speech_callback)
+  spanish_auto_manager=language_audio.Manager(ROOT,model or (ROOT/'models'/'unavailable.bin'),language_auto_commit,lambda:reload_spanish_auto_control(),probe=device_language_probe,log=log,threads=4,visits=language_visit_identity(),on_speech=episode_speech_callback,on_state=language_state_callback)
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
   pending=threading.Thread(target=language_pending_worker,args=(stop,),name='language-pending',daemon=True);pending.start()
   overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()

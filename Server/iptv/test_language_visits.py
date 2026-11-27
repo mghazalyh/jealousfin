@@ -320,6 +320,7 @@ class SamplerTwoProbeMismatchTests(unittest.TestCase):
         manager.fault = None
         manager._samples = {}
         manager._finalized = {}
+        manager._visit_results = {}
         manager._lock = threading.RLock()
         manager._probe_cid = None
         manager._probe_at = 0.0
@@ -412,6 +413,129 @@ class SamplerVisitSuppressionTests(unittest.TestCase):
             last, {"visitID": "", "verified": False},
             now + base.FINALIZE_COOLDOWN_SECONDS + 1))
 
+
+class SamplerShortSampleRetryTests(unittest.TestCase):
+    """A playing visit retries a short/inconclusive sample without overlap."""
+
+    def manager(self):
+        manager = object.__new__(language_audio.Manager)
+        manager.fault = None
+        manager._samples = {}
+        manager._finalized = {}
+        manager._lock = threading.RLock()
+        manager._probe_cid = None
+        manager._probe_at = 0.0
+        manager._jobs = queue.Queue()
+        manager.visits = None
+        manager.probe = lambda: {"channelID": A, "launchID": LAUNCH,
+                                 "streamGeneration": "S1", "surfPaused": True,
+                                 "surfing": True}
+        manager.control = lambda: True
+        manager._control_cache = (time.monotonic(), True)
+        manager.model_path = "/tmp/fixture-model.bin"
+        manager.threads = 1
+        manager.log = lambda message: None
+        manager._persist = lambda force=False: None
+        manager.on_exclusion = lambda *args, **kwargs: {"changed": True,
+            "reason": "evidence_recorded", "count": 1, "threshold": 25, "enforced": False}
+        manager.telemetry = language_audio.Manager._empty_state(manager)
+        manager._state_published = {}
+        manager.states = []
+        manager.on_state = manager.states.append
+        return manager
+
+    def sample(self, seconds, visit):
+        sample = base._Sample(A, "nltv:us:" + A, "A", time.time())
+        sample.probe = {"channelID": A, "launchID": LAUNCH,
+                        "streamGeneration": "S1", "surfPaused": True, "surfing": True}
+        sample.visit = {"visitID": visit, "verified": True, "channelID": A,
+                        "launchID": LAUNCH, "streamGeneration": "S1"}
+        part = base._Base("seg", True, time.time())
+        part.seconds = seconds
+        sample.bases = {"seg": part}
+        return sample
+
+    def test_short_sample_reports_retry_and_allows_a_bounded_second_attempt(self):
+        manager = self.manager()
+        visit = language_visits.new_visit_id()
+        manager._samples[A] = self.sample(36.03, visit)
+        manager._finalize(A, "idle")
+        marker = manager._finalized[A]
+        self.assertFalse(marker["conclusive"])
+        self.assertFalse(marker["pending"])
+        self.assertEqual(marker["attempts"], 1)
+        self.assertEqual(manager._jobs.qsize(), 0)
+        self.assertEqual(manager.telemetry["last"]["visitID"], visit)
+        self.assertEqual(manager.telemetry["last"]["reason"], "sample_too_short")
+        self.assertEqual(manager.telemetry["last"]["sampleSeconds"], 36.03)
+        self.assertTrue(manager._suppress_duplicate_visit(
+            marker, {"visitID": visit, "verified": True}, time.time() + 1))
+        self.assertFalse(manager._suppress_duplicate_visit(
+            marker, {"visitID": visit, "verified": True},
+            time.time() + language_audio.SAME_VISIT_RETRY_SECONDS + 0.5))
+        state = manager.states[-1]
+        self.assertEqual(state["state"], "inconclusive")
+        self.assertEqual(state["reason"], "sample_too_short")
+        self.assertEqual(state["retrySeconds"], language_audio.SAME_VISIT_RETRY_SECONDS)
+        self.assertTrue(state["surfPaused"])
+        self.assertTrue(state["surfing"])
+
+        manager._samples[A] = self.sample(30.0, visit)
+        manager._finalize(A, "idle")
+        marker = manager._finalized[A]
+        self.assertEqual(marker["attempts"], 2)
+        self.assertFalse(marker["conclusive"])
+
+    def test_retry_stops_at_bound_for_the_same_physical_visit(self):
+        manager = self.manager()
+        visit = language_visits.new_visit_id()
+        for _ in range(language_audio.MAX_SAME_VISIT_ATTEMPTS):
+            manager._samples[A] = self.sample(20.0, visit)
+            manager._finalize(A, "idle")
+        marker = manager._finalized[A]
+        self.assertEqual(marker["attempts"], language_audio.MAX_SAME_VISIT_ATTEMPTS)
+        self.assertTrue(manager._suppress_duplicate_visit(
+            marker, {"visitID": visit, "verified": True},
+            time.time() + language_audio.SAME_VISIT_RETRY_SECONDS + 1000))
+        self.assertIsNone(manager.states[-1]["retrySeconds"])
+        # A verified departure and return is a new physical visit, not a retry.
+        other = language_visits.new_visit_id()
+        self.assertFalse(manager._suppress_duplicate_visit(
+            marker, {"visitID": other, "verified": True}, time.time() + 1))
+
+    def test_pending_inference_blocks_overlap_and_old_result_cannot_clear_new_marker(self):
+        manager = self.manager()
+        visit = language_visits.new_visit_id()
+        manager._samples[A] = self.sample(55.0, visit)
+        manager._finalize(A, "target_reached")
+        first = manager._finalized[A]
+        self.assertTrue(first["pending"])
+        self.assertEqual(manager._jobs.qsize(), 1)
+        self.assertTrue(manager._suppress_duplicate_visit(
+            first, {"visitID": visit, "verified": True},
+            time.time() + language_audio.SAME_VISIT_RETRY_SECONDS + 1))
+        job = manager._jobs.get_nowait()
+        manager._record_result(job, {
+            "outcome": "inconclusive", "reason": "mixed_language", "language": None,
+            "languageName": None, "confidence": 0.0, "windows": 0,
+            "speechSeconds": 4.0, "sampleSeconds": 55.0, "speechCoverage": 0.08,
+            "languages": [], "lexicalMargin": None})
+        self.assertFalse(first["pending"])
+        self.assertFalse(first["conclusive"])
+        self.assertFalse(manager._suppress_duplicate_visit(
+            first, {"visitID": visit, "verified": True},
+            time.time() + language_audio.SAME_VISIT_RETRY_SECONDS + 1))
+
+        manager._samples[A] = self.sample(55.0, visit)
+        manager._finalize(A, "target_reached")
+        second = manager._finalized[A]
+        self.assertEqual(second["attempts"], 2)
+        self.assertTrue(second["pending"])
+        second_token = second["sampleToken"]
+        manager._mark_finalized_result(job, "excluded", True, "language_es_dominant")
+        self.assertEqual(manager._finalized[A]["sampleToken"], second_token)
+        self.assertTrue(manager._finalized[A]["pending"])
+        self.assertFalse(manager._finalized[A]["conclusive"])
 
 class StaleJobTests(unittest.TestCase):
     def test_reload_in_same_visit_is_current_but_previous_visit_is_stale(self):

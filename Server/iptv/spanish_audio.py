@@ -62,6 +62,11 @@ SWITCH_GRACE_SECONDS = 4.0
 VISIT_GAP_SECONDS = 6.0
 FINALIZE_COOLDOWN_SECONDS = 180.0
 MIN_REPORT_SECONDS = 15.0
+# A short or inconclusive sample must not burn the whole finalize cooldown.
+# A still-playing physical visit gets a small, bounded number of fresh samples;
+# identity and stream checks still decide whether a result belongs to it.
+SAME_VISIT_RETRY_SECONDS = 10.0
+MAX_SAME_VISIT_ATTEMPTS = 4
 PROBE_INTERVAL_SECONDS = 10.0
 INACTIVE_SECONDS = 180.0
 DETECT_TIMEOUT = 25
@@ -680,8 +685,11 @@ class Manager:
     def _visit_counted(self, visit_id):
         if not language_visits.is_verified(visit_id):
             return False
+        results = getattr(self, "_visit_results", None)
+        if not isinstance(results, dict):
+            return False
         with self._lock:
-            return bool(self._visit_results.get(visit_id))
+            return bool(results.get(visit_id))
 
     def _suppress_duplicate_visit(self, last, visit, now):
         """True when a new sample would be a reload/retry of one physical visit."""
@@ -697,13 +705,72 @@ class Manager:
             return False
         if last.get("conclusive") or self._visit_counted(current_visit):
             return True
+        if last.get("pending"):
+            # One physical visit has at most one inference in flight.  A retry
+            # may only start after the previous short/inconclusive result has
+            # completed, so inference cannot overlap and double count.
+            return True
+        attempts = last.get("attempts")
+        if type(attempts) is not int or attempts < 0:
+            attempts = 0
+        max_attempts = last.get("maxAttempts")
+        if type(max_attempts) is not int or max_attempts < 1:
+            max_attempts = MAX_SAME_VISIT_ATTEMPTS
         if verified_current and language_visits.is_verified(last_visit):
             # Same physical visit: allow a bounded retry only if the earlier
             # sample was inconclusive.  This preserves exactly one count while
-            # giving a long visit another chance to classify.
-            return now - last.get("at", 0) < FINALIZE_COOLDOWN_SECONDS
+            # giving a long visit another chance to classify, including while
+            # surf rotation is paused but playback is still running.
+            if attempts >= max_attempts:
+                return True
+            return now - last.get("at", 0) < SAME_VISIT_RETRY_SECONDS
         # Unverified identity: fail closed with the existing cooldown.
         return now - last.get("at", 0) < FINALIZE_COOLDOWN_SECONDS
+
+    def _finalized_marker(self, cid, sample, reason, now):
+        """Create the per-channel retry marker before any result is dispatched."""
+        visit = sample.visit if isinstance(sample.visit, dict) else {}
+        visit_id = visit.get("visitID") if visit.get("verified") else ""
+        markers = getattr(self, "_finalized", None)
+        previous = markers.get(cid) if isinstance(markers, dict) else None
+        attempts = 1
+        if (isinstance(previous, dict) and previous.get("visitID") == (visit_id or "")
+                and previous.get("conclusive") is not True):
+            value = previous.get("attempts")
+            attempts = (value if type(value) is int and value >= 1 else 0) + 1
+        probe = sample.probe if isinstance(sample.probe, dict) else {}
+        return {
+            "at": now, "visitID": visit_id or "", "verified": bool(visit_id),
+            "conclusive": False, "pending": False, "attempts": attempts,
+            "maxAttempts": MAX_SAME_VISIT_ATTEMPTS, "reason": reason,
+            "sampleToken": uuid.uuid4().hex,
+            "launchID": str(probe.get("launchID", "")),
+            "streamGeneration": str(probe.get("streamGeneration", "")),
+            "surfPaused": probe.get("surfPaused"),
+            "surfing": probe.get("surfing"),
+        }
+
+    def _mark_finalized_result(self, job, outcome, conclusive, reason=None):
+        """Complete the marker only for the sample token that produced it."""
+        cid = job.get("cid") if isinstance(job, dict) else None
+        if not cid:
+            return
+        token = job.get("sampleToken")
+        markers = getattr(self, "_finalized", None)
+        if not isinstance(markers, dict):
+            return
+        with self._lock:
+            marker = markers.get(cid)
+            if not isinstance(marker, dict):
+                return
+            if token and marker.get("sampleToken") and token != marker.get("sampleToken"):
+                # A newer sample for this channel already owns the marker.
+                return
+            marker["pending"] = False
+            marker["conclusive"] = bool(conclusive)
+            marker["outcome"] = outcome
+            marker["reason"] = reason or marker.get("reason")
+            marker["at"] = time.time()
 
     def _decode_loop(self):
         while not self._stop.is_set():
@@ -888,28 +955,46 @@ class Manager:
         sample = self._samples.pop(cid, None)
         if sample is None:
             return
+        now = time.time()
         visit = sample.visit if isinstance(sample.visit, dict) else {}
         visit_id = visit.get("visitID") if visit.get("verified") else ""
-        finalized = {"at": time.time(), "visitID": visit_id or "",
-                     "verified": bool(visit_id), "conclusive": False}
-        self._finalized[cid] = finalized
-        if len(self._finalized) > 256:
-            cutoff = time.time() - FINALIZE_COOLDOWN_SECONDS
-            for key, value in list(self._finalized.items()):
-                stamp = value.get("at", 0) if isinstance(value, dict) else value
-                if stamp < cutoff:
-                    self._finalized.pop(key, None)
+        marker = self._finalized_marker(cid, sample, reason, now)
+        with self._lock:
+            self._finalized[cid] = marker
+            if len(self._finalized) > 256:
+                cutoff = now - FINALIZE_COOLDOWN_SECONDS
+                for key, value in list(self._finalized.items()):
+                    stamp = value.get("at", 0) if isinstance(value, dict) else value
+                    if stamp < cutoff and key != cid:
+                        self._finalized.pop(key, None)
+        self._update_current()
         best = self._best_base(sample)
-        if best is not None and best.seconds < MIN_REPORT_SECONDS:
+        seconds = round(best.seconds if best else 0.0, 2)
+        if best is None or seconds <= 0:
+            # No decodable audio is a truthful state, not a reason to hide the
+            # channel behind an unbounded waiting label.  It is retried only
+            # by later media events, never by a new device poll.
+            self._record_last(cid, sample.provider, sample.name, {
+                "outcome": "inconclusive", "reason": "no_audio", "confidence": 0.0,
+                "speechSeconds": 0.0, "sampleSeconds": 0.0,
+                "speechCoverage": 0.0, "windows": 0, "languages": [], "lexicalMargin": None,
+            }, device_verified=None, changed=False, marked=False, reason_detail=reason,
+                session=marker, conclusive=False)
             return
-        if best is None or best.seconds < MIN_SAMPLE_SECONDS:
+        if best.seconds < MIN_REPORT_SECONDS or best.seconds < MIN_SAMPLE_SECONDS:
+            # A short sample is reported immediately and the same physical
+            # visit may retry after a short bounded delay.  It never enters the
+            # evidence store and never consumes the full finalize cooldown.
             self._record_last(cid, sample.provider, sample.name, {
                 "outcome": "inconclusive", "reason": "sample_too_short", "confidence": 0.0,
-                "speechSeconds": 0.0, "sampleSeconds": round(best.seconds if best else 0.0, 2),
+                "speechSeconds": 0.0, "sampleSeconds": seconds,
                 "speechCoverage": 0.0, "windows": 0, "languages": [], "lexicalMargin": None,
-            }, device_verified=None, changed=False, marked=False, reason_detail=reason)
+            }, device_verified=None, changed=False, marked=False, reason_detail=reason,
+                session=marker, conclusive=False)
             return
         if not self._enabled():
+            marker["reason"] = "observation_disabled"
+            self._state_disabled(cid, sample, marker)
             return
         end_probe = self._probe()
         if end_probe and end_probe.get("channelID"):
@@ -934,7 +1019,7 @@ class Manager:
                 "speechSeconds": 0.0, "sampleSeconds": round(best.seconds, 2),
                 "speechCoverage": 0.0, "windows": 0, "languages": [], "lexicalMargin": None,
             }, device_verified=False, changed=changed or launch_changed,
-                marked=False, reason_detail=reason)
+                marked=False, reason_detail=reason, session=marker, conclusive=False)
             return
         launch_id = str((sample.probe or {}).get("launchID", ""))
         stream_generation = str((sample.probe or {}).get("streamGeneration", ""))
@@ -944,14 +1029,31 @@ class Manager:
             "deviceVerified": start_verified if sample.probe else None,
             "changed": changed, "finalizeReason": reason,
             "launchID": launch_id, "streamGeneration": stream_generation,
-            "visitID": visit_id or "",
+            "visitID": visit_id or "", "sampleToken": marker["sampleToken"],
+            "attempt": marker["attempts"], "maxAttempts": marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS),
+            "surfPaused": marker.get("surfPaused"), "surfing": marker.get("surfing"),
         }
+        with self._lock:
+            marker["pending"] = True
         try:
             self._jobs.put_nowait(job)
         except Exception:
             with self._lock:
+                marker["pending"] = False
                 self.telemetry["counters"]["errors"] += 1
+            self._state_inconclusive(cid, sample, marker, "inference_unavailable", best.seconds)
+            return
+        self._state_inference(cid, sample, marker, best.seconds)
         self._update_current()
+
+    def _state_inference(self, cid, sample, marker, seconds):
+        """Optional adapter hook; the baseline Spanish lane has no overlay."""
+
+    def _state_inconclusive(self, cid, sample, marker, reason, seconds):
+        """Optional adapter hook; the baseline Spanish lane has no overlay."""
+
+    def _state_disabled(self, cid, sample, marker):
+        """Optional adapter hook; the baseline Spanish lane has no overlay."""
 
     def _infer_loop(self):
         while not self._stop.is_set():
@@ -965,6 +1067,7 @@ class Manager:
                 self._infer(job)
             except Exception as error:
                 self.log("spanish auto inference error " + type(error).__name__)
+                self._mark_finalized_result(job, "inconclusive", False, "inference_error")
                 with self._lock:
                     self.telemetry["counters"]["errors"] += 1
                     self.telemetry["counters"]["inconclusive"] += 1
@@ -973,6 +1076,7 @@ class Manager:
 
     def _infer(self, job):
         if not self._enabled():
+            self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
         try:
@@ -1045,6 +1149,9 @@ class Manager:
                 commit_reason = "commit_" + type(error).__name__
                 outcome = "inconclusive"
                 reason = "commit_error"
+        conclusive = outcome in ("spanish", "non_spanish") or reason in (
+            "manual_not_spanish", "manual_spanish", "already_marked", "duplicate_visit")
+        self._mark_finalized_result(job, outcome, conclusive, reason)
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1
@@ -1081,7 +1188,11 @@ class Manager:
                 job["provider"], job["cid"], outcome, reason, decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
         self._persist(force=True)
 
-    def _record_last(self, cid, provider, name, decision, device_verified, changed, marked, reason_detail):
+    def _record_last(self, cid, provider, name, decision, device_verified, changed, marked, reason_detail,
+                     session=None, conclusive=False):
+        job = {"cid": cid, "sampleToken": (session or {}).get("sampleToken") if isinstance(session, dict) else None}
+        self._mark_finalized_result(job, decision.get("outcome", "inconclusive"), conclusive,
+                                    decision.get("reason", reason_detail))
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1

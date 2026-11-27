@@ -12,6 +12,8 @@ import pathlib
 import shutil
 import tempfile
 import time
+import uuid
+from types import SimpleNamespace
 
 import language_catalog
 import language_visits
@@ -24,6 +26,9 @@ MIN_WINDOW_PROBABILITY = base.MIN_WINDOW_PROBABILITY
 MIN_LEXICAL_MARGIN = -0.05
 MAX_PORTUGUESE_MARGIN = 0.05
 STRICT_NO_LEXICAL_PROBABILITY = 0.92
+SAME_VISIT_RETRY_SECONDS = base.SAME_VISIT_RETRY_SECONDS
+MAX_SAME_VISIT_ATTEMPTS = base.MAX_SAME_VISIT_ATTEMPTS
+STATE_PUBLISH_SECONDS = 10.0
 
 
 def _decision_language(outcome, reason, confidence, analysis, window_results, lexical,
@@ -108,9 +113,12 @@ class Manager(base.Manager):
     """Generalized manager; sampler/decoder/AES are inherited from base."""
 
     def __init__(self, root, model_path, on_exclusion, control, probe=None, log=None,
-                 ffmpeg=None, whisper=None, threads=4, visits=None, on_speech=None):
+                 ffmpeg=None, whisper=None, threads=4, visits=None, on_speech=None,
+                 on_state=None):
         self.on_exclusion = on_exclusion
         self.on_speech = on_speech
+        self.on_state = on_state
+        self._state_published = {}
         super().__init__(root, model_path, None, control, probe=probe, log=log,
                          ffmpeg=ffmpeg, whisper=whisper, threads=threads, visits=visits)
 
@@ -185,6 +193,7 @@ class Manager(base.Manager):
 
     def _infer(self, job):
         if not self._enabled():
+            self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
         transcript = None
@@ -221,6 +230,21 @@ class Manager(base.Manager):
                                            transcript[0] if transcript else None)
             self._notify_speech(job, decision, transcript)
             self._record_result(job, decision)
+        except Exception as error:
+            self._mark_finalized_result(job, "inconclusive", False, "inference_error")
+            method = getattr(self, "_state_inconclusive", None)
+            if method is not None:
+                sample = SimpleNamespace(
+                    provider=job.get("provider"), name=job.get("name"),
+                    probe={"launchID": job.get("launchID", ""),
+                           "streamGeneration": job.get("streamGeneration", ""),
+                           "surfPaused": job.get("surfPaused"),
+                           "surfing": job.get("surfing")},
+                    visit={"visitID": job.get("visitID", ""),
+                           "verified": bool(job.get("visitID"))})
+                marker = self._finalized.get(job.get("cid"))
+                method(job.get("cid"), sample, marker or {}, "inference_error", job.get("seconds"))
+            raise
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -294,6 +318,133 @@ class Manager(base.Manager):
             return True
         visit = self._observe_visit(probe)
         return bool(visit.get("verified") and visit.get("visitID") == visit_id)
+
+    def _publish_state(self, state, cid, provider, name, *, reason="", seconds=None,
+                       target=None, attempt=None, max_attempts=None, retry_seconds=None,
+                       surf_paused=None, surfing=None, language=None, language_name=None,
+                       outcome=None, visit_id="", launch_id="", stream_generation="",
+                       conclusive=False, at=None):
+        """Push one bounded, event-driven overlay state through the adapter.
+
+        The view contains no PCM, transcript, URL or credential.  The adapter
+        re-probes the current channel before writing the single overlay field,
+        and stale channel/visit/stream results are suppressed there.
+        """
+        callback = getattr(self, "on_state", None)
+        if callback is None:
+            return False
+        now = time.time() if at is None else at
+        if not isinstance(cid, str) or not cid:
+            return False
+        view = {
+            "channelID": cid, "channelName": str(name or provider or cid)[:160],
+            "state": state, "reason": str(reason or "")[:80],
+            "sampleSeconds": round(float(seconds), 2) if isinstance(seconds, (int, float)) else None,
+            "targetSeconds": round(float(target), 2) if isinstance(target, (int, float)) else None,
+            "attempt": attempt if type(attempt) is int and attempt >= 0 else None,
+            "maxAttempts": max_attempts if type(max_attempts) is int and max_attempts >= 0 else None,
+            "retrySeconds": round(float(retry_seconds), 1) if isinstance(retry_seconds, (int, float)) else None,
+            "surfPaused": surf_paused if type(surf_paused) is bool else None,
+            "surfing": surfing if type(surfing) is bool else None,
+            "language": language if isinstance(language, str) else None,
+            "languageName": language_name if isinstance(language_name, str) else None,
+            "outcome": outcome if isinstance(outcome, str) else None,
+            "visitID": str(visit_id or ""), "launchID": str(launch_id or ""),
+            "streamGeneration": str(stream_generation or ""),
+            "conclusive": bool(conclusive), "observedAt": now,
+        }
+        try:
+            callback(view)
+            return True
+        except Exception as error:
+            self.log("language state callback error " + type(error).__name__)
+            return False
+
+    def _session_from_sample(self, sample, marker=None):
+        marker = marker if isinstance(marker, dict) else {}
+        probe = getattr(sample, "probe", None)
+        probe = probe if isinstance(probe, dict) else {}
+        visit = getattr(sample, "visit", None)
+        visit = visit if isinstance(visit, dict) else {}
+        return {
+            "visitID": str(visit.get("visitID") or marker.get("visitID") or ""),
+            "launchID": str((probe or {}).get("launchID") or marker.get("launchID") or ""),
+            "streamGeneration": str((probe or {}).get("streamGeneration") or marker.get("streamGeneration") or ""),
+            "surfPaused": (probe or {}).get("surfPaused"),
+            "surfing": (probe or {}).get("surfing"),
+            "attempts": marker.get("attempts"),
+            "maxAttempts": marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS),
+            "sampleToken": marker.get("sampleToken"),
+        }
+
+    def _update_current(self):
+        super()._update_current()
+        if not self._samples:
+            return
+        cid, sample = max(self._samples.items(), key=lambda item: item[1].last_tap)
+        best = self._best_base(sample)
+        if best is None:
+            return
+        marker = self._finalized.get(cid)
+        visit = sample.visit if isinstance(sample.visit, dict) else {}
+        visit_id = str(visit.get("visitID") or "")
+        attempt = 1
+        if isinstance(marker, dict) and marker.get("visitID") == visit_id:
+            attempt = int(marker.get("attempts") or 0) + 1
+        key = (cid, visit_id, sample.started)
+        now = time.time()
+        last = self._state_published.get(key, 0.0)
+        if last and now - last < STATE_PUBLISH_SECONDS:
+            return
+        self._state_published[key] = now
+        if len(self._state_published) > 64:
+            for old in list(self._state_published)[:len(self._state_published) - 64]:
+                self._state_published.pop(old, None)
+        session = self._session_from_sample(sample, marker if isinstance(marker, dict) else None)
+        self._publish_state(
+            "collecting", cid, sample.provider, sample.name,
+            reason="collecting", seconds=best.seconds, target=base.TARGET_SECONDS,
+            attempt=attempt, max_attempts=MAX_SAME_VISIT_ATTEMPTS,
+            surf_paused=session.get("surfPaused"), surfing=session.get("surfing"),
+            visit_id=session.get("visitID"), launch_id=session.get("launchID"),
+            stream_generation=session.get("streamGeneration"), at=now,
+        )
+
+    def _state_inference(self, cid, sample, marker, seconds):
+        session = self._session_from_sample(sample, marker)
+        self._publish_state(
+            "inference", cid, sample.provider, sample.name,
+            reason="inference", seconds=seconds, target=base.TARGET_SECONDS,
+            attempt=marker.get("attempts"), max_attempts=marker.get("maxAttempts"),
+            surf_paused=session.get("surfPaused"), surfing=session.get("surfing"),
+            visit_id=session.get("visitID"), launch_id=session.get("launchID"),
+            stream_generation=session.get("streamGeneration"),
+        )
+
+    def _state_inconclusive(self, cid, sample, marker, reason, seconds):
+        session = self._session_from_sample(sample, marker)
+        attempts = marker.get("attempts") if isinstance(marker, dict) else None
+        max_attempts = marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS) if isinstance(marker, dict) else MAX_SAME_VISIT_ATTEMPTS
+        retry = SAME_VISIT_RETRY_SECONDS if (type(attempts) is int and attempts < max_attempts) else None
+        self._publish_state(
+            "inconclusive", cid, sample.provider, sample.name,
+            reason=reason, seconds=seconds, target=base.MIN_SAMPLE_SECONDS,
+            attempt=attempts, max_attempts=max_attempts, retry_seconds=retry,
+            surf_paused=session.get("surfPaused"), surfing=session.get("surfing"),
+            visit_id=session.get("visitID"), launch_id=session.get("launchID"),
+            stream_generation=session.get("streamGeneration"),
+        )
+
+    def _state_disabled(self, cid, sample, marker):
+        session = self._session_from_sample(sample, marker)
+        self._publish_state(
+            "disabled", cid, sample.provider, sample.name, reason="observation_disabled",
+            attempt=marker.get("attempts") if isinstance(marker, dict) else None,
+            max_attempts=marker.get("maxAttempts") if isinstance(marker, dict) else None,
+            surf_paused=session.get("surfPaused"), surfing=session.get("surfing"),
+            visit_id=session.get("visitID"), launch_id=session.get("launchID"),
+            stream_generation=session.get("streamGeneration"),
+        )
 
     def _record_result(self, job, decision):
         outcome = decision["outcome"]
@@ -383,6 +534,10 @@ class Manager(base.Manager):
                 and commit_reason in ("evidence_recorded", "auto_threshold", "already_marked",
                                       "duplicate_visit", "manual_exclusion", "manual_not_spanish")):
             self._remember_visit_result(job.get("visitID", ""))
+        marker_conclusive = bool(
+            outcome in ("excluded", "allowed", "unauthorized", "deferred")
+            or reason in ("duplicate_visit", "manual_not_spanish", "manual_exclusion", "already_marked"))
+        self._mark_finalized_result(job, outcome, marker_conclusive, reason)
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1
@@ -428,12 +583,54 @@ class Manager(base.Manager):
                 "launchID": job.get("launchID", ""),
                 "streamGeneration": job.get("streamGeneration", ""),
                 "visitID": job.get("visitID", ""),
+                "surfPaused": job.get("surfPaused"),
+                "surfing": job.get("surfing"),
+                "attempt": job.get("attempt"),
+                "maxAttempts": job.get("maxAttempts"),
+                "conclusive": marker_conclusive,
                 "channelChangedBeforeResult": bool(job.get("changed")),
                 "marked": marked, "evidence": evidence_recorded, "count": count,
                 "threshold": threshold, "suppressed": suppressed, "commitReason": commit_reason,
             }
             self.telemetry["last"] = last
             self.telemetry["current"] = None
+        markers = getattr(self, "_finalized", None)
+        marker = markers.get(job.get("cid")) if isinstance(markers, dict) else None
+        attempts = marker.get("attempts") if isinstance(marker, dict) else job.get("attempt")
+        max_attempts = marker.get("maxAttempts") if isinstance(marker, dict) else job.get("maxAttempts")
+        retry_seconds = None
+        if (outcome == "inconclusive" and type(attempts) is int
+                and type(max_attempts) is int and attempts < max_attempts
+                and reason not in ("duplicate_visit", "manual_not_spanish", "manual_exclusion",
+                                   "already_marked", "stale_session", "stale_channel_changed",
+                                   "device_unverified", "session_mismatch", "launch_changed")):
+            retry_seconds = SAME_VISIT_RETRY_SECONDS
+        if outcome == "deferred":
+            self._publish_state(
+                "deferred", job["cid"], job.get("provider"), job.get("name"),
+                reason=reason, attempt=attempts, max_attempts=max_attempts,
+                surf_paused=job.get("surfPaused"), surfing=job.get("surfing"),
+                language=language, language_name=language_name, outcome=outcome,
+                visit_id=job.get("visitID", ""), launch_id=job.get("launchID", ""),
+                stream_generation=job.get("streamGeneration", ""), conclusive=True)
+        elif outcome == "inconclusive" and reason == "observation_disabled":
+            self._publish_state(
+                "disabled", job["cid"], job.get("provider"), job.get("name"),
+                reason=reason, attempt=attempts, max_attempts=max_attempts,
+                surf_paused=job.get("surfPaused"), surfing=job.get("surfing"),
+                visit_id=job.get("visitID", ""), launch_id=job.get("launchID", ""),
+                stream_generation=job.get("streamGeneration", ""), conclusive=False)
+        elif outcome == "inconclusive" and reason not in (
+                "duplicate_visit", "manual_not_spanish", "manual_exclusion", "already_marked"):
+            self._publish_state(
+                "inconclusive", job["cid"], job.get("provider"), job.get("name"),
+                reason=reason, seconds=decision.get("sampleSeconds"),
+                target=base.MIN_SAMPLE_SECONDS, attempt=attempts, max_attempts=max_attempts,
+                retry_seconds=retry_seconds,
+                surf_paused=job.get("surfPaused"), surfing=job.get("surfing"),
+                language=language, language_name=language_name, outcome=outcome,
+                visit_id=job.get("visitID", ""), launch_id=job.get("launchID", ""),
+                stream_generation=job.get("streamGeneration", ""), conclusive=False)
         if outcome == "deferred":
             self.log("LANGUAGE_AUTO_DEFER language=%s name=%s provider=%s channel=%s reason=%s confidence=%.3f speech=%.1fs" % (
                 language, language_name, job["provider"], job["cid"], reason,
@@ -449,7 +646,17 @@ class Manager(base.Manager):
                 decision.get("confidence", 0.0), decision.get("speechSeconds", 0.0)))
         self._persist(force=True)
 
-    def _record_last(self, cid, provider, name, decision, device_verified, changed, marked, reason_detail):
+    def _record_last(self, cid, provider, name, decision, device_verified, changed, marked, reason_detail,
+                     session=None, conclusive=False):
+        session = session if isinstance(session, dict) else {}
+        reason = decision.get("reason", reason_detail)
+        attempts = session.get("attempts")
+        max_attempts = session.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS)
+        marker_conclusive = bool(conclusive or decision.get("outcome") in (
+            "excluded", "allowed", "unauthorized", "deferred"))
+        self._mark_finalized_result(
+            {"cid": cid, "sampleToken": session.get("sampleToken")},
+            decision.get("outcome", "inconclusive"), marker_conclusive, reason)
         with self._lock:
             counters = self.telemetry["counters"]
             counters["tested"] += 1
@@ -459,17 +666,38 @@ class Manager(base.Manager):
                 "at": round(time.time(), 3), "channelID": cid, "providerID": provider, "name": name,
                 "language": decision.get("language"), "languageName": decision.get("languageName"),
                 "outcome": decision.get("outcome", "inconclusive"),
-                "reason": decision.get("reason", reason_detail),
+                "reason": reason,
                 "confidence": decision.get("confidence", 0.0),
                 "speechSeconds": decision.get("speechSeconds", 0.0),
                 "sampleSeconds": decision.get("sampleSeconds", 0.0),
                 "speechCoverage": decision.get("speechCoverage", 0.0),
                 "windows": decision.get("windows", 0),
                 "deviceVerified": device_verified,
+                "launchID": str(session.get("launchID") or ""),
+                "streamGeneration": str(session.get("streamGeneration") or ""),
+                "visitID": str(session.get("visitID") or ""),
+                "surfPaused": session.get("surfPaused"),
+                "surfing": session.get("surfing"),
+                "attempt": attempts, "maxAttempts": max_attempts,
+                "conclusive": marker_conclusive,
                 "channelChangedBeforeResult": bool(changed),
                 "marked": bool(marked), "suppressed": False, "commitReason": None,
             }
             self.telemetry["current"] = None
+        retry_seconds = None
+        if (type(attempts) is int and type(max_attempts) is int and attempts < max_attempts
+                and reason == "sample_too_short"):
+            retry_seconds = SAME_VISIT_RETRY_SECONDS
+        state = "no_audio" if reason == "no_audio" else "inconclusive"
+        self._publish_state(
+            state, cid, provider, name, reason=reason,
+            seconds=decision.get("sampleSeconds"), target=base.MIN_SAMPLE_SECONDS,
+            attempt=attempts, max_attempts=max_attempts, retry_seconds=retry_seconds,
+            surf_paused=session.get("surfPaused"), surfing=session.get("surfing"),
+            language=decision.get("language"), language_name=decision.get("languageName"),
+            outcome=decision.get("outcome", "inconclusive"),
+            visit_id=session.get("visitID", ""), launch_id=session.get("launchID", ""),
+            stream_generation=session.get("streamGeneration", ""), conclusive=marker_conclusive)
         self._persist(force=True)
 
     def status(self):

@@ -245,6 +245,61 @@ class ReleaseIntegration(unittest.TestCase):
         self.assertEqual(self.g.overlay_bridge_fault, "authorized_transport_unavailable")
         self.assertFalse(self.g.overlay_status()["configured"])
 
+    def test_sampler_state_callback_publishes_event_driven_overlay(self):
+        recorder = Recorder()
+        self.install_bridge(recorder)
+        now = time.time()
+        with patch.object(self.g, "device_language_probe",
+                          return_value=self.probe(A)):
+            self.assertTrue(self.g.language_state_callback({
+                "channelID": A, "channelName": "Fixture A", "state": "collecting",
+                "reason": "collecting", "sampleSeconds": 12.3, "targetSeconds": 55,
+                "attempt": 1, "maxAttempts": 4, "surfPaused": True, "surfing": True,
+                "visitID": "visit-1", "launchID": "launch-1",
+                "streamGeneration": "stream-1", "observedAt": now}))
+            results = self.drain()
+        self.assertEqual(results, ["published"])
+        self.assertIn("collecting 12.3s/55.0s", recorder.calls[-1][1]["value"])
+        before = len(recorder.calls)
+        with patch.object(self.g, "device_language_probe",
+                          return_value=self.probe(A, "stream-2")):
+            self.g.language_state_callback({
+                "channelID": A, "channelName": "Fixture A", "state": "inconclusive",
+                "reason": "sample_too_short", "sampleSeconds": 36.03,
+                "targetSeconds": 40, "retrySeconds": 10,
+                "streamGeneration": "stream-1", "observedAt": now + 1})
+            results = self.drain()
+        self.assertEqual(results, ["stale"])
+        self.assertEqual(len(recorder.calls), before)
+        self.assertEqual(self.g.overlay_bridge_fault, "stale_stream_generation")
+
+    def test_stale_physical_visit_state_is_suppressed_after_departure(self):
+        recorder = Recorder()
+        self.install_bridge(recorder)
+        ledger = self.g.language_visit_identity()
+        first = ledger.observe(A, "fixture-launch", "stream-1", now=1000)
+        now = time.time()
+        with patch.object(self.g, "device_language_probe",
+                          return_value=dict(self.probe(A), launchID="fixture-launch")):
+            self.g.language_state_callback({
+                "channelID": A, "channelName": "Fixture A", "state": "collecting",
+                "sampleSeconds": 20, "targetSeconds": 55, "visitID": first["visitID"],
+                "launchID": "fixture-launch", "streamGeneration": "stream-1",
+                "observedAt": now})
+            self.assertEqual(self.drain(), ["published"])
+            ledger.observe(B, "fixture-launch", "stream-1", now=1001)
+            returned = ledger.observe(A, "fixture-launch", "stream-1", now=1002)
+            self.assertNotEqual(returned["visitID"], first["visitID"])
+            before = len(recorder.calls)
+            self.g.language_state_callback({
+                "channelID": A, "channelName": "Fixture A", "state": "inconclusive",
+                "reason": "sample_too_short", "sampleSeconds": 36.03,
+                "visitID": first["visitID"], "launchID": "fixture-launch",
+                "streamGeneration": "stream-1", "observedAt": now + 1})
+            self.assertEqual(self.drain(), ["stale"])
+        self.assertEqual(len(recorder.calls), before)
+        self.assertEqual(self.g.overlay_bridge_fault, "stale_visit")
+
     def test_manual_correction_is_idempotent_and_publishes_english_count(self):
         recorder = Recorder()
         self.install_bridge(recorder)

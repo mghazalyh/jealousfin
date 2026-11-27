@@ -230,6 +230,86 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.bridge.status()["pending"], False)
         self.assertEqual(self.bridge.fault, "stale_pending")
 
+    def test_event_driven_states_are_truthful_and_bounded(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        states = [
+            ({"state": "collecting", "reason": "collecting", "sampleSeconds": 12.3,
+              "targetSeconds": 55, "attempt": 1, "maxAttempts": 4, "at": 1764201601.0},
+             ["collecting 12.3s/55.0s", "attempt 1/4"]),
+            ({"state": "inference", "sampleSeconds": 55, "at": 1764201602.0},
+             ["inference running"]),
+            ({"state": "inconclusive", "reason": "sample_too_short",
+              "sampleSeconds": 36.03, "targetSeconds": 40, "attempt": 1,
+              "maxAttempts": 4, "retrySeconds": 10, "at": 1764201603.0},
+             ["inconclusive: sample_too_short", "36.0s/40.0s", "retry in 10s"]),
+            ({"state": "inconclusive", "reason": "sample_too_short",
+              "sampleSeconds": 36.03, "targetSeconds": 40, "attempt": 4,
+              "maxAttempts": 4, "at": 1764201604.0},
+             ["retry limit reached"]),
+            ({"state": "deferred", "reason": "deferred_paused", "language": "pt",
+              "languageName": "Portuguese", "at": 1764201605.0},
+             ["Portuguese", "deferred", "deferred_paused"]),
+            ({"state": "no_audio", "at": 1764201606.0}, ["no audio"]),
+            ({"state": "disabled", "at": 1764201607.0},
+             ["language detection disabled"]),
+        ]
+        for evidence, expected in states:
+            with self.subTest(state=evidence["state"]):
+                self.assertEqual(self.bridge.publish_state(A, "Fixture English One", evidence),
+                                 "published")
+                for text in expected:
+                    self.assertIn(text, self.transport.calls[-1][1])
+
+    def test_stale_state_and_old_evidence_do_not_replace_current_label(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", self.event(0)),
+                         "published")
+        before = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_state(A, "Fixture English One", {
+            "state": "collecting", "sampleSeconds": 5, "targetSeconds": 55,
+            "at": self.event(0)["at"] - 1}), "stale")
+        self.assertEqual(len(self.transport.calls), before)
+        self.assertEqual(self.bridge.publish_state(A, "Fixture English One", {
+            "state": "collecting", "sampleSeconds": 15, "targetSeconds": 55,
+            "at": self.event(0)["at"] + 1}), "published")
+        # The transient state is displayed, but the last verified evidence is
+        # retained for the manual correction gate.
+        self.assertEqual(self.bridge.latest_snapshot.event_id, self.event(0)["eventID"])
+        self.assertEqual(self.bridge.status()["latestEventID"], self.event(0)["eventID"])
+        self.assertEqual(self.bridge.status()["latestState"], "collecting")
+        calls = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", dict(
+            self.event(0), eventID="evt-older-than-state",
+            at=self.event(0)["at"] - 0.5)), "stale")
+        self.assertEqual(len(self.transport.calls), calls)
+
+    def test_correction_is_retained_against_stale_state_and_duplicate_gesture(self):
+        self.bridge.observe_channel(A, "Fixture English One")
+        self.bridge.publish_evidence(A, "Fixture English One", self.event(0))
+        corrected = dict(self.event(0), eventID=self.event(0)["eventID"] + ":corrected",
+                         at=self.event(0)["at"] + 1, language="en", languageName="English",
+                         phase="corrected", outcome="allowed", count=1)
+        self.assertEqual(self.bridge.publish_evidence(A, "Fixture English One", corrected),
+                         "published")
+        self.bridge.confirm_correction(self.event(0)["eventID"])
+        self.bridge.confirm_correction()
+        before = len(self.transport.calls)
+        self.assertEqual(self.bridge.publish_state(A, "Fixture English One", {
+            "state": "collecting", "sampleSeconds": 4, "targetSeconds": 55,
+            "at": corrected["at"] - 0.5}), "stale")
+        self.assertEqual(len(self.transport.calls), before)
+        self.assertIn("English", self.transport.calls[-1][1])
+        self.assertIn("corrected", self.transport.calls[-1][1])
+        self.assertEqual(self.bridge.latest_snapshot.event_id, corrected["eventID"])
+        with self.assertRaises(ob.AlreadyCorrected):
+            self.bridge.manual_correction(A, "Fixture English One", "nonce-after-correction")
+        # A genuinely newer sampler state may update the display, but it never
+        # replaces the verified correction snapshot.
+        self.assertEqual(self.bridge.publish_state(A, "Fixture English One", {
+            "state": "collecting", "sampleSeconds": 8, "targetSeconds": 55,
+            "at": corrected["at"] + 2}), "published")
+        self.assertEqual(self.bridge.latest_snapshot.event_id, corrected["eventID"])
+
     def test_manual_correction_requires_latest_evidence_and_current_channel(self):
         with self.assertRaises(ob.ManualCorrectionError):
             self.bridge.manual_correction(A, "Fixture English One", "nonce-1")

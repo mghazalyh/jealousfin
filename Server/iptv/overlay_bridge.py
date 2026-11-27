@@ -140,6 +140,12 @@ class EvidenceSnapshot:
     phase: str = ""
     confidence: Optional[float] = None
     outcome: str = ""
+    detail: str = ""
+    seconds: Optional[float] = None
+    target: Optional[float] = None
+    attempt: Optional[int] = None
+    max_attempts: Optional[int] = None
+    retry_seconds: Optional[float] = None
 
 
 def _clip(value: str, limit: int = MAX_TEXT) -> str:
@@ -191,14 +197,18 @@ def snapshot_from_mapping(channel_id: str, channel_name: str, evidence: Optional
     language_name = evidence.get("languageName", "") or language
     if not isinstance(language_name, str) or len(language_name) > MAX_LANGUAGE_NAME:
         raise OverlayError("Invalid evidence language name")
-    phase = evidence.get("phase", "") or evidence.get("outcome", "") or ""
+    phase = (evidence.get("phase", "") or evidence.get("state", "")
+             or evidence.get("outcome", "") or "")
     if not isinstance(phase, str) or len(phase) > MAX_PHASE:
         raise OverlayError("Invalid evidence phase")
+    detail = evidence.get("detail", evidence.get("reason", "")) or ""
+    if not isinstance(detail, str) or len(detail) > 160:
+        raise OverlayError("Invalid evidence detail")
     event_id = evidence.get("eventID", evidence.get("event_id", "")) or ""
     if not isinstance(event_id, str) or len(event_id) > MAX_EVENT_ID:
         raise OverlayError("Invalid evidence event ID")
     if not event_id:
-        event_id = "evt-%s-%s-%s" % (channel_id, int(float(at) * 1000), language or "pending")
+        event_id = "evt-%s-%s-%s" % (channel_id, int(float(at) * 1000), phase or language or "pending")
     confidence = evidence.get("confidence")
     if confidence is not None:
         if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
@@ -208,22 +218,86 @@ def snapshot_from_mapping(channel_id: str, channel_name: str, evidence: Optional
     threshold = _optional_count(evidence.get("threshold"), "evidence threshold")
     if threshold == 0:
         raise OverlayError("Invalid evidence threshold")
+
+    def bounded_number(name, source, limit=86400.0):
+        value = evidence.get(name, evidence.get(source))
+        if value is None:
+            return None
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= limit:
+            raise OverlayError("Invalid evidence " + name)
+        return float(value)
+
+    seconds = bounded_number("seconds", "sampleSeconds", 86400.0)
+    target = bounded_number("target", "targetSeconds", 86400.0)
+    attempt = _optional_count(evidence.get("attempt"), "evidence attempt")
+    max_attempts = _optional_count(evidence.get("maxAttempts"), "evidence max attempts")
+    retry_seconds = bounded_number("retrySeconds", "retrySeconds", 86400.0)
     return EvidenceSnapshot(
         channel_id=channel_id, channel_name=channel_name, event_id=event_id,
         observed_at=float(at), language=language, language_name=language_name,
         count=count, threshold=threshold, phase=phase,
         confidence=confidence, outcome=str(evidence.get("outcome", "") or "")[:MAX_PHASE],
+        detail=detail, seconds=seconds, target=target, attempt=attempt,
+        max_attempts=max_attempts, retry_seconds=retry_seconds,
     )
+
+
+def _seconds_text(value: Optional[float]) -> str:
+    return "%.1fs" % value if value is not None else "?"
+
+
+def _state_label(snapshot: EvidenceSnapshot) -> str:
+    phase = snapshot.phase or ""
+    detail = (snapshot.detail or "").strip()
+    label = ""
+    if phase == "collecting":
+        label = "collecting %s/%s" % (
+            _seconds_text(snapshot.seconds),
+            _seconds_text(snapshot.target))
+        if snapshot.attempt is not None:
+            bounded = "" if snapshot.max_attempts is None else "/%d" % snapshot.max_attempts
+            label += " · attempt %d%s" % (snapshot.attempt, bounded)
+    elif phase == "inference":
+        label = "inference running"
+    elif phase in ("inconclusive", "retry"):
+        label = "inconclusive"
+        if detail:
+            label += ": " + detail
+        if snapshot.seconds is not None or snapshot.target is not None:
+            label += " (%s/%s)" % (_seconds_text(snapshot.seconds), _seconds_text(snapshot.target))
+        if snapshot.retry_seconds is not None:
+            label += " · retry in %.0fs" % snapshot.retry_seconds
+        elif snapshot.attempt is not None and snapshot.max_attempts is not None and snapshot.attempt >= snapshot.max_attempts:
+            label += " · retry limit reached"
+    elif phase in ("deferred", "deferred_pause", "deferred_paused"):
+        label = "deferred: " + (detail or "paused")
+        if snapshot.language_name or snapshot.language:
+            label += " · " + (snapshot.language_name or snapshot.language)
+    elif phase in ("no_audio", "no-audio"):
+        label = "no audio"
+        if detail and detail != "no_audio":
+            label += ": " + detail
+    elif phase in ("disabled", "observation_disabled"):
+        label = "language detection disabled"
+    elif phase in ("waiting", "pending", ""):
+        label = "language evidence pending"
+    else:
+        label = "language evidence pending"
+    return label
 
 
 def format_snapshot(snapshot: EvidenceSnapshot) -> str:
     """One atomic label.  Channel name and observation time are always present."""
     stamp = _iso_timestamp(snapshot.observed_at)
     if not snapshot.language:
+        if snapshot.phase:
+            return _clip("%s · %s · %s" % (stamp, snapshot.channel_name, _state_label(snapshot)))
         return _clip("%s · %s · language evidence pending" % (stamp, snapshot.channel_name))
     count = "-" if snapshot.count is None else str(snapshot.count)
     threshold = "-" if snapshot.threshold is None else str(snapshot.threshold)
     phase = snapshot.phase or "sampling"
+    if snapshot.detail and phase in ("deferred", "deferred_pause", "deferred_paused"):
+        phase += " (" + snapshot.detail + ")"
     confidence = "-" if snapshot.confidence is None else "%.1f%%" % (snapshot.confidence * 100)
     return _clip("%s · %s · %s %s/%s · %s · confidence %s" % (
         stamp, snapshot.channel_name, snapshot.language_name or snapshot.language,
@@ -280,6 +354,8 @@ class OverlayBridge:
         self.generation = 0
         self.latest_event_id = ""
         self.latest_snapshot: Optional[EvidenceSnapshot] = None
+        self.latest_state: Optional[EvidenceSnapshot] = None
+        self.latest_display_at = float("-inf")
         self.last_published_text = ""
         self.last_published_event_id = ""
         self.last_published_channel_id = ""
@@ -296,6 +372,7 @@ class OverlayBridge:
             "channelName": self.current_channel_name,
             "generation": self.generation,
             "latestEventID": self.latest_event_id,
+            "latestState": self.latest_state.phase if self.latest_state is not None else "",
             "publishedText": self.last_published_text,
             "publishedChannelID": self.last_published_channel_id,
             "staleLabel": bool(self.last_published_channel_id
@@ -322,6 +399,8 @@ class OverlayBridge:
         self.generation += 1
         self.latest_event_id = ""
         self.latest_snapshot = None
+        self.latest_state = None
+        self.latest_display_at = float("-inf")
         self._enqueue(format_waiting(channel_name, wall), "", channel_id, mono, immediate=True)
         return self._pump(mono)
 
@@ -339,6 +418,8 @@ class OverlayBridge:
             self.generation += 1
         self.latest_event_id = ""
         self.latest_snapshot = None
+        self.latest_state = None
+        self.latest_display_at = float("-inf")
         self._enqueue(format_waiting(name, wall), "", cid, mono, immediate=True)
         return self._pump(mono)
 
@@ -367,11 +448,45 @@ class OverlayBridge:
         if snapshot.event_id == self.latest_event_id:
             self.last_status = "duplicate"
             return self.last_status
-        if self.latest_snapshot is not None and snapshot.observed_at < self.latest_snapshot.observed_at:
+        if snapshot.observed_at < self.latest_display_at:
             self.last_status = "stale"
             return self.last_status
         self.latest_event_id = snapshot.event_id
         self.latest_snapshot = snapshot
+        self.latest_display_at = max(self.latest_display_at, snapshot.observed_at)
+        self._enqueue(format_snapshot(snapshot), snapshot.event_id, channel_id, mono, immediate=False)
+        return self._pump(mono)
+
+    def publish_state(self, channel_id: str, channel_name: str, state: Optional[Mapping[str, Any]],
+                      *, at: Optional[float] = None, now: Optional[float] = None) -> str:
+        """Publish a transient sampler state without replacing evidence.
+
+        A collecting/inference/inconclusive/retry/deferred/no-audio/disabled
+        label is truthful for the current visit, but it is not evidence.  Keep
+        the latest verified evidence snapshot separate so the manual correction
+        control still targets the last real event.  A stale channel, visit or
+        stream event must never overwrite a newer label.
+        """
+        mono = self._clock() if now is None else now
+        wall = self._wallclock() if at is None else at
+        if not self.current_channel_id:
+            self.observe_channel(channel_id, channel_name, at=wall, now=mono)
+        if channel_id != self.current_channel_id:
+            self.last_status = "suppressed_channel"
+            return self.last_status
+        self.current_channel_name = channel_name
+        snapshot = snapshot_from_mapping(channel_id, channel_name, state, observed_at=wall)
+        if snapshot is None:
+            self.last_status = "invalid"
+            return self.last_status
+        if self.latest_state is not None and snapshot.event_id == self.latest_state.event_id:
+            self.last_status = "duplicate"
+            return self.last_status
+        if snapshot.observed_at < self.latest_display_at:
+            self.last_status = "stale"
+            return self.last_status
+        self.latest_state = snapshot
+        self.latest_display_at = max(self.latest_display_at, snapshot.observed_at)
         self._enqueue(format_snapshot(snapshot), snapshot.event_id, channel_id, mono, immediate=False)
         return self._pump(mono)
 
