@@ -156,68 +156,60 @@ class ActiveViewing:
         row["last_mono"] = now; row["last_wall"] = wall
         if action == "start":
             row["verified"] = True
-            if report.get("paused") is True:
-                row["paused"] = True; row["active_since"] = None
-                row["confirmed_seconds"] = 0.0
-                row.pop("start_anchor", None)
-            elif row["active_since"] is None:
-                # Native Build 1036 reports Start only after decoded playback
-                # validation. Retain its position as an anchor, but never
-                # grant viewing time until an advancing Progress corroborates it.
-                pos = report.get("position")
-                if (report.get("paused") is not True and type(pos) in (int, float)
-                        and math.isfinite(pos) and pos >= 0):
-                    row["start_anchor"] = (now, float(pos))
-                    row["last_position"] = float(pos)
-                    row["confirmed_seconds"] = 0.0
-                row["active_since"] = None
+            # Start is an anchor, never proof of progress. Missing pause flags
+            # retain the legacy unpaused interpretation, including resume.
+            row["paused"] = report.get("paused") is True
+            row["active_since"] = None
+            row["confirmed_seconds"] = 0.0
+            row.pop("last_progress", None)
+            row.pop("start_anchor", None)
+            pos = report.get("position")
+            row["last_position"] = None
+            if (not row["paused"] and type(pos) in (int, float)
+                    and math.isfinite(pos) and pos >= 0):
+                row["start_anchor"] = (now, float(pos))
+                row["last_position"] = float(pos)
             self._expire(now)
             return self._view(row, now)
         paused = report.get("paused") is True
         was_paused = row["paused"]
-        if paused:
-            row["paused"] = True; row["active_since"] = None
-            row.pop("start_anchor", None)
-            row["confirmed_seconds"] = 0.0
-        else:
-            row["paused"] = False
+        row["paused"] = paused
         position = report.get("position")
-        if isinstance(position, (int, float)) and math.isfinite(position) and position >= 0:
+        if type(position) not in (int, float) or not math.isfinite(position) or position < 0:
+            row["active_since"] = None
+            row["confirmed_seconds"] = 0.0
+            row["last_position"] = None
+            row.pop("last_progress", None)
+            row.pop("start_anchor", None)
+        else:
             previous = row["last_position"]
-            advancing = previous is not None and position > previous + 0.05
-            anchor = row.pop("start_anchor", None)
-            row["last_position"] = position
-            # Separate conservative, corroborated duration for the no-EPG
-            # lane. No time between reports is credited without progress.
             elapsed = now - previous_mono
             delta = position - previous if previous is not None else 0.0
-            if (not paused and not was_paused
-                    and 0 < elapsed <= self.stale_seconds
-                    and 0.05 < delta <= elapsed + 2.0):
-                row["confirmed_seconds"] = row.get("confirmed_seconds", 0.0) + min(delta, elapsed)
-            else:
+            anchor = row.pop("start_anchor", None)
+            row["last_position"] = position
+            # Report timestamps cannot distinguish a small seek from delivery
+            # jitter. Never credit more than both observed media advancement
+            # and elapsed wall time; any detectable discontinuity resets both
+            # windows. Re-establish progress from the new position.
+            continuous = (not paused and not was_paused and previous is not None
+                          and 0 < elapsed <= self.stale_seconds
+                          and 0.05 < delta <= elapsed + 0.5)
+            if not continuous:
+                row["active_since"] = None
                 row["confirmed_seconds"] = 0.0
-            if paused:
-                pass
-            elif now - previous_mono > self.stale_seconds:
-                # A stale gap starts a new uncredited anchor. The following
-                # advancing report must establish fresh progress.
-                row["active_since"] = now
                 row.pop("last_progress", None)
-            elif advancing:
+                if not paused:
+                    row["start_anchor"] = (now, float(position))
+            else:
                 if row["active_since"] is None:
                     row["active_since"] = now
-                    if anchor is not None:
-                        elapsed = now - anchor[0]
-                        delta = position - anchor[1]
-                        # Do not backdate on seeks, implausible position jumps,
-                        # delayed reports or stale anchors. Count at most the
-                        # corroborated position advance and actual wall time.
-                        if 0 < elapsed <= self.stale_seconds and 0.05 < delta <= elapsed + 2.0:
-                            row["active_since"] = now - min(delta, elapsed)
+                    if anchor is not None and 0 < now - anchor[0] <= self.stale_seconds:
+                        anchor_delta = position - anchor[1]
+                        anchor_elapsed = now - anchor[0]
+                        if 0.05 < anchor_delta <= anchor_elapsed + 0.5:
+                            row["active_since"] = now - min(anchor_delta, anchor_elapsed)
+                row["confirmed_seconds"] = row.get("confirmed_seconds", 0.0) + min(delta, elapsed)
                 row["last_progress"] = now
-            elif previous is None:
-                row["active_since"] = now
         self._expire(now)
         return self._view(row, now)
 
@@ -239,6 +231,8 @@ class ActiveViewing:
                  now - row["last_progress"] > self.stale_seconds)):
             row["active_since"] = None
             row["confirmed_seconds"] = 0.0
+            row["last_position"] = None
+            row.pop("last_progress", None)
             row.pop("start_anchor", None)
             return None
         if not row["verified"] or row["active_since"] is None:

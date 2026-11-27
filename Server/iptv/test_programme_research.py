@@ -73,9 +73,9 @@ class ViewingTests(unittest.TestCase):
         self.progress(10, 129)
         self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 29)
         self.progress(15, 129)
-        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 0)
+        self.assertIsNone(self.viewing.views().get(self.cid))
         self.progress(15, 1300)
-        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 0)
+        self.assertIsNone(self.viewing.views().get(self.cid))
 
     def test_legacy_omitted_pause_flag_still_requires_corroborated_advance(self):
         self.viewing.issue(self.cid, self.sid)
@@ -87,7 +87,35 @@ class ViewingTests(unittest.TestCase):
         self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,14)
         self.clock.advance(15)
         self.viewing.observe(dict(start,action="progress",position=114))
-        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,0)
+        self.assertIsNone(self.viewing.views().get(self.cid))
+
+    def test_backward_and_forward_seek_reset_both_windows(self):
+        for jump in (-5, 17):
+            with self.subTest(jump=jump):
+                self.viewing = pr.ActiveViewing(clock=self.clock)
+                self.viewing.issue(self.cid,self.sid)
+                self.viewing.observe({"channelID":self.cid,"playSessionID":self.sid,
+                                      "action":"start","position":100,"paused":False})
+                self.progress(15,115);self.progress(15,130)
+                self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,30)
+                self.progress(15,130+jump)
+                self.assertIsNone(self.viewing.views().get(self.cid))
+                self.progress(15,145+jump)
+                self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,15)
+                self.assertEqual(self.viewing.views()[self.cid].active_seconds,15)
+
+    def test_start_without_pause_flag_resumes_paused_session_without_old_credit(self):
+        self.viewing.issue(self.cid,self.sid)
+        start={"channelID":self.cid,"playSessionID":self.sid,"action":"start","position":100}
+        self.viewing.observe(start)
+        self.progress(15,115)
+        self.progress(15,115,paused=True)
+        self.assertIsNone(self.viewing.views().get(self.cid))
+        self.viewing.observe(dict(start,position=115))
+        self.assertFalse(self.viewing.sessions[self.sid]["paused"])
+        self.assertIsNone(self.viewing.views().get(self.cid))
+        self.progress(15,130)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,15)
 
     def test_seek_or_pause_cannot_backdate_start(self):
         for paused, position in [(False, 1000), (True, 110)]:
@@ -178,7 +206,7 @@ class CoordinatorTests(unittest.TestCase):
         for _ in range(4):
             self.clock.advance(15); self.wall += 15
             self.viewing.observe({"channelID": self.cid, "playSessionID": self.sid, "action": "progress",
-                                  "position": 200 + self.wall}, wall=self.wall)
+                                  "position": self.wall}, wall=self.wall)
         plan = self.coordinator.choose_active({self.cid}, self.viewing.views(), self.wall, "low", {})
         self.assertEqual((plan.variant, plan.attempt), ("high", 2))
         self.assertLess(plan.due_at - 0, 320)
@@ -192,7 +220,7 @@ class CoordinatorTests(unittest.TestCase):
         self.coordinator.record(plan, "verified", self.wall)
         self.assertIsNone(self.coordinator.choose_active({self.cid}, self.viewing.views(), self.wall + 100, "low", {}))
         self.coordinator = pr.ResearchCoordinator(active_seconds=120, clock=self.clock, rng=random.Random(7))
-        position = 500
+        position = self.wall
         for attempt in range(1, 4):
             for _ in range(4):
                 self.clock.advance(15); self.wall += 15; position += 15
