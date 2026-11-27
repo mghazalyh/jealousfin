@@ -77,6 +77,18 @@ class ViewingTests(unittest.TestCase):
         self.progress(15, 1300)
         self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 0)
 
+    def test_legacy_omitted_pause_flag_still_requires_corroborated_advance(self):
+        self.viewing.issue(self.cid, self.sid)
+        start={"channelID":self.cid,"playSessionID":self.sid,"action":"start","position":100}
+        self.viewing.observe(start)
+        self.assertEqual(self.viewing.views(),{})
+        self.clock.advance(15)
+        self.viewing.observe(dict(start,action="progress",position=114))
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,14)
+        self.clock.advance(15)
+        self.viewing.observe(dict(start,action="progress",position=114))
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds,0)
+
     def test_seek_or_pause_cannot_backdate_start(self):
         for paused, position in [(False, 1000), (True, 110)]:
             with self.subTest(paused=paused, position=position):

@@ -165,7 +165,7 @@ class ActiveViewing:
                 # validation. Retain its position as an anchor, but never
                 # grant viewing time until an advancing Progress corroborates it.
                 pos = report.get("position")
-                if (report.get("paused") is False and type(pos) in (int, float)
+                if (report.get("paused") is not True and type(pos) in (int, float)
                         and math.isfinite(pos) and pos >= 0):
                     row["start_anchor"] = (now, float(pos))
                     row["last_position"] = float(pos)
@@ -191,7 +191,7 @@ class ActiveViewing:
             # lane. No time between reports is credited without progress.
             elapsed = now - previous_mono
             delta = position - previous if previous is not None else 0.0
-            if (not paused and not was_paused and report.get("paused") is False
+            if (not paused and not was_paused
                     and 0 < elapsed <= self.stale_seconds
                     and 0.05 < delta <= elapsed + 2.0):
                 row["confirmed_seconds"] = row.get("confirmed_seconds", 0.0) + min(delta, elapsed)
