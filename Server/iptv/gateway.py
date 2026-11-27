@@ -3286,10 +3286,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
    # Catalogue refresh remains the explicit manual-classification boundary.
    apply_device_spanish_request(config,token)
    overlay_enqueue('refresh')
-  elif re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
-   # Never wait for an optional UI callback before starting media.
-   enqueue_playback_marker(config,token)
-   overlay_enqueue('refresh')
   if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
    if selected_profile_admitted(config,token)=='malay':
     self.proxy_malay(config,path);return True
@@ -3312,6 +3308,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     selected=selected_profile_admitted(config,os.environ.get('JEALOUSFIN_DEVICE_TOKEN',''))
     if (selected=='malay')!=malay:
      self.reply(409,{'JealousfinPolicyError':'excluded'});return True
+    if re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
+     # Optional UI callbacks follow successful fresh profile admission.
+     # Keep both admitted profiles and the original async marker boundary.
+     enqueue_playback_marker(config,token)
+     overlay_enqueue('refresh')
    if malay:
     n=int(self.headers.get('Content-Length','0'))
     if not 0<=n<=262144:self.reply(413,{});return True

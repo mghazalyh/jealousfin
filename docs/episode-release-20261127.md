@@ -60,6 +60,7 @@ Server/iptv/test_gateway_policy.py
 Server/iptv/test_incident_identity_overlay_20261127.py
 Server/iptv/test_incident_sampler_gap_20261127.py
 Server/iptv/test_incident_selector_pressure_20261127.py
+Server/iptv/test_incident_startup_admission_pressure.py
 Server/iptv/test_language_pause.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
@@ -194,3 +195,6 @@ Verified on the integrated tree (2026-11-27):
   title until the native/source reconciliation is rebuilt.
 - Server frame-freeze and client frame-freeze work are out of scope and must
   stay on their own branches.
+
+### Playback admission callback ordering
+Optional playback callbacks run after successful profile admission; catalogue ordering and both admitted profiles remain unchanged.
