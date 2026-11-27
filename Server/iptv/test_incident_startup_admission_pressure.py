@@ -37,8 +37,27 @@ class StartupAdmissionTests(unittest.TestCase):
                 result='rejected'
         return result,actions
 
-    def test_failed_catalogue_retains_original_marker_boundary(self):
-        self.assertEqual(self.route('/LiveTv/Channels',RuntimeError('unavailable')),('rejected',['marker','overlay']))
+    def test_failed_catalogue_skips_optional_ui_pressure(self):
+        # A failed reconnect attempt must not issue the optional marker command
+        # before the fresh status read.
+        self.assertEqual(self.route('/LiveTv/Channels',RuntimeError('unavailable')),('rejected',[]))
+
+    def test_only_catalogue_reconnect_requests_bounded_recovery(self):
+        calls=[]
+        def admitted(config,token,**kwargs):
+            calls.append(kwargs)
+            return 'american'
+        with patch.object(self.g.prototype_selector,'load_selector',return_value=self.config), \
+             patch.object(self.g.prototype_selector,'source_ids',return_value=set()), \
+             patch.object(self.g,'selected_profile_admitted',side_effect=admitted), \
+             patch.object(self.g,'apply_device_spanish_request'), \
+             patch.object(self.g,'overlay_enqueue'):
+            self.g.Handler.route_prototype(self.handler,'/LiveTv/Channels',{})
+            self.g.Handler.route_prototype(self.handler,'/LiveTv/Programs',{})
+            self.g.Handler.route_prototype(self.handler,'/Jealousfin/Policy',{})
+        self.assertEqual(calls[0].get('reconnect'),True)
+        self.assertNotIn('reconnect',calls[1])
+        self.assertNotIn('reconnect',calls[2])
 
     def test_failed_playback_never_contacts_optional_ui(self):
         self.assertEqual(self.route('/Items/'+self.cid+'/PlaybackInfo',RuntimeError('unavailable')),('rejected',[]))

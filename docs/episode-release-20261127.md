@@ -205,3 +205,5 @@ Optional playback callbacks run after successful profile admission; catalogue or
 Bounded recovery may wait out shared status backoff only for English PlaybackInfo; credential-scoped single flight and fresh category verification remain fail-closed. Reserve selector and upstream time within the monotonic budget. Background and Malay admission remain unchanged. No IPA or state migration. Live acceptance requires advancing same-launch video and fresh programme/language evidence.
 
 Foreground recovery reserves the next status admission, accounts for elapsed initial reads, and shares selector observations only within the same credential scope. Multi-base requests without sufficient remaining budget fail closed.
+
+Catalogue reconnect now uses bounded fresh-profile recovery before the synchronous manual-classification callback; policy/programme polling remains fail-closed without waiting.

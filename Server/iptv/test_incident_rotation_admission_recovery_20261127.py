@@ -305,6 +305,44 @@ class RecoveryFixture(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(first))
         self.assertNotIn(TOKEN, str(first))
 
+    def test_catalogue_reconnect_recovers_status_backoff_without_caching(self):
+        clock = [100.0]
+        categories = ["Movies & Series", "All Channels"]
+        reads = []
+
+        def device(config, token):
+            reads.append(1)
+            return status(categories.pop(0))
+
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK", lambda: clock[0]), \
+                patch.object(self.g, "PLAYBACK_ADMISSION_WAIT",
+                             side_effect=self.fake_wait(clock)), \
+                patch.object(self.g.prototype_selector, "device_status",
+                             side_effect=device):
+            self.arm_backoff(clock, 2.0)
+            first = self.g.selected_profile_admitted(
+                self.selector, TOKEN, reconnect=True)
+            self.arm_backoff(clock, 2.0)
+            second = self.g.selected_profile_admitted(
+                self.selector, TOKEN, reconnect=True)
+        self.assertEqual((first, second), ("malay", "american"))
+        self.assertEqual(len(reads), 2)
+
+    def test_catalogue_reconnect_refuses_wait_beyond_budget(self):
+        clock = [100.0]
+        calls = []
+        with patch.object(self.g, "DEVICE_PROBE_CLOCK", lambda: clock[0]), \
+                patch.object(self.g, "PLAYBACK_ADMISSION_WAIT",
+                             side_effect=AssertionError("must not wait")), \
+                patch.object(self.g.prototype_selector, "device_status",
+                             side_effect=lambda *a, **k: calls.append(1)):
+            self.arm_backoff(clock, 6.0)
+            with self.assertRaises(RuntimeError):
+                self.g.selected_profile_admitted(
+                    self.selector, TOKEN, reconnect=True)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.g.PLAYBACK_ADMISSION_STATS["refused"], 1)
+
     def test_recovery_is_restricted_to_english_playback_info(self):
         path = "/Items/" + CID + "/PlaybackInfo"
         self.assertTrue(self.g.playback_admission_foreground(path, CID, False))

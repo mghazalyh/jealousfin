@@ -3316,10 +3316,14 @@ def playback_admission_foreground(path,cid,malay):
  # Recovery is restricted to English PlaybackInfo for a known catalogue
  # channel.  The Malay proxy keeps its immediate fail-closed admission.
  return bool(path.endswith('/PlaybackInfo') and not malay and cid in sources)
-def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=False):
+def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=False,reconnect=False):
  started=_device_probe_now()
  key=_device_probe_key(config)
- if foreground:
+ # Foreground PlaybackInfo and the catalogue reconnect boundary may wait out a
+ # shared status backoff under the existing monotonic budget.  Other background
+ # consumers stay immediately fail-closed.
+ recover=foreground or reconnect
+ if recover:
   with PLAYBACK_ADMISSION_LOCK:
    reserved=_playback_flight_key(config,token) in PLAYBACK_ADMISSION_FLIGHTS
   if reserved or prototype_selector.status_observation_remaining(config)>0:
@@ -3330,8 +3334,8 @@ def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=F
  if not admitted:
   # Status-only consumers must not be blocked by a snapshot/identity backoff.
   # Background callers keep the immediate fail-closed backoff response; only a
-  # foreground PlaybackInfo may wait it out under the request budget.
-  if foreground and fault in ('device_probe_backoff','device_probe_rate_limited','device_probe_playback_reserved'):
+  # foreground PlaybackInfo or catalogue reconnect may wait it out under budget.
+  if recover and fault in ('device_probe_backoff','device_probe_rate_limited','device_probe_playback_reserved'):
    if fault=='device_probe_playback_reserved':
     with PLAYBACK_ADMISSION_LOCK:
      same_scope=_playback_flight_key(config,token) in PLAYBACK_ADMISSION_FLIGHTS
@@ -3344,7 +3348,7 @@ def selected_profile_admitted(config,token,foreground=False,cid=None,_recovery=F
    _device_probe_record_failure_locked(key,'device_status_unavailable','profile')
   # Retry only when the selector recorded a failed fresh status observation,
   # never a successfully observed but invalid category.
-  if foreground and prototype_selector.status_observation_remaining(config)>0:
+  if recover and prototype_selector.status_observation_remaining(config)>0:
    return _playback_profile_recovery(config,token,cid,started)
   raise
  with DEVICE_PROBE_LOCK:
@@ -3448,10 +3452,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
   # boundaries. The health poll is deliberately excluded to avoid a callback
   # every few seconds. Failure never blocks the request.
   if path=='/LiveTv/Channels':
-   # Catalogue refresh remains the explicit manual-classification boundary.
+   # Admission first: a failed reconnect attempt must not add an optional UI
+   # command before the fresh status read.  The manual classification remains
+   # synchronous and still precedes the served catalogue.
+   malay=selected_profile_admitted(config,token,reconnect=True)=='malay'
    apply_device_spanish_request(config,token)
    overlay_enqueue('refresh')
-  if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
+   if malay:
+    self.proxy_malay(config,path);return True
+   return False
+  if path in ('/LiveTv/Programs','/Jealousfin/Policy'):
    if selected_profile_admitted(config,token)=='malay':
     self.proxy_malay(config,path);return True
    return False
