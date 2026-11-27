@@ -2411,7 +2411,7 @@ def load_episode_sources():
    out[episode_audio.source_key(key)]=entry
   return out
  except (OSError,ValueError,TypeError):return {}
-def episode_research_page(url):
+def episode_research_page(url,timeout=8.0):
  # Bounded, HTTPS-only read of one approved public page. Never stores the page.
  target=episode_audio.safe_source_url(url,EPISODE_SOURCE_HOSTS,allow_query=True)
  if not target:raise ValueError('Unapproved episode source')
@@ -2424,7 +2424,7 @@ def episode_research_page(url):
    return super().redirect_request(req,fp,code,msg,headers,redirect)
  req=urllib.request.Request(validate(target),headers={'User-Agent':'Jealousfin-Episode-Evidence/1.0','Accept':'text/html,application/xhtml+xml'})
  agent=urllib.request.build_opener(urllib.request.ProxyHandler({}),EpisodeRedirect())
- with agent.open(req,timeout=8) as f:
+ with agent.open(req,timeout=max(0.01,min(8.0,float(timeout)))) as f:
   data=f.read(episode_audio.MAX_PAGE_BYTES+1)
   final=f.geturl()
  if not episode_audio._same_site(urllib.parse.urlsplit(final).hostname,original_host):raise ValueError('Episode source left approved host')
@@ -2446,7 +2446,8 @@ def episode_source_provider(payload):
  if not opencode_discovery.available():return official,reports
  try:
   # Clue-backed work is latency-sensitive. Keep the alternate provider bounded.
-  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
+  unknown=not payload.get('seriesTitle') and bool(payload.get('clues'))
+  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
   prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
   raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'])
   result=opencode_discovery.normalize_episode_sources(raw)
@@ -2454,7 +2455,10 @@ def episode_source_provider(payload):
   combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
   return combined['official'],combined['reports']
  except Exception as error:
-  log('episode source discovery deferred '+type(error).__name__)
+  diagnostics=getattr(error,'diagnostics',{})
+  reason=diagnostics.get('error') if isinstance(diagnostics,dict) else None
+  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','timeout') else type(error).__name__
+  log('episode source discovery deferred '+safe_reason)
   return official,reports
 def episode_source_prefetch_worker(stop):
  # Public programme candidates are cached before a transcript exists. This
@@ -2570,7 +2574,7 @@ def episode_observer_instance():
    episode_source_discovery=episode_audio.EpisodeSourceDiscovery(
     episode_research_page,registry_loader=load_episode_sources,
     provider=episode_source_provider,max_candidates=EPISODE_SOURCE_PAGES)
-   research=episode_audio.PublicEvidenceResearch(episode_research_page,registry_loader=load_episode_sources,max_pages=EPISODE_SOURCE_PAGES,discovery=episode_source_discovery)
+   research=episode_audio.PublicEvidenceResearch(episode_research_page,registry_loader=load_episode_sources,max_pages=EPISODE_SOURCE_PAGES,discovery=episode_source_discovery,unknown_deadline_seconds=episode_audio.UNKNOWN_RESEARCH_SECONDS,fetch_with_timeout=episode_research_page)
    episode_observer=episode_audio.EpisodeObserver(
     probe=episode_probe,research=research,enabled=False,
     budget=episode_audio.EpisodeBudget(),programme=current_programme_context,

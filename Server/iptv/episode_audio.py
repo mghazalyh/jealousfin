@@ -114,6 +114,8 @@ AUDIO_MIN_ACTIVE_SECONDS = 40.0
 PUBLICATION_TTL = 1800.0
 MAX_PUBLICATIONS = 64
 MAX_RESEARCH_SECONDS = 20.0
+UNKNOWN_RESEARCH_SECONDS = 30.0
+UNKNOWN_PROVIDER_SECONDS = 18.0
 MAX_PENDING = 8
 PENDING_DEDUP_SECONDS = 120.0
 
@@ -2244,8 +2246,10 @@ class PublicEvidenceResearch:
     def __init__(self, fetch_page, source_registry=None, max_pages=MAX_SOURCE_PAGES,
                  registry_loader=None, deadline_seconds=MAX_RESEARCH_SECONDS,
                  discovery=None, provider=None, cache_ttl=SOURCE_CANDIDATE_TTL,
-                 official_hints=None, report_hints=None):
+                 official_hints=None, report_hints=None, unknown_deadline_seconds=None,
+                 fetch_with_timeout=None):
         self.fetch_page = fetch_page
+        self.fetch_with_timeout = fetch_with_timeout if callable(fetch_with_timeout) else None
         if callable(source_registry) and registry_loader is None:
             registry_loader = source_registry
             source_registry = None
@@ -2253,6 +2257,7 @@ class PublicEvidenceResearch:
         self.registry_loader = registry_loader if callable(registry_loader) else None
         self.max_pages = max(1, min(MAX_SOURCE_PAGES, int(max_pages)))
         self.deadline_seconds = max(1.0, float(deadline_seconds))
+        self.unknown_deadline_seconds = self.deadline_seconds if unknown_deadline_seconds is None else max(1.0, float(unknown_deadline_seconds))
         self.discovery = discovery if isinstance(discovery, EpisodeSourceDiscovery) else None
         if self.discovery is None:
             self.discovery = EpisodeSourceDiscovery(
@@ -2300,11 +2305,17 @@ class PublicEvidenceResearch:
         while len(self._evidence) > MAX_SOURCE_CACHE:
             self._evidence.popitem(last=False)
 
-    def _fetch_result(self, url, allowed_hosts):
+    def _fetch_result(self, url, allowed_hosts, deadline=None):
         if not callable(self.fetch_page) or _host(url) not in allowed_hosts:
             return None, False
         try:
-            page = self.fetch_page(url)
+            if self.fetch_with_timeout is not None and deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, False
+                page = self.fetch_with_timeout(url, min(8.0, remaining))
+            else:
+                page = self.fetch_page(url)
         except Exception as error:
             blocked = (isinstance(error, urllib.error.HTTPError)
                        and error.code in (401, 403, 451))
@@ -2335,7 +2346,7 @@ class PublicEvidenceResearch:
         cached = self._cached(key, now) if cacheable else None
         if cached is not None:
             return cached
-        deadline = (started if unknown_title else time.monotonic()) + self.deadline_seconds
+        deadline = (started + self.unknown_deadline_seconds if unknown_title else time.monotonic() + self.deadline_seconds)
         blocked = set()
         official = []
         for url in official_urls:
@@ -2344,7 +2355,7 @@ class PublicEvidenceResearch:
                 break
             if host in blocked:
                 continue
-            page, was_blocked = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS)
+            page, was_blocked = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS, deadline if unknown_title else None)
             if was_blocked:
                 blocked.add(host)
                 continue
@@ -2361,7 +2372,7 @@ class PublicEvidenceResearch:
                 break
             if host in blocked:
                 continue
-            page, was_blocked = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS)
+            page, was_blocked = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS, deadline if unknown_title else None)
             if was_blocked:
                 blocked.add(host)
                 continue
@@ -2976,4 +2987,6 @@ def status():
                         "maxCandidateCacheEntries": MAX_SOURCE_CACHE,
                         "maxSourcePages": MAX_SOURCE_PAGES,
                         "maxResearchSeconds": MAX_RESEARCH_SECONDS,
+                        "unknownResearchSeconds": UNKNOWN_RESEARCH_SECONDS,
+                        "unknownProviderSeconds": UNKNOWN_PROVIDER_SECONDS,
                         "searchEnabled": False}}

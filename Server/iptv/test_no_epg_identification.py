@@ -237,3 +237,29 @@ class ReviewObserverTests(unittest.TestCase):
         headline="WWE NXT Results 11/4 - Six Woman Tag Team Match"
         self.assertEqual(audio._unknown_report_air_date(headline,"This is Wrestling Inc.’s results for “WWE NXT” on November 4, 2025, with a singles match"),"2025-11-04")
         self.assertEqual(audio._unknown_report_air_date(headline,"Results for WWE Raw on November 4, 2025"),"")
+
+class ResearchTimingTests(unittest.TestCase):
+    def test_remaining_deadline_is_passed_to_page_fetch(self):
+        timeouts=[]
+        def fetch(url,timeout):
+            timeouts.append(timeout)
+            return fixtures.OFFICIAL_PAGE
+        research=audio.PublicEvidenceResearch(lambda _:None,provider=lambda _:([fixtures.OFFICIAL_URL],[]),
+            deadline_seconds=1,unknown_deadline_seconds=2,fetch_with_timeout=fetch)
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":""}
+        research({"programme":ctx,"clues":list(fixtures.nxt_request().clues)})
+        self.assertEqual(len(timeouts),1)
+        self.assertGreater(timeouts[0],0)
+        self.assertLessEqual(timeouts[0],2)
+
+class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
+    def test_unknown_provider_uses_expanded_budget_without_changing_known_lane(self):
+        ctx={"seriesTitle":"","clues":list(fixtures.nxt_request().clues)}
+        with patch.dict(self.g.gateway_config,{"episodeAudioEnabled":True,"metadataResearchTimeoutSeconds":180}), \
+             patch.object(self.g.opencode_discovery,"public_episode_search",return_value={"official":[],"reports":[]}), \
+             patch.object(self.g.opencode_discovery,"available",return_value=True), \
+             patch.object(self.g.opencode_discovery,"run_model_detailed",return_value=({"official":[],"reports":[]},{})) as model:
+            self.g.episode_source_provider(ctx)
+            self.assertEqual(model.call_args.args[2],audio.UNKNOWN_PROVIDER_SECONDS)
+            self.g.episode_source_provider(dict(ctx,seriesTitle="WWE NXT"))
+            self.assertEqual(model.call_args.args[2],8)
