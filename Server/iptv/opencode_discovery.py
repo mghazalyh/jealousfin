@@ -57,7 +57,7 @@ def model_environment(work):
 def _safe_tool_name(value):
     return value if isinstance(value,str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}",value) else ""
 
-def parse_events_detailed(data):
+def parse_events_detailed(data, strict_episode=False):
     """Parse OpenCode JSON events and return bounded diagnostics, never query text."""
     fragments=[];searched=False
     diagnostics={"eventCounts":{},"toolCalls":[],"completedSearches":0,"failedSearches":0,
@@ -74,9 +74,11 @@ def parse_events_detailed(data):
             return None,diagnostics
         if kind=="tool_use":
             if not isinstance(part,dict):
-                if "unknown" not in diagnostics["otherTools"]:diagnostics["otherTools"].append("unknown")
+                if strict_episode and "unknown" not in diagnostics["otherTools"]:diagnostics["otherTools"].append("unknown")
                 continue
-            tool=_safe_tool_name(part.get("tool")) or "unknown";state=part.get("state") if isinstance(part.get("state"),dict) else {}
+            tool=_safe_tool_name(part.get("tool"))
+            if strict_episode and not tool:tool="unknown"
+            state=part.get("state") if isinstance(part.get("state"),dict) else {}
             status=_safe_tool_name(state.get("status")) or "unknown"
             if len(diagnostics["toolCalls"])<64:diagnostics["toolCalls"].append({"tool":tool or "unknown","status":status})
             if tool=="websearch":
@@ -86,7 +88,7 @@ def parse_events_detailed(data):
                 diagnostics["otherTools"].append(tool)
         if kind=="text" and isinstance(part,dict) and isinstance(part.get("text"),str):
             fragments.append(part["text"]);diagnostics["textChars"]+=len(part["text"])
-    if diagnostics["otherTools"]:
+    if strict_episode and diagnostics["otherTools"]:
         diagnostics["error"]="unexpected-tool"
         return None,diagnostics
     raw="\n".join(fragments).strip();fence=chr(96)*3
@@ -199,7 +201,7 @@ def run_model_detailed(prompt,model,timeout,variant=DEFAULT_VARIANT,episode_lead
     try:
         data,timed_out=_run_model_process(prompt,model,timeout,variant,retain_partial=True) if episode_leads else _run_model_process(prompt,model,timeout,variant)
         diagnostics["outputBytes"]=len(data);diagnostics["timedOut"]=bool(timed_out)
-        result,parsed=parse_events_detailed(data);diagnostics.update(parsed)
+        result,parsed=parse_events_detailed(data,strict_episode=episode_leads);diagnostics.update(parsed)
         if episode_leads:
             leads=completed_episode_search_leads(data)
             # The final model answer is not source provenance. Even a valid

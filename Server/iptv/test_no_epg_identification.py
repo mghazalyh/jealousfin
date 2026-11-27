@@ -436,3 +436,20 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
         with patch.object(discovery,"_run_model_process",return_value=(encode([completed(official),answer]),False)):
             result,diag=discovery.run_model_detailed("fixture",discovery.DEFAULT_MODEL,1)
         self.assertEqual(result,final)
+
+    def test_strict_event_rejection_is_only_enabled_in_unknown_title_lane(self):
+        encode=lambda rows: "\n".join(json.dumps(r) for r in rows).encode()
+        completed={"type":"tool_use","part":{"tool":"websearch","state":{"status":"completed","output":fixtures.OFFICIAL_URL}}}
+        malformed={"type":"tool_use","part":{}}
+        answer={"type":"text","part":{"text":'{"official":[],"reports":[]}'}}
+        data=encode([completed,malformed,answer])
+        result,diag=discovery.parse_events_detailed(data)
+        self.assertEqual(result,{"official":[],"reports":[]})
+        self.assertIsNone(diag["error"])
+        result,diag=discovery.parse_events_detailed(data,strict_episode=True)
+        self.assertIsNone(result)
+        self.assertEqual(diag["error"],"unexpected-tool")
+        other={"type":"tool_use","part":{"tool":"bash"}}
+        data=encode([completed,other])
+        self.assertEqual(discovery.parse_events_detailed(data)[1]["error"],"invalid-answer")
+        self.assertEqual(discovery.parse_events_detailed(data,strict_episode=True)[1]["error"],"unexpected-tool")
