@@ -1076,6 +1076,98 @@ class EpisodeRetryDiagnosticsTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(observer.diagnostics()["reasons"].get("retry-inactive"), 1)
 
+    def inactive_observer(self, retry_calls, activity, research=None):
+        wall = time.time()
+        observer = audio.EpisodeObserver(
+            lambda: current(now=wall),
+            research or (lambda payload: (_ for _ in ()).throw(
+                AssertionError("research must not run below the active floor"))),
+            enabled=True, budget=audio.EpisodeBudget(),
+            programme=lambda cid: context_row(), activity=activity,
+            retry=lambda binding, reason: retry_calls.append((binding.visit_id, reason)) or True)
+        job = {"cid": CHANNEL, "name": "CW Presents WWE NXT", "deviceVerified": True,
+               "changed": False, "launchID": "launch-1", "streamGeneration": "generation-1",
+               "visitID": "visit-1", "observedAt": wall - 5, "expiresAt": wall + 50,
+               "sampleDigest": "b" * 32, "episodeOnly": False, "activeSeconds": 0}
+        decision = {"outcome": "allowed", "language": "en", "confidence": 0.97,
+                    "speechSeconds": 21.0, "sampleSeconds": 0.0}
+        return observer, job, decision
+
+    def test_positive_progress_below_floor_defers_bounded_same_visit_retry(self):
+        calls = []
+        observer, job, decision = self.inactive_observer(
+            calls, lambda cid: {"channel_id": cid, "active_seconds": 60,
+                                "hasEpisodeIdentity": False})
+        self.assertIsNone(observer(job, decision, NXT_TEXT))
+        self.assertEqual(calls, [("visit-1", "inactive")])
+        diagnostics = observer.diagnostics()
+        self.assertEqual(diagnostics["reasons"].get("budget-inactive"), 1)
+        self.assertEqual(diagnostics["retriesRequested"], 1)
+        # An independent episode retry is still bounded per physical visit.
+        observer(dict(job, episodeOnly=True), decision, NXT_TEXT)
+        observer(dict(job, episodeOnly=True), decision, NXT_TEXT)
+        self.assertEqual(len(calls), observer.max_retries)
+        self.assertEqual(observer.diagnostics()["reasons"].get("retry-exhausted"), 1)
+
+    def test_unavailable_active_view_never_requests_a_retry(self):
+        for activity in (None, lambda cid: {"channel_id": cid, "active_seconds": 0,
+                                            "hasEpisodeIdentity": False}):
+            with self.subTest(activity=activity):
+                calls = []
+                observer, job, decision = self.inactive_observer(calls, activity)
+                self.assertIsNone(observer(job, decision, NXT_TEXT))
+                self.assertEqual(calls, [])
+                diagnostics = observer.diagnostics()
+                self.assertEqual(diagnostics["reasons"].get("budget-inactive"), 1)
+                self.assertEqual(diagnostics["reasons"].get("retry-inactive"), 1)
+
+    def test_stale_visit_never_requests_an_inactive_retry(self):
+        calls = []
+        wall = time.time()
+        observer = audio.EpisodeObserver(
+            lambda: current(now=wall, visitID="visit-other"),
+            lambda payload: (_ for _ in ()).throw(AssertionError("research must not run")),
+            enabled=True, budget=audio.EpisodeBudget(),
+            activity=lambda cid: {"channel_id": cid, "active_seconds": 60,
+                                  "hasEpisodeIdentity": False},
+            retry=lambda binding, reason: calls.append(reason) or True)
+        job = {"cid": CHANNEL, "name": "CW Presents WWE NXT", "deviceVerified": True,
+               "changed": False, "launchID": "launch-1", "streamGeneration": "generation-1",
+               "visitID": "visit-1", "observedAt": wall - 5, "expiresAt": wall + 50,
+               "sampleDigest": "b" * 32, "activeSeconds": 60}
+        decision = {"outcome": "allowed", "language": "en", "confidence": 0.97,
+                    "speechSeconds": 21.0, "sampleSeconds": 0.0}
+        self.assertIsNone(observer(job, decision, NXT_TEXT))
+        self.assertEqual(calls, [])
+        self.assertEqual(observer.diagnostics()["reasons"].get("session-unverified"), 1)
+
+    def test_same_visit_retry_researches_once_progress_reaches_the_floor(self):
+        wall = time.time()
+        active = {"seconds": 60}
+        retries, researched = [], []
+        observer = audio.EpisodeObserver(
+            lambda: current(now=wall),
+            lambda payload: researched.append(payload) or ([nxt_official()], nxt_reports()),
+            enabled=True, budget=audio.EpisodeBudget(clock=lambda: wall),
+            activity=lambda cid: {"channel_id": cid, "active_seconds": active["seconds"],
+                                  "hasEpisodeIdentity": False},
+            retry=lambda binding, reason: retries.append((binding.visit_id, reason)) or True)
+        job = {"cid": CHANNEL, "name": "CW Presents WWE NXT", "deviceVerified": True,
+               "changed": False, "launchID": "launch-1", "streamGeneration": "generation-1",
+               "visitID": "visit-1", "observedAt": wall - 5, "expiresAt": wall + 50,
+               "sampleDigest": "b" * 32, "episodeOnly": False, "activeSeconds": 60}
+        decision = {"outcome": "allowed", "language": "en", "confidence": 0.97,
+                    "speechSeconds": 21.0, "sampleSeconds": 0.0}
+        self.assertIsNone(observer(job, decision, NXT_TEXT))
+        self.assertEqual(retries, [("visit-1", "inactive")])
+        self.assertEqual(researched, [])
+        active["seconds"] = 150
+        promotion = observer(dict(job, episodeOnly=True), decision, NXT_TEXT)
+        self.assertTrue(promotion.accepted)
+        self.assertEqual(promotion.episode.identity.broadcaster_code, "S20E24")
+        self.assertEqual(len(researched), 1)
+        self.assertEqual(len(retries), 1)
+
     def test_stale_session_rejection_is_not_retried(self):
         calls = []
         observer, job, decision = self.retry_observer(calls)

@@ -2481,7 +2481,7 @@ class EpisodeObserver:
     def _schedule_retry(self, binding, reason, now):
         """Request one bounded, independent episode-only retry if playback runs."""
         category = reason_category(reason)
-        if category not in ("commercial", "no-match"):
+        if category not in ("commercial", "no-match", "inactive"):
             self._diagnose("retry-not-applicable", category, reason)
             return False
         if not callable(self.retry):
@@ -2562,6 +2562,13 @@ class EpisodeObserver:
             if not allowed:
                 self._diagnose("budget-" + str(budget_reason or "rejected"), "budget",
                                "episodeOnly" if retry else "")
+                if budget_reason == "inactive":
+                    # The clue is not dropped just because independent active
+                    # viewing has not reached the unchanged floor yet. Ask the
+                    # existing media-triggered episode retry for one bounded,
+                    # same-visit reattempt; it only runs while playback is
+                    # actually progressing because _usable_activity fails closed.
+                    self._schedule_retry(binding, "inactive", now)
                 return None
             self.budget.begin(view, dedup_key=dedup_key)
         payload = request.research_payload()
