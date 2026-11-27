@@ -37,6 +37,7 @@ MAX_MAP_BYTES = 2 * 1024 * 1024
 MAX_SEGMENT_BYTES = 16 * 1024 * 1024
 MAX_PCM_SECONDS = 75.0
 TMP_PREFIX = "jealousfin-spanish-"
+_UNSET = object()
 
 # Conservative automatic-mark thresholds. These are intentionally stricter
 # than a single-window whisper heuristic: several separated speech-bearing
@@ -804,17 +805,70 @@ class Manager:
                 self.log("spanish auto decode error " + type(error).__name__)
             self._housekeeping()
 
+    def _gap_is_continuous(self, sample, probe, observed):
+        if not isinstance(probe, dict) or not isinstance(observed, dict):
+            return False
+        if not observed.get("verified") or not language_visits.is_verified(observed.get("visitID")):
+            return False
+        start = sample.probe if isinstance(sample.probe, dict) else {}
+        visit = sample.visit if isinstance(sample.visit, dict) else {}
+        if not visit.get("verified") or not language_visits.is_verified(visit.get("visitID")):
+            return False
+        if observed.get("visitID") != visit.get("visitID"):
+            return False
+        if probe.get("channelID") != sample.cid:
+            return False
+        if observed.get("channelID") and observed.get("channelID") != sample.cid:
+            return False
+        launch = start.get("launchID")
+        stream = start.get("streamGeneration")
+        if not isinstance(launch, str) or not launch:
+            return False
+        if not isinstance(stream, str) or not stream:
+            return False
+        if probe.get("launchID") != launch or probe.get("streamGeneration") != stream:
+            return False
+        if observed.get("launchID") not in (None, "", launch):
+            return False
+        if observed.get("streamGeneration") not in (None, "", stream):
+            return False
+        return True
+
     def _decode_event(self, event):
         if not self._enabled():
             return
         now = event["wall"]
         sample = self._samples.get(event["cid"])
-        if sample and now - sample.last_tap > VISIT_GAP_SECONDS:
-            self._finalize(event["cid"], "visit_gap")
-            sample = None
+        gap_checked = False
+        gap_probe = None
+        gap_observed = None
+        if sample is not None:
+            if now < sample.last_tap:
+                return
+            if now - sample.last_tap > VISIT_GAP_SECONDS:
+                gap_checked = True
+                gap_probe = self._probe()
+                gap_observed = self._observe_visit(gap_probe)
+                if self._gap_is_continuous(sample, gap_probe, gap_observed):
+                    sample.last_tap = now
+                    if isinstance(gap_probe, dict) and gap_probe.get("channelID"):
+                        self._probe_cid = gap_probe["channelID"]
+                        self._probe_at = time.time()
+                else:
+                    self._finalize(event["cid"], "visit_gap", end_probe=gap_probe,
+                                   observed=gap_observed)
+                    sample = None
+            else:
+                sample.last_tap = now
         if sample is None:
-            probe = self._probe()
-            observed = self._observe_visit(probe)
+            if gap_checked:
+                probe = gap_probe
+                observed = gap_observed if isinstance(gap_observed, dict) else {
+                    "visitID": "", "verified": False, "newVisit": False,
+                    "reason": "identity_unavailable"}
+            else:
+                probe = self._probe()
+                observed = self._observe_visit(probe)
             visit = observed
             if not (observed.get("verified") and observed.get("channelID") == event["cid"]):
                 visit = {"visitID": "", "verified": False, "newVisit": False,
@@ -969,7 +1023,7 @@ class Manager:
             }
         self._persist()
 
-    def _finalize(self, cid, reason):
+    def _finalize(self, cid, reason, end_probe=_UNSET, observed=_UNSET):
         sample = self._samples.pop(cid, None)
         if sample is None:
             return
@@ -1029,12 +1083,15 @@ class Manager:
             marker["reason"] = "observation_disabled"
             self._state_disabled(cid, sample, marker)
             return
-        end_probe = self._probe()
+        if end_probe is _UNSET:
+            end_probe = self._probe()
+            observed = _UNSET
         if end_probe and end_probe.get("channelID"):
             self._probe_cid = end_probe["channelID"]
             self._probe_at = time.time()
             # Recognise a departure even when no other channel was sampled.
-            self._observe_visit(end_probe)
+            if observed is _UNSET:
+                self._observe_visit(end_probe)
         start_verified = bool(sample.probe and sample.probe.get("channelID") == cid)
         identity_conflict = bool(sample.probe and sample.probe.get("channelID") and sample.probe.get("channelID") != cid)
         start_launch = str((sample.probe or {}).get("launchID", ""))
