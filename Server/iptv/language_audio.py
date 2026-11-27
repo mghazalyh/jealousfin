@@ -233,12 +233,14 @@ class Manager(base.Manager):
                             "speechRatio": window["speechRatio"], "usable": True,
                             "language": detected[0], "probability": detected[1],
                         })
-                full = pathlib.Path(workdir) / "full.wav"
-                base._write_wav(full, job["pcm"])
-                transcript = base.transcribe(full, self.whisper, self.model_path, workdir, self.threads)
-                lexical = base.lexical_margin(transcript[1]) if transcript else (None, 0, 0)
-                decision = decide_language(analysis, window_results, lexical,
-                                           transcript[0] if transcript else None)
+                decision = decide_language(analysis, window_results, None, None)
+                if base.decision_needs_transcript(decision):
+                    full = pathlib.Path(workdir) / "full.wav"
+                    base._write_wav(full, job["pcm"])
+                    transcript = base.transcribe(full, self.whisper, self.model_path, workdir, self.threads)
+                    lexical = base.lexical_margin(transcript[1]) if transcript else (None, 0, 0)
+                    decision = decide_language(analysis, window_results, lexical,
+                                               transcript[0] if transcript else None)
             self._notify_speech(job, decision, transcript)
             if job.get("episodeOnly"):
                 # Reuse the transcript for episode clues only. Never record a

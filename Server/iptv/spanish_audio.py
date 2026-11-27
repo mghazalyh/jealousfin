@@ -346,6 +346,28 @@ def lexical_margin(text):
     return round((spanish - portuguese) / total, 4), spanish, portuguese
 
 
+def decision_needs_transcript(decision):
+    """True only when a full-sample transcript can still change the decision.
+
+    The transcript is consumed exclusively by the lexical and full-language
+    checks, and those run only after separated windows have narrowed to one
+    confident language.  When the window evidence is already inconclusive for
+    another reason, a full-sample Whisper pass cannot alter the outcome, so it
+    is redundant work that delays the result and risks a stale-session
+    rejection.  A conclusive window decision still always transcribes because
+    lexical margin or a full-language mismatch may legitimately retract it.
+    """
+    if not isinstance(decision, dict) or decision.get("outcome") != "inconclusive":
+        return True
+    # Only skip known terminal window-only failures. Future/unknown reasons
+    # conservatively retain the original full-transcript path.
+    return decision.get("reason") not in {
+        "sample_too_short", "insufficient_speech", "low_speech_coverage",
+        "insufficient_speech_windows", "ambiguous_language", "mixed_language",
+        "low_language_confidence", "unknown_language",
+    }
+
+
 def decide(analysis, window_results, lexical, config=None):
     """Conservative aggregation. Returns outcome/reason/confidence/evidence."""
     values = {
@@ -1216,13 +1238,15 @@ class Manager:
                             "speechRatio": window["speechRatio"], "usable": True,
                             "language": detected[0], "probability": detected[1],
                         })
-                full = Path(workdir) / "full.wav"
-                _write_wav(full, job["pcm"])
-                transcript = transcribe(full, self.whisper, self.model_path, workdir, self.threads)
-                lexical = lexical_margin(transcript[1]) if transcript else (None, 0, 0)
-                if transcript and transcript[0] not in ("es", "en", "pt"):
-                    lexical = (None, lexical[1], lexical[2])
-                decision = decide(analysis, window_results, lexical)
+                decision = decide(analysis, window_results, None)
+                if decision_needs_transcript(decision):
+                    full = Path(workdir) / "full.wav"
+                    _write_wav(full, job["pcm"])
+                    transcript = transcribe(full, self.whisper, self.model_path, workdir, self.threads)
+                    lexical = lexical_margin(transcript[1]) if transcript else (None, 0, 0)
+                    if transcript and transcript[0] not in ("es", "en", "pt"):
+                        lexical = (None, lexical[1], lexical[2])
+                    decision = decide(analysis, window_results, lexical)
             self._record_result(job, decision)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

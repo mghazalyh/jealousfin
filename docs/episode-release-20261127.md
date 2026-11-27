@@ -63,6 +63,7 @@ Server/iptv/test_incident_sampler_gap_20261127.py
 Server/iptv/test_incident_selector_pressure_20261127.py
 Server/iptv/test_incident_startup_admission_pressure.py
 Server/iptv/test_language_pause.py
+Server/iptv/test_language_timing_20261128.py
 Server/iptv/test_overlay_bridge.py
 Server/iptv/test_programme_overlay.py
 Server/iptv/test_release_integration.py
@@ -207,3 +208,5 @@ Bounded recovery may wait out shared status backoff only for English PlaybackInf
 Foreground recovery reserves the next status admission, accounts for elapsed initial reads, and shares selector observations only within the same credential scope. Multi-base requests without sufficient remaining budget fail closed.
 
 Catalogue reconnect now uses bounded fresh-profile recovery before the synchronous manual-classification callback; policy/programme polling remains fail-closed without waiting.
+
+Language inference skips full transcription only for known terminal window-only failures. Conclusive and lexical-dependent decisions retain transcription and episode handoff.
