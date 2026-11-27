@@ -359,6 +359,25 @@ class GatewayAcceptance(unittest.TestCase):
                     json.dumps({'schemaVersion':1,'action':'add','channelID':'a'*32,'channelName':'A','nonce':'n','extra':1})):
             self.assertIsNone(sc.parse_marker(raw))
 
+    def test_playback_marker_is_nonblocking_and_single_flight(self):
+        import threading
+        g=self.g
+        entered=threading.Event()
+        release=threading.Event()
+        def slow(*args):
+            entered.set()
+            release.wait(3)
+        with patch.object(g,'apply_device_spanish_request',side_effect=slow) as callback:
+            try:
+                self.assertTrue(g.enqueue_playback_marker({},''))
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(g.enqueue_playback_marker({},''))
+                self.assertEqual(callback.call_count,1)
+            finally:
+                release.set()
+                self.assertTrue(g.playback_marker_lock.acquire(timeout=2))
+                g.playback_marker_lock.release()
+
     def test_prototype_selector_contract(self):
         import prototype_selector as ps
         from unittest.mock import patch

@@ -1811,6 +1811,20 @@ def language_visit_identity():
  if language_visit_ledger is None:
   language_visit_ledger=language_visits.Ledger(ROOT)
  return language_visit_ledger
+playback_marker_lock=threading.Lock()
+def enqueue_playback_marker(config,device_token):
+ # Bound optional UI callbacks to one in flight.
+ if not playback_marker_lock.acquire(blocking=False):return False
+ def run():
+  try:apply_device_spanish_request(config,device_token)
+  except Exception as error:log('Playback marker worker '+type(error).__name__)
+  finally:playback_marker_lock.release()
+ try:threading.Thread(target=run,name='playback-marker',daemon=True).start()
+ except Exception:
+  playback_marker_lock.release()
+  return False
+ return True
+
 def apply_device_spanish_request(config, device_token):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint
  if SOURCE_PROFILE!='american':return
@@ -2889,10 +2903,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
   # Read a pending manual Spanish request only on catalogue and playback
   # boundaries. The health poll is deliberately excluded to avoid a callback
   # every few seconds. Failure never blocks the request.
-  if path in ('/LiveTv/Channels',) or re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
+  if path=='/LiveTv/Channels':
+   # Catalogue refresh remains the explicit manual-classification boundary.
    apply_device_spanish_request(config,token)
-   # Existing catalogue/playback lifecycle only. The worker re-probes the
-   # verified device channel before it writes the one overlay form field.
+   overlay_enqueue('refresh')
+  elif re.fullmatch(r'/Items/[a-f0-9]{32}/PlaybackInfo',path):
+   # Never wait for an optional UI callback before starting media.
+   enqueue_playback_marker(config,token)
    overlay_enqueue('refresh')
   if path in ('/LiveTv/Channels','/LiveTv/Programs','/Jealousfin/Policy'):
    if prototype_selector.selected_profile(config,token)=='malay':
