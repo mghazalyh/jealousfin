@@ -46,6 +46,7 @@ import CryptoKit
     @Published var commandOutput=""
     let player=AVPlayer()
     let disk=Disk()
+    private lazy var eventAppends=EventAppendQueue(disk:disk)
     @Published private(set) var db:TorrioDB
     private var repositoryChanging=false
     let lan=LANServer()
@@ -276,8 +277,13 @@ import CryptoKit
         rotationState=disk.load(SurfRotationState.self,"surf-rotation.json") ?? SurfRotationState()
         let cachedIDs=Set(channels.map(\.id))
         rotationState.seed(scope:rotationScope,ids:Set(ledger.events.map(\.channelID)).intersection(cachedIDs))
-        for url in disk.files(prefix:"event-").suffix(150) {
-            if let d=try? Data(contentsOf:url),let e=try? JSONCodec.decoder().decode(Event.self,from:d){ events.append(e) }
+        Task { [weak self] in
+            guard let self=self else{return}
+            _=await self.disk.trimDiagnosticEventsAsync(maxCount:5000,maxBytes:32*1024*1024)
+            let replayed=await self.disk.loadRecentEvents(limit:150)
+            guard !replayed.isEmpty else{return}
+            let known=Set(self.events.map(\.id))
+            self.events=Array((replayed.filter{!known.contains($0.id)}+self.events).suffix(300))
         }
         jelly.log={ [weak self] severity,code,fields in self?.log(severity,"jellyfin",code,fields) }
         lan.handler={ [weak self] data,completion in
@@ -484,6 +490,10 @@ import CryptoKit
                         self.sampleSystemTelemetry(force:true)
                         self.publishHeartbeat(now:Date())
                         self.requestSync()
+                    }
+                    if name==UIApplication.didEnterBackgroundNotification {
+                        await self.eventAppends.flush()
+                        self.disk.markCleanShutdown()
                     }
                 }
             }
@@ -760,7 +770,7 @@ import CryptoKit
     func log(_ severity:String,_ component:String,_ code:String,_ fields:[String:String]=[:]){
         let e=Event(severity:severity,component:component,code:code,trace:trace,fields:fields.mapValues{sanitized($0)})
         events.append(e);if events.count>300 {events.removeFirst(events.count-300)}
-        disk.save(e,"event-\(e.id).json")
+        eventAppends.enqueue(e,name:"event-\(e.id).json")
         if severity=="ERROR" || severity=="CRITICAL" {recalculateInsights()}
     }
     var eligibleChannels:[Channel] {channels.filter{!$0.isSurf && (health[$0.id]?.eligible(at:Date()) ?? true)}}
@@ -1803,20 +1813,25 @@ import CryptoKit
         await retentionTask?.value
         try Task.checkCancellation()
         // Persist immutable batches before deleting their source records.
-        for url in disk.files(prefix:"batch-").prefix(5) {
-            let b=try Data(contentsOf:url)
-            try await db.immutable("telemetry/\(deviceID)/"+url.lastPathComponent,data:b)
+        let batchURLs=Array(disk.files(prefix:"batch-").prefix(5))
+        for url in batchURLs {
+            let name=url.lastPathComponent
+            let b=try await Task.detached(priority:.utility){try Data(contentsOf:url)}.value
+            try await db.immutable("telemetry/\(deviceID)/"+name,data:b)
             disk.remove(url)
         }
         let urls=Array(disk.files(prefix:"event-").prefix(200))
         if !urls.isEmpty {
-            let records=try urls.map{try JSONCodec.decoder().decode(Event.self,from:Data(contentsOf:$0))}
+            let records=try await Task.detached(priority:.utility){
+                try urls.map{try JSONCodec.decoder().decode(Event.self,from:Data(contentsOf:$0))}
+            }.value
             let name="batch-\(UUID().uuidString).json"
             guard disk.save(records,name) else{throw AppError.message("Local batch write failed")}
             for url in urls{disk.remove(url)}
-            let data=try Data(contentsOf:disk.root.appendingPathComponent(name))
+            let batchURL=disk.root.appendingPathComponent(name)
+            let data=try await Task.detached(priority:.utility){try Data(contentsOf:batchURL)}.value
             try await db.immutable("telemetry/\(deviceID)/"+name,data:data)
-            disk.remove(disk.root.appendingPathComponent(name))
+            disk.remove(batchURL)
         }
     }
     private func synchronize() async {
@@ -3068,7 +3083,7 @@ extension AppModel {
         for url in disk.files(prefix:"qa-result-").prefix(12) {
             if applicationTrial?.pending==true,let cp=campaign,url.lastPathComponent.hasPrefix("qa-result-"+cp.runID+"-"){continue}
             if let cp=campaign,cp.canResume,url.lastPathComponent=="qa-result-"+cp.resultID+".json"{continue}
-            let data=try Data(contentsOf:url)
+            let data=try await Task.detached(priority:.utility){try Data(contentsOf:url)}.value
             let result=try JSONCodec.decoder().decode(DeviceTestResult.self,from:data)
             try await db.immutable("engineering/"+deviceID+"/results/"+result.id+".json",data:data)
             disk.remove(url)
@@ -3489,7 +3504,7 @@ extension AppModel {
     }
     private func uploadPatchArchives()async throws{
         for url in disk.files(prefix:"patch-archive-").prefix(8){
-            let data=try Data(contentsOf:url)
+            let data=try await Task.detached(priority:.utility){try Data(contentsOf:url)}.value
             let record=try JSONCodec.decoder().decode(PatchArchive.self,from:data)
             guard record.deviceID==deviceID,record.build==patchReleaseEpoch.build,DynamicUILayout.validID(record.id) else{throw AppError.message("Invalid or cross-build patch archive")}
             try dbArchiveCheck(record)

@@ -136,7 +136,31 @@ import Foundation
         precondition(asyncDisk.queuedCount(prefix:"event-")==3 && asyncDisk.files(prefix:"event-").count==3)
         let asyncFocusedTrim=await asyncDisk.trimDiagnosticEventsAsync(maxCount:1,maxBytes:1024*1024)
         precondition(asyncFocusedTrim.removed==2 && asyncDisk.queuedCount(prefix:"event-")==1)
-        print("PASS: exact diagnostic accounting, byte bound, durable retention, off-main append and unclean-launch evidence")
+        let orderedDisk=Disk(root:fixtureRoot.appendingPathComponent("ordered-events"))
+        let appendQueue=EventAppendQueue(disk:orderedDisk,maxPending:3)
+        for index in 0..<5{appendQueue.enqueue(Event(severity:"INFO",component:"focused",code:"QUEUE_\(index)"),name:"event-queue-\(index).json")}
+        precondition(appendQueue.pendingCount==3 && appendQueue.dropped==2)
+        await appendQueue.flush()
+        precondition(orderedDisk.files(prefix:"event-").map{$0.lastPathComponent}==["event-queue-2.json","event-queue-3.json","event-queue-4.json"])
+        let queuedEvents=await orderedDisk.loadRecentEvents(limit:3)
+        precondition(queuedEvents.map(\.code)==["QUEUE_2","QUEUE_3","QUEUE_4"])
+        let recentDisk=Disk(root:fixtureRoot.appendingPathComponent("recent-events"))
+        for index in 0..<4{
+            let name="event-recent-\(index).json"
+            precondition(recentDisk.save(Event(severity:"INFO",component:"focused",code:"RECENT_\(index)"),name))
+            let stamp=Date(timeIntervalSince1970:1_700_000_000+Double(index))
+            try FileManager.default.setAttributes([.creationDate:stamp],ofItemAtPath:recentDisk.root.appendingPathComponent(name).path)
+        }
+        let recentEvents=await recentDisk.loadRecentEvents(limit:2)
+        precondition(recentEvents.map(\.code)==["RECENT_2","RECENT_3"])
+        let lifecycleDisk=Disk(root:fixtureRoot.appendingPathComponent("lifecycle-events"))
+        let lifecycleQueue=EventAppendQueue(disk:lifecycleDisk,maxPending:8)
+        for index in 0..<3{lifecycleQueue.enqueue(Event(severity:"INFO",component:"focused",code:"LIFECYCLE_\(index)"),name:"event-lifecycle-\(index).json")}
+        await lifecycleQueue.flush()
+        lifecycleDisk.markCleanShutdown()
+        let cleanLifecycleDisk=Disk(root:fixtureRoot.appendingPathComponent("lifecycle-events"))
+        precondition(cleanLifecycleDisk.previousUncleanLaunch==nil && cleanLifecycleDisk.queuedCount(prefix:"event-")==3)
+        print("PASS: exact diagnostic accounting, byte bound, durable retention, bounded ordered off-main append, startup replay order and clean lifecycle evidence")
         let trial=try HotConfigurationTrial(before:HotConfigurationStore(),candidateRevision:hotConfigFixture.revision,expiresAt:Date().addingTimeInterval(60)).checked()
         precondition(configDisk.save(trial,"hot-config-trial.json"))
         let recoveredTrial=try configDisk.recoverConfigurationTrial()

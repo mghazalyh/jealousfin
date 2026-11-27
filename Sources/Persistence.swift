@@ -304,6 +304,69 @@ struct DiagnosticPruneResult: Equatable {
             if name.hasPrefix("batch-"),batchIndex != nil{batchIndex?.removeValue(forKey:name)}
         } catch { self.error="Cannot remove uploaded batch" }
     }
+    func loadRecentEvents(limit:Int) async -> [Event] {
+        guard limit>0 else{return []}
+        let directory=root
+        return await Task.detached(priority:.utility){
+            Self.readRecentEvents(root:directory,limit:limit)
+        }.value
+    }
+    private nonisolated static func readRecentEvents(root:URL,limit:Int)->[Event]{
+        let keys:[URLResourceKey]=[.creationDateKey,.isRegularFileKey]
+        guard let urls=try? FileManager().contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{return []}
+        var entries:[(URL,Date,String)]=[]
+        for url in urls {
+            let name=url.lastPathComponent
+            guard name.hasPrefix("event-"),url.pathExtension=="json",
+                  let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile==true else{continue}
+            entries.append((url,v.creationDate ?? .distantPast,name))
+        }
+        entries.sort{$0.1 == $1.1 ? $0.2 < $1.2 : $0.1 < $1.1}
+        var events:[Event]=[]
+        for entry in entries.suffix(limit) {
+            guard let data=try? Data(contentsOf:entry.0),
+                  let event=try? JSONCodec.decoder().decode(Event.self,from:data) else{continue}
+            events.append(event)
+        }
+        return events
+    }
+}
+
+@MainActor final class EventAppendQueue {
+    private let disk:Disk
+    private let maxPending:Int
+    private var pending:[(Event,String)]=[]
+    private var drainTask:Task<Void,Never>?
+    private(set) var dropped=0
+    init(disk:Disk,maxPending:Int=512){
+        self.disk=disk
+        self.maxPending=max(1,maxPending)
+    }
+    var pendingCount:Int{pending.count}
+    func enqueue(_ event:Event,name:String){
+        guard name.hasPrefix("event-") else{return}
+        if pending.count>=maxPending{pending.removeFirst();dropped+=1}
+        pending.append((event,name))
+        if drainTask==nil{
+            drainTask=Task{[weak self] in await self?.drain()}
+        }
+    }
+    func drain() async {
+        while !pending.isEmpty {
+            let item=pending.removeFirst()
+            _=await disk.appendEventAsync(item.0,item.1)
+        }
+        drainTask=nil
+    }
+    func flush() async {
+        while let task=drainTask {
+            await task.value
+        }
+        if !pending.isEmpty {
+            drainTask=Task{[weak self] in await self?.drain()}
+            await drainTask?.value
+        }
+    }
 }
 struct GitFile {
     var sha: String
