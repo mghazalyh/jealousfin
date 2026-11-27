@@ -13,6 +13,7 @@ import language_audio
 import language_pending
 import language_visits
 import overlay_bridge
+import deployment_continuity
 spanish_classification=language_exclusions
 spanish_audio=language_audio
 from policy_observer import connect as policy_connect, failure as policy_failure, penalty as policy_penalty
@@ -23,6 +24,7 @@ PORT=source_profiles.gateway_port(os.environ,SOURCE_PROFILE)
 MIN_CHANNELS=source_profiles.minimum_channels(os.environ,SOURCE_PROFILE)
 ROOT=source_profiles.state_root(os.environ['JEALOUSFIN_STATE_DIR'],SOURCE_PROFILE)
 ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
+MEDIA_CONTINUITY=deployment_continuity.Continuity(ROOT)
 MAX_BODY=32*1024*1024
 MAX_PLAYLIST=2*1024*1024
 TEST_USER=os.environ['JEALOUSFIN_USERNAME']
@@ -338,6 +340,8 @@ def register(url,cid,correlation=None,identity=None):
    if len(resources)>=RESOURCE_LIMIT:raise RuntimeError("Resource registry saturated")
    rid=secrets.token_hex(16);resources[rid]=(cid,url);reverse[key]=rid;resource_keys[rid]=key
    if identity is not None:segment_resources.add(rid);resource_bases[rid]=identity[0]
+   kind='segment' if identity is not None else ('playlist' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else 'media')
+   MEDIA_CONTINUITY.record_handle(rid,cid,kind,time.time())
   resource_touched[rid]=now
   if correlation:resource_correlation[rid]=correlation
  return ('/malay/media/' if SOURCE_PROFILE=='malay' else '/media/')+TOKEN+'/'+rid+('.m3u8' if '.m3u8' in urllib.parse.urlsplit(url).path.lower() else '.bin')
@@ -2244,6 +2248,18 @@ def policy_event(cid,trace,action,reason):
    record_maintenance_ignored(cid,trace,reason,now)
    log('MAINTENANCE_IGNORED failure channel='+cid)
    return
+  if action=="failure":
+   deployment=deployment_continuity.failure_ignores(ROOT,cid,reason,now)
+   if deployment is not None:
+    # A gateway restart invalidated the handles used by the live visit. Only a
+    # fixed after-startup reason, the same channel's repeated stale-handle 404s
+    # and the short post-restart window qualify; the original event identity is
+    # preserved and no health counter is changed.
+    db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_DEPLOYMENT_IGNORED",cid,trace,reason[:300]))
+    db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)",(trace,cid,now))
+    deployment_continuity.record_ignored(ROOT,'gateway','NATIVE_POLICY_FAILURE',trace,reason,deployment)
+    log('DEPLOYMENT_IGNORED failure channel='+cid+' stale='+str(deployment['staleHitCount']))
+    return
   db.execute("INSERT INTO observed VALUES(?,?,?,?,?,?)",(event_id,now,"NATIVE_POLICY_"+action,cid,trace,reason[:300]))
   if action=="failure":
    db.execute("INSERT OR IGNORE INTO sessions(trace,cid,opened) VALUES(?,?,?)",(trace,cid,now))
@@ -2498,7 +2514,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
      else:
       resources.move_to_end(rid);resource_touched[rid]=now;active_channels[entry[0]]=now+gateway_config['activeProtectionSeconds']
       correlation=resource_correlation.get(rid,correlation)
-   if not entry:return self.reply(404,{})
+   if not entry:
+    MEDIA_CONTINUITY.stale_handle(rid)
+    return self.reply(404,{})
    cid,url=entry
    playback_activity.touch(cid)
    started=time.monotonic();kind='segment' if rid in segment_resources else 'other'
@@ -2638,6 +2656,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main():
  global PROVIDER,spanish_auto_manager
  PROVIDER=provider()
+ MEDIA_CONTINUITY.begin_generation()
  reload_gateway_config(force=True)
  initialize_catalogue()
  load_favorites()

@@ -138,3 +138,62 @@ assert report.error_category({'phase':'policy','error':'OperationalError'})=='ga
 assert report.error_category({'phase':'media','error':'HTTP 403'})=='upstream_http'
 assert report.error_category({'phase':'resolve','error':'ValueError'})=='resolution_or_delivery_unknown'
 print('PASS: telemetry metric validity and explicit delivery evidence classification')
+
+# A gateway restart can invalidate the live visit's handles. Only a fixed
+# after-startup reason, repeated stale 404s for the same channel and the short
+# post-restart window are suppressed; a generic stall remains a real failure.
+with tempfile.TemporaryDirectory() as d:
+    import json
+    import deployment_continuity
+    root=pathlib.Path(d)
+    original_root=p.ROOT
+    p.ROOT=root
+    try:
+        c=p.connect(root/'deployment.sqlite3')
+        cid='d'*32
+        c.execute('INSERT INTO channel(id,name) VALUES(?,?)',(cid,'D'))
+        now=int(time.time())
+        rid='a'*32
+        old=deployment_continuity.Continuity(root)
+        old.begin_generation(now=now-30)
+        old.record_handle(rid,cid,'playlist',now-29)
+        active=deployment_continuity.Continuity(root)
+        active.begin_generation(now=now-20)
+        assert active.stale_handle(rid,now-10)
+        assert active.stale_handle(rid,now-5)
+        p.ingest(c,[event(100,'PLAYBACK_STALLED',now-1,'deploy-trace',cid,
+                          reason='Video frames stalled after startup',terminal=True)],
+                 {'rotationMinutes':1})
+        assert c.execute('SELECT failures,hiatus_until FROM channel WHERE id=?',(cid,)).fetchone()==(0,0)
+        assert c.execute('SELECT code FROM observed WHERE id=?',('100',)).fetchone()[0]=='DEPLOYMENT_IGNORED_PLAYBACK_STALLED'
+        audit=json.loads((root/deployment_continuity.IGNORED_FILE).read_text().splitlines()[-1])
+        assert audit['source']=='observer' and audit['originalCode']=='PLAYBACK_STALLED'
+        assert audit['correlation']['staleHitCount']==2
+        p.ingest(c,[event(101,'PLAYBACK_STALLED',now-1,'real-trace',cid,
+                          reason='Playback stalled',terminal=True)],
+                 {'rotationMinutes':1})
+        failures,hiatus=c.execute('SELECT failures,hiatus_until FROM channel WHERE id=?',(cid,)).fetchone()
+        assert failures==1 and hiatus>now
+        c.close()
+    finally:
+        p.ROOT=original_root
+print('PASS: deployment restart correlation suppresses only the stale-handle startup stall')
+
+# Missing generation state, stale evidence for another channel, too few hits and
+# an expired window all fail open to the normal strict health policy.
+with tempfile.TemporaryDirectory() as d:
+    import deployment_continuity
+    root=pathlib.Path(d)
+    cid='e'*32;other='f'*32;rid='b'*32
+    assert deployment_continuity.failure_ignores(root,cid,'Video frames stalled after startup',time.time()) is None
+    old=deployment_continuity.Continuity(root);old.begin_generation(now=1000.0)
+    old.record_handle(rid,cid,'segment',1001.0)
+    active=deployment_continuity.Continuity(root);active.begin_generation(now=1010.0)
+    active.stale_handle(rid,1011.0)
+    assert deployment_continuity.failure_ignores(root,cid,'Video frames stalled after startup',1012.0) is None
+    active.stale_handle(rid,1012.0)
+    assert deployment_continuity.failure_ignores(root,other,'Video frames stalled after startup',1013.0) is None
+    assert deployment_continuity.failure_ignores(root,cid,'Video frames stalled',1013.0) is None
+    assert deployment_continuity.failure_ignores(root,cid,'Video frames stalled after startup',1010.0+181.0) is None
+    assert deployment_continuity.failure_ignores(root,cid,'Video frames stalled after startup',1013.0) is not None
+print('PASS: deployment correlation fails closed for unrelated channels, weak evidence and expired windows')

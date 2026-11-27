@@ -2,6 +2,7 @@
 Never controls playback, changes credentials, or contacts an upstream media source."""
 import os, collections, datetime as dt, json, pathlib, sqlite3, time, urllib.request, uuid, sys, re, hashlib
 import source_profiles
+import deployment_continuity
 SOURCE_PROFILE=source_profiles.profile_name(os.environ)
 ROOT=source_profiles.state_root(os.environ.get('JEALOUSFIN_STATE_DIR',str(pathlib.Path(__file__).resolve().parent)),SOURCE_PROFILE)
 DB=ROOT/'policy.sqlite3'
@@ -193,6 +194,11 @@ def ingest(c,events,status):
         if not cid or not c.execute('SELECT 1 FROM channel WHERE id=?',(cid,)).fetchone():continue
         reason=str(fields.get('reason',''))
         if code in ('PLAYBACK_STALLED','FAILURE_UNCONFIRMED','CHANNEL_FAILED') and fields.get('terminal') not in ('false',False):
+            deployment=deployment_continuity.failure_ignores(ROOT,cid,reason,at)
+            if deployment is not None:
+                cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,'DEPLOYMENT_IGNORED_'+code,cid,trace,reason[:300]))
+                if cur.rowcount:deployment_continuity.record_ignored(ROOT,'observer',code,trace,reason,deployment)
+                continue
             if maintenance_ignores(reason,at) is not None:
                 cur=c.execute('INSERT OR IGNORE INTO observed VALUES(?,?,?,?,?,?)',(e['id'],at,'MAINTENANCE_IGNORED_'+code,cid,trace,reason[:300]))
                 if cur.rowcount:record_maintenance_ignored(cid,trace,reason,at)

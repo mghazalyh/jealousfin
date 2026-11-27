@@ -15,7 +15,7 @@ Run gateway.py and policy_observer.py as separate managed processes. Do not expo
 
 An optional local hiatus-seed.json in the state directory may contain an array of objects with id, at (ISO 8601), reason. Never commit deployment-specific data or secrets. The native app's record_channel_failure command requires explicit approval. Gateway filtering is independent of native health accounting; the client's hiatus screen only shows native ledger entries. Native and gateway exclusions may overlap.
 
-Run python3 test_policy_observer.py for isolated policy checks. The first successful startup does not prove sustained playback. The observer can miss old events that have already rotated out of the device log window. It uses observed terminal failures, not individual retry errors, to avoid penalizing an otherwise successful session. A policy database outage fails closed; do not install a new IPA until policy readiness is verified.
+Run python3 test_policy_observer.py for isolated policy checks and python3 -m unittest test_deployment_continuity -v for restart-correlation checks. The first successful startup does not prove sustained playback. The observer can miss old events that have already rotated out of the device log window. It uses observed terminal failures, not individual retry errors, to avoid penalizing an otherwise successful session. A policy database outage fails closed; do not install a new IPA until policy readiness is verified.
 
 ## Future iOS deployment
 
@@ -38,6 +38,8 @@ After deploying the reviewed gateway, place a validated `gateway-runtime.json` i
 ## Restart-safe quality and rotation
 
 Gateway favorites are persisted atomically in private `favorites.json`; migration from a legacy gateway must export the full authenticated favorites catalogue before stopping it, and retain the original token, account/server ID and login credentials. Keep a consistent SQLite backup and checkpoint the current channel/category/pause/countdown. Existing attempt history is preserved. A legacy client requires a same-channel reload after a controlled gateway restart; opaque media handles are not portable across processes.
+
+A private, bounded handle ledger now correlates a gateway restart with the live physical visit without making the upstream URL or token portable. After restart, repeated stale-handle 404s for the same channel plus one fixed native after-startup stall reason inside a 180-second window suppress only that failure. The original observed event identity and an audit are retained; health counters, bans, rotations, language decisions and Surf state are untouched. Generic stalls, other channels, weak/expired evidence and corrupt state still receive strict hiatus. See [deployment media continuity](../../docs/deployment-media-continuity-20261127.md) for rollout, rollback and limitations.
 
 Explicitly sequenced complete HLS segments can be coalesced and cached for 45 seconds, with a 64 MiB global cap and 8 MiB item cap. Manifests, keys, byte ranges and unsequenced resources bypass caching. Private status exposes bounded per-channel delivery latency samples, errors and cache hits. This is delivery telemetry, not decoded frame cadence measurement, and does not transcode the stream.
 

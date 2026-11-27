@@ -408,6 +408,58 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(self.req("/Jealousfin/Policy")[1]["channels"][self.b]["banned"],False)
         self.assertEqual(self.req("/Jealousfin/Policy",auth=False)[0],401)
 
+    def test_deployment_restart_suppresses_only_correlated_startup_stall(self):
+        import deployment_continuity as continuity
+        g=self.g
+        root=pathlib.Path(self.temp.name)
+        rid="a"*32
+        old=continuity.Continuity(root)
+        old.begin_generation(now=1000.0)
+        old.record_handle(rid,self.c,"playlist",1001.0)
+        active=continuity.Continuity(root)
+        active.begin_generation(now=1010.0)
+        g.MEDIA_CONTINUITY=active
+        self.assertIsNotNone(active.stale_handle(rid,1011.0))
+        self.assertIsNotNone(active.stale_handle(rid,1012.0))
+        before=g.policy_rows()[self.c]
+        with patch.object(g.time,"time",return_value=1013.0):
+            g.policy_event(self.c,"TRACE-DEPLOY","failure","Video frames stalled after startup")
+        self.assertEqual(g.policy_rows()[self.c],before)
+        with g.policy_connect(self.db) as db:
+            self.assertTrue(db.execute("SELECT 1 FROM observed WHERE id=?",("native-policy:TRACE-DEPLOY:failure",)).fetchone())
+            self.assertEqual(db.execute("SELECT code FROM observed WHERE id=?",("native-policy:TRACE-DEPLOY:failure",)).fetchone()[0],"NATIVE_POLICY_DEPLOYMENT_IGNORED")
+        audit=[json.loads(line) for line in (root/continuity.IGNORED_FILE).read_text().splitlines()]
+        self.assertEqual(audit[-1]["originalCode"],"NATIVE_POLICY_FAILURE")
+        self.assertEqual(audit[-1]["trace"],"TRACE-DEPLOY")
+        # A different channel and a generic real stall cannot borrow the evidence.
+        other="d"*32
+        g.channels[other]={"Id":other,"Name":other,"Type":"TvChannel"}
+        g.sources[other]=other
+        with g.policy_connect(self.db) as db:
+            db.execute("INSERT OR IGNORE INTO channel(id,name) VALUES(?,?)",(other,other))
+        with patch.object(g.time,"time",return_value=1013.5):
+            g.policy_event(other,"TRACE-OTHER","failure","Video frames stalled after startup")
+            g.policy_event(self.c,"TRACE-REAL","failure","Playback stalled")
+        self.assertEqual(g.policy_rows()[other]["failures"],1)
+        self.assertGreater(g.policy_rows()[self.c]["failures"],before["failures"])
+
+    def test_restart_stale_media_request_is_recorded_by_channel(self):
+        import deployment_continuity as continuity
+        g=self.g
+        root=pathlib.Path(self.temp.name)
+        rid="e"*32
+        now=time.time()
+        old=continuity.Continuity(root)
+        old.begin_generation(now=now-10)
+        old.record_handle(rid,self.c,"playlist",now-9)
+        active=continuity.Continuity(root)
+        active.begin_generation(now=now-5)
+        g.MEDIA_CONTINUITY=active
+        self.assertEqual(self.req("/media/fixture-token/"+rid+".m3u8")[0],404)
+        self.assertEqual(len(continuity.stale_hits(root,self.c,now-10,now+10)),1)
+        self.assertEqual(self.req("/media/fixture-token/"+("f"*32)+".m3u8")[0],404)
+        self.assertEqual(len(continuity.stale_hits(root,self.c,now-10,now+10)),1)
+
     def test_policy_unavailable_fails_closed(self):
         with self.g.policy_connect(self.db) as db:db.execute("DELETE FROM meta WHERE key='seeded'")
         self.assertEqual(self.req("/LiveTv/Channels")[0],503)
@@ -739,6 +791,8 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertNotIn("idle",g.resources)
         self.assertNotIn((self.a,"idle"),g.reverse)
 
+
+from test_deployment_continuity import DeploymentContinuityTests
 
 if __name__=="__main__":
     unittest.main()
