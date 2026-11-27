@@ -77,6 +77,7 @@ Tests/main.swift
 docs/episode-paused-retry-20261127.md
 docs/episode-release-20261127.md
 docs/incident-identity-overlay-20261127.md
+docs/incident-overlay-post-pressure-20261127.md
 docs/incident-probe-concurrency-20261127.md
 docs/schedule-episode-discovery-20261127.md
 ```
