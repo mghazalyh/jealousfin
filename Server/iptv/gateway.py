@@ -2007,42 +2007,56 @@ DEVICE_PROBE_LOCK=threading.Lock()
 DEVICE_PROBE_CONDITION=threading.Condition(DEVICE_PROBE_LOCK)
 DEVICE_PROBE_INFLIGHT=False
 DEVICE_PROBE_VERSION=0
+DEVICE_PROBE_CURRENT=None
 DEVICE_PROBE_SHARED=None
 DEVICE_PROBE_SHARED_FAULT=''
 DEVICE_PROBE_SHARED_VERSION=-1
-DEVICE_PROBE_STATS={'probes':0,'shared':0,'failures':0,'byReason':{}}
+DEVICE_PROBE_STATS={'probes':0,'shared':0,'failures':0,'timeouts':0,'byReason':{}}
 device_probe_fault=''
+DEVICE_PROBE_LOCAL=threading.local()
 def _device_probe_copy(value):
  return dict(value) if isinstance(value,dict) else value
+def _device_probe_set_local_fault(reason):
+ # Per-call attribution.  A fresh probe must never overwrite the fault of a
+ # coalesced flight that is still running on another worker thread.
+ DEVICE_PROBE_LOCAL.fault=reason or ''
+def _device_probe_local_fault():
+ return getattr(DEVICE_PROBE_LOCAL,'fault','')
+class _DeviceProbeFlight:
+ # One owner plus its exact waiters.  The completion event is the single
+ # handoff point: a waiter can never mistake a newer flight for the one it
+ # joined, and a timeout never starts a duplicate owner.
+ __slots__=('version','event','result','fault','exception')
+ def __init__(self,version):
+  self.version=version;self.event=threading.Event()
+  self.result=None;self.fault='';self.exception=None
 def device_identity_pair(config,token):
  # The GET route is read-only and does not create durable command receipts.
  # New native builds provide channel and generation in a single atomic status.
  # Legacy installed IPAs need a separate player snapshot for stream identity.
- global device_probe_fault
  try:status=prototype_selector.device_status(config,token)
  except Exception:
-  device_probe_fault='device_status_unavailable';raise
+  _device_probe_set_local_fault('device_status_unavailable');raise
  if not isinstance(status,dict):
-  device_probe_fault='device_status_invalid';raise ValueError('Invalid device state')
+  _device_probe_set_local_fault('device_status_invalid');raise ValueError('Invalid device state')
  channel=status.get('currentChannelID');generation=status.get('streamGeneration')
  if isinstance(channel,str) and channel and isinstance(generation,str) and generation:
   return status,{'channelID':channel,'streamGeneration':generation}
  try:snapshot=json.loads(prototype_selector.device_command(config,token,'get_player_snapshot',{}))
  except Exception:
-  device_probe_fault='device_snapshot_unavailable';raise
+  _device_probe_set_local_fault('device_snapshot_unavailable');raise
  if not isinstance(snapshot,dict):
-  device_probe_fault='device_snapshot_invalid';raise ValueError('Invalid player snapshot')
+  _device_probe_set_local_fault('device_snapshot_invalid');raise ValueError('Invalid player snapshot')
  return status,snapshot
 
 def _device_language_probe_once():
  # One coherent read: channel, launch and generation must describe the same
  # instant.  An incoherent status/snapshot pair is retried once, then fails
  # closed with a stable reason instead of an opaque 'device_unavailable'.
- global device_probe_fault
- device_probe_fault=''
+ _device_probe_set_local_fault('')
  config=prototype_selector.load_selector(ROOT)
  if config is None:
-  device_probe_fault='device_not_configured';return None
+  _device_probe_set_local_fault('device_not_configured');return None
  token=os.environ.get('JEALOUSFIN_DEVICE_TOKEN','')
  incoherent=False
  for _ in range(2):
@@ -2061,57 +2075,87 @@ def _device_language_probe_once():
   paused=status.get('surfPaused') if type(status.get('surfPaused')) is bool else None
   surfing=status.get('surfing') if type(status.get('surfing')) is bool else None
   playing=status.get('playing') if type(status.get('playing')) is bool else None
-  device_probe_fault=''
+  _device_probe_set_local_fault('')
   return {'channelID':channel_id,'launchID':str(status.get('launchID','') or ''),
           'streamGeneration':stream_generation,'surfPaused':paused,'surfing':surfing,
           'playing':playing}
- if incoherent:device_probe_fault='device_incoherent'
+ if incoherent:_device_probe_set_local_fault('device_incoherent')
  return None
 
+def _device_probe_record_completion(flight,value,fault,error,count_probe):
+ global device_probe_fault,DEVICE_PROBE_INFLIGHT,DEVICE_PROBE_CURRENT
+ global DEVICE_PROBE_SHARED,DEVICE_PROBE_SHARED_FAULT,DEVICE_PROBE_SHARED_VERSION
+ with DEVICE_PROBE_LOCK:
+  flight.result=_device_probe_copy(value)
+  flight.fault=fault or ''
+  flight.exception=error
+  flight.event.set()
+  DEVICE_PROBE_SHARED=_device_probe_copy(value)
+  DEVICE_PROBE_SHARED_FAULT=flight.fault
+  DEVICE_PROBE_SHARED_VERSION=flight.version
+  DEVICE_PROBE_INFLIGHT=False
+  if DEVICE_PROBE_CURRENT is flight:DEVICE_PROBE_CURRENT=None
+  device_probe_fault=flight.fault
+  if count_probe:
+   DEVICE_PROBE_STATS['probes']+=1
+   if not isinstance(value,dict):
+    DEVICE_PROBE_STATS['failures']+=1
+    reasons=DEVICE_PROBE_STATS['byReason']
+    reason=flight.fault or 'device_unavailable'
+    reasons[reason]=(reasons.get(reason,0)+1)
+  DEVICE_PROBE_CONDITION.notify_all()
 def device_language_probe(share=True):
  # Single-flight, not a launch cache.  A probe that is genuinely in flight is
  # shared by callers that arrive while it runs; a probe that already finished
  # is never reused.  Sequential probes therefore always read a fresh launch,
  # while concurrent language/episode/overlay probes after a new launch collapse
  # to one coherent read instead of several 3s/8s device calls.
- global device_probe_fault,DEVICE_PROBE_INFLIGHT,DEVICE_PROBE_VERSION
- global DEVICE_PROBE_SHARED,DEVICE_PROBE_SHARED_FAULT,DEVICE_PROBE_SHARED_VERSION
- if not share:return _device_language_probe_once()
- with DEVICE_PROBE_CONDITION:
-  if DEVICE_PROBE_INFLIGHT:
-   wait_version=DEVICE_PROBE_VERSION
-   deadline=time.monotonic()+DEVICE_PROBE_WAIT_SECONDS
-   while DEVICE_PROBE_INFLIGHT and DEVICE_PROBE_VERSION==wait_version:
-    remaining=deadline-time.monotonic()
-    if remaining<=0:break
-    DEVICE_PROBE_CONDITION.wait(remaining)
-   if (not DEVICE_PROBE_INFLIGHT
-       and DEVICE_PROBE_SHARED_VERSION==wait_version):
-    DEVICE_PROBE_STATS['shared']+=1
-    device_probe_fault=DEVICE_PROBE_SHARED_FAULT
-    return _device_probe_copy(DEVICE_PROBE_SHARED)
-  DEVICE_PROBE_VERSION+=1
-  my_version=DEVICE_PROBE_VERSION
-  DEVICE_PROBE_INFLIGHT=True
+ global DEVICE_PROBE_INFLIGHT,DEVICE_PROBE_VERSION,DEVICE_PROBE_CURRENT
+ if not share:
+  # Independently fresh observation.  It owns its own thread-local fault and
+  # never joins or mutates the coalesced flight.
+  return _device_language_probe_once()
+ with DEVICE_PROBE_LOCK:
+  flight=DEVICE_PROBE_CURRENT
+  if flight is None or flight.event.is_set():
+   DEVICE_PROBE_VERSION+=1
+   flight=_DeviceProbeFlight(DEVICE_PROBE_VERSION)
+   DEVICE_PROBE_CURRENT=flight
+   DEVICE_PROBE_INFLIGHT=True
+   owner=True
+  else:
+   owner=False
+ if not owner:
+  if not flight.event.wait(DEVICE_PROBE_WAIT_SECONDS):
+   # Fail closed: do not start another owner while the original is still
+   # running.  A later caller will start a new flight once it completes.
+   with DEVICE_PROBE_LOCK:
+    DEVICE_PROBE_STATS['timeouts']+=1
+    reasons=DEVICE_PROBE_STATS['byReason']
+    reasons['device_probe_timeout']=(reasons.get('device_probe_timeout',0)+1)
+   _device_probe_set_local_fault('device_probe_timeout')
+   return None
+  with DEVICE_PROBE_LOCK:
+   DEVICE_PROBE_STATS['shared']+=1
+   device_probe_fault=flight.fault
+  _device_probe_set_local_fault(flight.fault)
+  if flight.exception is not None:raise flight.exception
+  return _device_probe_copy(flight.result)
+ value=None;fault='';error=None
  try:
   value=_device_language_probe_once()
- finally:
-  with DEVICE_PROBE_CONDITION:
-   DEVICE_PROBE_SHARED=_device_probe_copy(value)
-   DEVICE_PROBE_SHARED_FAULT=device_probe_fault
-   DEVICE_PROBE_SHARED_VERSION=my_version
-   DEVICE_PROBE_INFLIGHT=False
-   DEVICE_PROBE_CONDITION.notify_all()
- DEVICE_PROBE_STATS['probes']+=1
- if not isinstance(value,dict):
-  DEVICE_PROBE_STATS['failures']+=1
-  reasons=DEVICE_PROBE_STATS['byReason']
-  reasons[device_probe_fault]=(reasons.get(device_probe_fault,0)+1)
+  fault=_device_probe_local_fault()
+ except BaseException as failure:
+  error=failure
+  fault=_device_probe_local_fault() or 'device_probe_exception'
+ _device_probe_record_completion(flight,value,fault,error,True)
+ if error is not None:raise error
  return value
 def device_probe_diagnostics():
  with DEVICE_PROBE_LOCK:
   return {'probes':DEVICE_PROBE_STATS['probes'],'shared':DEVICE_PROBE_STATS['shared'],
           'failures':DEVICE_PROBE_STATS['failures'],
+          'timeouts':DEVICE_PROBE_STATS['timeouts'],
           'byReason':dict(DEVICE_PROBE_STATS['byReason']),
           'fault':device_probe_fault,'inFlight':DEVICE_PROBE_INFLIGHT}
 # Optional audio-assisted episode identity. It reuses the single language
@@ -2240,7 +2284,7 @@ def episode_probe():
  if not isinstance(probe,dict):
   # Keep the legacy bucket for older dashboards but expose the exact read
   # failure so a launch-time timeout is not confused with an incoherent pair.
-  note_episode_probe('device_unavailable',device_probe_fault or 'device_unavailable');return None
+  note_episode_probe('device_unavailable',_device_probe_local_fault() or 'device_unavailable');return None
  if probe.get('surfing') is not True:
   note_episode_probe('rotation_stopped');return None
  if probe.get('playing') is False:
@@ -2570,6 +2614,7 @@ def _overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
  if not isinstance(evidence,dict):
   cached=overlay_combined_evidence
   if (isinstance(cached,dict) and cached.get('channelID')==cid
+      and (not cached.get('launchID') or cached.get('launchID')==scope.launch_id)
       and (not cached.get('visitID') or cached.get('visitID')==scope.visit_id)
       and (not cached.get('streamGeneration') or cached.get('streamGeneration')==scope.stream_generation)):
    evidence=cached.get('evidence')
@@ -2732,6 +2777,9 @@ def _overlay_process(job,stop):
   stream=job.get('streamGeneration') or '';probe_stream=current['streamGeneration']
   if stream and probe_stream and stream!=probe_stream:
    overlay_bridge_fault='stale_stream_generation';return 'stale'
+  job_launch=str(job.get('launchID') or '')
+  if job_launch and job_launch!=str(current.get('launchID') or ''):
+   overlay_bridge_fault='stale_launch';return 'stale'
   visit_id=job.get('visitID') or evidence.get('visitID') or ''
   if not _overlay_visit_matches(visit_id,current):
    overlay_bridge_fault='stale_visit';return 'stale'
@@ -2742,6 +2790,7 @@ def _overlay_process(job,stop):
    # and refresh events keep the combined label coherent without inventing a
    # new language result. The stream/visit match is checked before reuse.
    overlay_combined_evidence={'channelID':cid,
+    'launchID':str(job.get('launchID') or evidence.get('launchID') or ''),
     'visitID':str(job.get('visitID') or evidence.get('visitID') or ''),
     'streamGeneration':str(job.get('streamGeneration') or evidence.get('streamGeneration') or ''),
     'evidence':dict(evidence)}

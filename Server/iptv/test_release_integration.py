@@ -40,7 +40,7 @@ class Recorder:
         return "OK"
 
 
-def evidence(language="pt", name="Portuguese", visit="visit-1", launch="launch-1",
+def evidence(language="pt", name="Portuguese", visit="visit-1", launch="fixture-launch",
              stream="stream-1", outcome="excluded"):
     return {"model": "fixture.bin", "windows": 4, "speechSeconds": 40.0,
             "sampleSeconds": 60.0, "speechCoverage": 0.66,
@@ -261,7 +261,7 @@ class ReleaseIntegration(unittest.TestCase):
                 "channelID": A, "channelName": "Fixture A", "state": "collecting",
                 "reason": "collecting", "sampleSeconds": 12.3, "targetSeconds": 55,
                 "attempt": 1, "maxAttempts": 4, "surfPaused": True, "surfing": True,
-                "visitID": "visit-1", "launchID": "launch-1",
+                "visitID": "visit-1", "launchID": "fixture-launch",
                 "streamGeneration": "stream-1", "observedAt": now}))
             results = self.drain()
         self.assertEqual(results, ["published"])
