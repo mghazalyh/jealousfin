@@ -119,6 +119,7 @@ PUBLICATION_TTL = 1800.0
 MAX_PUBLICATIONS = 64
 MAX_RESEARCH_SECONDS = 20.0
 UNKNOWN_RESEARCH_SECONDS = 30.0
+UNKNOWN_PAGE_TIMEOUT_SECONDS = 3.0
 UNKNOWN_PROVIDER_SECONDS = 18.0
 MAX_PENDING = 8
 PENDING_DEDUP_SECONDS = 120.0
@@ -2464,7 +2465,7 @@ class PublicEvidenceResearch:
         while len(self._evidence) > MAX_SOURCE_CACHE:
             self._evidence.popitem(last=False)
 
-    def _fetch_result(self, url, allowed_hosts, deadline=None):
+    def _fetch_result(self, url, allowed_hosts, deadline=None, timeout_cap=8.0):
         if not callable(self.fetch_page) or _host(url) not in allowed_hosts:
             return None, False
         try:
@@ -2472,7 +2473,7 @@ class PublicEvidenceResearch:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None, False
-                page = self.fetch_with_timeout(url, min(8.0, remaining))
+                page = self.fetch_with_timeout(url, min(timeout_cap, remaining))
             else:
                 page = self.fetch_page(url)
         except Exception as error:
@@ -2487,6 +2488,56 @@ class PublicEvidenceResearch:
 
     def _fetch(self, url, allowed_hosts):
         return self._fetch_result(url, allowed_hosts)[0]
+
+    def _read_unknown(self, official_urls, report_urls, context, clues, deadline):
+        """Use the shared deadline fairly across both required source families.
+
+        Prefer distinct report publishers and interleave archive reads. URL
+        dates only affect order: actual fetched pages still establish identity.
+        A timeout or rejected source cannot become evidence.
+        """
+        first, later, publishers = [], [], set()
+        for url in report_urls:
+            publisher = independent_publisher(url)
+            (later if publisher in publishers else first).append(url)
+            publishers.add(publisher)
+        report_urls = first + later
+        official_urls = list(official_urls)
+        official, reports, blocked = [], [], set()
+        report_turn = bool(report_urls)
+        while (official_urls or report_urls) and time.monotonic() < deadline:
+            if report_urls and (report_turn or not official_urls):
+                url = report_urls.pop(0)
+                report_turn = False
+                if independent_publisher(url) in blocked:
+                    continue
+                page, denied = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                if denied:
+                    blocked.add(independent_publisher(url))
+                elif page is not None:
+                    reports.extend(parse_report_page(page, url, context, clues=clues))
+            elif official_urls:
+                # A report's explicit air date can prioritize existing archive
+                # leads, but cannot generate a new URL or establish identity.
+                dates = {r.original_air_date for r in reports}
+                def priority(url):
+                    match = _URL_DATE.search(urllib.parse.urlsplit(url).path + "/")
+                    return bool(match and match[1] in dates)
+                index = next((i for i, url in enumerate(official_urls) if priority(url)), 0)
+                url = official_urls.pop(index)
+                report_turn = True
+                if _host(url).removeprefix("www.") in blocked:
+                    continue
+                page, denied = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                if denied:
+                    blocked.add(_host(url).removeprefix("www."))
+                elif page is not None:
+                    official.extend(parse_official_page(page, url))
+            if len(official) >= MAX_OFFICIAL_EPISODES:
+                official_urls.clear()
+            if len(reports) >= MAX_REPORTS:
+                report_urls.clear()
+        return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
 
     def _read(self, context, clues=(), now=None):
         context = _source_context(context)
@@ -2506,6 +2557,11 @@ class PublicEvidenceResearch:
         if cached is not None:
             return cached
         deadline = (started + self.unknown_deadline_seconds if unknown_title else time.monotonic() + self.deadline_seconds)
+        if unknown_title:
+            official, reports = self._read_unknown(official_urls, report_urls, context, clues, deadline)
+            if cacheable:
+                self._store(key, official, reports, now)
+            return official, reports
         blocked = set()
         official = []
         for url in official_urls:

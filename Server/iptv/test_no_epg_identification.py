@@ -487,3 +487,35 @@ class PublicArticleAndPartialSearchTests(unittest.TestCase):
         self.assertEqual(duplicate.corroborating_sources,2)
         self.assertEqual(normal.matched_clue_count,duplicate.matched_clue_count)
         self.assertEqual(audio.independent_publisher("https://www.wrestlingobserver.com/foo"),audio.independent_publisher("https://f4wonline.com/bar"))
+
+class FairSourceReadTests(unittest.TestCase):
+    def test_distinct_reports_and_matching_archive_prioritized_under_deadline(self):
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":""}
+        first="https://www.pwmania.com/first"
+        duplicate="https://pwmania.com/second"
+        second="https://www.wrestlinginc.com/other"
+        wrong="https://www.wwe.com/shows/wwenxt/2025-11-04"
+        right="https://www.wwe.com/shows/wwenxt/2026-06-16"
+        calls=[]
+        def fetch(url,timeout):
+            calls.append((url,timeout))
+            return fixture_scoped_report() if url in (first,duplicate,second) else fixtures.OFFICIAL_PAGE
+        research=audio.PublicEvidenceResearch(lambda u:fetch(u,8),provider=lambda _:([wrong,right],[first,duplicate,second]),
+                   unknown_deadline_seconds=30,fetch_with_timeout=fetch)
+        official,reports=research({"programme":ctx,"clues":list(fixtures.nxt_request().clues)})
+        self.assertEqual([u for u,_ in calls],[first,right,second,wrong,duplicate])
+        self.assertTrue(all(0<t<=3 for _,t in calls))
+        self.assertTrue(official)
+        self.assertTrue(reports)
+
+    def test_access_denial_is_not_retried_through_publisher_alias(self):
+        import urllib.error
+        first="https://www.pwmania.com/a";alias="https://pwmania.com/b"
+        calls=[]
+        def fetch(url,timeout):
+            calls.append(url)
+            if url==first:raise urllib.error.HTTPError(url,403,"denied",None,None)
+            return None
+        research=audio.PublicEvidenceResearch(lambda u:fetch(u,8),provider=lambda _:([fixtures.OFFICIAL_URL],[first,alias]),fetch_with_timeout=fetch)
+        research({"programme":{"channelID":fixtures.CHANNEL,"seriesTitle":""},"clues":list(fixtures.nxt_request().clues)})
+        self.assertEqual(calls,[first,fixtures.OFFICIAL_URL])

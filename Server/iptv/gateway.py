@@ -2442,7 +2442,7 @@ def episode_source_provider(payload):
  if official or reports:
   log('episode public search official=%d reports=%d'%(len(official),len(reports)))
  required_reports=2 if not payload.get('seriesTitle') else 1
- if official and len({episode_audio._host(u).removeprefix('www.') for u in reports})>=required_reports:return official,reports
+ if official and len({episode_audio.independent_publisher(u) for u in reports})>=required_reports:return official,reports
  if not opencode_discovery.available():return official,reports
  try:
   # Clue-backed work is latency-sensitive. Keep the alternate provider bounded.
