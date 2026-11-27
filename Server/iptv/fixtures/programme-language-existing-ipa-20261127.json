@@ -1,0 +1,213 @@
+{
+  "pages": [],
+  "presentation": {
+    "fullscreenButtonHeight": 44,
+    "fullscreenControlTheme": "night",
+    "fullscreenCornerRadius": 12,
+    "fullscreenFitContent": true,
+    "fullscreenIconSize": 24,
+    "fullscreenMaxHeight": 0.32,
+    "fullscreenOpacity": 0.35,
+    "fullscreenPadding": 4,
+    "fullscreenPortraitMaxHeight": 0.28,
+    "fullscreenSpacing": 3
+  },
+  "revision": "programme-language-existing-ipa-20261127",
+  "schemaVersion": 1,
+  "slots": [
+    {
+      "location": "player.fullscreen.category",
+      "nodes": [
+        {
+          "id": "prototype-source-label",
+          "kind": "text",
+          "style": "caption",
+          "title": "Channel source"
+        }
+      ]
+    },
+    {
+      "location": "more.bottom",
+      "nodes": [
+        {
+          "children": [
+            {
+              "defaultValue": "",
+              "id": "spanish-request-value",
+              "kind": "input",
+              "title": "Pending request",
+              "valueKey": "form.spanishRequest"
+            },
+            {
+              "action": {
+                "arguments": {
+                  "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||\"\");})()"
+                },
+                "command": "script"
+              },
+              "id": "spanish-read",
+              "kind": "button",
+              "style": "muted",
+              "title": "Read Spanish request"
+            }
+          ],
+          "detail": "Automatic gateway read path",
+          "id": "spanish-advanced",
+          "kind": "disclosure",
+          "title": "Spanish classification"
+        },
+        {
+          "defaultValue": "Detector status unavailable",
+          "id": "language-overlay-value",
+          "kind": "input",
+          "title": "Language overlay value",
+          "valueKey": "form.languageOverlay",
+          "visibleWhen": "form.languageOverlayVisible"
+        },
+        {
+          "id": "hidden-programmeOverlay",
+          "kind": "input",
+          "title": "programmeOverlay",
+          "valueKey": "form.programmeOverlay",
+          "defaultValue": "",
+          "visibleWhen": "form.programmeOverlayHidden"
+        },
+        {
+          "id": "hidden-programmeOverlayReady",
+          "kind": "input",
+          "title": "programmeOverlayReady",
+          "valueKey": "form.programmeOverlayReady",
+          "defaultValue": "false",
+          "visibleWhen": "form.programmeOverlayHidden"
+        },
+        {
+          "id": "hidden-programmeOverlayFallback",
+          "kind": "input",
+          "title": "programmeOverlayFallback",
+          "valueKey": "form.programmeOverlayFallback",
+          "defaultValue": "true",
+          "visibleWhen": "form.programmeOverlayHidden"
+        }
+      ]
+    },
+    {
+      "location": "player.fullscreen.top",
+      "nodes": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "height": 80,
+                      "html": "<style>body{padding:3px 1px;color:#bfc0b8;background:transparent}.sources{display:flex;gap:8px}.sources button{flex:1;min-height:42px;border:1px solid #393b3b;color:#bfc0b8;background:#1b1d1e;border-radius:9px;font-weight:600}.sources button.active{background:#27332e;border-color:#53675b;color:#c1c9bb}.sources button:disabled{opacity:.5}.sources button:active{background:#343935}#msg{font-size:12px;text-align:center;padding-top:5px;color:#999e96;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}</style><div class=\"sources\"><button id=\"american\" onclick=\"selectSource('american')\">English</button><button id=\"malay\" onclick=\"selectSource('malay')\">Malay</button></div><div id=\"msg\">Source selector</div><script>\nlet busy=false,serial=0,waiters={};const el=id=>document.getElementById(id);\nfunction paint(){let s=window.jealousfinState||{},p=s.preferences||{},a=p.surfCategory==='Movies & Series'?'malay':'american';for(let name of ['american','malay']){el(name).classList.toggle('active',a===name);el(name).disabled=busy;}if(!busy)el('msg').textContent=(a==='malay'?'Malay':'English')+' · '+(s.channels??'—')+' channels';}\nwindow.addEventListener('jealousfin-state',paint);\nwindow.addEventListener('jealousfin-receipt',e=>{let d=e.detail,w=waiters[d.requestID];if(w){delete waiters[d.requestID];clearTimeout(w.timer);d.status==='succeeded'?w.resolve(d):w.reject(Error(d.result||d.status));}});\nfunction call(command,args){return new Promise((resolve,reject)=>{let id='source-'+Date.now()+'-'+(++serial);let timer=setTimeout(()=>{delete waiters[id];reject(Error('Command timed out: '+command));},120000);waiters[id]={resolve,reject,timer};window.jealousfin.command(command,args||{},id);});}\nasync function selectSource(name){if(busy)return;let s=window.jealousfinState||{},p=s.preferences||{},old=p.surfCategory||'All Channels',target=name==='malay'?'Movies & Series':'All Channels';busy=true;paint();el('msg').textContent='Loading '+(name==='american'?'English':'Malay')+'…';try{if(old===target&&s.surfing&&s.channels){if(s.surfPaused)await call('resume_surf');}else{if(s.surfing&&!s.surfPaused)await call('pause_surf');await call('stop');await call('set_preferences',{surfCategory:target});await call('refresh_catalogue');await call('start_surf',{category:target});}el('msg').textContent='Loaded '+(name==='american'?'English':'Malay');}catch(e){el('msg').textContent='Switch failed: '+String(e.message).slice(0,140);try{await call('stop');await call('set_preferences',{surfCategory:old});await call('refresh_catalogue');}catch(_){} }finally{busy=false;for(let name of ['american','malay'])el(name).disabled=false;}}\npaint();</script>",
+                      "id": "prototype-source-switcher",
+                      "kind": "web"
+                    }
+                  ],
+                  "id": "compact-sources-v2-content",
+                  "kind": "vstack"
+                }
+              ],
+              "id": "compact-sources-v2",
+              "kind": "disclosure",
+              "title": "Sources"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "defaultValue": "Detector status unavailable",
+                      "id": "language-evidence",
+                      "kind": "text",
+                      "style": "caption",
+                      "title": "Language evidence",
+                      "valueKey": "form.languageOverlay"
+                    },
+                    {
+                      "children": [
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nif(s.surfing!==true){return \"Spanish: Surf is not active\";}\nif(s.currentSharedTransport===true||s.surfRotationControllable===false){return \"Spanish: device-owned rotation required\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"add\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.command(\"next_channel\",{});\napi.log(\"Spanish mark requested: \"+id);\nreturn \"Spanish: marked \"+name+\"; excluding and advancing\";\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Mark this English channel Spanish, exclude it and advance",
+                          "id": "spanish-mark",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "globe",
+                          "title": "Spanish"
+                        },
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"remove\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"Spanish unmark requested: \"+id);\nreturn \"Spanish: unmarked \"+name+\"; English membership will refresh\";\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Explicitly remove this English channel from Spanish exclusion",
+                          "id": "spanish-unmark",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "globe.badge.chevron.backward",
+                          "title": "Not Spanish"
+                        },
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Correction: no current channel\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:2,action:\"mistaken_english\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"English correction requested: \"+id);\nreturn \"Correction: English retraction queued for \"+name;\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Retract the latest automatic language evidence for this channel; playback is unchanged",
+                          "id": "language-mistaken",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "checkmark.circle",
+                          "title": "Mistaken — English"
+                        }
+                      ],
+                      "id": "spanish-actions",
+                      "kind": "hstack"
+                    }
+                  ],
+                  "id": "compact-language-v2-content",
+                  "kind": "vstack"
+                }
+              ],
+              "id": "compact-language-v2",
+              "kind": "disclosure",
+              "title": "Language"
+            }
+          ],
+          "id": "compact-side-columns-v2",
+          "kind": "hstack"
+        }
+      ]
+    },
+    {
+      "location": "player.fullscreen.programmeTitle",
+      "nodes": [
+        {
+          "id": "programme-bottom-left-v1",
+          "kind": "web",
+          "height": 80,
+          "html": "<style>body{color:#bfc0b8;overflow:hidden;display:flex;align-items:center;height:80px;background:transparent}#wrap{min-width:0;width:100%}#title{font-size:22px;font-weight:650;line-height:26px;white-space:normal;overflow-wrap:anywhere}#note{font-size:14px;color:#a2a79f;line-height:17px}</style><div id=\"wrap\"><div id=\"title\"></div><div id=\"note\"></div></div><script>function render(){const s=window.jealousfinState||{};const title=String(s.currentProgrammeTitle||'');document.getElementById('title').textContent=title||'Identifying programme…';document.getElementById('note').textContent=title?'Language and episode evidence pending':(s.currentChannel?'Channel: '+String(s.currentChannel):'Waiting for playback');}window.addEventListener('jealousfin-state',render);render();</script>",
+          "visibleWhen": "form.programmeOverlayFallback"
+        },
+        {
+          "id": "programme-combined-native-v1",
+          "kind": "text",
+          "style": "headline",
+          "valueKey": "form.programmeOverlay",
+          "visibleWhen": "form.programmeOverlayReady",
+          "defaultValue": ""
+        }
+      ]
+    }
+  ]
+}

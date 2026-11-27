@@ -29,6 +29,12 @@ STRICT_NO_LEXICAL_PROBABILITY = 0.92
 SAME_VISIT_RETRY_SECONDS = base.SAME_VISIT_RETRY_SECONDS
 MAX_SAME_VISIT_ATTEMPTS = base.MAX_SAME_VISIT_ATTEMPTS
 STATE_PUBLISH_SECONDS = 10.0
+# An episode lookup rejected for a commercial/no-match reason may request a
+# fresh, episode-only sample in the same physical visit. It reuses already
+# fetched media bytes, never records another language evidence event and is
+# bounded independently of the language retry marker.
+EPISODE_RETRY_SECONDS = 8.0
+MAX_EPISODE_RETRY_ATTEMPTS = 2
 
 
 def _decision_language(outcome, reason, confidence, analysis, window_results, lexical,
@@ -119,6 +125,8 @@ class Manager(base.Manager):
         self.on_speech = on_speech
         self.on_state = on_state
         self._state_published = {}
+        self._episode_retries = {}
+        self._episode_retry_results = []
         super().__init__(root, model_path, None, control, probe=probe, log=log,
                          ffmpeg=ffmpeg, whisper=whisper, threads=threads, visits=visits)
 
@@ -229,7 +237,12 @@ class Manager(base.Manager):
                 decision = decide_language(analysis, window_results, lexical,
                                            transcript[0] if transcript else None)
             self._notify_speech(job, decision, transcript)
-            self._record_result(job, decision)
+            if job.get("episodeOnly"):
+                # Reuse the transcript for episode clues only. Never record a
+                # second language result, evidence event or visit count.
+                self._finish_episode_retry(job, decision)
+            else:
+                self._record_result(job, decision)
         except Exception as error:
             self._mark_finalized_result(job, "inconclusive", False, "inference_error")
             method = getattr(self, "_state_inconclusive", None)
@@ -247,6 +260,86 @@ class Manager(base.Manager):
             raise
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    @staticmethod
+    def _verified_visit(visit):
+        if not isinstance(visit, dict) or visit.get("verified") is not True:
+            return ""
+        visit_id = visit.get("visitID")
+        if not isinstance(visit_id, str) or not visit_id:
+            return ""
+        return visit_id if language_visits.is_verified(visit_id) else ""
+
+    def request_episode_retry(self, view, reason=""):
+        """Request one bounded episode-only sample in the same physical visit.
+
+        Called by the episode observer after a commercial/no-match rejection.
+        No language decision is recorded when the retry completes, so the one
+        conclusive language result for the visit is never counted twice.
+        """
+        if not isinstance(view, dict):
+            return False
+        cid = view.get("cid")
+        visit_id = view.get("visitID")
+        if not isinstance(cid, str) or not cid:
+            return False
+        if not isinstance(visit_id, str) or not language_visits.is_verified(visit_id):
+            return False
+        now = time.time()
+        key = (cid, visit_id)
+        row = self._episode_retries.get(key)
+        if row is None:
+            row = {"attempts": 0, "requested": 0.0, "reason": ""}
+            self._episode_retries[key] = row
+        if row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
+            self.log("EPISODE_RETRY_SUPPRESSED channel=%s reason=retry_limit" % cid)
+            return False
+        row["requested"] = now
+        row["reason"] = str(reason or "")[:40]
+        while len(self._episode_retries) > 128:
+            self._episode_retries.pop(next(iter(self._episode_retries)))
+        self.log("EPISODE_RETRY_REQUEST channel=%s reason=%s" % (cid, row["reason"] or "-"))
+        return True
+
+    def _episode_retry_ready(self, cid, visit, now):
+        visit_id = self._verified_visit(visit)
+        if not visit_id or not isinstance(cid, str):
+            return False
+        rows = getattr(self, "_episode_retries", None)
+        if not isinstance(rows, dict):
+            return False
+        row = rows.get((cid, visit_id))
+        if row is None or row["attempts"] >= MAX_EPISODE_RETRY_ATTEMPTS:
+            return False
+        requested = row.get("requested") or 0.0
+        return bool(requested and now - requested >= EPISODE_RETRY_SECONDS)
+
+    def _take_episode_retry(self, cid, visit, now):
+        visit_id = self._verified_visit(visit)
+        if not visit_id or not self._episode_retry_ready(cid, visit, now):
+            return False
+        row = self._episode_retries.get((cid, visit_id))
+        if row is None:
+            return False
+        row["attempts"] += 1
+        row["requested"] = 0.0
+        return True
+
+    def _finish_episode_retry(self, job, decision):
+        """Complete an episode-only sample without touching language evidence."""
+        self._mark_finalized_result(job, "episode-retry", True, "episode_only")
+        record = {
+            "at": round(time.time(), 3), "channelID": job.get("cid"),
+            "visitID": job.get("visitID", ""), "outcome": decision.get("outcome"),
+            "reason": decision.get("reason"), "language": decision.get("language"),
+            "sampleSeconds": decision.get("sampleSeconds"),
+        }
+        self._episode_retry_results.append(record)
+        while len(self._episode_retry_results) > 16:
+            self._episode_retry_results.pop(0)
+        self.log("EPISODE_RETRY_RESULT channel=%s outcome=%s reason=%s" % (
+            job.get("cid"), decision.get("outcome"), decision.get("reason")))
+        self._persist(force=True)
 
     def _notify_speech(self, job, decision, transcript):
         """Hand off only an allowed, device-verified transient transcript.
@@ -276,6 +369,7 @@ class Manager(base.Manager):
             "streamGeneration": job.get("streamGeneration", ""), "visitID": job.get("visitID", ""),
             "observedAt": now, "expiresAt": None,
             "sampleDigest": job.get("sampleDigest"), "profile": job.get("profile", "american"),
+            "episodeOnly": bool(job.get("episodeOnly")),
         }
         try:
             result = self.on_speech(view, dict(decision), transcript[1])
@@ -388,9 +482,20 @@ class Manager(base.Manager):
         marker = self._finalized.get(cid)
         visit = sample.visit if isinstance(sample.visit, dict) else {}
         visit_id = str(visit.get("visitID") or "")
+        if getattr(sample, "episode_only", False):
+            # Episode-only retries never own the language label.
+            return
         attempt = 1
         if isinstance(marker, dict) and marker.get("visitID") == visit_id:
-            attempt = int(marker.get("attempts") or 0) + 1
+            attempts = marker.get("attempts")
+            max_attempts = marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS)
+            if marker.get("conclusive") is True:
+                # The conclusive language result already owns the label; a
+                # late/in-flight collecting event must not hide it.
+                return
+            if type(attempts) is int and type(max_attempts) is int and attempts >= max_attempts:
+                return
+            attempt = int(attempts or 0) + 1
         key = (cid, visit_id, sample.started)
         now = time.time()
         last = self._state_published.get(key, 0.0)

@@ -71,6 +71,35 @@ COOLDOWN_SECONDS = 300.0
 DEDUP_SECONDS = 300.0
 MAX_DAILY_EPISODE_CALLS = 24
 
+# One rejected research attempt (no source, no match or an ad/promo-only page)
+# may be retried a small, bounded number of times in the same physical visit
+# while real playback continues. The retry reuses the existing audio sampler
+# and never records a second language evidence event.
+MAX_EPISODE_RETRIES = 2
+EPISODE_RETRY_SECONDS = 8.0
+COMMERCIAL_REASONS = frozenset({"advertisement", "reused-promo", "commercial"})
+NO_MATCH_REASONS = frozenset({
+    "missing-official-archive", "no-independent-report", "insufficient-clue-match",
+    "missing-official-air-date-match", "no-corroboration", "no-match",
+    "series-mismatch", "conflicting-air-date", "ambiguous-episode",
+})
+RETRYABLE_REASONS = COMMERCIAL_REASONS | NO_MATCH_REASONS
+
+
+def reason_category(reason):
+    """Stable diagnostics category for a rejection reason."""
+    value = str(reason or "")
+    if value in COMMERCIAL_REASONS:
+        return "commercial"
+    if value in NO_MATCH_REASONS:
+        return "no-match"
+    if value in ("session-expired", "session-changed", "session-mismatch",
+                 "session-unprobeable", "programme-changed", "stale"):
+        return "stale"
+    if value in ("duplicate-publication", "duplicate-search"):
+        return "duplicate"
+    return value or "unknown"
+
 # The existing language sampler completes a verified sample of at least
 # MIN_EVIDENCE_SAMPLE_SECONDS of real progressing playback before it hands over
 # a transcript.  A typical 60-second rotation never reaches the 120-second
@@ -106,9 +135,21 @@ ALLOWED_PROFILES = frozenset({"american"})
 ALLOWED_LANGUAGES = frozenset({"en"})
 
 # Bounded public source families. Extend only after an explicit source review.
+# The lane is not wrestling-specific: general broadcaster archives and general
+# television episode reports are accepted when their pages publish an explicit
+# episode-scoped original air date.
 OFFICIAL_ARCHIVE_HOSTS = frozenset({
     "cwtv.com", "www.cwtv.com",
     "wwe.com", "www.wwe.com",
+    "showtime.com", "www.showtime.com", "sho.com", "www.sho.com",
+    "nbc.com", "www.nbc.com", "abc.com", "www.abc.com",
+    "cbs.com", "www.cbs.com", "fox.com", "www.fox.com",
+    "amc.com", "www.amc.com", "hbo.com", "www.hbo.com",
+    "max.com", "www.max.com", "usanetwork.com", "www.usanetwork.com",
+    "syfy.com", "www.syfy.com", "tntdrama.com", "www.tntdrama.com",
+    "tbs.com", "www.tbs.com", "bravotv.com", "www.bravotv.com",
+    "paramountnetwork.com", "www.paramountnetwork.com",
+    "peacocktv.com", "www.peacocktv.com", "hulu.com", "www.hulu.com",
 })
 INDEPENDENT_REPORT_HOSTS = frozenset({
     "f4wonline.com", "www.f4wonline.com",
@@ -116,6 +157,15 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
     "wrestlinginc.com", "www.wrestlinginc.com",
     "sescoops.com", "www.sescoops.com",
     "wrestlingobserver.com", "www.wrestlingobserver.com",
+    "tvline.com", "www.tvline.com",
+    "ew.com", "www.ew.com",
+    "variety.com", "www.variety.com",
+    "hollywoodreporter.com", "www.hollywoodreporter.com",
+    "avclub.com", "www.avclub.com",
+    "vulture.com", "www.vulture.com",
+    "ign.com", "www.ign.com",
+    "decider.com", "www.decider.com",
+    "tvguide.com", "www.tvguide.com",
 })
 
 # Reviewed, non-date-specific official archive roots. A known series can be
@@ -1293,7 +1343,7 @@ class EpisodeBudget:
             self.seen.popitem(last=False)
 
     def eligible(self, view, *, has_episode_identity, profile, language, language_outcome,
-                 now=None, dedup_key="", sample_seconds=0.0):
+                 now=None, dedup_key="", sample_seconds=0.0, allow_retry=False):
         now = self.clock() if now is None else float(now)
         if profile not in ALLOWED_PROFILES:
             return False, "profile"
@@ -1323,14 +1373,16 @@ class EpisodeBudget:
         if active < required:
             return False, "inactive"
         self._prune(now)
-        if dedup_key and now - self.seen.get(dedup_key, -86400.0) < self.dedup_seconds:
-            return False, "duplicate-search"
-        row = self.windows.get(key)
-        if row:
-            if row["attempts"] and now - row["last"] < self.cooldown_seconds:
-                return False, "duplicate"
-            if len(row["attempts"]) >= self.max_attempts:
-                return False, "attempt-limit"
+        if not allow_retry:
+            if dedup_key and now - self.seen.get(dedup_key, -86400.0) < self.dedup_seconds:
+                return False, "duplicate-search"
+            row = self.windows.get(key)
+            if row:
+                if row["attempts"] and now - row["last"] < self.cooldown_seconds:
+                    return False, "duplicate"
+                if len(row["attempts"]) >= self.max_attempts:
+                    return False, "attempt-limit"
+        # Even an independent episode retry respects the daily network budget.
         if len(self.calls) >= self.daily_budget:
             return False, "budget"
         return True, ""
@@ -2269,6 +2321,7 @@ def _sanitized_job(job, now):
         "observedAt": now, "expiresAt": None,
         "sampleDigest": job.get("sampleDigest"), "profile": job.get("profile", "american"),
         "activeSeconds": job.get("activeSeconds"), "hasEpisodeIdentity": bool(job.get("hasEpisodeIdentity")),
+        "episodeOnly": bool(job.get("episodeOnly")),
     }
     for key in ("launchID", "streamGeneration", "visitID", "profile"):
         value = view.get(key)
@@ -2307,7 +2360,8 @@ class EpisodeObserver:
 
     def __init__(self, probe, research, *, enabled=DEFAULT_ENABLED, budget=None,
                  ttl=DEFAULT_SESSION_TTL, log=None, programme=None, activity=None,
-                 publisher=None, publish=None):
+                 publisher=None, publish=None, retry=None,
+                 retry_seconds=EPISODE_RETRY_SECONDS, max_retries=MAX_EPISODE_RETRIES):
         self.probe = probe
         self.research = research
         self.enabled = bool(enabled)
@@ -2318,13 +2372,36 @@ class EpisodeObserver:
         self.activity = activity
         self.publisher = publisher
         self.publish = publish
+        self.retry = retry
+        self.retry_seconds = max(0.0, float(retry_seconds))
+        self.max_retries = max(0, min(6, int(max_retries)))
         self._published = OrderedDict()
+        self._retries = OrderedDict()
         self._queue = None
         self._worker = None
         self._queue_lock = threading.Lock()
         self._pending = OrderedDict()
         self.submitted = 0
         self.dropped = 0
+        self._diagnostics = {"reasons": OrderedDict(), "lastReason": None,
+                             "lastCategory": None, "lastAt": 0.0,
+                             "retriesRequested": 0, "retriesAccepted": 0,
+                             "retriesSuppressed": 0, "lastRetryReason": None}
+        self._diag_lock = threading.Lock()
+
+    def _diagnose(self, reason, category=None, detail=None):
+        reason = str(reason or "unknown")[:80]
+        category = str(category or reason_category(reason))[:40]
+        with self._diag_lock:
+            reasons = self._diagnostics["reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
+            while len(reasons) > 32:
+                reasons.popitem(last=False)
+            self._diagnostics["lastReason"] = reason
+            self._diagnostics["lastCategory"] = category
+            self._diagnostics["lastAt"] = round(time.time(), 3)
+            if detail:
+                self._diagnostics["lastDetail"] = str(detail)[:120]
 
     def _context(self, channel_id):
         if not callable(self.programme):
@@ -2384,29 +2461,92 @@ class EpisodeObserver:
             return False
         return True
 
+    def _usable_activity(self, channel_id):
+        if not callable(self.activity):
+            return None
+        try:
+            view = self.activity(channel_id)
+        except Exception:
+            return None
+        if not isinstance(view, dict):
+            return None
+        if view.get("channel_id") not in (None, channel_id):
+            return None
+        try:
+            active = float(view.get("active_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            active = 0.0
+        return view if active > 0 else None
+
+    def _schedule_retry(self, binding, reason, now):
+        """Request one bounded, independent episode-only retry if playback runs."""
+        category = reason_category(reason)
+        if category not in ("commercial", "no-match"):
+            self._diagnose("retry-not-applicable", category, reason)
+            return False
+        if not callable(self.retry):
+            self._diagnose("retry-unavailable", "retry", reason)
+            return False
+        if self._usable_activity(binding.channel_id) is None:
+            # Actual playback paused/stopped/stale: no new media will be
+            # sampled, so the retry is intentionally not requested.
+            self._diagnose("retry-inactive", "retry", reason)
+            return False
+        key = binding.digest()
+        row = self._retries.get(key)
+        if row is None:
+            row = {"attempts": 0, "last": 0.0, "reason": ""}
+            self._retries[key] = row
+        if row["attempts"] >= self.max_retries:
+            self._diagnose("retry-exhausted", "retry", reason)
+            with self._diag_lock:
+                self._diagnostics["retriesSuppressed"] += 1
+            return False
+        row["attempts"] += 1
+        row["last"] = now
+        row["reason"] = category
+        self._retries.move_to_end(key)
+        while len(self._retries) > 64:
+            self._retries.popitem(last=False)
+        with self._diag_lock:
+            self._diagnostics["retriesRequested"] += 1
+            self._diagnostics["lastRetryReason"] = category
+        try:
+            accepted = bool(self.retry(binding, category))
+        except Exception as error:
+            self._diagnose("retry-error", "retry", type(error).__name__)
+            return False
+        self._diagnose("retry-" + ("scheduled" if accepted else "rejected"), "retry", reason)
+        if accepted:
+            with self._diag_lock:
+                self._diagnostics["retriesAccepted"] += 1
+        return accepted
+
     def _publish(self, promotion, context, now):
         if not promotion.accepted or promotion.episode is None:
             return False
         published = False
+        sink = self.publisher is not None
         if self.publisher is not None:
             try:
                 published = bool(self.publisher.publish(promotion, context, now))
             except Exception as error:
                 self.log("episode publication error " + type(error).__name__)
         if callable(self.publish):
+            sink = True
             try:
                 published = bool(self.publish(promotion, context, now)) or published
             except Exception as error:
                 self.log("episode publish callback error " + type(error).__name__)
-        if published:
+        if published or not sink:
             identity = promotion.episode.identity
             self.log("EPISODE_IDENTITY series=%s date=%s code=%s confidence=%.3f sources=%d" % (
                 identity.series_title[:80], identity.original_air_date,
                 identity.broadcaster_code or "-", promotion.episode.confidence,
                 promotion.episode.corroborating_sources))
-        return published
+        return bool(published or not sink)
 
-    def _evaluate(self, request, snapshot, context, job, now):
+    def _evaluate(self, request, snapshot, context, job, now, retry=False):
         binding = request.binding
         view = None
         dedup_key = ""
@@ -2414,21 +2554,28 @@ class EpisodeObserver:
             view = self._view(binding, job)
             dedup_key = _digest(binding.channel_id + "|" + _norm_text((context or {}).get("seriesTitle"))
                                 + "|" + "|".join(request.clues))
-            allowed, _reason = self.budget.eligible(
+            allowed, budget_reason = self.budget.eligible(
                 view, has_episode_identity=bool(view.get("hasEpisodeIdentity")),
                 profile=binding.profile, language=request.language,
                 language_outcome=request.language_outcome, dedup_key=dedup_key,
-                sample_seconds=request.sample_seconds)
+                sample_seconds=request.sample_seconds, allow_retry=retry)
             if not allowed:
+                self._diagnose("budget-" + str(budget_reason or "rejected"), "budget",
+                               "episodeOnly" if retry else "")
                 return None
             self.budget.begin(view, dedup_key=dedup_key)
         payload = request.research_payload()
         if context is not None:
             payload = dict(payload, channelID=binding.channel_id, programme=context)
-        if not callable(self.research):
-            official, reports = [], []
-        else:
-            official, reports = self.research(payload)
+        official, reports = [], []
+        if callable(self.research):
+            try:
+                official, reports = self.research(payload)
+            except Exception as error:
+                self._diagnose("research-error", "research", type(error).__name__)
+                official, reports = [], []
+        if not official and not reports:
+            self._diagnose("no-sources", "no-sources")
         # Research is network-bound. Re-probe after it and require the same
         # exact physical visit and a coherent programme before publishing.
         after = time.time()
@@ -2450,37 +2597,58 @@ class EpisodeObserver:
             elif fresh_context is not None and programme_has_episode_identity(fresh_context):
                 promotion = Promotion(False, "identity-present")
             else:
-                promotion = promote_episode(request, official, reports, fresh, after,
-                                            programme=fresh_context)
+                try:
+                    promotion = promote_episode(request, official, reports, fresh, after,
+                                                programme=fresh_context)
+                except Exception as error:
+                    self._diagnose("promotion-error", "research", type(error).__name__)
+                    promotion = Promotion(False, "promotion-error")
         if promotion.accepted and promotion.episode is not None:
             if self._duplicate(binding, promotion.episode.identity, after):
                 promotion = Promotion(False, "duplicate-publication")
+                self._diagnose("duplicate-publication", "duplicate")
+            elif not self._publish(promotion, fresh_context, after):
+                promotion = Promotion(False, "publication-failed")
+                self._diagnose("publication-failed", "publication")
             else:
-                self._publish(promotion, fresh_context, after)
+                self._diagnose("promoted", "promoted")
+        else:
+            self._diagnose(promotion.reason, reason_category(promotion.reason))
+            # Only a conclusive no-source/no-match/commercial rejection gets a
+            # bounded independent retry. Stale sessions and identity-present
+            # paths never request another audio sample.
+            self._schedule_retry(binding, promotion.reason, after)
         if self.budget is not None and view is not None:
             self.budget.finish(view, "promoted" if promotion.accepted else promotion.reason)
         return promotion
 
     def __call__(self, job, decision, text):
         if not self.enabled:
+            self._diagnose("disabled", "disabled")
             return None
         try:
             now = time.time()
-            snapshot = self.probe()
+            snapshot = self.probe() if callable(self.probe) else None
             binding = make_binding(job, snapshot, now, self.ttl)
             if binding is None or not binding.visit_id:
+                self._diagnose("session-unverified", "stale")
                 return None
             context = self._context(binding.channel_id)
             if context is not None:
                 if context.get("channelID") and context.get("channelID") != binding.channel_id:
+                    self._diagnose("programme-changed", "stale")
                     return None
                 if programme_has_episode_identity(context):
+                    self._diagnose("identity-present", "identity-present")
                     return None
             request = build_request(text, job, decision, binding, now)
             if request is None:
+                self._diagnose("request-rejected", "early-return")
                 return None
-            return self._evaluate(request, snapshot, context, job, now)
+            return self._evaluate(request, snapshot, context, job, now,
+                                  retry=bool(job.get("episodeOnly")))
         except Exception as error:
+            self._diagnose("observer-error", "error", type(error).__name__)
             self.log("episode clue observer error " + type(error).__name__)
             return None
 
@@ -2500,23 +2668,29 @@ class EpisodeObserver:
         clues and is then dropped; no PCM, transcript or page body is queued.
         """
         if not self.enabled:
+            self._diagnose("disabled", "disabled")
             return None
         try:
             clues = extract_clues(text)
             if len(clues) < MIN_DISTINCTIVE_CLUES:
+                self._diagnose("insufficient-clues", "early-return")
                 return None
             view = _sanitized_job(job, time.time())
             decision_view = _sanitized_decision(decision)
             if view is None or decision_view is None:
+                self._diagnose("invalid-handoff", "early-return")
                 return None
             if view.get("deviceVerified") is not True or view.get("changed"):
+                self._diagnose("device-unverified", "stale")
                 return None
             if decision_view.get("outcome") != "allowed" or decision_view.get("language") not in ALLOWED_LANGUAGES:
+                self._diagnose("language-gated", "language")
                 return None
             key = _digest(str(view.get("cid")) + "|" + str(view.get("visitID")) + "|" + "|".join(clues))
             now = time.time()
             self._prune_pending(now)
             if key in self._pending:
+                self._diagnose("pending-duplicate", "duplicate")
                 return None
             self._ensure_worker()
             item = PendingClue(view, decision_view, tuple(clues), now, key)
@@ -2524,11 +2698,14 @@ class EpisodeObserver:
                 self._queue.put_nowait(item)
             except queue.Full:
                 self.dropped += 1
+                self._diagnose("queue-full", "early-return")
                 return None
             self._pending[key] = now
             self.submitted += 1
+            self._diagnose("queued", "queued")
             return None
         except Exception as error:
+            self._diagnose("handoff-error", "error", type(error).__name__)
             self.log("episode handoff error " + type(error).__name__)
             return None
 
@@ -2555,22 +2732,28 @@ class EpisodeObserver:
 
     def _process_pending(self, item):
         if not self.enabled:
+            self._diagnose("disabled", "disabled")
             return None
         now = time.time()
         snapshot = self.probe() if callable(self.probe) else None
         binding = make_binding(item.job, snapshot, now, self.ttl)
         if binding is None or not binding.visit_id:
+            self._diagnose("session-unverified", "stale")
             return None
         context = self._context(binding.channel_id)
         if context is not None:
             if context.get("channelID") and context.get("channelID") != binding.channel_id:
+                self._diagnose("programme-changed", "stale")
                 return None
             if programme_has_episode_identity(context):
+                self._diagnose("identity-present", "identity-present")
                 return None
         request = build_request_from_clues(item.clues, item.job, item.decision, binding, now)
         if request is None:
+            self._diagnose("request-rejected", "early-return")
             return None
-        return self._evaluate(request, snapshot, context, item.job, now)
+        return self._evaluate(request, snapshot, context, item.job, now,
+                              retry=bool(item.job.get("episodeOnly")))
 
     def prefetch(self, context):
         """Warm public source/evidence caches without a transcript or callback.
@@ -2601,9 +2784,17 @@ class EpisodeObserver:
         return self._queue.unfinished_tasks == 0
 
     def diagnostics(self):
-        return {"submitted": self.submitted, "dropped": self.dropped,
-                "pending": len(self._pending) if self._queue is not None else 0,
-                "publications": self.publisher.diagnostics() if self.publisher is not None else None}
+        with self._diag_lock:
+            diagnostics = {key: (dict(value) if isinstance(value, OrderedDict) else value)
+                           for key, value in self._diagnostics.items()}
+        diagnostics.update({
+            "submitted": self.submitted, "dropped": self.dropped,
+            "pending": len(self._pending) if self._queue is not None else 0,
+            "retryWindows": len(self._retries),
+            "maxRetriesPerVisit": self.max_retries,
+            "retrySeconds": self.retry_seconds,
+            "publications": self.publisher.diagnostics() if self.publisher is not None else None})
+        return diagnostics
 
 
 class LocalWhisperAdapter:

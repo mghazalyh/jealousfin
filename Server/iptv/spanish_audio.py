@@ -421,7 +421,8 @@ class _Base:
 
 
 class _Sample:
-    __slots__ = ("cid", "provider", "name", "bases", "started", "last_tap", "probe", "probe_done", "visit")
+    __slots__ = ("cid", "provider", "name", "bases", "started", "last_tap", "probe",
+                 "probe_done", "visit", "episode_only")
 
     def __init__(self, cid, provider, name, now):
         self.cid = cid
@@ -433,6 +434,7 @@ class _Sample:
         self.probe = None
         self.probe_done = False
         self.visit = None
+        self.episode_only = False
 
 
 class Manager:
@@ -691,8 +693,19 @@ class Manager:
         with self._lock:
             return bool(results.get(visit_id))
 
-    def _suppress_duplicate_visit(self, last, visit, now):
+    def _episode_retry_ready(self, cid, visit, now):
+        """Optional hook: an explicit bounded episode-only retry is pending."""
+        return False
+
+    def _take_episode_retry(self, cid, visit, now):
+        """Optional hook: consume one pending episode-only retry."""
+        return False
+
+    def _suppress_duplicate_visit(self, cid, last=None, visit=None, now=None):
         """True when a new sample would be a reload/retry of one physical visit."""
+        if now is None and isinstance(cid, dict):
+            # Backward-compatible (last, visit, now) call shape.
+            cid, last, visit, now = "", cid, last, visit
         if not isinstance(last, dict):
             return False
         last_visit = last.get("visitID") if isinstance(last.get("visitID"), str) else ""
@@ -702,6 +715,10 @@ class Manager:
         if verified_current and language_visits.is_verified(last_visit) and current_visit != last_visit:
             # A verified departure and return inside the cooldown is a genuine
             # new visit and must be sampled.
+            return False
+        if verified_current and self._episode_retry_ready(cid, visit, now):
+            # A bounded episode-only retry is independent of language evidence
+            # counting. It reuses the same physical visit and audio pipeline.
             return False
         if last.get("conclusive") or self._visit_counted(current_visit):
             return True
@@ -803,12 +820,13 @@ class Manager:
                 visit = {"visitID": "", "verified": False, "newVisit": False,
                          "reason": "sample_channel_unverified"}
             last = self._finalized.get(event["cid"])
-            if self._suppress_duplicate_visit(last, visit, now):
+            if self._suppress_duplicate_visit(event["cid"], last, visit, now):
                 return
             sample = _Sample(event["cid"], event["provider"], event["name"], now)
             sample.probe = probe
             sample.probe_done = True
             sample.visit = visit
+            sample.episode_only = bool(self._take_episode_retry(event["cid"], visit, now))
             self._samples[event["cid"]] = sample
         sample.last_tap = now
         if event["name"] and not sample.name:
@@ -1032,6 +1050,7 @@ class Manager:
             "visitID": visit_id or "", "sampleToken": marker["sampleToken"],
             "attempt": marker["attempts"], "maxAttempts": marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS),
             "surfPaused": marker.get("surfPaused"), "surfing": marker.get("surfing"),
+            "episodeOnly": bool(getattr(sample, "episode_only", False)),
         }
         with self._lock:
             marker["pending"] = True
