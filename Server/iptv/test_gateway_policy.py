@@ -675,6 +675,70 @@ class GatewayAcceptance(unittest.TestCase):
         g.programme_rows[self.c]['title']='Other series'
         self.assertNotIn('episodeTitle',g.programme_snapshot(now)[self.c])
 
+    def test_episode_candidate_isolation_and_backoff(self):
+        g=self.g
+        row={'title':'Blue Bloods','episodeTitle':'Flags of Our Fathers','guideSeasonNumber':6,'guideEpisodeNumber':10}
+        search={'metas':[{'name':'Blue Bloods','id':'tt1595859'},{'name':'Blue Bloods','id':'tt32940328'}]}
+        def fetch(mid):
+            if mid=='tt32940328':raise ValueError('Invalid series metadata')
+            return ('Blue Bloods',[(6,10,'Flags of Our Fathers',2015)])
+        with patch.object(g,'lookup_json',return_value=search),patch.object(g,'fetch_episode_series',side_effect=fetch):
+            self.assertEqual(g.resolve_episode(row),{'seasonNumber':6,'episodeNumber':10})
+        self.assertEqual(g.episode_candidate_errors,1)
+        self.assertEqual(g.episode_candidate_last_error['candidate'],'tt32940328')
+        self.assertEqual(g.episode_candidate_last_error['reason'],'Invalid series metadata')
+        self.assertIn('tt32940328',g.episode_series_faults)
+        calls=[]
+        def fetch_good(mid):
+            calls.append(mid)
+            return ('Blue Bloods',[(6,10,'Flags of Our Fathers',2015)])
+        with patch.object(g,'lookup_json',return_value=search),patch.object(g,'fetch_episode_series',side_effect=fetch_good):
+            self.assertEqual(g.resolve_episode(row),{'seasonNumber':6,'episodeNumber':10})
+        self.assertEqual(calls,['tt1595859'])
+        self.assertEqual(g.episode_candidate_errors,1)
+
+    def test_episode_candidate_failure_preserves_unique_named_match(self):
+        g=self.g
+        row={'title':'Blue Bloods','episodeTitle':'Cursed','guideSeasonNumber':6,'guideEpisodeNumber':11}
+        search={'metas':[{'name':'Blue Bloods','id':'tt1595859'},{'name':'Blue Bloods','id':'tt32940328'}]}
+        def fetch(mid):
+            if mid=='tt32940328':raise ValueError('Invalid series metadata')
+            return ('Blue Bloods',[(6,12,'Cursed',2015)])
+        with patch.object(g,'lookup_json',return_value=search),patch.object(g,'fetch_episode_series',side_effect=fetch):
+            self.assertEqual(g.resolve_episode(row),{'seasonNumber':6,'episodeNumber':12})
+        self.assertEqual(g.episode_candidate_errors,1)
+
+    def test_episode_all_candidates_unavailable_fails_closed(self):
+        g=self.g
+        row={'title':'Blue Bloods','episodeTitle':'Flags of Our Fathers','guideSeasonNumber':6,'guideEpisodeNumber':10}
+        search={'metas':[{'name':'Blue Bloods','id':'tt1595859'},{'name':'Blue Bloods','id':'tt32940328'}]}
+        with patch.object(g,'lookup_json',return_value=search),patch.object(g,'fetch_episode_series',side_effect=ValueError('Invalid series metadata')):
+            with self.assertRaises(g.EpisodeLookupIncomplete) as raised:g.resolve_episode(row)
+        self.assertEqual(str(raised.exception),'Incomplete candidate details')
+        self.assertEqual(g.episode_error_code(raised.exception),'Incomplete candidate details')
+        self.assertGreaterEqual(raised.exception.retry_after,g.YEAR_RETRY_SECONDS)
+        self.assertEqual(g.episode_candidate_errors,2)
+        self.assertEqual(g.episode_error_code(ValueError('Invalid series metadata')),'Invalid series metadata')
+        self.assertEqual(g.episode_error_code(ValueError('Episode metadata limit')),'Episode metadata limit')
+        self.assertEqual(g.episode_error_code(ValueError('unexpected detail')),'ValueError')
+
+    def test_episode_worker_defers_incomplete_candidates_without_error_counter(self):
+        g=self.g;now=time.time()
+        row={'title':'Blue Bloods','episodeTitle':'Flags of Our Fathers','guideSeasonNumber':6,'guideEpisodeNumber':10}
+        stop=threading.Event()
+        incomplete=g.EpisodeLookupIncomplete([('tt32940328','Invalid series metadata',now+900)],900)
+        def wait(seconds):
+            return bool(g.episode_cache)
+        with patch.object(g,'programme_snapshot',return_value={self.c:row}),patch.object(g,'resolve_episode',side_effect=incomplete),patch.object(stop,'wait',side_effect=wait):
+            g.episode_worker(stop)
+        key=g.episode_key(row)
+        self.assertIn(key,g.episode_cache)
+        self.assertLessEqual(g.episode_cache[key]['expires']-now,905)
+        self.assertEqual(g.episode_lookup_errors,0)
+        self.assertEqual(g.episode_lookup_deferred,1)
+        self.assertEqual(g.episode_lookup_last_error['reason'],'Incomplete candidate details')
+        self.assertIn('tt32940328:Invalid series metadata',g.episode_lookup_last_error['candidates'])
+
     def test_physical_playback_activity_is_distinct_from_resource_protection(self):
         import programme_research
         g=self.g
