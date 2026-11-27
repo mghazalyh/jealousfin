@@ -8,6 +8,8 @@ import http.client
 import ipaddress
 import json
 import re
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -18,6 +20,29 @@ DEVICE_PORT = 8765
 ID = re.compile(r"^[a-f0-9]{32}$")
 NODE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 ACTION_ID = re.compile(r"^[a-z_]{1,80}$")
+STATUS_WAIT_SECONDS = 6.0
+STATUS_BACKOFF_SECONDS = 2.0
+STATUS_CLOCK = time.monotonic
+STATUS_LOCK = threading.Lock()
+STATUS_FLIGHTS = {}
+STATUS_BACKOFF = {}
+STATUS_STATS = {"reads": 0, "shared": 0, "timeouts": 0, "failures": 0, "backoffRejected": 0}
+
+
+class _StatusFlight:
+    """One owner plus the exact callers that joined its in-flight read."""
+
+    __slots__ = ("event", "status", "error", "waiters")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.status = None
+        self.error = None
+        self.waiters = 0
+
+
+def _status_key(config):
+    return (str(config["deviceIP"]), DEVICE_PORT)
 
 def load_selector(root):
     p = Path(root) / "prototype-source-selector.json"
@@ -60,10 +85,90 @@ def device_status(config, device_token=""):
         raise RuntimeError("Prototype device status invalid")
     return status
 
+def observe_device_status(config, device_token=""):
+    """Return one fresh status observation, sharing only a genuinely in-flight read.
+
+    The installed IPA is queried once per device while a read is running and
+    callers that arrive during that window join the same flight.  A completed
+    observation is never reused, so a later request always observes an explicit
+    category transition.  After a failed read, new observations fail closed for
+    a short per-device backoff instead of adding pressure to a slow device.
+    """
+    key = _status_key(config)
+    now = STATUS_CLOCK()
+    with STATUS_LOCK:
+        until = STATUS_BACKOFF.get(key, 0.0)
+        if now < until:
+            STATUS_STATS["backoffRejected"] += 1
+            raise RuntimeError("Prototype device status backoff")
+        flight = STATUS_FLIGHTS.get(key)
+        owner = flight is None
+        if owner:
+            flight = _StatusFlight()
+            STATUS_FLIGHTS[key] = flight
+    if not owner:
+        with STATUS_LOCK:
+            flight.waiters += 1
+        if not flight.event.wait(STATUS_WAIT_SECONDS):
+            with STATUS_LOCK:
+                STATUS_STATS["timeouts"] += 1
+            raise RuntimeError("Prototype device status observation timeout")
+        if flight.error is not None:
+            raise RuntimeError(str(flight.error))
+        with STATUS_LOCK:
+            STATUS_STATS["shared"] += 1
+        return dict(flight.status)
+    try:
+        status = device_status(config, device_token)
+        if not isinstance(status, dict):
+            raise RuntimeError("Prototype device status invalid")
+    except BaseException as error:
+        with STATUS_LOCK:
+            if STATUS_FLIGHTS.get(key) is flight:
+                STATUS_FLIGHTS.pop(key, None)
+            if isinstance(error, Exception):
+                STATUS_BACKOFF[key] = STATUS_CLOCK() + STATUS_BACKOFF_SECONDS
+                STATUS_STATS["failures"] += 1
+            flight.error = error
+            flight.event.set()
+        raise
+    with STATUS_LOCK:
+        if STATUS_FLIGHTS.get(key) is flight:
+            STATUS_FLIGHTS.pop(key, None)
+        STATUS_BACKOFF.pop(key, None)
+        STATUS_STATS["reads"] += 1
+        flight.status = status
+        flight.event.set()
+    return dict(status)
+
+
+def status_observation_diagnostics():
+    """Bounded counters for the selector status observation layer."""
+    now = STATUS_CLOCK()
+    with STATUS_LOCK:
+        active = {"%s:%d" % key: max(0.0, until - now)
+                  for key, until in STATUS_BACKOFF.items() if until > now}
+        return dict(STATUS_STATS, activeBackoff=active,
+                    inFlight=len(STATUS_FLIGHTS))
+
+
+def reset_status_observations():
+    """Reset observation state; intended for deterministic tests and operators."""
+    with STATUS_LOCK:
+        STATUS_FLIGHTS.clear()
+        STATUS_BACKOFF.clear()
+        for name in STATUS_STATS:
+            STATUS_STATS[name] = 0
+
+
 def selected_profile(config, device_token=""):
-    status = device_status(config, device_token)
-    category = status.get("preferences", {}).get("surfCategory")
-    if category not in ("All Channels", "Favorites", "Sports", MALAY_CATEGORY):
+    status = observe_device_status(config, device_token)
+    preferences = status.get("preferences")
+    if not isinstance(preferences, dict):
+        raise RuntimeError("Prototype device category unavailable")
+    category = preferences.get("surfCategory")
+    if not isinstance(category, str) or category not in (
+        "All Channels", "Favorites", "Sports", MALAY_CATEGORY):
         raise RuntimeError("Prototype device category unavailable")
     return "malay" if category == MALAY_CATEGORY else "american"
 
