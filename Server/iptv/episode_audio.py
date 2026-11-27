@@ -2426,6 +2426,18 @@ class PublicEvidenceResearch:
                 max_candidates=self.max_pages, cache_ttl=cache_ttl)
         self._evidence = OrderedDict()
         self._evidence_ttl = max(1.0, float(cache_ttl))
+        self._read_diag_lock = threading.Lock()
+        self._unknown_read_diag = {}
+
+    def diagnostics(self):
+        with self._read_diag_lock:
+            return dict(self._unknown_read_diag)
+
+    def _record_unknown_read(self, counts):
+        with self._read_diag_lock:
+            self._unknown_read_diag = {"calls": self._unknown_read_diag.get("calls", 0) + 1,
+                                       "last": dict(counts)}
+
 
     def _registry(self):
         if self.registry_loader is not None:
@@ -2505,13 +2517,19 @@ class PublicEvidenceResearch:
         official_urls = list(official_urls)
         official, reports, blocked = [], [], set()
         report_turn = bool(report_urls)
+        counts = {"officialCandidates": len(official_urls), "reportCandidates": len(report_urls),
+                  "officialAttempts": 0, "reportAttempts": 0, "officialFetched": 0,
+                  "reportFetched": 0, "denied": 0}
         while (official_urls or report_urls) and time.monotonic() < deadline:
             if report_urls and (report_turn or not official_urls):
                 url = report_urls.pop(0)
                 report_turn = False
                 if independent_publisher(url) in blocked:
                     continue
+                counts["reportAttempts"] += 1
                 page, denied = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                counts["denied"] += int(denied)
+                counts["reportFetched"] += int(page is not None)
                 if denied:
                     blocked.add(independent_publisher(url))
                 elif page is not None:
@@ -2528,7 +2546,10 @@ class PublicEvidenceResearch:
                 report_turn = True
                 if _host(url).removeprefix("www.") in blocked:
                     continue
+                counts["officialAttempts"] += 1
                 page, denied = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS, deadline, UNKNOWN_PAGE_TIMEOUT_SECONDS)
+                counts["denied"] += int(denied)
+                counts["officialFetched"] += int(page is not None)
                 if denied:
                     blocked.add(_host(url).removeprefix("www."))
                 elif page is not None:
@@ -2537,6 +2558,10 @@ class PublicEvidenceResearch:
                 official_urls.clear()
             if len(reports) >= MAX_REPORTS:
                 report_urls.clear()
+        counts.update(officialParsed=min(len(official), MAX_OFFICIAL_EPISODES),
+                      reportParsed=min(len(reports), MAX_REPORTS),
+                      remainingSeconds=round(max(0.0, deadline-time.monotonic()), 3))
+        self._record_unknown_read(counts)
         return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
 
     def _read(self, context, clues=(), now=None):

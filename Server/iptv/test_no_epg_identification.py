@@ -260,6 +260,22 @@ class ResearchTimingTests(unittest.TestCase):
         self.assertEqual(len(timeouts),1)
         self.assertGreater(timeouts[0],0)
         self.assertLessEqual(timeouts[0],2)
+        diag=research.diagnostics()["last"]
+        self.assertEqual(diag["officialAttempts"],1)
+        self.assertEqual(diag["officialFetched"],1)
+        self.assertEqual(diag["officialParsed"],1)
+        self.assertEqual(diag["reportFetched"],0)
+        self.assertNotIn(fixtures.OFFICIAL_URL,str(diag))
+
+    def test_failed_search_diagnostics_are_strict_only_and_redacted(self):
+        data=discovery.json.dumps({"type":"tool_use","part":{"tool":"websearch","state":{"status":"error","error":"HTTP 429 private transcript"}}}).encode()
+        _, strict=discovery.parse_events_detailed(data,strict_episode=True)
+        _, normal=discovery.parse_events_detailed(data)
+        self.assertEqual(strict["searchFailureCategories"],{"rate-limit":1})
+        self.assertEqual(strict["failedSearches"],1)
+        self.assertNotIn("private",str(strict))
+        self.assertNotIn("searchFailureCategories",normal)
+
 
 class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
     def test_unknown_provider_uses_expanded_budget_without_changing_known_lane(self):
@@ -272,6 +288,22 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
             self.assertEqual(model.call_args.args[2],audio.UNKNOWN_PROVIDER_SECONDS)
             self.g.episode_source_provider(dict(ctx,seriesTitle="WWE NXT"))
             self.assertEqual(model.call_args.args[2],8)
+
+    def test_unknown_provider_diagnostics_are_separate_and_sanitized(self):
+        ctx={"seriesTitle":"","clues":list(fixtures.nxt_request().clues)}
+        with patch.dict(self.g.gateway_config,{"episodeAudioEnabled":True}), \
+             patch.object(self.g.opencode_discovery,"public_episode_search",return_value={"official":[],"reports":[]}), \
+             patch.object(self.g.opencode_discovery,"available",return_value=True), \
+             patch.object(self.g.opencode_discovery,"run_model_detailed",side_effect=discovery.ResearchError("private transcript",{"error":"no-completed-public-search","completedSearches":0,"failedSearches":2,"timedOut":True,"seconds":17.5,"private":"private transcript"})):
+            self.assertEqual(self.g.episode_source_provider(ctx),([],[]))
+            unknown=self.g.episode_provider_diagnostics["unknown"]["last"]
+            self.assertEqual(unknown["failedSearches"],2)
+            self.assertTrue(unknown["timedOut"])
+            self.assertEqual(unknown["providerSeconds"],17.5)
+            self.assertNotIn("private",str(unknown))
+            self.g.episode_source_provider(dict(ctx,seriesTitle="WWE NXT"))
+            self.assertEqual(self.g.episode_provider_diagnostics["unknown"]["last"],unknown)
+            self.assertIn("known",self.g.episode_provider_diagnostics)
 
 class ConfirmedProgressTests(unittest.TestCase):
     def test_lead_budget_does_not_relax_known_title_or_short_sample(self):

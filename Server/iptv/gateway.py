@@ -117,6 +117,8 @@ def _overlay_pump_retire(token):
   if token is not None:overlay_pump_tokens.discard(token)
   overlay_pump_pending=bool(overlay_pump_tokens)
 episode_probe_diagnostics={'checks':0,'accepted':0,'rejections':{},'last':None}
+episode_provider_diagnostics={}
+episode_provider_diagnostics_lock=threading.Lock()
 device_rotation_cache=None
 device_rotation_checked=0.0
 language_visit_ledger=None
@@ -2431,35 +2433,71 @@ def episode_research_page(url,timeout=8.0):
  if len(data)>episode_audio.MAX_PAGE_BYTES:raise ValueError('Episode evidence page too large')
  return data
 def episode_source_provider(payload):
- # Search results are URL leads only; all pages are independently fetched,
- # parsed and corroborated. The direct lane does not depend on a paid model.
+ # Search results are URL leads only; pages still require independent evidence.
  if not gateway_config.get('episodeAudioEnabled'):return [], []
- diagnostics={}
- direct=opencode_discovery.public_episode_search(payload,validate,diagnostics=diagnostics)
- if diagnostics.get('queries') or diagnostics.get('backoff'):
-  log('EPISODE_PUBLIC_SEARCH '+json.dumps(diagnostics,separators=(',',':')))
- official,reports=direct['official'],direct['reports']
- if official or reports:
-  log('episode public search official=%d reports=%d'%(len(official),len(reports)))
- required_reports=2 if not payload.get('seriesTitle') else 1
- if official and len({episode_audio.independent_publisher(u) for u in reports})>=required_reports:return official,reports
- if not opencode_discovery.available():return official,reports
+ unknown=not payload.get('seriesTitle') and bool(payload.get('clues'))
+ lane='unknown' if unknown else 'known'
+ started=time.monotonic()
+ direct_diag={};model_diag={};official=[];reports=[]
+ direct_counts={'official':0,'reports':0}
+ model_counts={'official':0,'reports':0}
+ outcome='direct-error'
  try:
-  # Clue-backed work is latency-sensitive. Keep the alternate provider bounded.
-  unknown=not payload.get('seriesTitle') and bool(payload.get('clues'))
-  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
-  prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
-  raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'],episode_leads=unknown)
-  result=opencode_discovery.normalize_episode_sources(raw)
-  log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
-  combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
-  return combined['official'],combined['reports']
- except Exception as error:
-  diagnostics=getattr(error,'diagnostics',{})
-  reason=diagnostics.get('error') if isinstance(diagnostics,dict) else None
-  safe_reason=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','no-completed-public-search','timeout-no-approved-leads','no-approved-search-leads','timeout') else type(error).__name__
-  log('episode source discovery deferred '+safe_reason)
-  return official,reports
+  direct=opencode_discovery.public_episode_search(payload,validate,diagnostics=direct_diag)
+  if direct_diag.get('queries') or direct_diag.get('backoff'):
+   log('EPISODE_PUBLIC_SEARCH '+json.dumps(direct_diag,separators=(',',':')))
+  official,reports=direct['official'],direct['reports']
+  direct_counts={'official':len(official),'reports':len(reports)}
+  if official or reports:
+   log('episode public search official=%d reports=%d'%(len(official),len(reports)))
+  required_reports=2 if not payload.get('seriesTitle') else 1
+  if official and len({episode_audio.independent_publisher(u) for u in reports})>=required_reports:
+   outcome='direct-sufficient';return official,reports
+  if not opencode_discovery.available():
+   outcome='provider-unavailable';return official,reports
+  try:
+   timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.UNKNOWN_PROVIDER_SECONDS if unknown else 8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
+   prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
+   raw,model_diag=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'],episode_leads=unknown)
+   result=opencode_discovery.normalize_episode_sources(raw)
+   model_counts={key:len(result[key]) for key in ('official','reports')}
+   log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
+   combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
+   official,reports=combined['official'],combined['reports']
+   outcome='provider-leads' if official or reports else 'no-approved-search-leads'
+   return official,reports
+  except Exception as error:
+   model_diag=getattr(error,'diagnostics',{})
+   reason=model_diag.get('error') if isinstance(model_diag,dict) else None
+   outcome=reason if reason in ('opencode-error','invalid-answer','unexpected-tool','missing-search','no-search','no-completed-public-search','timeout-no-approved-leads','no-approved-search-leads','timeout') else 'provider-exception'
+   log('episode source discovery deferred '+outcome)
+   return official,reports
+ finally:
+  # Only fixed-schema numeric and boolean telemetry; no prompts, URLs,
+  # transcript, response text, channel identity or arbitrary exception strings.
+  if not isinstance(model_diag,dict):model_diag={}
+  def count(values,key):
+   value=values.get(key,0)
+   return min(1000000,max(0,value)) if type(value) is int else 0
+  elapsed=time.monotonic()-started
+  seconds=model_diag.get('seconds',0)
+  record={'outcome':outcome,'seconds':round(elapsed,3),
+          'directQueries':count(direct_diag,'queries'),'directResponses':count(direct_diag,'responses'),
+          'directBackoff':direct_diag.get('backoff') is True,'directLeads':direct_counts,
+          'completedSearches':count(model_diag,'completedSearches'),'failedSearches':count(model_diag,'failedSearches'),
+          'searchFailureCategories':{k:count(model_diag['searchFailureCategories'],k)
+              for k in opencode_discovery.EPISODE_SEARCH_FAILURE_CATEGORIES
+              if count(model_diag['searchFailureCategories'],k)}
+              if isinstance(model_diag.get('searchFailureCategories'),dict) else {},
+          'timedOut':model_diag.get('timedOut') is True,
+          'providerSeconds':round(seconds,3) if type(seconds) in (int,float) and 0<=seconds<=3600 else None,
+          'providerLeads':model_counts,'combinedLeads':{'official':len(official),'reports':len(reports)},
+          'remainingResearchSeconds':round(max(0,episode_audio.UNKNOWN_RESEARCH_SECONDS-elapsed),3) if unknown else None}
+  with episode_provider_diagnostics_lock:
+   previous=episode_provider_diagnostics.get(lane,{})
+   episode_provider_diagnostics[lane]={'calls':previous.get('calls',0)+1,'last':record}
+  log('EPISODE_PROVIDER_DIAGNOSTICS '+json.dumps(dict(record,lane=lane),separators=(',',':')))
+
 def episode_source_prefetch_worker(stop):
  # Public programme candidates are cached before a transcript exists. This
  # worker never touches audio, language decisions, rotation or playback.
@@ -2602,6 +2640,8 @@ def episode_audio_status():
  status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
                            'runtimeGated':not bool(gateway_config.get('episodeAudioEnabled'))}
  status['sourceProvider']['publicSearchConfigured']=True
+ with episode_provider_diagnostics_lock:
+  status['sourceProvider']['diagnostics']=dict(episode_provider_diagnostics)
  status['handoff']['searchEnabled']=not status['sourceProvider']['runtimeGated']
  if episode_observer is None:
   status['active']=False;status['fault']='not_started';status['observer']=None;return status
@@ -2610,6 +2650,8 @@ def episode_audio_status():
  status['fault']=None
  status['budget']=episode_observer.budget.diagnostics() if episode_observer.budget is not None else None
  status['observer']=episode_observer.diagnostics()
+ if isinstance(episode_observer.research,episode_audio.PublicEvidenceResearch):
+  status['evidenceReads']=episode_observer.research.diagnostics()
  return status
 def language_auto_commit(cid,provider,name,language,language_name,confidence,reason,evidence,session=None,respect_pause=True):
  global spanish_state,spanish_provider_ids,spanish_manual_provider_ids,spanish_auto_provider_ids,spanish_fingerprint

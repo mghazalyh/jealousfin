@@ -57,6 +57,28 @@ def model_environment(work):
 def _safe_tool_name(value):
     return value if isinstance(value,str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}",value) else ""
 
+EPISODE_SEARCH_FAILURE_CATEGORIES = ("rate-limit", "access", "timeout", "network", "invalid-query", "other")
+
+
+def _episode_search_failure(state):
+    # The provider's error may contain a query, URL or private text.
+    # Classify transiently and retain only a fixed category.
+    value = state.get("error")
+    if not isinstance(value, str):
+        return "other"
+    value = value[:4096].lower()
+    for category, needles in (
+        ("rate-limit", ("429", "rate limit", "too many requests")),
+        ("access", ("403", "401", "unauthorized", "forbidden", "access denied")),
+        ("timeout", ("timeout", "timed out", "deadline")),
+        ("network", ("network", "connection", "econn", "fetch failed", "dns")),
+        ("invalid-query", ("invalid query", "invalid argument", "bad request", "400")),
+    ):
+        if any(needle in value for needle in needles):
+            return category
+    return "other"
+
+
 def parse_events_detailed(data, strict_episode=False):
     """Parse OpenCode JSON events and return bounded diagnostics, never query text."""
     fragments=[];searched=False
@@ -83,7 +105,12 @@ def parse_events_detailed(data, strict_episode=False):
             if len(diagnostics["toolCalls"])<64:diagnostics["toolCalls"].append({"tool":tool or "unknown","status":status})
             if tool=="websearch":
                 if status=="completed":searched=True;diagnostics["completedSearches"]+=1
-                elif status=="error":diagnostics["failedSearches"]+=1
+                elif status=="error":
+                    diagnostics["failedSearches"]+=1
+                    if strict_episode:
+                        failures=diagnostics.setdefault("searchFailureCategories",{})
+                        category=_episode_search_failure(state)
+                        failures[category]=failures.get(category,0)+1
             elif tool and tool not in diagnostics["otherTools"] and len(diagnostics["otherTools"])<16:
                 diagnostics["otherTools"].append(tool)
         if kind=="text" and isinstance(part,dict) and isinstance(part.get("text"),str):
