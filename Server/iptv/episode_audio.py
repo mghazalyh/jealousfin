@@ -35,11 +35,13 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import html as html_module
+import ipaddress
 import json
 import queue
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 from collections import OrderedDict
 
@@ -86,6 +88,18 @@ MAX_RESEARCH_SECONDS = 20.0
 MAX_PENDING = 8
 PENDING_DEDUP_SECONDS = 120.0
 
+# Automatic source discovery is non-date-specific: reviewed official archive
+# roots plus an optional bounded search provider. The private registry remains
+# an explicit override for a reviewed episode. Candidate and parsed-evidence
+# caches are bounded, in-memory and never contain a transcript.
+SOURCE_CANDIDATE_TTL = 1800.0
+SOURCE_NEGATIVE_TTL = 300.0
+MAX_SOURCE_CACHE = 64
+MAX_AUTO_CANDIDATES = 8
+MAX_INDEX_LINKS = 64
+MAX_INDEX_PAGES = 4
+MAX_PROVIDER_CANDIDATES = 8
+
 ALLOWED_PROFILES = frozenset({"american"})
 # Preserve the generalized-language gate: only an allowed English stream may
 # produce programme clues. Excluded/unauthorized languages never reach research.
@@ -103,6 +117,17 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
     "sescoops.com", "www.sescoops.com",
     "wrestlingobserver.com", "www.wrestlingobserver.com",
 })
+
+# Reviewed, non-date-specific official archive roots. A known series can be
+# tried as a direct dated archive URL (``<root>/YYYY-MM-DD``) and as an index
+# page whose dated links are bounded. This is deliberately a small reviewed
+# map, not an open crawler; the private registry can override it.
+DEFAULT_OFFICIAL_HINTS = {
+    "wwenxt": ("https://www.wwe.com/shows/wwenxt",),
+    "wweraw": ("https://www.wwe.com/shows/raw",),
+    "wwesmackdown": ("https://www.wwe.com/shows/smackdown",),
+}
+DEFAULT_REPORT_HINTS = {}
 
 GENERIC_TERMS = frozenset("""
 about after again against almost alone along already also although always among another answer around
@@ -152,6 +177,67 @@ def _host(url):
         return ""
     host = match[1].lower()
     return host if re.fullmatch(r"[a-z0-9.-]+", host) and "." in host else ""
+
+
+def _public_host(value):
+    """Return a syntactically public DNS host, or an empty string.
+
+    IP literals, credentials, malformed labels and non-443 ports are rejected
+    before any source URL can reach a page reader. The caller still applies the
+    approved-host allowlist and the gateway still resolves DNS before fetching.
+    """
+    host = str(value or "").strip().lower()
+    if not host or len(host) > 253 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
+        return ""
+    if "." not in host or ".." in host:
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return ""
+    except ValueError:
+        pass
+    if any(not label or len(label) > 63 for label in host.split(".")):
+        return ""
+    return host
+
+
+def safe_source_url(value, allowed_hosts, allow_query=True):
+    """Validate one automatic candidate against an explicit host allowlist.
+
+    Only HTTPS, one of the approved DNS hosts, no credentials, no fragment and
+    the default port are accepted. Query strings are optional because a reviewed
+    independent report may legitimately carry one; they are bounded and never
+    used to select a destination host.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= 500:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+    except (TypeError, ValueError):
+        return ""
+    if parts.scheme.casefold() != "https" or parts.username or parts.password:
+        return ""
+    if parts.port not in (None, 443):
+        return ""
+    host = _public_host(parts.hostname)
+    if not host or host not in allowed_hosts:
+        return ""
+    if parts.fragment or any(ord(character) < 0x21 for character in value if character not in "\t"):
+        return ""
+    query = parts.query if allow_query else ""
+    if len(query) > 300 or any(character in query for character in "\r\n\x00"):
+        return ""
+    path = parts.path or "/"
+    if len(path) > 400 or any(character in path for character in "\r\n\x00"):
+        return ""
+    return urllib.parse.urlunsplit(("https", host, path, query, ""))
+
+
+def _same_site(left, right):
+    """Compare hosts ignoring only the conventional ``www.`` alias."""
+    a = _public_host(left)
+    b = _public_host(right)
+    return bool(a and b and a.removeprefix("www.") == b.removeprefix("www."))
 
 
 def _date(value):
@@ -1367,6 +1453,8 @@ _STRIP_BLOCK = re.compile(r"<(?:script|style|noscript|svg)\b.*?</(?:script|style
                           re.IGNORECASE | re.DOTALL)
 _TAG = re.compile(r"<[^>]+>")
 _URL_DATE = re.compile(r"/((?:19|20)\d{2}-\d{2}-\d{2})(?:/|$)")
+_LINK_TAG = re.compile(r"<a\b[^>]*href\s*=\s*(?:\"([^\"]*)\"|'([^']*)')[^>]*>(.*?)</a>",
+                       re.IGNORECASE | re.DOTALL)
 
 
 def _valid_iso(year, month, day):
@@ -1712,27 +1800,61 @@ def parse_report_page(page, source_url, context=None):
     return rows[:MAX_REPORTS]
 
 
-class PublicEvidenceResearch:
-    """Actual bounded research adapter for the audio episode handoff.
+def _source_context(context):
+    if not isinstance(context, dict):
+        return {}
+    series = context.get("seriesTitle")
+    if not isinstance(series, str):
+        return {}
+    value = {"seriesTitle": " ".join(series.split())[:200],
+             "originalAirDate": _date(context.get("originalAirDate"))}
+    episode = context.get("episodeTitle")
+    if isinstance(episode, str) and episode:
+        value["episodeTitle"] = " ".join(episode.split())[:300]
+    channel = context.get("channelID")
+    if isinstance(channel, str) and CHANNEL_RE.fullmatch(channel):
+        value["channelID"] = channel
+    name = context.get("channelName")
+    if isinstance(name, str) and name:
+        value["channelName"] = " ".join(name.split())[:120]
+    return value
 
-    It consumes the minimal clue payload plus the gateway's already-observed
-    programme context, then reads only explicitly reviewed official broadcaster
-    archive and independent-report URLs from a private registry. Network access
-    is injected (``fetch_page``); no media stream, microphone or Whisper pass is
-    started here. An empty registry or any lookup failure yields no evidence, so
-    the handoff stays inconclusive rather than guessing.
+
+class EpisodeSourceDiscovery:
+    """Bounded automatic episode-source discovery with registry override.
+
+    ``resolve`` derives candidate official archive URLs from a small reviewed
+    set of non-date-specific roots and asks an optional injected provider for
+    additional official/report URLs. A private registry entry for the exact
+    series is authoritative and suppresses automatic candidates. Nothing here
+    promotes evidence: every candidate still has to be fetched, parsed and
+    corroborated by the existing audio episode contract. Candidate results are
+    cached in memory, bounded and independent of the transient transcript.
     """
 
-    def __init__(self, fetch_page, source_registry=None, max_pages=MAX_SOURCE_PAGES,
-                 registry_loader=None, deadline_seconds=MAX_RESEARCH_SECONDS):
-        self.fetch_page = fetch_page
+    def __init__(self, fetch_page=None, source_registry=None, registry_loader=None,
+                 provider=None, official_hints=None, report_hints=None,
+                 max_candidates=MAX_AUTO_CANDIDATES, cache_ttl=SOURCE_CANDIDATE_TTL,
+                 clock=time.time):
         if callable(source_registry) and registry_loader is None:
             registry_loader = source_registry
             source_registry = None
+        self.fetch_page = fetch_page
         self.source_registry = source_registry if isinstance(source_registry, dict) else {}
         self.registry_loader = registry_loader if callable(registry_loader) else None
-        self.max_pages = max(1, min(MAX_SOURCE_PAGES, int(max_pages)))
-        self.deadline_seconds = max(1.0, float(deadline_seconds))
+        self.provider = provider if callable(provider) else None
+        self.official_hints = dict(official_hints if isinstance(official_hints, dict)
+                                   else DEFAULT_OFFICIAL_HINTS)
+        self.report_hints = dict(report_hints if isinstance(report_hints, dict)
+                                 else DEFAULT_REPORT_HINTS)
+        self.max_candidates = max(1, min(MAX_SOURCE_PAGES, int(max_candidates)))
+        self.cache_ttl = max(1.0, float(cache_ttl))
+        self.clock = clock
+        self._cache = OrderedDict()
+        self._index_cache = OrderedDict()
+        self.lookups = 0
+        self.provider_calls = 0
+        self.rejected = 0
 
     def _registry(self):
         if self.registry_loader is not None:
@@ -1743,17 +1865,44 @@ class PublicEvidenceResearch:
             return value if isinstance(value, dict) else {}
         return self.source_registry
 
-    def _urls(self, context):
-        series = context.get("seriesTitle") if isinstance(context, dict) else ""
-        entry = self._registry().get(source_key(series)) if series else None
-        if not isinstance(entry, dict):
-            return [], []
-        official = [url for url in entry.get("official", []) if isinstance(url, str)]
-        reports = [url for url in entry.get("reports", []) if isinstance(url, str)]
-        return official[:self.max_pages], reports[:self.max_pages]
+    def _registry_entry(self, series):
+        if not series:
+            return None
+        entry = self._registry().get(source_key(series))
+        return entry if isinstance(entry, dict) else None
 
-    def _fetch(self, url, allowed_hosts):
-        if not callable(self.fetch_page) or _host(url) not in allowed_hosts:
+    @staticmethod
+    def _cache_key(context, clues):
+        series = _norm_text(context.get("seriesTitle"))
+        air = _date(context.get("originalAirDate"))
+        if air:
+            return series + "|" + air
+        normalized = normalize_clues(clues)
+        episode = _norm_text(context.get("episodeTitle"))
+        seed = "|".join((episode, "|".join(normalized)))
+        return series + "|" + (_digest(seed) if seed.strip("|") else "")
+
+    def _cache_get(self, key, now):
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        if now >= entry[0]:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return entry[1], entry[2], entry[3]
+
+    def _cache_put(self, key, official, reports, source, now):
+        official = tuple(official[:self.max_candidates])
+        reports = tuple(reports[:self.max_candidates])
+        ttl = self.cache_ttl if (official or reports) else min(self.cache_ttl, SOURCE_NEGATIVE_TTL)
+        self._cache[key] = (now + ttl, official, reports, source)
+        self._cache.move_to_end(key)
+        while len(self._cache) > MAX_SOURCE_CACHE:
+            self._cache.popitem(last=False)
+
+    def _fetch(self, url):
+        if not callable(self.fetch_page):
             return None
         try:
             page = self.fetch_page(url)
@@ -1765,27 +1914,337 @@ class PublicEvidenceResearch:
             return None
         return page
 
+    @staticmethod
+    def _clean_candidates(values, allowed_hosts):
+        rows = []
+        if not isinstance(values, (list, tuple)):
+            return rows
+        for value in values[:MAX_PROVIDER_CANDIDATES * 2]:
+            url = safe_source_url(value, allowed_hosts, allow_query=True)
+            if url and url not in rows:
+                rows.append(url)
+        return rows
+
+    def _provider_urls(self, context, clues):
+        if self.provider is None:
+            return [], []
+        payload = dict(context, clues=list(normalize_clues(clues)))
+        self.provider_calls += 1
+        try:
+            result = self.provider(payload)
+        except Exception:
+            return [], []
+        if isinstance(result, tuple) and len(result) == 2:
+            official_raw, report_raw = result
+        elif isinstance(result, dict):
+            official_raw, report_raw = result.get("official", []), result.get("reports", [])
+        else:
+            return [], []
+        return (self._clean_candidates(official_raw, OFFICIAL_ARCHIVE_HOSTS),
+                self._clean_candidates(report_raw, INDEPENDENT_REPORT_HOSTS))
+
+    def _index_urls(self, page, root, context, deadline, clues=()):
+        if page is None or time.monotonic() >= deadline:
+            return []
+        clues = normalize_clues(clues)
+        root_host = _host(root)
+        try:
+            root_path = urllib.parse.urlsplit(root).path.rstrip("/")
+        except ValueError:
+            return []
+        text = _page_text(page)
+        if not text:
+            return []
+        wanted = _date(context.get("originalAirDate"))
+        rows = []
+        for match in _LINK_TAG.finditer(text):
+            href = html_module.unescape(match.group(1) or match.group(2) or "")
+            try:
+                target = urllib.parse.urljoin(root, href)
+                target_parts = urllib.parse.urlsplit(target)
+            except ValueError:
+                continue
+            url = safe_source_url(target, OFFICIAL_ARCHIVE_HOSTS, allow_query=False)
+            if not url or not _same_site(_host(url), root_host):
+                continue
+            if root_path and not target_parts.path.startswith(root_path + "/"):
+                continue
+            date_match = _URL_DATE.search(target_parts.path + "/")
+            if not date_match:
+                continue
+            anchor = " ".join(html_module.unescape(_TAG.sub(" ", match.group(3) or "")).split())
+            score = len(clue_matches(clues, anchor)) if clues else 0
+            rows.append((date_match[1], url, score))
+            if len(rows) >= MAX_INDEX_LINKS:
+                break
+        rows.sort(key=lambda item: item[0], reverse=True)
+        if clues:
+            rows.sort(key=lambda item: item[2], reverse=True)
+        if wanted:
+            rows.sort(key=lambda item: item[0] != wanted)
+        seen = []
+        for _date_value, url, _score in rows:
+            if url not in seen:
+                seen.append(url)
+            if len(seen) >= MAX_INDEX_PAGES:
+                break
+        return seen
+
+    def _automatic_urls(self, context, clues, now):
+        deadline = time.monotonic() + MAX_RESEARCH_SECONDS
+        series = context.get("seriesTitle", "")
+        key = source_key(series)
+        roots = self.official_hints.get(key, ())
+        if isinstance(roots, str):
+            roots = (roots,)
+        air = _date(context.get("originalAirDate"))
+        official = []
+        for root in roots if isinstance(roots, (list, tuple)) else ():
+            root_url = safe_source_url(root, OFFICIAL_ARCHIVE_HOSTS, allow_query=False)
+            if not root_url:
+                self.rejected += 1
+                continue
+            if air:
+                for suffix in ("", "/results"):
+                    url = safe_source_url(root_url.rstrip("/") + "/" + air + suffix,
+                                          OFFICIAL_ARCHIVE_HOSTS, allow_query=False)
+                    if url and url not in official:
+                        official.append(url)
+            else:
+                cached = self._index_cache.get(root_url)
+                if cached is not None and now < cached[0]:
+                    found = list(cached[1])
+                else:
+                    page = self._fetch(root_url)
+                    found = self._index_urls(page, root_url, context, deadline, clues)
+                    self._index_cache[root_url] = (now + self.cache_ttl, tuple(found))
+                    self._index_cache.move_to_end(root_url)
+                    while len(self._index_cache) > MAX_SOURCE_CACHE:
+                        self._index_cache.popitem(last=False)
+                for url in found:
+                    if url not in official:
+                        official.append(url)
+                if time.monotonic() >= deadline:
+                    break
+        report_roots = self.report_hints.get(key, ())
+        if isinstance(report_roots, str):
+            report_roots = (report_roots,)
+        reports = []
+        for root in report_roots if isinstance(report_roots, (list, tuple)) else ():
+            url = safe_source_url(root, INDEPENDENT_REPORT_HOSTS, allow_query=True)
+            if url and url not in reports:
+                reports.append(url)
+        if time.monotonic() < deadline:
+            extra_official, extra_reports = self._provider_urls(context, clues)
+            for url in extra_official:
+                if url not in official:
+                    official.append(url)
+            for url in extra_reports:
+                if url not in reports:
+                    reports.append(url)
+        return (official[:self.max_candidates], reports[:self.max_candidates],
+                "automatic+provider" if self.provider is not None else "automatic")
+
+    def resolve(self, context, clues=(), now=None):
+        """Return ``(official_urls, report_urls, source)`` for a programme context.
+
+        A private registry entry always wins. Automatic discovery is otherwise
+        bounded by the reviewed roots, the injected provider result limit, the
+        per-family candidate limit and the in-memory TTL cache. It never returns
+        a URL outside the two existing host allowlists.
+        """
+        context = _source_context(context)
+        if not context or not context.get("seriesTitle"):
+            return [], [], ""
+        now = self.clock() if now is None else float(now)
+        clues = normalize_clues(clues)
+        key = self._cache_key(context, clues)
+        cached = self._cache_get(key, now)
+        if cached is not None:
+            return list(cached[0]), list(cached[1]), cached[2]
+        entry = self._registry_entry(context.get("seriesTitle"))
+        if entry is not None:
+            official = self._clean_candidates(entry.get("official", []), OFFICIAL_ARCHIVE_HOSTS)
+            reports = self._clean_candidates(entry.get("reports", []), INDEPENDENT_REPORT_HOSTS)
+            official, reports = official[:self.max_candidates], reports[:self.max_candidates]
+            self._cache_put(key, official, reports, "registry", now)
+            return official, reports, "registry"
+        official, reports, source = self._automatic_urls(context, clues, now)
+        self.lookups += 1
+        self._cache_put(key, official, reports, source, now)
+        return official, reports, source
+
+    def prefetch(self, context, clues=()):
+        """Warm the bounded candidate cache without any transcript dependency."""
+        official, reports, _source = self.resolve(context, ())
+        return bool(official or reports)
+
+    def clear(self):
+        self._cache.clear()
+        self._index_cache.clear()
+
+    def diagnostics(self):
+        return {"revision": REVISION, "cacheEntries": len(self._cache),
+                "indexCacheEntries": len(self._index_cache),
+                "maxCacheEntries": MAX_SOURCE_CACHE, "cacheTtlSeconds": self.cache_ttl,
+                "lookups": self.lookups, "providerCalls": self.provider_calls,
+                "rejectedCandidates": self.rejected,
+                "officialHosts": sorted(OFFICIAL_ARCHIVE_HOSTS),
+                "independentReportHosts": sorted(INDEPENDENT_REPORT_HOSTS),
+                "maxCandidatesPerFamily": self.max_candidates,
+                "registryOverride": True}
+
+
+class PublicEvidenceResearch:
+    """Actual bounded research adapter for the audio episode handoff.
+
+    It consumes the minimal clue payload plus the gateway's already-observed
+    programme context, then reads only approved official broadcaster archive
+    and independent-report URLs. The optional registry is an override; without
+    it, bounded automatic discovery derives candidates from reviewed archive
+    roots and an optional injected search provider. Network access is injected
+    (``fetch_page``); no media stream, microphone or Whisper pass is started
+    here. Missing evidence or any lookup failure stays inconclusive.
+    """
+
+    def __init__(self, fetch_page, source_registry=None, max_pages=MAX_SOURCE_PAGES,
+                 registry_loader=None, deadline_seconds=MAX_RESEARCH_SECONDS,
+                 discovery=None, provider=None, cache_ttl=SOURCE_CANDIDATE_TTL,
+                 official_hints=None, report_hints=None):
+        self.fetch_page = fetch_page
+        if callable(source_registry) and registry_loader is None:
+            registry_loader = source_registry
+            source_registry = None
+        self.source_registry = source_registry if isinstance(source_registry, dict) else {}
+        self.registry_loader = registry_loader if callable(registry_loader) else None
+        self.max_pages = max(1, min(MAX_SOURCE_PAGES, int(max_pages)))
+        self.deadline_seconds = max(1.0, float(deadline_seconds))
+        self.discovery = discovery if isinstance(discovery, EpisodeSourceDiscovery) else None
+        if self.discovery is None:
+            self.discovery = EpisodeSourceDiscovery(
+                fetch_page, source_registry=self.source_registry,
+                registry_loader=self.registry_loader, provider=provider,
+                official_hints=official_hints, report_hints=report_hints,
+                max_candidates=self.max_pages, cache_ttl=cache_ttl)
+        self._evidence = OrderedDict()
+        self._evidence_ttl = max(1.0, float(cache_ttl))
+
+    def _registry(self):
+        if self.registry_loader is not None:
+            try:
+                value = self.registry_loader()
+            except Exception:
+                return {}
+            return value if isinstance(value, dict) else {}
+        return self.source_registry
+
+    def _urls(self, context, clues=()):
+        return self.discovery.resolve(context, clues)[:2]
+
+    def _evidence_key(self, context, official_urls, report_urls):
+        identity = "|".join((_norm_text(context.get("seriesTitle")),
+                             _date(context.get("originalAirDate")),
+                             ",".join(official_urls), ",".join(report_urls)))
+        return _digest(identity)
+
+    def _cached(self, key, now):
+        entry = self._evidence.get(key)
+        if entry is None:
+            return None
+        if now >= entry[0]:
+            self._evidence.pop(key, None)
+            return None
+        self._evidence.move_to_end(key)
+        return list(entry[1]), list(entry[2])
+
+    def _store(self, key, official, reports, now):
+        ttl = self._evidence_ttl if (official or reports) else min(self._evidence_ttl,
+                                                                   SOURCE_NEGATIVE_TTL)
+        self._evidence[key] = (now + ttl, tuple(official), tuple(reports))
+        self._evidence.move_to_end(key)
+        while len(self._evidence) > MAX_SOURCE_CACHE:
+            self._evidence.popitem(last=False)
+
+    def _fetch_result(self, url, allowed_hosts):
+        if not callable(self.fetch_page) or _host(url) not in allowed_hosts:
+            return None, False
+        try:
+            page = self.fetch_page(url)
+        except Exception as error:
+            blocked = (isinstance(error, urllib.error.HTTPError)
+                       and error.code in (401, 403, 451))
+            return None, blocked
+        if isinstance(page, (bytes, bytearray)) and len(page) > MAX_PAGE_BYTES:
+            return None, False
+        if isinstance(page, str) and len(page) > MAX_PAGE_BYTES:
+            return None, False
+        return page, False
+
+    def _fetch(self, url, allowed_hosts):
+        return self._fetch_result(url, allowed_hosts)[0]
+
+    def _read(self, context, clues=(), now=None):
+        context = _source_context(context)
+        if not context or not context.get("seriesTitle"):
+            return [], []
+        now = time.time() if now is None else float(now)
+        official_urls, report_urls, _source = self.discovery.resolve(context, clues, now)
+        official_urls = official_urls[:self.max_pages]
+        report_urls = report_urls[:self.max_pages]
+        key = self._evidence_key(context, official_urls, report_urls)
+        cached = self._cached(key, now)
+        if cached is not None:
+            return cached
+        deadline = time.monotonic() + self.deadline_seconds
+        blocked = set()
+        official = []
+        for url in official_urls:
+            host = _host(url)
+            if time.monotonic() >= deadline:
+                break
+            if host in blocked:
+                continue
+            page, was_blocked = self._fetch_result(url, OFFICIAL_ARCHIVE_HOSTS)
+            if was_blocked:
+                blocked.add(host)
+                continue
+            if page is None:
+                continue
+            official.extend(parse_official_page(page, url, context.get("seriesTitle", "")))
+            if len(official) >= MAX_OFFICIAL_EPISODES:
+                official = official[:MAX_OFFICIAL_EPISODES]
+                break
+        reports = []
+        for url in report_urls:
+            host = _host(url)
+            if time.monotonic() >= deadline:
+                break
+            if host in blocked:
+                continue
+            page, was_blocked = self._fetch_result(url, INDEPENDENT_REPORT_HOSTS)
+            if was_blocked:
+                blocked.add(host)
+                continue
+            if page is None:
+                continue
+            reports.extend(parse_report_page(page, url, context))
+            if len(reports) >= MAX_REPORTS:
+                reports = reports[:MAX_REPORTS]
+                break
+        self._store(key, official, reports, now)
+        return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
+
+    def prefetch(self, context, clues=()):
+        """Warm public evidence independently of the transient transcript."""
+        official, reports = self._read(context, ())
+        return bool(official or reports)
+
     def __call__(self, payload):
         context = payload.get("programme") if isinstance(payload, dict) else None
         if not isinstance(context, dict) or not context.get("seriesTitle"):
             return [], []
-        official_urls, report_urls = self._urls(context)
-        deadline = time.monotonic() + self.deadline_seconds
-        official = []
-        for url in official_urls:
-            if time.monotonic() >= deadline:
-                break
-            page = self._fetch(url, OFFICIAL_ARCHIVE_HOSTS)
-            if page is not None:
-                official.extend(parse_official_page(page, url, context.get("seriesTitle", "")))
-        reports = []
-        for url in report_urls:
-            if time.monotonic() >= deadline:
-                break
-            page = self._fetch(url, INDEPENDENT_REPORT_HOSTS)
-            if page is not None:
-                reports.extend(parse_report_page(page, url, context))
-        return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
+        clues = payload.get("clues") if isinstance(payload, dict) else ()
+        return self._read(context, clues)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2113,6 +2572,23 @@ class EpisodeObserver:
             return None
         return self._evaluate(request, snapshot, context, item.job, now)
 
+    def prefetch(self, context):
+        """Warm public source/evidence caches without a transcript or callback.
+
+        This is intentionally separate from the language worker. It never
+        extracts clues and never publishes anything.
+        """
+        if not self.enabled:
+            return False
+        prefetch = getattr(self.research, "prefetch", None)
+        if not callable(prefetch) or not isinstance(context, dict):
+            return False
+        try:
+            return bool(prefetch(context))
+        except Exception as error:
+            self.log("episode prefetch error " + type(error).__name__)
+            return False
+
     def flush(self, timeout=5.0):
         """Test/diagnostic barrier for the bounded worker."""
         if self._queue is None:
@@ -2173,7 +2649,12 @@ def status():
                         "dailyBudget": MAX_DAILY_EPISODE_CALLS,
                         "officialArchiveHosts": sorted(OFFICIAL_ARCHIVE_HOSTS),
                         "independentReportHosts": sorted(INDEPENDENT_REPORT_HOSTS),
-                        "researchAttendance": "injected-reviewed-source-registry",
+                        "researchAttendance": "automatic-allowlisted-discovery-with-registry-override",
+                        "registryOverride": True,
+                        "automaticDiscovery": True,
+                        "automaticOfficialHints": sorted(DEFAULT_OFFICIAL_HINTS),
+                        "candidateCacheTtlSeconds": SOURCE_CANDIDATE_TTL,
+                        "maxCandidateCacheEntries": MAX_SOURCE_CACHE,
                         "maxSourcePages": MAX_SOURCE_PAGES,
                         "maxResearchSeconds": MAX_RESEARCH_SECONDS,
                         "searchEnabled": False}}

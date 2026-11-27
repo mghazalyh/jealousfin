@@ -1798,11 +1798,13 @@ def device_language_probe():
 # decode/transcribe pass through on_speech; it never requests media, starts a
 # second Whisper run or calls a research service while disabled.
 episode_observer=None
+episode_source_discovery=None
 episode_init_lock=threading.Lock()
 episode_publisher=episode_audio.PublicationStore()
 EPISODE_SOURCE_FILE=ROOT/'episode-sources.json'
 EPISODE_SOURCE_LIMIT=65536
 EPISODE_SOURCE_PAGES=8
+EPISODE_SOURCE_HOSTS=episode_audio.OFFICIAL_ARCHIVE_HOSTS|episode_audio.INDEPENDENT_REPORT_HOSTS
 def load_episode_sources():
  # Private, reviewed registry only. Unknown fields, hosts or oversized files
  # are ignored so an unsafe registry can never widen the source allowlist.
@@ -1831,12 +1833,56 @@ def load_episode_sources():
   return out
  except (OSError,ValueError,TypeError):return {}
 def episode_research_page(url):
- # Bounded read of one already-reviewed public page. Never stores the page.
- validate(url)
- req=urllib.request.Request(url,headers={'User-Agent':'Jealousfin-Episode-Evidence/1.0','Accept':'text/html,application/xhtml+xml'})
- with opener.open(req,timeout=8) as f:data=f.read(episode_audio.MAX_PAGE_BYTES+1)
+ # Bounded, HTTPS-only read of one approved public page. Never stores the page.
+ target=episode_audio.safe_source_url(url,EPISODE_SOURCE_HOSTS,allow_query=True)
+ if not target:raise ValueError('Unapproved episode source')
+ original_host=urllib.parse.urlsplit(target).hostname
+ class EpisodeRedirect(Redirect):
+  def redirect_request(self,req,fp,code,msg,headers,newurl):
+   redirect=episode_audio.safe_source_url(urllib.parse.urljoin(req.full_url,newurl),EPISODE_SOURCE_HOSTS,allow_query=True)
+   if not redirect or not episode_audio._same_site(urllib.parse.urlsplit(redirect).hostname,original_host):
+    raise ValueError('Unapproved episode source redirect')
+   return super().redirect_request(req,fp,code,msg,headers,redirect)
+ req=urllib.request.Request(validate(target),headers={'User-Agent':'Jealousfin-Episode-Evidence/1.0','Accept':'text/html,application/xhtml+xml'})
+ agent=urllib.request.build_opener(urllib.request.ProxyHandler({}),EpisodeRedirect())
+ with agent.open(req,timeout=8) as f:
+  data=f.read(episode_audio.MAX_PAGE_BYTES+1)
+  final=f.geturl()
+ if not episode_audio._same_site(urllib.parse.urlsplit(final).hostname,original_host):raise ValueError('Episode source left approved host')
  if len(data)>episode_audio.MAX_PAGE_BYTES:raise ValueError('Episode evidence page too large')
  return data
+def episode_source_provider(payload):
+ # Optional bounded OpenCode websearch. Its answer is only URL leads; the
+ # gateway fetches/parses the approved page and existing corroboration decides.
+ if not gateway_config.get('episodeAudioEnabled') or not opencode_discovery.available():return [], []
+ try:
+  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.MAX_RESEARCH_SECONDS)
+  prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
+  raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'])
+  result=opencode_discovery.normalize_episode_sources(raw)
+  log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
+  return result['official'],result['reports']
+ except Exception as error:
+  log('episode source discovery deferred '+type(error).__name__)
+  return [], []
+def episode_source_prefetch_worker(stop):
+ # Public programme candidates are cached before a transcript exists. This
+ # worker never touches audio, language decisions, rotation or playback.
+ while not stop.wait(15):
+  try:
+   reload_gateway_config()
+   if not gateway_config.get('episodeAudioEnabled'):continue
+   observer=episode_observer_instance()
+   if observer is None:continue
+   observer.enabled=True
+   now=time.monotonic()
+   with lock:active=[cid for cid,until in active_channels.items() if until>now]
+   for cid in active[:4]:
+    context=current_programme_context(cid)
+    if not context or episode_audio.programme_has_episode_identity(context):continue
+    observer.prefetch(context)
+  except Exception as error:
+   log('episode source prefetch '+type(error).__name__)
 def current_programme_context(channel_id):
  try:row=programme_snapshot().get(channel_id)
  except (sqlite3.Error,OSError,RuntimeError,ValueError):return None
@@ -1865,11 +1911,14 @@ def episode_probe():
  if not visit_id:return None
  return dict(probe,visitID=visit_id,visitVerified=language_visits.is_verified(visit_id))
 def episode_observer_instance():
- global episode_observer
+ global episode_observer,episode_source_discovery
  if SOURCE_PROFILE!='american':return None
  with episode_init_lock:
   if episode_observer is None:
-   research=episode_audio.PublicEvidenceResearch(episode_research_page,registry_loader=load_episode_sources,max_pages=EPISODE_SOURCE_PAGES)
+   episode_source_discovery=episode_audio.EpisodeSourceDiscovery(
+    episode_research_page,registry_loader=load_episode_sources,
+    provider=episode_source_provider,max_candidates=EPISODE_SOURCE_PAGES)
+   research=episode_audio.PublicEvidenceResearch(episode_research_page,registry_loader=load_episode_sources,max_pages=EPISODE_SOURCE_PAGES,discovery=episode_source_discovery)
    episode_observer=episode_audio.EpisodeObserver(
     probe=episode_probe,research=research,enabled=False,
     budget=episode_audio.EpisodeBudget(),programme=current_programme_context,
@@ -1890,6 +1939,9 @@ def episode_audio_status():
  status=episode_audio.status()
  status['configuredEnabled']=bool(gateway_config.get('episodeAudioEnabled'))
  status['publication']=episode_publisher.diagnostics()
+ status['sourceDiscovery']=episode_source_discovery.diagnostics() if episode_source_discovery is not None else None
+ status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
+                           'runtimeGated':not bool(gateway_config.get('episodeAudioEnabled'))}
  if episode_observer is None:
   status['active']=False;status['fault']='not_started';status['observer']=None;return status
  status['enabled']=bool(episode_observer.enabled)
@@ -2600,6 +2652,7 @@ def main():
   if not spanish_auto_manager.start():log('Language auto unavailable '+str(spanish_auto_manager.fault))
   pending=threading.Thread(target=language_pending_worker,args=(stop,),name='language-pending',daemon=True);pending.start()
   overlay_publisher=threading.Thread(target=overlay_worker,args=(stop,),name='language-overlay-publisher',daemon=True);overlay_publisher.start()
+  episode_prefetch=threading.Thread(target=episode_source_prefetch_worker,args=(stop,),name='episode-source-prefetch',daemon=True);episode_prefetch.start()
  worker=threading.Thread(target=programme_worker,args=(stop,),name='programme-refresh',daemon=True);worker.start()
  guide=threading.Thread(target=guide_worker,args=(stop,),name='external-guide-refresh',daemon=True);guide.start()
  epg=threading.Thread(target=episode_guide_worker,args=(stop,),name='episode-guide-refresh',daemon=True);epg.start()

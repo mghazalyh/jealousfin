@@ -1,5 +1,12 @@
 # Audio episode identity — real public-source acceptance and bounded publication (2026-11-27)
 
+> Follow-up: the date-specific private registry is no longer required. Bounded
+> automatic source discovery, optional registry override, candidate/evidence
+> caching and a transcript-independent prefetch worker are documented in
+> [`episode-autodiscovery-20261127.md`](episode-autodiscovery-20261127.md).
+> The verification, date-only identity, publication and default-off contracts
+> below are unchanged.
+
 Isolated follow-up lane on top of `3f94486` (production release, language
 observation enabled with enforcement OFF). It fixes the observed end-to-end
 failure: the strict JSON-LD parser found zero official rows on the real WWE
@@ -106,12 +113,14 @@ programme still fails closed.
 - Official archives: `wwe.com` / `www.wwe.com`, `cwtv.com` / `www.cwtv.com`.
 - Independent reports: `f4wonline.com`, `pwinsider.com`, `wrestlinginc.com`,
   `sescoops.com`, `wrestlingobserver.com` (and `www.` forms).
-- Only URLs explicitly listed in the private, schema-1 `episode-sources.json`
-  registry are fetched. The registry is absent by default (empty). See
+- The private, schema-1 `episode-sources.json` registry remains an optional
+  per-series override. When it has an entry, that entry is authoritative. See
   `Server/iptv/episode-sources.example.json`.
-- Because reviewed registry URLs are date-specific, an operator must add the
-  current episode's official archive/results URL and corroborating report URLs
-  before a live trial. No live search or model call is performed.
+- Without a registry entry, reviewed non-date-specific official archive roots
+  are used automatically, and an optional bounded OpenCode websearch may return
+  additional official/report URL leads. Every candidate is still restricted to
+  the host allowlists above, fetched as HTTPS, parsed and corroborated. The
+  provider answer alone is never identity evidence.
 - A blocked source (for example F4W `403`) stays blocked; it is reported as an
   error and never retried around, proxied or scraped through another route.
 
@@ -120,10 +129,13 @@ programme still fails closed.
 Run from `Server/iptv/`:
 
 ```
-python3 -m py_compile episode_audio.py language_audio.py gateway.py test_episode_audio.py validate_episode_sources.py
-python3 -m unittest test_episode_audio -q
-python3 -m unittest test_episode_audio test_language_visits test_language_pause \
-  test_surf_maintenance test_language_auto test_spanish_auto -q
+python3 -m py_compile episode_audio.py language_audio.py gateway.py \
+  opencode_discovery.py test_episode_audio.py test_episode_autodiscovery.py \
+  validate_episode_sources.py
+python3 -m unittest test_episode_audio test_episode_autodiscovery -q
+python3 -m unittest test_episode_audio test_episode_autodiscovery \
+  test_language_visits test_language_pause test_surf_maintenance \
+  test_language_auto test_spanish_auto -q
 python3 -m unittest test_overlay_bridge test_release_integration test_gateway_policy \
   test_programme_research test_schedule_evidence test_opencode_discovery \
   test_policy_snapshot test_endurance_acceptance -q
@@ -133,11 +145,14 @@ python3 validate_episode_sources.py --json
 
 Results on this worktree:
 
-- `test_episode_audio`: 64 tests, OK. New coverage includes the real WWE
+- `test_episode_audio`: 64 tests, OK. Coverage includes the real WWE
   archive/results shapes, WrestlingInc JSON-LD (show date vs publish date),
   PWInsider HTML without JSON-LD, date-only corroboration, no invented numbers,
   publication expiry/no-overwrite/no-transcript, post-research visit/programme
   re-probe, asynchronous submit/publication and sample-backed active viewing.
+  Automatic source discovery, registry override, bounded caches, prefetch,
+  blocked-host no-bypass and adversarial URL fixtures are covered by
+  `test_episode_autodiscovery.py`.
 - Focused language/visit/pause set: 161 tests, OK (1 skipped).
 - Remaining release regressions: 98 tests, OK (1 skipped).
 - `test_policy_observer.py`: all assertion groups PASS.

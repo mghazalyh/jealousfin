@@ -4,6 +4,9 @@
 > identities, post-research re-probe, bounded programme-metadata publication,
 > runtime opt-in and asynchronous research are documented in
 > [`audio-episode-real-source-20261127.md`](audio-episode-real-source-20261127.md).
+> Bounded automatic source discovery, optional registry override and
+> transcript-independent prefetch/caching are documented in
+> [`episode-autodiscovery-20261127.md`](episode-autodiscovery-20261127.md).
 
 Isolated engineering lane that reconciles the completed audio episode handoff
 (`f3ef187`/`943a937`) with the corrected core release `404859d`
