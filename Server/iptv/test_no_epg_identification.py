@@ -263,3 +263,36 @@ class GatewayResearchTimingTests(fixtures.GatewayAudioIntegrationTests):
             self.assertEqual(model.call_args.args[2],audio.UNKNOWN_PROVIDER_SECONDS)
             self.g.episode_source_provider(dict(ctx,seriesTitle="WWE NXT"))
             self.assertEqual(model.call_args.args[2],8)
+
+class ConfirmedProgressTests(unittest.TestCase):
+    def test_lead_budget_does_not_relax_known_title_or_short_sample(self):
+        budget=audio.EpisodeBudget()
+        view={"channel_id":fixtures.CHANNEL,"session_hash":"s1","active_seconds":15}
+        args=dict(has_episode_identity=False,profile="american",language="en",language_outcome="allowed")
+        self.assertEqual(budget.eligible(view,sample_seconds=55,**args),(False,"inactive"))
+        self.assertEqual(budget.eligible(view,sample_seconds=55,unknown_lead=True,**args),(True,""))
+        self.assertEqual(budget.eligible(view,sample_seconds=39,unknown_lead=True,**args),(False,"inactive"))
+        self.assertEqual(budget.eligible(dict(view,active_seconds=11),sample_seconds=55,unknown_lead=True,**args),(False,"inactive"))
+
+    def test_research_may_start_early_but_cannot_publish_before_confirmed_floor(self):
+        for final, expected in [(20,False),(40,True)]:
+            with self.subTest(final=final):
+                wall=time.time();progress=[15];calls=[];store=audio.PublicationStore()
+                def research(payload):
+                    calls.append(payload)
+                    progress[0]=final
+                    return [fixtures.nxt_official()],fixtures.nxt_reports()
+                observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),research,enabled=True,
+                    budget=audio.EpisodeBudget(),programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+                    activity=lambda cid:{"channel_id":cid,"active_seconds":60,"confirmed_seconds":progress[0],"session_hash":"s1"},
+                    publisher=store)
+                job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+                     "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
+                     "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+                decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":55.0}
+                with patch.object(audio,"UNKNOWN_CONFIRM_WAIT_SECONDS",0):
+                    result=observer(job,decision,fixtures.NXT_TEXT)
+                self.assertEqual(len(calls),1)
+                self.assertEqual(result.accepted,expected)
+                self.assertEqual(store.get(fixtures.CHANNEL) is not None,expected)
+                if not expected:self.assertEqual(result.reason,"insufficient-confirmed-progress")

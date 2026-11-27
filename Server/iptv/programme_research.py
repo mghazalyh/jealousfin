@@ -71,6 +71,7 @@ class ActiveView:
     verified: bool
     trace_present: bool
     position: float | None
+    confirmed_seconds: float = 0.0
 
 
 class ActiveViewing:
@@ -137,7 +138,7 @@ class ActiveViewing:
         row = self.sessions.get(session_id)
         if action == "stop":
             if row and row["cid"] == cid:
-                row.update(stopped=True, paused=False, active_since=None, last_mono=now, last_wall=wall)
+                row.update(stopped=True, paused=False, active_since=None, last_mono=now, last_wall=wall, confirmed_seconds=0.0)
             return self._view(row, now) if row else None
         if row and row["cid"] != cid:
             # A reused session identity for another channel is not trusted.
@@ -157,29 +158,63 @@ class ActiveViewing:
             row["verified"] = True
             if report.get("paused") is True:
                 row["paused"] = True; row["active_since"] = None
+                row["confirmed_seconds"] = 0.0
+                row.pop("start_anchor", None)
             elif row["active_since"] is None:
-                # Start alone is not progress. A later advancing report opens
-                # the evidence window.
+                # Native Build 1036 reports Start only after decoded playback
+                # validation. Retain its position as an anchor, but never
+                # grant viewing time until an advancing Progress corroborates it.
+                pos = report.get("position")
+                if (report.get("paused") is False and type(pos) in (int, float)
+                        and math.isfinite(pos) and pos >= 0):
+                    row["start_anchor"] = (now, float(pos))
+                    row["last_position"] = float(pos)
+                    row["confirmed_seconds"] = 0.0
                 row["active_since"] = None
             self._expire(now)
             return self._view(row, now)
         paused = report.get("paused") is True
+        was_paused = row["paused"]
         if paused:
             row["paused"] = True; row["active_since"] = None
+            row.pop("start_anchor", None)
+            row["confirmed_seconds"] = 0.0
         else:
             row["paused"] = False
         position = report.get("position")
         if isinstance(position, (int, float)) and math.isfinite(position) and position >= 0:
             previous = row["last_position"]
             advancing = previous is not None and position > previous + 0.05
+            anchor = row.pop("start_anchor", None)
             row["last_position"] = position
+            # Separate conservative, corroborated duration for the no-EPG
+            # lane. No time between reports is credited without progress.
+            elapsed = now - previous_mono
+            delta = position - previous if previous is not None else 0.0
+            if (not paused and not was_paused and report.get("paused") is False
+                    and 0 < elapsed <= self.stale_seconds
+                    and 0.05 < delta <= elapsed + 2.0):
+                row["confirmed_seconds"] = row.get("confirmed_seconds", 0.0) + min(delta, elapsed)
+            else:
+                row["confirmed_seconds"] = 0.0
             if paused:
                 pass
             elif now - previous_mono > self.stale_seconds:
+                # A stale gap starts a new uncredited anchor. The following
+                # advancing report must establish fresh progress.
                 row["active_since"] = now
+                row.pop("last_progress", None)
             elif advancing:
                 if row["active_since"] is None:
                     row["active_since"] = now
+                    if anchor is not None:
+                        elapsed = now - anchor[0]
+                        delta = position - anchor[1]
+                        # Do not backdate on seeks, implausible position jumps,
+                        # delayed reports or stale anchors. Count at most the
+                        # corroborated position advance and actual wall time.
+                        if 0 < elapsed <= self.stale_seconds and 0.05 < delta <= elapsed + 2.0:
+                            row["active_since"] = now - min(delta, elapsed)
                 row["last_progress"] = now
             elif previous is None:
                 row["active_since"] = now
@@ -199,8 +234,12 @@ class ActiveViewing:
     def _view(self, row, now):
         if not row or row["stopped"] or row["paused"]:
             return None
-        if now - row["last_mono"] > self.stale_seconds:
+        if (now - row["last_mono"] > self.stale_seconds or
+                (row.get("last_progress") is not None and
+                 now - row["last_progress"] > self.stale_seconds)):
             row["active_since"] = None
+            row["confirmed_seconds"] = 0.0
+            row.pop("start_anchor", None)
             return None
         if not row["verified"] or row["active_since"] is None:
             return None
@@ -213,7 +252,8 @@ class ActiveViewing:
                           active_seconds=seconds, started_at=row["opened"],
                           last_progress=row.get("last_progress", row["last_mono"]),
                           paused=False, verified=row["verified"], trace_present=bool(row["trace"]),
-                          position=row["last_position"])
+                          position=row["last_position"],
+                          confirmed_seconds=min(seconds, row.get("confirmed_seconds", 0.0)))
 
     def views(self, now=None, minimum=0.0):
         now = self.clock() if now is None else float(now)
@@ -232,6 +272,7 @@ class ActiveViewing:
         return {"revision": REVISION, "activeCandidates": len(views),
                 "activeChannels": [{"channelID": v.channel_id, "sessionHash": v.session_hash,
                                     "activeSeconds": round(v.active_seconds, 1),
+                                     "confirmedSeconds": round(v.confirmed_seconds, 1),
                                     "traceCorrelated": v.trace_present}
                                    for v in sorted(views.values(), key=lambda v: v.channel_id)],
                 "staleSeconds": self.stale_seconds, "activeThresholdSeconds": self.active_seconds}

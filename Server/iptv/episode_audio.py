@@ -37,6 +37,7 @@ import hashlib
 import html as html_module
 import ipaddress
 import json
+import math
 import queue
 import re
 import threading
@@ -109,6 +110,9 @@ def reason_category(reason):
 # sample-backed, same-visit callback eligible for bounded episode research.
 MIN_EVIDENCE_SAMPLE_SECONDS = 40.0
 AUDIO_MIN_ACTIVE_SECONDS = 40.0
+UNKNOWN_LEAD_PROGRESS_SECONDS = 12.0
+UNKNOWN_PUBLISH_PROGRESS_SECONDS = 40.0
+UNKNOWN_CONFIRM_WAIT_SECONDS = 12.0
 
 # Bounded publication into the existing programme metadata path.
 PUBLICATION_TTL = 1800.0
@@ -1386,7 +1390,7 @@ class EpisodeBudget:
             self.seen.popitem(last=False)
 
     def eligible(self, view, *, has_episode_identity, profile, language, language_outcome,
-                 now=None, dedup_key="", sample_seconds=0.0, allow_retry=False):
+                 now=None, dedup_key="", sample_seconds=0.0, allow_retry=False, unknown_lead=False):
         now = self.clock() if now is None else float(now)
         if profile not in ALLOWED_PROFILES:
             return False, "profile"
@@ -1413,6 +1417,14 @@ class EpisodeBudget:
             # deliberate, bounded floor for this lane only.  Rotation and every
             # language confidence threshold remain unchanged.
             required = min(required, max(AUDIO_MIN_ACTIVE_SECONDS, sample))
+        if not math.isfinite(active) or not math.isfinite(sample):
+            return False, "inactive"
+        if unknown_lead and sample < MIN_EVIDENCE_SAMPLE_SECONDS:
+            return False, "inactive"
+        if unknown_lead:
+            # Lead search may start earlier; publishing still requires the
+            # independent confirmed-progress gate, full sample and source proof.
+            required = UNKNOWN_LEAD_PROGRESS_SECONDS
         if active < required:
             return False, "inactive"
         self._prune(now)
@@ -2628,8 +2640,13 @@ class EpisodeObserver:
         if not promotion.accepted or promotion.episode is None:
             return False
         session = (context or {}).get("publicationSessionHash")
+        minimum = (context or {}).get("minimumConfirmedSeconds", 0.0)
         def same_session():
-            return not session or (self._usable_activity(promotion.episode.channel_id) or {}).get("session_hash") == session
+            if not session:
+                return not minimum
+            activity = self._usable_activity(promotion.episode.channel_id) or {}
+            return (activity.get("session_hash") == session and
+                    (not minimum or self._confirmed_progress(activity) >= minimum))
         def discard():
             if isinstance(self.publisher, PublicationStore):
                 self.publisher.discard_publication(promotion, context, now)
@@ -2665,22 +2682,39 @@ class EpisodeObserver:
             promotion.episode.corroborating_sources))
         return True
 
+    @staticmethod
+    def _confirmed_progress(activity):
+        try:
+            value = float((activity or {}).get("confirmed_seconds", 0))
+            return value if math.isfinite(value) and value > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _evaluate(self, request, snapshot, context, job, now, retry=False):
         binding = request.binding
+        unknown_title = isinstance(context, dict) and not context.get("seriesTitle")
+        initial_activity = self._usable_activity(binding.channel_id) if unknown_title else None
+        session_hash = initial_activity.get("session_hash") if initial_activity else None
+        early_lead = bool(unknown_title and self.budget is not None)
+        if early_lead and not session_hash:
+            self._diagnose("session-unverified", "stale")
+            return None
         view = None
         dedup_key = ""
         if self.budget is not None:
             view = self._view(binding, job)
+            if early_lead:
+                view["active_seconds"] = self._confirmed_progress(initial_activity)
             dedup_key = _digest(binding.channel_id + "|" + _norm_text((context or {}).get("seriesTitle"))
                                 + "|" + "|".join(request.clues))
             allowed, budget_reason = self.budget.eligible(
                 view, has_episode_identity=bool(view.get("hasEpisodeIdentity")),
                 profile=binding.profile, language=request.language,
                 language_outcome=request.language_outcome, dedup_key=dedup_key,
-                sample_seconds=request.sample_seconds, allow_retry=retry)
+                sample_seconds=request.sample_seconds, allow_retry=retry, unknown_lead=early_lead)
             if not allowed:
                 self._diagnose("budget-" + str(budget_reason or "rejected"), "budget",
-                               "episodeOnly" if retry else "")
+                               ("confirmed=%.1f sample=%.1f" % (view["active_seconds"], request.sample_seconds)) if early_lead else ("episodeOnly" if retry else ""))
                 if budget_reason == "inactive":
                     # The clue is not dropped just because independent active
                     # viewing has not reached the unchanged floor yet. Ask the
@@ -2691,9 +2725,6 @@ class EpisodeObserver:
                 return None
             self.budget.begin(view, dedup_key=dedup_key)
         payload = request.research_payload()
-        unknown_title = isinstance(context, dict) and not context.get("seriesTitle")
-        initial_activity = self._usable_activity(binding.channel_id) if unknown_title else None
-        session_hash = initial_activity.get("session_hash") if initial_activity else None
         if context is not None:
             programme = dict(context, channelName=request.channel_name)
             if unknown_title:
@@ -2708,6 +2739,16 @@ class EpisodeObserver:
                 official, reports = [], []
         if not official and not reports:
             self._diagnose("no-sources", "no-sources")
+        # A fast lead search may finish before the publish floor. Retain only
+        # the already bounded clues/evidence, never resample or delay rotation.
+        # The worker waits at most 12 seconds and never beyond the binding age.
+        if early_lead and official and len(reports) >= 2:
+            deadline = time.monotonic() + UNKNOWN_CONFIRM_WAIT_SECONDS
+            while binding.checked(time.time()) and time.monotonic() < deadline:
+                activity = self._usable_activity(binding.channel_id) or {}
+                if activity.get("session_hash") != session_hash or self._confirmed_progress(activity) >= UNKNOWN_PUBLISH_PROGRESS_SECONDS:
+                    break
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         # Research is network-bound. Re-probe after it and require the same
         # exact physical visit and a coherent programme before publishing.
         after = time.time()
@@ -2745,7 +2786,12 @@ class EpisodeObserver:
                     (self._usable_activity(binding.channel_id) or {}).get("session_hash") != session_hash):
                 promotion = Promotion(False, "session-changed")
                 self._diagnose("session-changed", "stale")
-            elif not self._publish(promotion, dict(fresh_context, publicationSessionHash=session_hash) if unknown_title else fresh_context, after):
+            elif early_lead and (request.sample_seconds < MIN_EVIDENCE_SAMPLE_SECONDS or
+                    self._confirmed_progress(self._usable_activity(binding.channel_id)) < UNKNOWN_PUBLISH_PROGRESS_SECONDS):
+                promotion = Promotion(False, "insufficient-confirmed-progress")
+                self._diagnose("insufficient-confirmed-progress", "budget")
+            elif not self._publish(promotion, dict(fresh_context, publicationSessionHash=session_hash,
+                    minimumConfirmedSeconds=UNKNOWN_PUBLISH_PROGRESS_SECONDS if early_lead else 0.0) if unknown_title else fresh_context, after):
                 promotion = Promotion(False, "publication-failed")
                 self._diagnose("publication-failed", "publication")
             else:
@@ -2989,4 +3035,6 @@ def status():
                         "maxResearchSeconds": MAX_RESEARCH_SECONDS,
                         "unknownResearchSeconds": UNKNOWN_RESEARCH_SECONDS,
                         "unknownProviderSeconds": UNKNOWN_PROVIDER_SECONDS,
+                        "unknownLeadConfirmedSeconds": UNKNOWN_LEAD_PROGRESS_SECONDS,
+                        "unknownPublishConfirmedSeconds": UNKNOWN_PUBLISH_PROGRESS_SECONDS,
                         "searchEnabled": False}}

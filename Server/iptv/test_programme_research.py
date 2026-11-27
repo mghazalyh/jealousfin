@@ -51,6 +51,42 @@ class ViewingTests(unittest.TestCase):
         self.progress(15, 20)
         self.assertEqual(self.viewing.views()[self.cid].active_seconds, 15)
 
+    def test_native_start_position_is_only_credited_after_advancing_progress(self):
+        self.assertTrue(self.viewing.issue(self.cid, self.sid))
+        self.viewing.observe({"channelID": self.cid, "playSessionID": self.sid,
+                              "action": "start", "position": 100, "paused": False})
+        self.clock.advance(8)
+        self.assertEqual(self.viewing.views(), {})
+        self.progress(7, 114)
+        self.assertEqual(self.viewing.views()[self.cid].active_seconds, 14)
+        self.progress(15, 129)
+        self.assertEqual(self.viewing.views()[self.cid].active_seconds, 29)
+
+    def test_confirmed_seconds_require_real_progress_and_reset_on_stall(self):
+        self.viewing.issue(self.cid, self.sid)
+        self.viewing.observe({"channelID": self.cid, "playSessionID": self.sid,
+                              "action": "start", "position": 100, "paused": False})
+        self.progress(15, 114)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 14)
+        self.clock.advance(5)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 14)
+        self.progress(10, 129)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 29)
+        self.progress(15, 129)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 0)
+        self.progress(15, 1300)
+        self.assertEqual(self.viewing.views()[self.cid].confirmed_seconds, 0)
+
+    def test_seek_or_pause_cannot_backdate_start(self):
+        for paused, position in [(False, 1000), (True, 110)]:
+            with self.subTest(paused=paused, position=position):
+                self.viewing = pr.ActiveViewing(clock=self.clock)
+                self.viewing.issue(self.cid, self.sid)
+                self.viewing.observe({"channelID": self.cid, "playSessionID": self.sid,
+                                      "action": "start", "position": 100, "paused": False})
+                self.progress(15, position, paused=paused)
+                self.assertEqual(self.viewing.views(), {})
+
     def test_extended_viewing_requires_contiguous_progress(self):
         self.start()
         position = 0

@@ -2491,7 +2491,7 @@ def episode_active_view(channel_id):
  try:row=programme_snapshot().get(channel_id) or {}
  except (sqlite3.Error,OSError,RuntimeError,ValueError):row={}
  return {'channel_id':channel_id,'session_hash':view.session_hash,
-         'active_seconds':view.active_seconds,
+         'active_seconds':view.active_seconds,'confirmed_seconds':view.confirmed_seconds,
          'hasEpisodeIdentity':episode_audio.programme_has_episode_identity(row)}
 def note_episode_probe(reason=None,detail=None):
  # Short, bounded diagnostics for every early return. No audio, transcript,
