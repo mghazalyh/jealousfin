@@ -208,8 +208,11 @@ class Manager(base.Manager):
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
         transcript = None
+        timing = job.get("_inferenceTiming", {})
         try:
+            phase = time.monotonic()
             analysis = base.analyze_speech(job["pcm"])
+            timing["analysisMs"] = round((time.monotonic() - phase) * 1000)
             if analysis["duration"] < base.MIN_SAMPLE_SECONDS or analysis["speechSeconds"] < base.MIN_SPEECH_SECONDS:
                 decision = _decision_language(
                     "inconclusive",
@@ -217,6 +220,7 @@ class Manager(base.Manager):
                     0.0, analysis, [], None,
                 )
             else:
+                phase = time.monotonic()
                 window_results = []
                 for window in analysis["windows"]:
                     if not window["usable"]:
@@ -233,14 +237,21 @@ class Manager(base.Manager):
                             "speechRatio": window["speechRatio"], "usable": True,
                             "language": detected[0], "probability": detected[1],
                         })
+                timing["windowMs"] = round((time.monotonic() - phase) * 1000)
                 decision = decide_language(analysis, window_results, None, None)
                 if base.decision_needs_transcript(decision):
+                    phase = time.monotonic()
+                    timing["transcript"] = "attempted"
                     full = pathlib.Path(workdir) / "full.wav"
                     base._write_wav(full, job["pcm"])
                     transcript = base.transcribe(full, self.whisper, self.model_path, workdir, self.threads)
+                    timing["transcriptMs"] = round((time.monotonic() - phase) * 1000)
+                    timing["transcript"] = "completed" if transcript else "unavailable"
                     lexical = base.lexical_margin(transcript[1]) if transcript else (None, 0, 0)
                     decision = decide_language(analysis, window_results, lexical,
                                                transcript[0] if transcript else None)
+                else:
+                    timing["transcript"] = "skipped_terminal"
             self._notify_speech(job, decision, transcript)
             if job.get("episodeOnly"):
                 # Reuse the transcript for episode clues only. Never record a
@@ -248,6 +259,7 @@ class Manager(base.Manager):
                 self._finish_episode_retry(job, decision)
             else:
                 self._record_result(job, decision)
+            timing["completion"] = "completed"
         except Exception as error:
             if job.get("episodeOnly"):
                 self._mark_finalized_result(job, "episode-retry", True, "episode_only")

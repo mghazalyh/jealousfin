@@ -1200,6 +1200,7 @@ class Manager:
             "attempt": marker["attempts"], "maxAttempts": marker.get("maxAttempts", MAX_SAME_VISIT_ATTEMPTS),
             "surfPaused": marker.get("surfPaused"), "surfing": marker.get("surfing"),
             "episodeOnly": bool(getattr(sample, "episode_only", False)),
+            "queuedMonotonic": time.monotonic(),
         }
         with self._lock:
             marker["pending"] = True
@@ -1243,9 +1244,13 @@ class Manager:
                 continue
             if job is None:
                 continue
+            started = time.monotonic()
+            metrics = {}
+            job["_inferenceTiming"] = metrics
             try:
                 self._infer(job)
             except Exception as error:
+                metrics["completion"] = "error"
                 self.log("spanish auto inference error " + type(error).__name__)
                 if job.get("episodeOnly"):
                     self._mark_finalized_result(job, "episode-retry", True, "episode_only")
@@ -1256,6 +1261,29 @@ class Manager:
                         self.telemetry["counters"]["inconclusive"] += 1
                         self.telemetry["counters"]["tested"] += 1
                 self._persist(force=True)
+            finally:
+                self._log_inference_timing(job, started, metrics)
+                job.pop("_inferenceTiming", None)
+
+    def _log_inference_timing(self, job, started, metrics):
+        """Bounded, content-free observability for the optimization."""
+        try:
+            queued = job.get("queuedMonotonic")
+            queue_ms = round(max(0.0, started - queued) * 1000) if type(queued) in (int, float) else None
+            result = {
+                "queueMs": queue_ms,
+                "totalMs": round(max(0.0, time.monotonic() - started) * 1000),
+                "analysisMs": metrics.get("analysisMs"),
+                "windowMs": metrics.get("windowMs"),
+                "transcriptMs": metrics.get("transcriptMs"),
+                "transcript": metrics.get("transcript", "not_attempted"),
+                "completion": metrics.get("completion", "disabled_or_incomplete"),
+                "episodeOnly": bool(job.get("episodeOnly")),
+            }
+            self.log("LANGUAGE_INFERENCE_TIMING " + json.dumps(result, separators=(",", ":")))
+        except Exception:
+            # Metrics must never alter inference or evidence publication.
+            pass
 
     def _infer(self, job):
         if not self._enabled():
@@ -1265,14 +1293,18 @@ class Manager:
                 self._mark_finalized_result(job, "inconclusive", False, "observation_disabled")
             return
         workdir = tempfile.mkdtemp(prefix="job-", dir=self._tmpdir)
+        timing = job.get("_inferenceTiming", {})
         try:
+            phase = time.monotonic()
             analysis = analyze_speech(job["pcm"])
+            timing["analysisMs"] = round((time.monotonic() - phase) * 1000)
             if analysis["duration"] < MIN_SAMPLE_SECONDS or analysis["speechSeconds"] < MIN_SPEECH_SECONDS:
                 decision = _decision(
                     "inconclusive", "sample_too_short" if analysis["duration"] < MIN_SAMPLE_SECONDS else "insufficient_speech",
                     0.0, analysis, [], None,
                 )
             else:
+                phase = time.monotonic()
                 window_results = []
                 for window in analysis["windows"]:
                     if not window["usable"]:
@@ -1289,16 +1321,24 @@ class Manager:
                             "speechRatio": window["speechRatio"], "usable": True,
                             "language": detected[0], "probability": detected[1],
                         })
+                timing["windowMs"] = round((time.monotonic() - phase) * 1000)
                 decision = decide(analysis, window_results, None)
                 if decision_needs_transcript(decision):
+                    phase = time.monotonic()
+                    timing["transcript"] = "attempted"
                     full = Path(workdir) / "full.wav"
                     _write_wav(full, job["pcm"])
                     transcript = transcribe(full, self.whisper, self.model_path, workdir, self.threads)
+                    timing["transcriptMs"] = round((time.monotonic() - phase) * 1000)
+                    timing["transcript"] = "completed" if transcript else "unavailable"
                     lexical = lexical_margin(transcript[1]) if transcript else (None, 0, 0)
                     if transcript and transcript[0] not in ("es", "en", "pt"):
                         lexical = (None, lexical[1], lexical[2])
                     decision = decide(analysis, window_results, lexical)
+                else:
+                    timing["transcript"] = "skipped_terminal"
             self._record_result(job, decision)
+            timing["completion"] = "completed"
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 

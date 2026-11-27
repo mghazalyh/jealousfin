@@ -7,7 +7,9 @@ the decision, so that extra pass only delayed the result and widened the
 stale-session window.  These fixtures prove the pass is skipped without
 weakening any threshold or conclusive path.
 """
+import json
 import pathlib
+import time
 import sys
 import tempfile
 import unittest
@@ -70,7 +72,12 @@ class SpanishInferTimingTests(unittest.TestCase):
                              side_effect=lambda *a, **k: next(detections)), \
                 patch.object(spanish_audio, "transcribe",
                              side_effect=AssertionError("redundant transcript")):
-            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32})
+            timing = {}
+            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32, "_inferenceTiming": timing})
+        self.assertEqual(timing["transcript"], "skipped_terminal")
+        self.assertEqual(timing["completion"], "completed")
+        self.assertNotIn("transcriptMs", timing)
+        self.assertGreaterEqual(timing["windowMs"], 0)
         self.assertEqual(len(self.results), 1)
         self.assertEqual(self.results[0]["reason"], "ambiguous_language")
         self.assertEqual(self.results[0]["speechSeconds"], 38.66)
@@ -101,10 +108,34 @@ class LanguageInferTimingTests(unittest.TestCase):
         with patch.object(spanish_audio, "analyze_speech", return_value=analysis()), \
                 patch.object(spanish_audio, "detect_language", side_effect=lambda *a, **k: next(detections)), \
                 patch.object(spanish_audio, "transcribe", return_value=("en", "fixture speech")) as transcribe:
-            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32})
+            timing = {}
+            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32, "_inferenceTiming": timing})
+        self.assertEqual(timing["transcript"], "completed")
+        self.assertGreaterEqual(timing["transcriptMs"], 0)
+        self.assertEqual(timing["completion"], "completed")
         transcribe.assert_called_once()
         self.assertEqual(self.results[0]["outcome"], "allowed")
         self.assertEqual(handoffs[0][1], ("en", "fixture speech"))
+
+    def test_timing_log_is_content_free_and_logger_errors_are_nonfatal(self):
+        logs = []
+        self.manager.log = logs.append
+        started = time.monotonic()
+        job = {"queuedMonotonic": started - 0.125, "episodeOnly": False,
+               "pcm": b"private-audio", "provider": "private-provider", "name": "private-name"}
+        self.manager._log_inference_timing(job, started, {
+            "analysisMs": 10, "windowMs": 20, "transcript": "skipped_terminal",
+            "completion": "completed", "transcriptText": "private-text"})
+        self.assertEqual(len(logs), 1)
+        payload = json.loads(logs[0].split(" ", 1)[1])
+        self.assertEqual(payload["queueMs"], 125)
+        self.assertEqual(payload["windowMs"], 20)
+        self.assertIsNone(payload["transcriptMs"])
+        self.assertNotIn("private-", logs[0])
+        def failed_logger(message):
+            raise OSError("logger unavailable")
+        self.manager.log = failed_logger
+        self.manager._log_inference_timing(job, started, {})
 
     def test_unknown_language_retains_transcript_mismatch_diagnostic(self):
         windows = [{"usable": True, "language": "fixture_unknown", "probability": 0.99}] * 4
@@ -126,7 +157,12 @@ class LanguageInferTimingTests(unittest.TestCase):
                              side_effect=lambda *a, **k: next(detections)), \
                 patch.object(spanish_audio, "transcribe",
                              side_effect=AssertionError("redundant transcript")):
-            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32})
+            timing = {}
+            self.manager._infer({"pcm": pcm, "seconds": 56.0, "cid": "a" * 32, "_inferenceTiming": timing})
+        self.assertEqual(timing["transcript"], "skipped_terminal")
+        self.assertEqual(timing["completion"], "completed")
+        self.assertNotIn("transcriptMs", timing)
+        self.assertGreaterEqual(timing["windowMs"], 0)
         self.assertEqual(len(self.results), 1)
         self.assertEqual(self.results[0]["reason"], "ambiguous_language")
 
