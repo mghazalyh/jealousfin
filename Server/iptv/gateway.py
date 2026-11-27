@@ -2424,19 +2424,31 @@ def episode_research_page(url):
  if len(data)>episode_audio.MAX_PAGE_BYTES:raise ValueError('Episode evidence page too large')
  return data
 def episode_source_provider(payload):
- # Optional bounded OpenCode websearch. Its answer is only URL leads; the
- # gateway fetches/parses the approved page and existing corroboration decides.
- if not gateway_config.get('episodeAudioEnabled') or not opencode_discovery.available():return [], []
+ # Search results are URL leads only; all pages are independently fetched,
+ # parsed and corroborated. The direct lane does not depend on a paid model.
+ if not gateway_config.get('episodeAudioEnabled'):return [], []
+ diagnostics={}
+ direct=opencode_discovery.public_episode_search(payload,validate,diagnostics=diagnostics)
+ if diagnostics.get('queries') or diagnostics.get('backoff'):
+  log('EPISODE_PUBLIC_SEARCH '+json.dumps(diagnostics,separators=(',',':')))
+ official,reports=direct['official'],direct['reports']
+ if official or reports:
+  log('episode public search official=%d reports=%d'%(len(official),len(reports)))
+ required_reports=2 if not payload.get('seriesTitle') else 1
+ if official and len({episode_audio._host(u).removeprefix('www.') for u in reports})>=required_reports:return official,reports
+ if not opencode_discovery.available():return official,reports
  try:
-  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),episode_audio.MAX_RESEARCH_SECONDS)
+  # Clue-backed work is latency-sensitive. Keep the alternate provider bounded.
+  timeout=min(float(gateway_config.get('metadataResearchTimeoutSeconds',180)),8 if payload.get('clues') else episode_audio.MAX_RESEARCH_SECONDS)
   prompt=opencode_discovery.episode_prompt_for(payload,payload.get('clues',()) if isinstance(payload,dict) else ())
   raw,_diagnostics=opencode_discovery.run_model_detailed(prompt,gateway_config['metadataResearchModel'],timeout,gateway_config['metadataResearchVariant'])
   result=opencode_discovery.normalize_episode_sources(raw)
   log('episode source discovery official=%d reports=%d'%(len(result['official']),len(result['reports'])))
-  return result['official'],result['reports']
+  combined=opencode_discovery.normalize_episode_sources({'official':official+result['official'],'reports':reports+result['reports']})
+  return combined['official'],combined['reports']
  except Exception as error:
   log('episode source discovery deferred '+type(error).__name__)
-  return [], []
+  return official,reports
 def episode_source_prefetch_worker(stop):
  # Public programme candidates are cached before a transcript exists. This
  # worker never touches audio, language decisions, rotation or playback.
@@ -2578,7 +2590,8 @@ def episode_audio_status():
  status['sourceDiscovery']=episode_source_discovery.diagnostics() if episode_source_discovery is not None else None
  status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
                            'runtimeGated':not bool(gateway_config.get('episodeAudioEnabled'))}
- status['handoff']['searchEnabled']=status['sourceProvider']['opencodeAvailable'] and not status['sourceProvider']['runtimeGated']
+ status['sourceProvider']['publicSearchConfigured']=True
+ status['handoff']['searchEnabled']=not status['sourceProvider']['runtimeGated']
  if episode_observer is None:
   status['active']=False;status['fault']='not_started';status['observer']=None;return status
  status['enabled']=bool(episode_observer.enabled)

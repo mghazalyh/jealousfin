@@ -2,6 +2,10 @@
 import datetime as dt
 import json, math, os, pathlib, re, selectors, signal, subprocess, tempfile, time, unicodedata, urllib.parse
 from html import unescape
+from html.parser import HTMLParser
+import urllib.request
+import urllib.error
+import threading
 import episode_audio
 import schedule_evidence
 
@@ -220,6 +224,128 @@ def eps_clean(value,limit=300):
     v=" ".join(str(value).split()) if isinstance(value,str) else ""
     return v[:limit]
 
+
+# Direct public search is a lead generator only. Never trust search snippets,
+# never follow search-engine redirect links, and never expose transcript text.
+EPISODE_SEARCH_HOST = "lite.duckduckgo.com"
+EPISODE_SEARCH_LIMIT = 256 * 1024
+EPISODE_SEARCH_TIMEOUT = 4.0
+_EPISODE_SEARCH_LOCK = threading.Lock()
+_EPISODE_SEARCH_BACKOFF = 0.0
+
+class _EpisodeSearchLinks(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a" or len(self.links) >= 40:
+            return
+        fields = dict(attrs)
+        if "result-link" in (fields.get("class") or "").split():
+            href = fields.get("href")
+            if isinstance(href, str) and len(href) <= 2048:
+                self.links.append(href)
+
+def parse_episode_search_page(page):
+    if not isinstance(page, bytes) or len(page) > EPISODE_SEARCH_LIMIT:
+        return {"official": [], "reports": []}
+    parser = _EpisodeSearchLinks()
+    parser.feed(page.decode("utf-8", errors="replace"))
+    raw = {"official": [], "reports": []}
+    for href in parser.links:
+        try:
+            parts = urllib.parse.urlsplit(urllib.parse.urljoin("https://" + EPISODE_SEARCH_HOST, href))
+            if parts.hostname in ("duckduckgo.com", EPISODE_SEARCH_HOST) and parts.path == "/l/":
+                href = urllib.parse.parse_qs(parts.query, max_num_fields=12).get("uddg", [""])[0]
+            else:
+                href = parts.geturl()
+            for family, hosts in (("official", episode_audio.OFFICIAL_ARCHIVE_HOSTS),
+                                  ("reports", episode_audio.INDEPENDENT_REPORT_HOSTS)):
+                url = episode_audio.safe_source_url(href, hosts, allow_query=False)
+                if url and url not in raw[family]:
+                    raw[family].append(url)
+        except (ValueError, TypeError):
+            continue
+    return normalize_episode_sources(raw)
+
+def episode_search_queries(context):
+    if not isinstance(context, dict):
+        return ()
+    clues = episode_audio.normalize_clues(context.get("clues"))
+    if len(clues) < episode_audio.MIN_DISTINCTIVE_CLUES:
+        return ()
+    chosen = []
+    used = set()
+    for clue in clues:
+        words = set(clue.split())
+        if words and not words.intersection(used):
+            chosen.append(clue)
+            used.update(words)
+        if len(chosen) == 2:
+            break
+    if len(chosen) < 2:
+        return ()
+    clue_query = " ".join('"' + c + '"' for c in chosen)
+    series = clean(context.get("seriesTitle"), 200)
+    # A channel is only a query hint; do not require its name in every search.
+    hint = series or clean(context.get("channelName"), 120)
+    hint = " ".join(re.findall(r"[a-zA-Z0-9]+", hint))[:100]
+    broad = " ".join(chosen)
+    return tuple(dict.fromkeys(q for q in (clue_query + (" " + hint if hint else ""), broad) if q))
+
+def fetch_episode_search(query, validate):
+    # A fixed public HTTPS endpoint with no credentials, cookies or redirects.
+    class RejectRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise ValueError("Search redirect rejected")
+    url = "https://" + EPISODE_SEARCH_HOST + "/lite/?q=" + urllib.parse.quote(query)
+    req = urllib.request.Request(validate(url), headers={
+        "User-Agent": "Jealousfin-Episode-Evidence/1.0", "Accept": "text/html"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), RejectRedirect())
+    with opener.open(req, timeout=EPISODE_SEARCH_TIMEOUT) as response:
+        if response.status != 200:
+            raise urllib.error.HTTPError(url, response.status, "Search response unavailable", None, None)
+        return response.read(EPISODE_SEARCH_LIMIT + 1)
+
+def public_episode_search(context, validate, fetch_page=None, diagnostics=None):
+    global _EPISODE_SEARCH_BACKOFF
+    queries = episode_search_queries(context)
+    result = {"official": [], "reports": []}
+    diag = diagnostics if isinstance(diagnostics, dict) else {}
+    diag.update(queries=0, responses=0, faults={}, backoff=False)
+    if not queries:
+        return result
+    with _EPISODE_SEARCH_LOCK:
+        if fetch_page is None and time.monotonic() < _EPISODE_SEARCH_BACKOFF:
+            diag["backoff"] = True
+            return result
+    fetch = fetch_page or (lambda query: fetch_episode_search(query, validate))
+    # Try the most specific query first. Stop on access/rate restrictions
+    # rather than continuing to request a challenged service.
+    for q in queries[:2]:
+        diag["queries"] += 1
+        try:
+            leads = parse_episode_search_page(fetch(q))
+            diag["responses"] += 1
+        except Exception as error:
+            reason = ("http-" + str(error.code) if isinstance(error, urllib.error.HTTPError)
+                      else type(error).__name__)
+            diag["faults"][reason] = diag["faults"].get(reason, 0) + 1
+            if isinstance(error, urllib.error.HTTPError) and error.code in (202, 403, 429):
+                if fetch_page is None:
+                    with _EPISODE_SEARCH_LOCK:
+                        _EPISODE_SEARCH_BACKOFF = time.monotonic() + 900.0
+                break
+            continue
+        for family in result:
+            for url in leads[family]:
+                if url not in result[family]:
+                    result[family].append(url)
+        if result["official"] and len({episode_audio._host(url).removeprefix("www.")
+                                       for url in result["reports"]}) >= 2:
+            break
+    return normalize_episode_sources(result)
 
 def normalize_episode_sources(raw):
     """Validate an OpenCode episode-source answer as bounded URL leads."""

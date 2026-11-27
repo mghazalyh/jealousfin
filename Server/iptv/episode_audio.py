@@ -273,7 +273,10 @@ def safe_source_url(value, allowed_hosts, allow_query=True):
         return ""
     if parts.scheme.casefold() != "https" or parts.username or parts.password:
         return ""
-    if parts.port not in (None, 443):
+    try:
+        if parts.port not in (None, 443):
+            return ""
+    except ValueError:
         return ""
     host = _public_host(parts.hostname)
     if not host or host not in allowed_hosts:
@@ -1282,11 +1285,12 @@ class PublicationStore:
             "episodeNumberingConflict": bool(episode.numbering_conflict),
             "episodeVisitDigest": episode.binding.digest(),
         }
-        if isinstance(context, dict) and not context.get("seriesTitle"):
+        if isinstance(context, dict):
             session = context.get("publicationSessionHash")
-            if not isinstance(session, str) or not session:
+            if not context.get("seriesTitle") and (not isinstance(session, str) or not session):
                 return False
-            row["audioPlaybackSessionHash"] = session
+            if isinstance(session, str) and session:
+                row["audioPlaybackSessionHash"] = session
         if identity.season_number is not None and identity.episode_number is not None:
             row["seasonNumber"] = int(identity.season_number)
             row["episodeNumber"] = int(identity.episode_number)
@@ -1852,7 +1856,8 @@ def parse_report_page(page, source_url, context=None):
         if not headline and not description:
             continue
         published = _page_date(obj.get("datePublished") or obj.get("dateModified"))
-        air = _report_air_date(headline, description, "", fallback_air)
+        air = (_report_air_date(headline, description, "", fallback_air) if fallback_series
+               else _date_from_text(headline + " " + description))
         if not published or not air:
             continue
         series = fallback_series or _series_from_report_headline(headline)
@@ -1868,7 +1873,8 @@ def parse_report_page(page, source_url, context=None):
     if not headline and not description:
         return rows
     published = _report_published(meta, visible)
-    air = _report_air_date(headline, description, visible, fallback_air)
+    air = (_report_air_date(headline, description, visible, fallback_air) if fallback_series
+           else _date_from_text(headline + " " + description))
     if not published or not air:
         return rows
     series = fallback_series or _series_from_report_headline(headline)
@@ -2265,6 +2271,10 @@ class PublicEvidenceResearch:
         if not context or (not context.get("seriesTitle") and (not context.get("channelID") or len(normalize_clues(clues)) < MIN_DISTINCTIVE_CLUES)):
             return [], []
         now = time.time() if now is None else float(now)
+        # In no-EPG mode, discovery and verification share one research clock.
+        # The known-title lane retains its previous fetch budget.
+        unknown_title = not context.get("seriesTitle")
+        started = time.monotonic()
         official_urls, report_urls, _source = self.discovery.resolve(context, clues, now)
         official_urls = official_urls[:self.max_pages]
         report_urls = report_urls[:self.max_pages]
@@ -2272,7 +2282,7 @@ class PublicEvidenceResearch:
         cached = self._cached(key, now)
         if cached is not None:
             return cached
-        deadline = time.monotonic() + self.deadline_seconds
+        deadline = (started if unknown_title else time.monotonic()) + self.deadline_seconds
         blocked = set()
         official = []
         for url in official_urls:
@@ -2634,7 +2644,9 @@ class EpisodeObserver:
             else:
                 try:
                     promotion = promote_episode(request, official, reports, fresh, after,
-                                                programme=fresh_context)
+                                                programme=context if unknown_title else fresh_context)
+                    if promotion.accepted and not programme_matches(promotion.episode.identity, fresh_context):
+                        promotion = Promotion(False, "programme-mismatch")
                 except Exception as error:
                     self._diagnose("promotion-error", "research", type(error).__name__)
                     promotion = Promotion(False, "promotion-error")

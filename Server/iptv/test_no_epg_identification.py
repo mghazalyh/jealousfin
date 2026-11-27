@@ -1,4 +1,8 @@
 import time
+import json
+import urllib.error
+import urllib.parse
+import opencode_discovery as discovery
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -67,3 +71,63 @@ class NoEPGGatewayTests(fixtures.GatewayAudioIntegrationTests):
             self.assertEqual(self.g.merge_episode_publication({},now),{})
         with patch.object(self.g.playback_activity,"views",return_value={}):
             self.assertEqual(self.g.merge_episode_publication({},now),{})
+
+
+class PublicSearchTests(unittest.TestCase):
+    def setUp(self):
+        self.context={"seriesTitle":"","channelName":"WWE NXT","clues":["jevon evans","saquon shugars"]}
+        self.official=fixtures.WWE_ARCHIVE_URL
+        self.report=fixtures.WI_URL
+
+    def test_search_page_accepts_only_real_result_links_and_approved_https(self):
+        urls=[self.official,self.report,"https://127.0.0.1/private",
+              "https://www.wwe.com:invalid/path","http://www.wwe.com/show",
+              "https://www.wwe.com.evil.test/show","https://user@www.wwe.com/path"]
+        markup="".join('<a class="result-link" href="//duckduckgo.com/l/?uddg='+urllib.parse.quote(u,safe="")+'">result</a>' for u in urls)
+        markup+='<a href="https://www.wwe.com/not-a-result">unrelated</a>'
+        self.assertEqual(discovery.parse_episode_search_page(markup.encode()),{"official":[self.official],"reports":[self.report]})
+
+    def test_search_variants_are_bounded_and_clue_driven(self):
+        queries=discovery.episode_search_queries(self.context)
+        self.assertEqual(len(queries),2)
+        self.assertIn("WWE NXT",queries[0])
+        self.assertNotIn("WWE NXT",queries[1])
+        self.assertEqual(discovery.episode_search_queries({"channelName":"WWE NXT"}),())
+
+    def test_access_restriction_stops_second_query(self):
+        calls=[];diag={}
+        def fetch(q):
+            calls.append(q)
+            raise urllib.error.HTTPError("https://lite.duckduckgo.com",202,"challenge",None,None)
+        result=discovery.public_episode_search(self.context,lambda x:x,fetch_page=fetch,diagnostics=diag)
+        self.assertEqual(result,{"official":[],"reports":[]})
+        self.assertEqual(len(calls),1)
+        self.assertEqual(diag["faults"],{"http-202":1})
+
+    def test_unknown_title_reports_need_explicit_air_date(self):
+        self.assertEqual(audio.parse_report_page(fixtures.REPORT_PAGE,fixtures.REPORT_URL,{"seriesTitle":""}),[])
+        report=fixtures.REPORT_PAGE.replace("WWE NXT results:", "WWE NXT results: June 16, 2026:")
+        second="https://www.pwinsider.com/article/wwe-nxt-june-16"
+        pages={fixtures.OFFICIAL_URL:fixtures.OFFICIAL_PAGE,fixtures.REPORT_URL:report,second:report}
+        research=audio.PublicEvidenceResearch(pages.get,provider=lambda _:([fixtures.OFFICIAL_URL],[fixtures.REPORT_URL,second]))
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":"","channelName":"Channel"}
+        req=fixtures.nxt_request()
+        official,reports=research({"programme":ctx,"clues":list(req.clues)})
+        self.assertEqual(len(official),1)
+        self.assertEqual(len(reports),2)
+        self.assertTrue(audio.promote_episode(req,official,reports,fixtures.current(),fixtures.NOW,programme=ctx).accepted)
+
+
+class NoEPGDeadlineTests(unittest.TestCase):
+    def test_discovery_uses_same_budget_as_page_fetch(self):
+        context={"channelID":fixtures.CHANNEL,"seriesTitle":"","channelName":"Channel"}
+        calls=[]
+        def provider(_):
+            time.sleep(1.01)
+            return [fixtures.OFFICIAL_URL],[fixtures.REPORT_URL]
+        def fetch(url):
+            calls.append(url)
+            return fixtures.OFFICIAL_PAGE
+        research=audio.PublicEvidenceResearch(fetch,provider=provider,deadline_seconds=1)
+        self.assertEqual(research({"programme":context,"clues":list(fixtures.nxt_request().clues)}),([],[]))
+        self.assertEqual(calls,[])
