@@ -1465,9 +1465,17 @@ def merge_episode_publication(result,now=None):
  now=time.time() if now is None else now
  for cid,audio in episode_publisher.snapshot(now).items():
   row=result.get(cid)
-  if not isinstance(row,dict):continue
+  series=audio.get("audioSeriesTitle")
+  session=audio.get("audioPlaybackSessionHash")
+  if session:
+   view=playback_activity.views().get(cid)
+   if view is None or view.session_hash!=session:continue
+  if not isinstance(row,dict):
+   if not session or not series:continue
+   row={"title":series,"source":"local-audio-identity","observedAt":audio["episodeObservedAt"]}
   if episode_audio.programme_has_stronger_episode_metadata(row):continue
-  merged=dict(row);merged.update(audio);result[cid]=merged
+  if series and episode_audio.source_key(row.get("title"))!=episode_audio.source_key(series):continue
+  merged=dict(row);merged.update({k:v for k,v in audio.items() if k not in ("audioSeriesTitle","audioPlaybackSessionHash")});result[cid]=merged
  return result
 
 def programme_snapshot(now=None):
@@ -1518,7 +1526,7 @@ def programme_item(cid,row):
   prefix='' if guide_norm(channels.get(cid,{}).get('Name',''))==guide_norm(title_year(title)[0]) else title_year(title)[0]+' — '
   season=row.get('seasonNumber');number=row.get('episodeNumber')
   code=f'S{season:02d}E{number:02d}: ' if type(season) is int and type(number) is int else ''
-  season_year=release_year(row.get('seasonYear'))
+  season_year=release_year(row.get('seasonYear')) or (release_year(row.get('episodeYear')) if row.get('episodeSource')=='local-audio-episode-identity' else None)
   display=prefix+code+episode+(f' ({season_year})' if season_year else '')
  if year:evidence['year']=year
  identity=title if not episode else title+'\0'+episode+'\0'+str(row.get('start',''))
@@ -1526,7 +1534,7 @@ def programme_item(cid,row):
        'Name':display,'ChannelId':cid,'Type':'Program',
        'JealousfinProgramme':evidence}
  if year:item['ProductionYear']=year
- if row.get('source')=='corroborated-external-schedule' or episode:
+ if (row.get('source')=='corroborated-external-schedule' or episode) and isinstance(row.get('start'),(int,float)) and isinstance(row.get('end'),(int,float)):
   if row.get('source')=='corroborated-external-schedule':item['Name']='Scheduled: '+display
   item['StartDate']=datetime.datetime.fromtimestamp(row['start'],datetime.timezone.utc).isoformat()
   item['EndDate']=datetime.datetime.fromtimestamp(row['end'],datetime.timezone.utc).isoformat()
@@ -2443,14 +2451,17 @@ def episode_source_prefetch_worker(stop):
    with lock:active=[cid for cid,until in active_channels.items() if until>now]
    for cid in active[:4]:
     context=current_programme_context(cid)
-    if not context or episode_audio.programme_has_episode_identity(context):continue
+    if not context or not context.get('seriesTitle') or episode_audio.programme_has_episode_identity(context):continue
     observer.prefetch(context)
   except Exception as error:
    log('episode source prefetch '+type(error).__name__)
 def current_programme_context(channel_id):
  try:row=programme_snapshot().get(channel_id)
  except (sqlite3.Error,OSError,RuntimeError,ValueError):return None
- return episode_audio.programme_context(row,channel_id)
+ context=episode_audio.programme_context(row,channel_id)
+ if context is not None:return context
+ if channel_id not in channels:return None
+ return {'channelID':channel_id,'seriesTitle':'','channelName':channels[channel_id].get('Name','')}
 def episode_active_view(channel_id):
  view=playback_activity.views().get(channel_id)
  if view is None:return None
@@ -2567,6 +2578,7 @@ def episode_audio_status():
  status['sourceDiscovery']=episode_source_discovery.diagnostics() if episode_source_discovery is not None else None
  status['sourceProvider']={'opencodeAvailable':opencode_discovery.available(),
                            'runtimeGated':not bool(gateway_config.get('episodeAudioEnabled'))}
+ status['handoff']['searchEnabled']=status['sourceProvider']['opencodeAvailable'] and not status['sourceProvider']['runtimeGated']
  if episode_observer is None:
   status['active']=False;status['fault']='not_started';status['observer']=None;return status
  status['enabled']=bool(episode_observer.enabled)

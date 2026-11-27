@@ -150,6 +150,10 @@ OFFICIAL_ARCHIVE_HOSTS = frozenset({
     "tbs.com", "www.tbs.com", "bravotv.com", "www.bravotv.com",
     "paramountnetwork.com", "www.paramountnetwork.com",
     "peacocktv.com", "www.peacocktv.com", "hulu.com", "www.hulu.com",
+    "bbc.co.uk", "www.bbc.co.uk", "bbc.com", "www.bbc.com",
+    "itv.com", "www.itv.com", "channel4.com", "www.channel4.com",
+    "channel5.com", "www.channel5.com", "uktv.co.uk", "www.uktv.co.uk",
+    "cbc.ca", "www.cbc.ca", "ctv.ca", "www.ctv.ca",
 })
 INDEPENDENT_REPORT_HOSTS = frozenset({
     "f4wonline.com", "www.f4wonline.com",
@@ -166,6 +170,8 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
     "ign.com", "www.ign.com",
     "decider.com", "www.decider.com",
     "tvguide.com", "www.tvguide.com",
+    "theguardian.com", "www.theguardian.com", "radiotimes.com", "www.radiotimes.com",
+    "digitalspy.com", "www.digitalspy.com",
 })
 
 # Reviewed, non-date-specific official archive roots. A known series can be
@@ -1066,7 +1072,19 @@ def promote_episode(request, official_episodes, reports, current, now=None, sche
         return Promotion(False, "session-expired")
     if not request.binding.matches(current, now):
         return Promotion(False, "session-mismatch")
+    # Unknown-title discovery needs explicit matching series identities from independent pages.
+    unknown_title = isinstance(programme, dict) and not programme.get("seriesTitle")
+    if unknown_title:
+        reports = [r for r in (reports or ()) if isinstance(r, IndependentReport) and r.series_title]
     verification = corroborate_episode(request.clues, official_episodes, reports, now=now)
+    if unknown_title and verification.accepted:
+        identity = verification.identity
+        matching_hosts = {("f4wonline.com" if _host(r.source_url).removeprefix("www.") == "wrestlingobserver.com" else _host(r.source_url).removeprefix("www.")) for r in reports
+                          if not r.rejection() and _norm_text(r.series_title) == _norm_text(identity.series_title)
+                          and _date(r.original_air_date) == identity.original_air_date
+                          and len(clue_matches(request.clues, r.terms)) >= MIN_DISTINCTIVE_CLUES}
+        if len(matching_hosts) < 2:
+            return Promotion(False, "no-independent-report")
     if not verification.accepted or verification.identity is None:
         return Promotion(False, verification.reason)
     if not programme_matches(verification.identity, programme):
@@ -1251,6 +1269,7 @@ class PublicationStore:
         if not title:
             return False
         row = {
+            "audioSeriesTitle": identity.series_title,
             "episodeTitle": title,
             "originalAirDate": _date(identity.original_air_date),
             "episodeSource": "local-audio-episode-identity",
@@ -1263,6 +1282,11 @@ class PublicationStore:
             "episodeNumberingConflict": bool(episode.numbering_conflict),
             "episodeVisitDigest": episode.binding.digest(),
         }
+        if isinstance(context, dict) and not context.get("seriesTitle"):
+            session = context.get("publicationSessionHash")
+            if not isinstance(session, str) or not session:
+                return False
+            row["audioPlaybackSessionHash"] = session
         if identity.season_number is not None and identity.episode_number is not None:
             row["seasonNumber"] = int(identity.season_number)
             row["episodeNumber"] = int(identity.episode_number)
@@ -1932,7 +1956,8 @@ class EpisodeSourceDiscovery:
         normalized = normalize_clues(clues)
         episode = _norm_text(context.get("episodeTitle"))
         seed = "|".join((episode, "|".join(normalized)))
-        return series + "|" + (_digest(seed) if seed.strip("|") else "")
+        scope = series or ("unknown:" + str(context.get("channelID") or context.get("channelName") or ""))
+        return scope + "|" + (_digest(seed) if seed.strip("|") else "")
 
     def _cache_get(self, key, now):
         entry = self._cache.get(key)
@@ -2106,10 +2131,10 @@ class EpisodeSourceDiscovery:
         a URL outside the two existing host allowlists.
         """
         context = _source_context(context)
-        if not context or not context.get("seriesTitle"):
+        clues = normalize_clues(clues)
+        if not context or (not context.get("seriesTitle") and (not context.get("channelID") or len(clues) < MIN_DISTINCTIVE_CLUES)):
             return [], [], ""
         now = self.clock() if now is None else float(now)
-        clues = normalize_clues(clues)
         key = self._cache_key(context, clues)
         cached = self._cache_get(key, now)
         if cached is not None:
@@ -2237,7 +2262,7 @@ class PublicEvidenceResearch:
 
     def _read(self, context, clues=(), now=None):
         context = _source_context(context)
-        if not context or not context.get("seriesTitle"):
+        if not context or (not context.get("seriesTitle") and (not context.get("channelID") or len(normalize_clues(clues)) < MIN_DISTINCTIVE_CLUES)):
             return [], []
         now = time.time() if now is None else float(now)
         official_urls, report_urls, _source = self.discovery.resolve(context, clues, now)
@@ -2293,7 +2318,7 @@ class PublicEvidenceResearch:
 
     def __call__(self, payload):
         context = payload.get("programme") if isinstance(payload, dict) else None
-        if not isinstance(context, dict) or not context.get("seriesTitle"):
+        if not isinstance(context, dict):
             return [], []
         clues = payload.get("clues") if isinstance(payload, dict) else ()
         return self._read(context, clues)
@@ -2532,7 +2557,7 @@ class EpisodeObserver:
                 published = bool(self.publisher.publish(promotion, context, now))
             except Exception as error:
                 self.log("episode publication error " + type(error).__name__)
-        if callable(self.publish):
+        if callable(self.publish) and (self.publisher is None or published):
             sink = True
             try:
                 published = bool(self.publish(promotion, context, now)) or published
@@ -2572,8 +2597,11 @@ class EpisodeObserver:
                 return None
             self.budget.begin(view, dedup_key=dedup_key)
         payload = request.research_payload()
+        unknown_title = isinstance(context, dict) and not context.get("seriesTitle")
+        initial_activity = self._usable_activity(binding.channel_id) if unknown_title else None
+        session_hash = initial_activity.get("session_hash") if initial_activity else None
         if context is not None:
-            payload = dict(payload, channelID=binding.channel_id, programme=context)
+            payload = dict(payload, channelID=binding.channel_id, programme=dict(context, channelName=request.channel_name))
         official, reports = [], []
         if callable(self.research):
             try:
@@ -2614,7 +2642,11 @@ class EpisodeObserver:
             if self._duplicate(binding, promotion.episode.identity, after):
                 promotion = Promotion(False, "duplicate-publication")
                 self._diagnose("duplicate-publication", "duplicate")
-            elif not self._publish(promotion, fresh_context, after):
+            elif unknown_title and (not session_hash or not fresh_context or
+                    (self._usable_activity(binding.channel_id) or {}).get("session_hash") != session_hash):
+                promotion = Promotion(False, "session-changed")
+                self._diagnose("session-changed", "stale")
+            elif not self._publish(promotion, dict(fresh_context, publicationSessionHash=session_hash) if unknown_title else fresh_context, after):
                 promotion = Promotion(False, "publication-failed")
                 self._diagnose("publication-failed", "publication")
             else:
