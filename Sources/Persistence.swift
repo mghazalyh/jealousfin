@@ -1,77 +1,270 @@
 import Foundation
 
+// Durable retention accounting. This file is outside the event- namespace so
+// pruning can never delete its own evidence.
+struct DiagnosticRetentionState: Codable, Equatable {
+    var schemaVersion=1
+    var lastAttempt:Date?
+    var lastSuccess:Date?
+    var lastError:String?
+    var totalEventsRemoved=0
+    var totalBytesRemoved=0
+    var lastEventCount:Int?
+    var lastEventBytes:Int?
+    var lastTrimMs:Int?
+}
+// A launch marker is written before serving startup work and marked clean only
+// by an explicit shutdown call. A marker left unclean is suspected crash or
+// watchdog evidence, never proof that a particular subsystem failed.
+struct DiagnosticLaunchEvidence: Codable, Equatable {
+    var schemaVersion=1
+    var launchID:String
+    var startedAt:Date
+    var previousLaunchID:String?
+    var cleanShutdown=false
+    var eventCount:Int?
+    var eventBytes:Int?
+}
+struct DiagnosticPruneResult: Equatable {
+    var removed:Int
+    var bytes:Int
+    var removedNames:[String]
+    var failed:Bool
+}
+
 @MainActor final class Disk {
+    private static let retentionName="diagnostic-retention-v1.json"
+    private static let launchName="diagnostic-launch-v1.json"
+    private static let maxLoadBytes=16*1024*1024
+    // Safety ceiling independent of hot configuration. Hot retention may ask
+    // for less; these values only stop unbounded diagnostic growth if the
+    // application never reaches its scheduled retention pass.
+    private static let hardMaxEvents=5000
+    private static let hardMaxBytes=32*1024*1024
     let root: URL
     private(set) var error: String?
-    private var diagnosticCount:Int?
-    private var batchCount:Int?
+    private(set) var retention:DiagnosticRetentionState
+    private(set) var previousUncleanLaunch:DiagnosticLaunchEvidence?
+    private(set) var diagnosticLaunchID=UUID().uuidString
+    private var eventIndex:[String:Int]?
+    private var batchIndex:[String:Int]?
+    private var trimInFlight=false
     init(root override:URL? = nil) {
-        root = override ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
-        do { try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true) } catch { self.error="Cannot create app storage" }
+        let storage=override ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first!.appendingPathComponent("Jealousfin",isDirectory:true)
+        root=storage
+        do { try FileManager.default.createDirectory(at:storage,withIntermediateDirectories:true) } catch { self.error="Cannot create app storage" }
+        let previous:DiagnosticLaunchEvidence?=Self.readEvidence(root:storage,name:Self.launchName)
+        retention=Self.readEvidence(root:storage,name:Self.retentionName) ?? DiagnosticRetentionState()
+        if let previous=previous,!previous.cleanShutdown {
+            previousUncleanLaunch=previous
+            Self.writeCrashEvidence(root:storage,previous:previous,retention:retention)
+        }
+        Self.writeLaunchEvidence(root:storage,launchID:diagnosticLaunchID,previous:previous)
+    }
+    private static func readEvidence<T:Decodable>(root:URL,name:String)->T?{
+        let url=root.appendingPathComponent(name)
+        guard let data=try? Data(contentsOf:url) else{return nil}
+        return try? JSONCodec.decoder().decode(T.self,from:data)
+    }
+    private static func writeEvidence<T:Encodable>(root:URL,name:String,_ value:T){
+        guard let data=try? JSONCodec.encoder().encode(value) else{return}
+        try? data.write(to:root.appendingPathComponent(name),options:.atomic)
+    }
+    private static func writeCrashEvidence(root:URL,previous:DiagnosticLaunchEvidence,retention:DiagnosticRetentionState){
+        let event=Event(severity:"WARN",component:"lifecycle",code:"UNCLEAN_LAUNCH",fields:[
+            "previousLaunchID":previous.launchID,
+            "previousStartedAt":ISO8601DateFormatter().string(from:previous.startedAt),
+            "previousCleanShutdown":String(previous.cleanShutdown),
+            "previousEventCount":previous.eventCount.map{String($0)} ?? "",
+            "lastKnownEventCount":retention.lastEventCount.map{String($0)} ?? "",
+            "lastKnownEventBytes":retention.lastEventBytes.map{String($0)} ?? "",
+            "confidence":"suspected"
+        ])
+        writeEvidence(root:root,name:"event-\(event.id).json",event)
+    }
+    private static func writeLaunchEvidence(root:URL,launchID:String,previous:DiagnosticLaunchEvidence?){
+        let evidence=DiagnosticLaunchEvidence(launchID:launchID,startedAt:Date(),previousLaunchID:previous?.launchID,cleanShutdown:false,eventCount:nil,eventBytes:nil)
+        writeEvidence(root:root,name:launchName,evidence)
+    }
+    // Called from the application shutdown/background-complete path. Absence of
+    // this call is intentionally reported as an unclean prior launch.
+    func markCleanShutdown(){
+        guard var evidence:DiagnosticLaunchEvidence=Self.readEvidence(root:root,name:Self.launchName),
+              evidence.launchID==diagnosticLaunchID else{return}
+        evidence.cleanShutdown=true
+        evidence.eventCount=eventIndex?.count ?? retention.lastEventCount
+        evidence.eventBytes=eventIndex?.values.reduce(0,+) ?? retention.lastEventBytes
+        Self.writeEvidence(root:root,name:Self.launchName,evidence)
     }
     func load<T: Decodable>(_ type:T.Type,_ name:String) -> T? {
         let url=root.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath:url.path) else { return nil }
+        guard let attributes=try? FileManager.default.attributesOfItem(atPath:url.path),
+              let size=attributes[.size] as? NSNumber,size.intValue<=Self.maxLoadBytes else { return nil }
         do { return try JSONCodec.decoder().decode(type,from:Data(contentsOf:url)) }
         catch { self.error="Cannot read \(name)"; return nil }
     }
     @discardableResult func save<T:Encodable>(_ object:T,_ name:String) -> Bool {
         let url=root.appendingPathComponent(name)
         let isEvent=name.hasPrefix("event-"),isBatch=name.hasPrefix("batch-")
-        let existed=(isEvent || isBatch) && FileManager.default.fileExists(atPath:url.path)
+        if isEvent,eventIndex==nil{refreshEventIndex()}
+        if isBatch,batchIndex==nil{refreshBatchIndex()}
+        let data:Data
+        do { data=try JSONCodec.encoder().encode(object) }
+        catch { self.error="Cannot write \(name)"; return false }
         do {
-            try JSONCodec.encoder().encode(object).write(to:url,options:.atomic)
-            if !existed {if isEvent{diagnosticCount=diagnosticCount.map{$0+1}};if isBatch{batchCount=batchCount.map{$0+1}}}
+            try data.write(to:url,options:.atomic)
+            if isEvent,eventIndex != nil {eventIndex?[name]=data.count}
+            if isBatch,batchIndex != nil {batchIndex?[name]=data.count}
+            if isEvent {scheduleEmergencyTrimIfNeeded()}
             return true
         }
         catch { self.error="Cannot write \(name)"; return false }
     }
+    // Diagnostic appends are immutable, uniquely named events. Encoding and
+    // the atomic write run off the MainActor; only exact index accounting is
+    // applied back on the actor. If the index was never derived it stays nil so
+    // the next count performs one exact scan rather than trusting a stale value.
+    func appendEventAsync(_ event:Event,_ name:String) async -> Bool {
+        guard name.hasPrefix("event-") else{return save(event,name)}
+        let directory=root
+        guard let data=try? JSONCodec.encoder().encode(event) else{error="Cannot write \(name)";return false}
+        let wrote=await Task.detached(priority:.utility){ ()->Bool in
+            do{try data.write(to:directory.appendingPathComponent(name),options:.atomic);return true}
+            catch{return false}
+        }.value
+        guard wrote else{error="Cannot write \(name)";return false}
+        if eventIndex != nil{eventIndex?[name]=data.count}
+        scheduleEmergencyTrimIfNeeded()
+        return true
+    }
+    private nonisolated static func scanIndex(root:URL,prefix:String)->[String:Int]? {
+        let keys:[URLResourceKey]=[.fileSizeKey,.isRegularFileKey]
+        guard let urls=try? FileManager().contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{return nil}
+        var index:[String:Int]=[:]
+        for url in urls {
+            let name=url.lastPathComponent
+            guard name.hasPrefix(prefix),url.pathExtension=="json",
+                  let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile==true else{continue}
+            index[name]=v.fileSize ?? 0
+        }
+        return index
+    }
+    private nonisolated static func scanNames(root:URL,prefix:String)->[String]? {
+        let keys:[URLResourceKey]=[.isRegularFileKey]
+        guard let urls=try? FileManager().contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{return nil}
+        var names:[String]=[]
+        for url in urls {
+            let name=url.lastPathComponent
+            guard name.hasPrefix(prefix),url.pathExtension=="json",
+                  let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile==true else{continue}
+            names.append(name)
+        }
+        return names.sorted()
+    }
+    private func refreshEventIndex(){eventIndex=Self.scanIndex(root:root,prefix:"event-")}
+    private func refreshBatchIndex(){batchIndex=Self.scanIndex(root:root,prefix:"batch-")}
     func files(prefix:String) -> [URL] {
-        let files=(try? FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)) ?? []
-        return files.filter{$0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension=="json"}.sorted{$0.lastPathComponent<$1.lastPathComponent}
+        if prefix=="event-" {
+            if eventIndex==nil{refreshEventIndex()}
+            if let index=eventIndex{return index.keys.sorted().map{root.appendingPathComponent($0)}}
+            return []
+        }
+        if prefix=="batch-" {
+            if batchIndex==nil{refreshBatchIndex()}
+            if let index=batchIndex{return index.keys.sorted().map{root.appendingPathComponent($0)}}
+            return []
+        }
+        return (Self.scanNames(root:root,prefix:prefix) ?? []).map{root.appendingPathComponent($0)}
     }
     func queuedCount(prefix:String)->Int {
-        if prefix=="event-" {if let n=diagnosticCount{return n};let n=files(prefix:prefix).count;diagnosticCount=n;return n}
-        if prefix=="batch-" {if let n=batchCount{return n};let n=files(prefix:prefix).count;batchCount=n;return n}
-        return files(prefix:prefix).count
+        if prefix=="event-" {
+            if eventIndex==nil{refreshEventIndex()}
+            return eventIndex?.count ?? 0
+        }
+        if prefix=="batch-" {
+            if batchIndex==nil{refreshBatchIndex()}
+            return batchIndex?.count ?? 0
+        }
+        return Self.scanNames(root:root,prefix:prefix)?.count ?? 0
     }
-    // Only immutable diagnostic events are pruned. Receipts, health, patches
-    // and queued batches are deliberately excluded. The worker never accesses
-    // actor-isolated state. Directory attributes are prefetched in one scan.
-    private nonisolated static func pruneEvents(root:URL,maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int,failed:Bool){
+    // Only immutable diagnostic events are pruned. Receipts, health, patches,
+    // settings, rotation, programme/language data and queued batches are
+    // deliberately excluded. The worker never accesses actor-isolated state.
+    // Every event-*.json entry is considered so an unreadable entry cannot hide
+    // the count bound, but non-regular entries are reported rather than removed.
+    private nonisolated static func pruneEvents(root:URL,maxCount:Int,maxBytes:Int)->DiagnosticPruneResult{
         let fm=FileManager()
         let keys:[URLResourceKey]=[.fileSizeKey,.creationDateKey,.isRegularFileKey]
-        guard let files=try? fm.contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{return(0,0,true)}
-        let candidates=files.compactMap{url->(URL,Int,Date)? in
-            guard url.lastPathComponent.hasPrefix("event-"),url.pathExtension=="json",
-                  let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile==true,let bytes=v.fileSize else{return nil}
-            return (url,bytes,v.creationDate ?? .distantPast)
-        }.sorted{a,b in a.2==b.2 ? a.0.lastPathComponent<b.0.lastPathComponent:a.2<b.2}
-        var count=candidates.count,total=candidates.reduce(0){$0+$1.1},removed=0,bytes=0,failed=false
+        guard let files=try? fm.contentsOfDirectory(at:root,includingPropertiesForKeys:keys) else{
+            return DiagnosticPruneResult(removed:0,bytes:0,removedNames:[],failed:true)
+        }
+        var candidates:[(URL,Int,Date)]=[]
+        var failed=false
+        for url in files {
+            guard url.lastPathComponent.hasPrefix("event-"),url.pathExtension=="json" else{continue}
+            let v=try? url.resourceValues(forKeys:Set(keys))
+            guard v?.isRegularFile==true else{failed=true;continue}
+            candidates.append((url,v?.fileSize ?? 0,v?.creationDate ?? .distantPast))
+        }
+        candidates.sort{a,b in a.2==b.2 ? a.0.lastPathComponent<b.0.lastPathComponent:a.2<b.2}
+        var count=candidates.count,total=candidates.reduce(0){$0+$1.1},removed=0,bytes=0
+        var removedNames:[String]=[]
         for entry in candidates{
             guard count>maxCount || total>maxBytes else{break}
-            do{try fm.removeItem(at:entry.0);count-=1;total-=entry.1;removed+=1;bytes+=entry.1}
+            do{try fm.removeItem(at:entry.0);count-=1;total-=entry.1;removed+=1;bytes+=entry.1;removedNames.append(entry.0.lastPathComponent)}
             catch{failed=true}
         }
-        return(removed,bytes,failed)
+        return DiagnosticPruneResult(removed:removed,bytes:bytes,removedNames:removedNames,failed:failed)
+    }
+    private func apply(_ result:DiagnosticPruneResult){
+        if result.failed{eventIndex=nil}
+        else if eventIndex != nil{for name in result.removedNames{eventIndex?.removeValue(forKey:name)}}
+    }
+    private func record(_ result:DiagnosticPruneResult,startedAt:TimeInterval){
+        retention.lastAttempt=Date()
+        if result.failed{retention.lastError="Diagnostic retention cleanup failed";error=retention.lastError}
+        else{retention.lastSuccess=Date();retention.lastError=nil}
+        retention.totalEventsRemoved+=result.removed
+        retention.totalBytesRemoved+=result.bytes
+        retention.lastEventCount=eventIndex?.count
+        retention.lastEventBytes=eventIndex?.values.reduce(0,+)
+        retention.lastTrimMs=Int((ProcessInfo.processInfo.systemUptime-startedAt)*1000)
+        Self.writeEvidence(root:root,name:Self.retentionName,retention)
     }
     func trimDiagnosticEvents(maxCount:Int,maxBytes:Int)->(removed:Int,bytes:Int){
+        let started=ProcessInfo.processInfo.systemUptime
         let result=Self.pruneEvents(root:root,maxCount:maxCount,maxBytes:maxBytes)
-        diagnosticCount=diagnosticCount.map{max(0,$0-result.removed)}
-        if result.failed{error="Diagnostic retention cleanup failed";diagnosticCount=nil}
+        apply(result);record(result,startedAt:started)
         return(result.removed,result.bytes)
     }
     func trimDiagnosticEventsAsync(maxCount:Int,maxBytes:Int)async->(removed:Int,bytes:Int){
-        // The caller serializes retention with telemetry upload. Concurrent
-        // log appends have unique names and update the cached count on MainActor.
-        let directory=root,hadCount=diagnosticCount != nil
+        guard !trimInFlight else{return(0,0)}
+        trimInFlight=true
+        defer{trimInFlight=false}
+        let started=ProcessInfo.processInfo.systemUptime
+        let directory=root
         let result=await Task.detached(priority:.utility){
             Self.pruneEvents(root:directory,maxCount:maxCount,maxBytes:maxBytes)
         }.value
-        if hadCount && !result.failed{diagnosticCount=diagnosticCount.map{max(0,$0-result.removed)}}
-        else{diagnosticCount=nil}
-        if result.failed{error="Diagnostic retention cleanup failed"}
+        apply(result);record(result,startedAt:started)
         return(result.removed,result.bytes)
+    }
+    private func scheduleEmergencyTrimIfNeeded(){
+        guard !trimInFlight,let index=eventIndex else{return}
+        let bytes=index.values.reduce(0,+)
+        guard index.count>Self.hardMaxEvents || bytes>Self.hardMaxBytes else{return}
+        trimInFlight=true
+        let maxCount=Self.hardMaxEvents,maxBytes=Self.hardMaxBytes
+        Task{[weak self] in
+            guard let self=self else{return}
+            let started=ProcessInfo.processInfo.systemUptime
+            let directory=self.root
+            let result=await Task.detached(priority:.utility){
+                Self.pruneEvents(root:directory,maxCount:maxCount,maxBytes:maxBytes)
+            }.value
+            self.apply(result);self.record(result,startedAt:started)
+            self.trimInFlight=false
+        }
     }
     func quarantineUnreadableConfigurationTrial()throws{
         let path=root.appendingPathComponent("hot-config-trial.json")
@@ -104,10 +297,11 @@ import Foundation
         guard save(candidate,"hot-config.json") else{throw AppError.message("Cannot activate configuration")}
     }
     func remove(_ url:URL) {
+        let name=url.lastPathComponent
         do {
             try FileManager.default.removeItem(at:url)
-            if url.lastPathComponent.hasPrefix("event-"){diagnosticCount=diagnosticCount.map{max(0,$0-1)}}
-            if url.lastPathComponent.hasPrefix("batch-"){batchCount=batchCount.map{max(0,$0-1)}}
+            if name.hasPrefix("event-"),eventIndex != nil{eventIndex?.removeValue(forKey:name)}
+            if name.hasPrefix("batch-"),batchIndex != nil{batchIndex?.removeValue(forKey:name)}
         } catch { self.error="Cannot remove uploaded batch" }
     }
 }

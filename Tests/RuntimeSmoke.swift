@@ -100,6 +100,43 @@ import Foundation
         for index in 7..<12{precondition(configDisk.save(["event":index],"event-\(index).json"))}
         let asyncTrimmed=await configDisk.trimDiagnosticEventsAsync(maxCount:2,maxBytes:1024*1024)
         precondition(asyncTrimmed.removed==5 && configDisk.queuedCount(prefix:"event-")==2 && configDisk.files(prefix:"receipt-").count==1)
+        // Durable diagnostics: exact index accounting, byte bound, retention
+        // journal and unclean-launch evidence. Only event-* files may be pruned.
+        let diagRoot=fixtureRoot.appendingPathComponent("diagnostics")
+        let diagDisk=Disk(root:diagRoot)
+        precondition(diagDisk.previousUncleanLaunch==nil && diagDisk.queuedCount(prefix:"event-")==0)
+        for index in 0..<6{precondition(diagDisk.save(Event(severity:"INFO",component:"focused",code:"EVENT_\(index)"),"event-\(index).json"))}
+        precondition(diagDisk.queuedCount(prefix:"event-")==6 && diagDisk.files(prefix:"event-").count==6)
+        precondition(diagDisk.save(Event(severity:"INFO",component:"focused",code:"OVERWRITE"),"event-0.json"))
+        precondition(diagDisk.queuedCount(prefix:"event-")==6)
+        precondition(diagDisk.save(["receipt":"preserved"],"receipt-focused.json"))
+        let focusedReceipt=Receipt(id:"focused-receipt",action:"fixture",status:"interrupted",result:"preserved")
+        precondition(diagDisk.save(focusedReceipt,"receipt-focused-receipt.json"))
+        precondition(diagDisk.save(["settings":"preserved"],"settings.json"))
+        let focusedTrim=await diagDisk.trimDiagnosticEventsAsync(maxCount:2,maxBytes:1024*1024)
+        precondition(focusedTrim.removed==4 && diagDisk.queuedCount(prefix:"event-")==2)
+        precondition(diagDisk.retention.totalEventsRemoved==4 && diagDisk.retention.lastError==nil && diagDisk.retention.lastEventCount==2)
+        precondition(diagDisk.files(prefix:"receipt-").count==2 && diagDisk.load([String:String].self,"settings.json")?["settings"]=="preserved")
+        let relaunchedDisk=Disk(root:diagRoot)
+        precondition(relaunchedDisk.previousUncleanLaunch?.launchID==diagDisk.diagnosticLaunchID)
+        precondition(relaunchedDisk.retention.totalEventsRemoved==4)
+        precondition(relaunchedDisk.queuedCount(prefix:"event-")==3)
+        let preservedReceipt=relaunchedDisk.load(Receipt.self,"receipt-focused-receipt.json")
+        precondition(preservedReceipt?.id==focusedReceipt.id && preservedReceipt?.status=="interrupted" && preservedReceipt?.result=="preserved")
+        relaunchedDisk.markCleanShutdown()
+        let cleanDisk=Disk(root:diagRoot)
+        precondition(cleanDisk.previousUncleanLaunch==nil && cleanDisk.queuedCount(prefix:"event-")==3)
+        let byteTrim=await cleanDisk.trimDiagnosticEventsAsync(maxCount:100,maxBytes:1)
+        precondition(byteTrim.removed>=1 && cleanDisk.queuedCount(prefix:"event-")<3)
+        let asyncDisk=Disk(root:fixtureRoot.appendingPathComponent("async-events"))
+        for index in 0..<3 {
+            let appended=await asyncDisk.appendEventAsync(Event(severity:"INFO",component:"focused",code:"ASYNC_\(index)"),"event-async-\(index).json")
+            precondition(appended)
+        }
+        precondition(asyncDisk.queuedCount(prefix:"event-")==3 && asyncDisk.files(prefix:"event-").count==3)
+        let asyncFocusedTrim=await asyncDisk.trimDiagnosticEventsAsync(maxCount:1,maxBytes:1024*1024)
+        precondition(asyncFocusedTrim.removed==2 && asyncDisk.queuedCount(prefix:"event-")==1)
+        print("PASS: exact diagnostic accounting, byte bound, durable retention, off-main append and unclean-launch evidence")
         let trial=try HotConfigurationTrial(before:HotConfigurationStore(),candidateRevision:hotConfigFixture.revision,expiresAt:Date().addingTimeInterval(60)).checked()
         precondition(configDisk.save(trial,"hot-config-trial.json"))
         let recoveredTrial=try configDisk.recoverConfigurationTrial()
@@ -215,6 +252,91 @@ with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10) as s:
         }
         precondition(dispatchCount==2)
         print("PASS: malformed LAN envelopes return 400 without dispatch; decoded commands retain HTTP 200 receipts")
+        // LAN lifecycle: idle/partial clients release their slots, completed
+        // responses release the slot at the connection cap, a handler that
+        // outlives its deadline cannot retain the listener, and authentication
+        // plus the /health bypass are unchanged.
+        let lifecycleFixture=LANServer(port:.any,advertise:false,maxConnections:1,idleTimeout:0.4,responseTimeout:5,queryTimeout:5)
+        lifecycleFixture.handler={body,complete in complete("200 OK",body)}
+        try lifecycleFixture.start()
+        defer{lifecycleFixture.stop()}
+        for _ in 0..<100 {if lifecycleFixture.port != nil{break};try await Task.sleep(nanoseconds:20_000_000)}
+        guard let lifecyclePort=lifecycleFixture.port else{throw AppError.message("LAN lifecycle listener did not start")}
+        let idleProbe=Process()
+        idleProbe.executableURL=URL(fileURLWithPath:"/usr/bin/python3")
+        idleProbe.arguments=["-c","""
+import socket, sys, time
+port=int(sys.argv[1])
+s=socket.create_connection(("127.0.0.1",port),timeout=3)
+s.sendall(b"GET /health HTTP/1.1\\r\\nHost: x\\r\\n")
+time.sleep(1.0)
+try:
+    s.sendall(b"X"); data=s.recv(1024)
+except Exception:
+    data=b""
+assert data==b"", data
+s.close()
+t=socket.create_connection(("127.0.0.1",port),timeout=3)
+t.sendall(b"GET /health HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n")
+data=b""
+while b"\\r\\n\\r\\n" not in data:
+    part=t.recv(1024)
+    if not part: break
+    data+=part
+assert data.startswith(b"HTTP/1.1 200 "), data[:100]
+t.close()
+""",String(lifecyclePort)]
+        try idleProbe.run()
+        idleProbe.waitUntilExit()
+        guard idleProbe.terminationStatus==0 else{throw AppError.message("Idle LAN connection was not cleaned up")}
+        guard let lifecycleURL=URL(string:"http://127.0.0.1:\(lifecyclePort)/command") else{throw AppError.message("Invalid LAN URL")}
+        for index in 0..<12 {
+            var req=URLRequest(url:lifecycleURL);req.httpMethod="POST";req.httpBody=Data("fixture-\(index)".utf8);req.timeoutInterval=5
+            let (reply,response)=try await localTransport.data(for:req)
+            precondition((response as? HTTPURLResponse)?.statusCode==200 && reply==req.httpBody)
+        }
+        print("PASS: idle and completed LAN control connections release bounded slots")
+        let deadlineFixture=LANServer(port:.any,advertise:false,maxConnections:1,idleTimeout:2,responseTimeout:0.4,queryTimeout:5)
+        deadlineFixture.handler={_,complete in Task{try? await Task.sleep(nanoseconds:1_000_000_000);complete("200 OK",Data("late".utf8))}}
+        try deadlineFixture.start()
+        defer{deadlineFixture.stop()}
+        for _ in 0..<100 {if deadlineFixture.port != nil{break};try await Task.sleep(nanoseconds:20_000_000)}
+        guard let deadlinePort=deadlineFixture.port,
+              let deadlineURL=URL(string:"http://127.0.0.1:\(deadlinePort)/command"),
+              let deadlineHealth=URL(string:"http://127.0.0.1:\(deadlinePort)/health") else{throw AppError.message("LAN deadline fixture did not start")}
+        var lateTimedOut=false
+        do{
+            var req=URLRequest(url:deadlineURL);req.httpMethod="POST";req.httpBody=Data("late".utf8);req.timeoutInterval=5
+            _ = try await localTransport.data(for:req)
+        }catch{lateTimedOut=true}
+        precondition(lateTimedOut)
+        try await Task.sleep(nanoseconds:1_200_000_000)
+        let (_,health)=try await localTransport.data(for:URLRequest(url:deadlineHealth))
+        precondition((health as? HTTPURLResponse)?.statusCode==200)
+        print("PASS: late command completion cannot retain a LAN control connection")
+        let authFixture=LANServer(port:.any,advertise:false,maxConnections:4,idleTimeout:2,responseTimeout:5,queryTimeout:5)
+        authFixture.setAccessToken("fixture-token")
+        authFixture.handler={_,complete in complete("200 OK",Data("{}".utf8))}
+        authFixture.queryHandler={path,complete in complete(path=="/health" || path=="/status" ? "200 OK":"404 Not Found",Data("{}".utf8))}
+        try authFixture.start()
+        defer{authFixture.stop()}
+        for _ in 0..<100 {if authFixture.port != nil{break};try await Task.sleep(nanoseconds:20_000_000)}
+        guard let authPort=authFixture.port else{throw AppError.message("LAN auth fixture did not start")}
+        func authRequest(_ path:String,method:String="GET",token:String?=nil,body:Data?=nil)async throws->Int{
+            guard let url=URL(string:"http://127.0.0.1:\(authPort)"+path) else{throw AppError.message("Invalid LAN URL")}
+            var req=URLRequest(url:url);req.httpMethod=method;req.httpBody=body
+            if let token=token{req.setValue("Bearer "+token,forHTTPHeaderField:"Authorization")}
+            req.timeoutInterval=5
+            let (_,response)=try await localTransport.data(for:req)
+            return (response as? HTTPURLResponse)?.statusCode ?? -1
+        }
+        let healthStatus=try await authRequest("/health")
+        let unauthenticatedStatus=try await authRequest("/status")
+        let authenticatedStatus=try await authRequest("/status",token:"fixture-token")
+        let wrongTokenCommand=try await authRequest("/command",method:"POST",token:"wrong",body:Data("{}".utf8))
+        let authenticatedCommand=try await authRequest("/command",method:"POST",token:"fixture-token",body:Data("{}".utf8))
+        precondition(healthStatus==200 && unauthenticatedStatus==401 && authenticatedStatus==200 && wrongTokenCommand==401 && authenticatedCommand==200)
+        print("PASS: LAN authentication and /health bypass preserved after connection cleanup")
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }
