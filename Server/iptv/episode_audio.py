@@ -1712,6 +1712,11 @@ class EpisodeBudget:
         while len(self.seen) > 1024:
             self.seen.popitem(last=False)
 
+    def required_progress(self, sample_seconds, unknown_lead=False):
+        if unknown_lead:
+            return UNKNOWN_LEAD_PROGRESS_SECONDS
+        return min(self.active_seconds,max(AUDIO_MIN_ACTIVE_SECONDS,sample_seconds)) if sample_seconds>=MIN_EVIDENCE_SAMPLE_SECONDS else self.active_seconds
+
     def eligible(self, view, *, has_episode_identity, profile, language, language_outcome,
                  now=None, dedup_key="", sample_seconds=0.0, allow_retry=False, unknown_lead=False):
         now = self.clock() if now is None else float(now)
@@ -1732,22 +1737,11 @@ class EpisodeBudget:
             sample = float(sample_seconds or 0.0)
         except (TypeError, ValueError):
             sample = 0.0
-        required = self.active_seconds
-        if sample >= MIN_EVIDENCE_SAMPLE_SECONDS:
-            # A completed, verified language sample already demonstrates real
-            # progressing playback for its own bounded window.  A 60-second
-            # rotation cannot reach 120 seconds, so use the sample window as a
-            # deliberate, bounded floor for this lane only.  Rotation and every
-            # language confidence threshold remain unchanged.
-            required = min(required, max(AUDIO_MIN_ACTIVE_SECONDS, sample))
         if not math.isfinite(active) or not math.isfinite(sample):
             return False, "inactive"
         if unknown_lead and sample < MIN_EVIDENCE_SAMPLE_SECONDS:
             return False, "inactive"
-        if unknown_lead:
-            # Lead search may start earlier; publishing still requires the
-            # independent confirmed-progress gate, full sample and source proof.
-            required = UNKNOWN_LEAD_PROGRESS_SECONDS
+        required = self.required_progress(sample, unknown_lead)
         if active < required:
             return False, "inactive"
         self._prune(now)
@@ -3700,9 +3694,42 @@ class EpisodeObserver:
                 profile=binding.profile, language=request.language,
                 language_outcome=request.language_outcome, dedup_key=dedup_key,
                 sample_seconds=request.sample_seconds, allow_retry=retry, unknown_lead=early_lead)
+            if not allowed and budget_reason == "inactive" and request.sample_seconds >= MIN_EVIDENCE_SAMPLE_SECONDS:
+                activity = self._usable_activity(binding.channel_id)
+                active_session = (activity or {}).get("session_hash")
+                if early_lead and active_session != session_hash:
+                    self._diagnose("session-changed", "stale")
+                    return None
+                required = self.budget.required_progress(request.sample_seconds, early_lead)
+                progress = self._confirmed_progress(activity) if early_lead else float((activity or {}).get("active_seconds",0))
+                gap = required-progress
+                if active_session and 0 < gap <= UNKNOWN_CONFIRM_WAIT_SECONDS:
+                    deadline = time.monotonic()+UNKNOWN_CONFIRM_WAIT_SECONDS
+                    while binding.checked(time.time()) and time.monotonic()<deadline:
+                        time.sleep(min(0.5,max(0.0,deadline-time.monotonic())))
+                        activity = self._usable_activity(binding.channel_id)
+                        if not activity or activity.get("session_hash") != active_session:
+                            self._diagnose("session-changed", "stale")
+                            return None
+                        progress = self._confirmed_progress(activity) if early_lead else float(activity.get("active_seconds",0))
+                        if progress < required:
+                            continue
+                        fresh = self.probe() if callable(self.probe) else None
+                        if not binding.matches(fresh,time.time()) or not self._programme_coherent(context,self._context(binding.channel_id)):
+                            self._diagnose("session-changed", "stale")
+                            return None
+                        view = self._view(binding,job)
+                        view["active_seconds"] = progress
+                        allowed,budget_reason = self.budget.eligible(
+                            view,has_episode_identity=bool(view.get("hasEpisodeIdentity")),
+                            profile=binding.profile,language=request.language,language_outcome=request.language_outcome,
+                            dedup_key=dedup_key,sample_seconds=request.sample_seconds,allow_retry=retry,unknown_lead=early_lead)
+                        if allowed:
+                            self._diagnose("progress-ready-reused-sample","budget")
+                        break
             if not allowed:
                 self._diagnose("budget-" + str(budget_reason or "rejected"), "budget",
-                               ("confirmed=%.1f sample=%.1f" % (view["active_seconds"], request.sample_seconds)) if early_lead else ("episodeOnly" if retry else ""))
+                               ("progress=%.1f sample=%.1f required=%.1f" % (view["active_seconds"], request.sample_seconds, self.budget.required_progress(request.sample_seconds,early_lead))))
                 if budget_reason == "inactive":
                     # The clue is not dropped just because independent active
                     # viewing has not reached the unchanged floor yet. Ask the

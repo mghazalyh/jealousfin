@@ -103,6 +103,12 @@ class PublicSearchTests(unittest.TestCase):
         self.assertNotIn("WWE NXT",queries[1])
         self.assertEqual(discovery.episode_search_queries({"channelName":"WWE NXT"}),())
 
+    def test_known_prefetch_queries_use_episode_metadata_without_audio(self):
+        queries=discovery.episode_search_queries({"seriesTitle":"WWE NXT","originalAirDate":"2025-11-04"})
+        self.assertEqual(len(queries),2)
+        self.assertTrue(all("WWE NXT" in q and "2025-11-04" in q for q in queries))
+        self.assertEqual(discovery.episode_search_queries({"seriesTitle":"WWE NXT"}),())
+
     def test_distinct_names_survive_long_conversational_clues(self):
         transcript=("We're looking at a really incredible opportunity for this particular "
                     "combination of strategic considerations. Alex Palou passes Marcus Ericsson "
@@ -490,6 +496,40 @@ class ConfirmedProgressTests(unittest.TestCase):
         self.assertEqual(budget.eligible(view,sample_seconds=55,unknown_lead=True,**args),(True,""))
         self.assertEqual(budget.eligible(view,sample_seconds=39,unknown_lead=True,**args),(False,"inactive"))
         self.assertEqual(budget.eligible(dict(view,active_seconds=11),sample_seconds=55,unknown_lead=True,**args),(False,"inactive"))
+
+    def test_full_sample_is_reused_when_confirmed_progress_catches_up(self):
+        wall=time.time();progress=[10];calls=[];store=audio.PublicationStore()
+        def research(payload):
+            calls.append(payload);progress[0]=40
+            return [fixtures.nxt_official()],fixtures.nxt_reports()
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),research,enabled=True,
+            budget=audio.EpisodeBudget(),programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":60,"confirmed_seconds":progress[0],"session_hash":"s1"},
+            publisher=store)
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1","visitID":"visit-1",
+             "observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":55.0}
+        with patch.object(audio.time,"sleep",side_effect=lambda _:progress.__setitem__(0,12)):
+            result=observer(job,decision,fixtures.NXT_TEXT)
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(observer.diagnostics()["reasons"].get("progress-ready-reused-sample"),1)
+
+    def test_reused_sample_cannot_cross_playback_sessions(self):
+        wall=time.time();session=["s1"];calls=[]
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),
+            lambda payload:calls.append(payload) or ([],[]),enabled=True,
+            budget=audio.EpisodeBudget(),programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":60,"confirmed_seconds":10,"session_hash":session[0]})
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1","visitID":"visit-1",
+             "observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":55.0}
+        with patch.object(audio.time,"sleep",side_effect=lambda _:session.__setitem__(0,"s2")):
+            self.assertIsNone(observer(job,decision,fixtures.NXT_TEXT))
+        self.assertEqual(calls,[])
+        self.assertEqual(observer.diagnostics()["reasons"].get("session-changed"),1)
 
     def test_research_may_start_early_but_cannot_publish_before_confirmed_floor(self):
         for final, expected in [(20,False),(40,True)]:

@@ -382,7 +382,17 @@ def episode_search_queries(context):
         return ()
     clues = episode_audio.normalize_clues(context.get("clues"))
     if len(clues) < episode_audio.MIN_DISTINCTIVE_CLUES:
-        return ()
+        # Known metadata can warm the source cache without a transcript.
+        # Never use a bare channel name or undated series as evidence.
+        series = " ".join(re.findall(r"[a-zA-Z0-9]+",clean(context.get("seriesTitle"),200)))[:100]
+        air = episode_audio._date(context.get("originalAirDate"))
+        episode = " ".join(re.findall(r"[a-zA-Z0-9]+",clean(context.get("episodeTitle"),150)))[:100]
+        if not series or not (air or episode):
+            return ()
+        exact = '"' + series + '"'
+        detail = (' "' + episode + '"') if episode else ""
+        date = (" " + air) if air else ""
+        return (exact + detail + date + " episode official", exact + detail + date + " episode recap")
     chosen = []
     used = set()
     for clue in clues:
