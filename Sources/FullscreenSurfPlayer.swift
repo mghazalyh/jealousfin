@@ -102,7 +102,7 @@ struct FullscreenSurfPlayer:View {
                 PatchableRegion("player.fullscreen.heading"){
                     HStack(spacing:8){
                         PatchableRegion("player.fullscreen.programmeTitle"){
-                            Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Programme unavailable")
+                            Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? (model.current == nil ? "Choose a channel" : "Programme unavailable"))
                                 .font(.system(size:22,weight:.semibold)).lineLimit(3)
                                 .frame(maxWidth:.infinity,alignment:.leading)
                                 .accessibilityIdentifier("player.fullscreen.programmeTitle")
@@ -166,7 +166,7 @@ struct FullscreenSurfPlayer:View {
     @ViewBuilder private func transportControl(_ id:String)->some View{
         switch id{
         case "rotationToggle":
-            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:model.surfPaused ? .favorite : .rotation){model.toggleSurfPause()}}
+            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:model.surfPaused ? .rotationPaused : .rotation){model.toggleSurfPause()}}
         case "previous":
             control("Previous channel","backward.end.fill",id){model.previousFromUI()}
                 .disabled(!model.canGoPrevious)
@@ -274,7 +274,7 @@ private struct FullscreenContentHeight:PreferenceKey{
 
 // Native colors mirror the physically accepted night hot patch. The standard
 // variant is opt-in and remains subdued; neither changes video brightness.
-enum FullscreenControlRole{case normal,rotation,favorite}
+enum FullscreenControlRole{case normal,rotation,rotationPaused,favorite}
 struct FullscreenControlPalette{
     let theme:String
     private var night:Bool{theme != "standard"}
@@ -290,21 +290,21 @@ struct FullscreenControlPalette{
         switch role{
         case .normal:return text
         case .rotation:return rgb(night ? 0xb5c1d0:0xd5e3f6)
-        case .favorite:return rgb(night ? 0xc4aab6:0xe0c3ce)
+        case .rotationPaused,.favorite:return rgb(night ? 0xc4aab6:0xe0c3ce)
         }
     }
     func background(_ role:FullscreenControlRole)->Color{
         switch role{
         case .normal:return button
         case .rotation:return rgb(night ? 0x26313f:0x34465b).opacity(0.91)
-        case .favorite:return rgb(night ? 0x352a31:0x493641).opacity(0.91)
+        case .rotationPaused,.favorite:return rgb(night ? 0x352a31:0x493641).opacity(0.91)
         }
     }
     func outline(_ role:FullscreenControlRole)->Color{
         switch role{
         case .normal:return border
         case .rotation:return rgb(0x8193ad).opacity(night ? 0.20:0.35)
-        case .favorite:return rgb(0x8b6e79).opacity(night ? 0.24:0.40)
+        case .rotationPaused,.favorite:return rgb(0x8b6e79).opacity(night ? 0.24:0.40)
         }
     }
 }

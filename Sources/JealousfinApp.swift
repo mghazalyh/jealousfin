@@ -157,7 +157,7 @@ struct PlaybackView:View{
             PatchableRegion("player.transport"){
             Panel{
                 VStack(alignment:.leading,spacing:8){
-                    Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Programme unavailable")
+                    Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? (model.current == nil ? model.status : "Programme unavailable"))
                         .font(.title2.bold()).frame(maxWidth:.infinity,alignment:.leading)
                         .accessibilityIdentifier("player.programmeTitle")
                     if let p=model.current?.program?.progress {ProgressView(value:p).tint(accent)}

@@ -824,3 +824,5 @@ check(overlayDefaults.slots.map(\.location)==["more.bottom","player.fullscreen.t
 check(overlayDefaults.formNode("languageOverlay") != nil && overlayDefaults.formNode("spanishRequest") != nil && overlayDefaults.formNode("programmeOverlay") != nil,"gateway overlay bindings restored")
 check(overlayDefaults.formDefaults()["languageOverlay"]=="Detector status unavailable","native overlay starts with honest detector fallback")
 print("PASS: native overlay defaults")
+
+check(NativeOverlayDefaults.markerAction("spanish-mark")=="add" && NativeOverlayDefaults.markerAction("spanish-unmark")=="remove" && NativeOverlayDefaults.markerAction("language-mistaken")=="mistaken_english" && NativeOverlayDefaults.markerAction("spanish-read")==nil,"native language actions are explicitly scoped")

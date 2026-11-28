@@ -321,6 +321,10 @@ enum DynamicUIBinding {
 // and rotation use SwiftUI rather than persistent WebKit replacements.
 enum NativeOverlayDefaults {
     static let marker = "native-overlay-defaults.json"
+    static let revision = "native-overlay-controls-20261128"
+    static func markerAction(_ id:String)->String?{
+        ["spanish-mark":"add","spanish-unmark":"remove","language-mistaken":"mistaken_english"][id]
+    }
     static func layout() throws -> DynamicUILayout {
         let data=Data(#"""
 {
@@ -413,11 +417,11 @@ enum NativeOverlayDefaults {
                         {
                           "action": {
                             "arguments": {
-                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nif(s.surfing!==true){return \"Spanish: Surf is not active\";}\nif(s.currentSharedTransport===true||s.surfRotationControllable===false){return \"Spanish: device-owned rotation required\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"add\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.command(\"next_channel\",{});\napi.log(\"Spanish mark requested: \"+id);\nreturn \"Spanish: marked \"+name+\"; excluding and advancing\";\n})()"
+                              "source": "(function(){return \"Native language action\";})()"
                             },
                             "command": "script"
                           },
-                          "detail": "Mark this English channel Spanish, exclude it and advance",
+                          "detail": "Request Spanish exclusion; advance only after catalogue confirmation",
                           "id": "spanish-mark",
                           "kind": "button",
                           "style": "muted",
@@ -427,7 +431,7 @@ enum NativeOverlayDefaults {
                         {
                           "action": {
                             "arguments": {
-                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"remove\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"Spanish unmark requested: \"+id);\nreturn \"Spanish: unmarked \"+name+\"; English membership will refresh\";\n})()"
+                              "source": "(function(){return \"Native language action\";})()"
                             },
                             "command": "script"
                           },
@@ -441,7 +445,7 @@ enum NativeOverlayDefaults {
                         {
                           "action": {
                             "arguments": {
-                              "source": "(function(){\nvar s=api.state||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Correction: no current channel\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:2,action:\"mistaken_english\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"English correction requested: \"+id);\nreturn \"Correction: English retraction queued for \"+name;\n})()"
+                              "source": "(function(){return \"Native language action\";})()"
                             },
                             "command": "script"
                           },

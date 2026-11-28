@@ -3277,6 +3277,28 @@ extension AppModel {
         guard dynamicUISeen.insert(identity).inserted else{return}
         log("INFO","dynamic-ui","SLOT_RENDERED",["slot":slot,"revision":dynamicUI.active?.revision ?? ""])
     }
+    // Native actions capture the channel and generation before any suspension.
+    // Do not advance merely because a local marker write was queued.
+    private func applyNativeLanguageMarker(_ marker:String)async throws->String{
+        guard activeSurfSource == .american,!sourceTransitionBusy,let channel=current,!channel.isSurf,
+              channel.id.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil,
+              ["add","remove","mistaken_english"].contains(marker) else{throw AppError.message("Language correction requires a current American channel")}
+        if marker=="add"{
+            guard surfing,!usingSharedSurf,!currentSharedTransport else{throw AppError.message("Spanish exclusion requires device-owned Surf rotation")}
+        }
+        let capturedGeneration=generation
+        let value:[String:Any]=["schemaVersion":marker=="mistaken_english" ? 2:1,"action":marker,
+            "channelID":channel.id,"channelName":channel.name,"nonce":UUID().uuidString.lowercased()]
+        let encoded=String(decoding:try JSONSerialization.data(withJSONObject:value,options:[.sortedKeys]),as:UTF8.self)
+        try setDynamicUIValue("spanishRequest",value:encoded)
+        do{try await refresh()}catch{return "Language correction queued; catalogue refresh unavailable. Playback unchanged."}
+        if marker=="add",generation==capturedGeneration,current?.id==channel.id,activeSurfSource == .american,
+           surfing,!usingSharedSurf,!currentSharedTransport,catalogueReady,!channels.contains(where:{$0.id==channel.id}){
+            next(reason:"confirmed-language-exclusion")
+            return "Spanish exclusion confirmed; advancing."
+        }
+        return "Language correction queued; playback unchanged until catalogue confirmation."
+    }
     func triggerDynamicUI(_ id:String,origin:String)async throws->Receipt{
         guard let layout=dynamicUI.active,let node=layout.node(id),let action=node.action,
               dynamicVisible(node),dynamicEnabled(node) else{throw AppError.message("UI action unavailable")}
@@ -3286,7 +3308,14 @@ extension AppModel {
         let args=try DynamicUIBinding.arguments(action.arguments ?? [:],values:inputs,state:stateSnapshot())
         log("INFO","dynamic-ui","ACTION_STARTED",["node":id,"origin":origin,"revision":layout.revision,"command":action.command])
         let result:Receipt
-        if action.command=="script" {
+        if layout.revision==NativeOverlayDefaults.revision,let marker=NativeOverlayDefaults.markerAction(id){
+            do{
+                let output=try await applyNativeLanguageMarker(marker)
+                result=Receipt(id:UUID().uuidString,action:"language-marker",status:"succeeded",result:output)
+            }catch{
+                result=Receipt(id:UUID().uuidString,action:"language-marker",status:"failed",result:sanitized(error.localizedDescription))
+            }
+        }else if action.command=="script" {
             do {
                 guard let source=args["source"] else{throw AppError.message("Missing script source")}
                 let output=try await runScript(source,uiInputs:inputs)
