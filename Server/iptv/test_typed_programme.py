@@ -105,7 +105,10 @@ class TypedGatewayTests(fixtures.GatewayAudioIntegrationTests):
             result=merged[fixtures.CHANNEL]
             self.assertEqual(result["source"],"local-audio-identity")
             self.assertEqual(result["observedAt"],result["contentObservedAt"])
-            self.assertTrue(audio.programme_has_resolved_identity(audio.programme_context(result)))
+            self.assertTrue(audio.programme_has_resolved_identity(audio.programme_context(result,session_hash="s1"),"s1"))
+            self.assertIsNone(audio.programme_context(result,session_hash="s2"))
+            self.assertFalse(audio.programme_has_resolved_identity(result))
+            self.assertFalse(audio.programme_has_resolved_identity(result,"s1",now+audio.PUBLICATION_TTL+1))
             self.assertFalse(audio.programme_has_episode_identity(result))
             item=self.g.programme_item(fixtures.CHANNEL,result)
             self.assertEqual(item["Name"],"Example Film (1975)")
@@ -113,10 +116,27 @@ class TypedGatewayTests(fixtures.GatewayAudioIntegrationTests):
             self.assertNotIn("StartDate",item)
             self.assertNotIn("EndDate",item)
             self.assertNotIn("episodeTitle",item["JealousfinProgramme"])
+            self.assertNotIn("audioPlaybackSessionHash",item["JealousfinProgramme"])
+            for key in ("contentTitle","contentReleaseYear","contentVerification","contentVisitDigest","contentObservedAt","contentExpiresAt"):
+                corrupt=dict(result);corrupt.pop(key)
+                self.assertFalse(audio.programme_has_resolved_identity(corrupt,"s1"))
+                self.assertIsNone(audio.programme_context(corrupt,session_hash="s1"))
+                self.assertIsNone(self.g.programme_item(fixtures.CHANNEL,corrupt))
+            for overrides in ({"contentConfidence":float("nan")},{"contentObservedAt":10**1000},
+                              {"contentExpiresAt":now+999999},{"contentTitle":"Wrong title"},
+                              {"contentReleaseYear":True},{"contentReleaseYear":2100},
+                              {"seasonNumber":1,"episodeNumber":2}):
+                self.assertFalse(audio.programme_has_resolved_identity(dict(result,**overrides),"s1"))
             existing={fixtures.CHANNEL:{"title":"Example Film","source":"provider-catalogue"}}
             self.assertEqual(self.g.merge_episode_publication(existing.copy(),now),existing)
         with patch.object(self.g.playback_activity,"views",return_value={fixtures.CHANNEL:SimpleNamespace(session_hash="s2")}):
             self.assertEqual(self.g.merge_episode_publication({},now),{})
+            self.assertIsNone(self.g.programme_item(fixtures.CHANNEL,result))
+
+    def test_incomplete_typed_identity_cannot_suppress_research(self):
+        row={"title":"Unverified","contentKind":"movie","contentSource":"local-audio-programme-identity","contentCorroboratingSources":2}
+        self.assertFalse(audio.programme_has_resolved_identity(row,"s1"))
+        self.assertIsNone(audio.programme_context(row,session_hash="s1"))
 
 class TypedParserTests(unittest.TestCase):
     def setUp(self):

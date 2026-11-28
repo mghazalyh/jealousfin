@@ -1484,18 +1484,22 @@ def merge_episode_publication(result,now=None):
  now=time.time() if now is None else now
  for cid,audio in episode_publisher.snapshot(now).items():
   row=result.get(cid)
-  if audio.get("contentKind") in episode_audio.TYPED_CONTENT_KINDS and isinstance(row,dict):continue
+  typed=audio.get("contentSource")=="local-audio-programme-identity"
+  if typed and isinstance(row,dict):continue
   series=audio.get("audioSeriesTitle")
   session=audio.get("audioPlaybackSessionHash")
   if session:
    view=playback_activity.views().get(cid)
    if view is None or view.session_hash!=session:continue
+  if typed and not episode_audio.typed_programme_resolved(audio,session,now):continue
   if not isinstance(row,dict):
    if not session or not series:continue
    row={"title":series,"source":"local-audio-identity","observedAt":audio.get("contentObservedAt",audio.get("episodeObservedAt"))}
   if episode_audio.programme_has_stronger_episode_metadata(row):continue
   if series and episode_audio.source_key(row.get("title"))!=episode_audio.source_key(series):continue
-  merged=dict(row);merged.update({k:v for k,v in audio.items() if k not in ("audioSeriesTitle","audioPlaybackSessionHash")});result[cid]=merged
+  merged=dict(row);merged.update({k:v for k,v in audio.items() if k not in ("audioSeriesTitle","audioPlaybackSessionHash")})
+  if typed:merged["audioPlaybackSessionHash"]=session
+  result[cid]=merged
  return result
 
 def programme_snapshot(now=None):
@@ -1532,19 +1536,25 @@ def programme_snapshot(now=None):
       if key in evidence and key not in primary:primary[key]=evidence[key]
    result[cid]=primary
  for cid,episode in episode_snapshot(now,result).items():result[cid].update(episode)
+ # Reserved local evidence must originate only in the private publication store.
+ for cid,row in list(result.items()):
+  if row.get("source")=="local-audio-identity" or row.get("contentSource")=="local-audio-programme-identity":result.pop(cid,None)
  return merge_episode_publication(result,now)
 
 def programme_item(cid,row):
  # The provider supplies a title and an unzoned end clock, not a reliable
  # UTC schedule. Keep the standard programme dates absent and expose evidence.
  title=row['title']
- typed=row.get('source')=='local-audio-identity' and row.get('contentSource')=='local-audio-programme-identity' and row.get('contentKind') in episode_audio.TYPED_CONTENT_KINDS
+ typed=row.get('contentSource')=='local-audio-programme-identity'
+ if typed:
+  view=playback_activity.views().get(cid)
+  if row.get('source')!='local-audio-identity' or view is None or not episode_audio.typed_programme_resolved(row,view.session_hash):return None
  year=release_year(row.get('contentReleaseYear')) if typed else cached_year(row)
  display=title if not year or title_year(title)[1] else title+' ('+str(year)+')'
  if typed and row.get('contentKind')=='sports-event':
   date=episode_audio._pretty_date(row.get('contentEventDate'))
   if date:display=title+' — '+date
- evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber')}
+ evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber','audioPlaybackSessionHash')}
  episode=None if typed else programme_text(row.get('episodeTitle'))
  if episode:
   prefix='' if guide_norm(channels.get(cid,{}).get('Name',''))==guide_norm(title_year(title)[0]) else title_year(title)[0]+' — '
@@ -2545,14 +2555,15 @@ def episode_source_prefetch_worker(stop):
    with lock:active=[cid for cid,until in active_channels.items() if until>now]
    for cid in active[:4]:
     context=current_programme_context(cid)
-    if not context or not context.get('seriesTitle') or episode_audio.programme_has_resolved_identity(context):continue
+    if not context or not context.get('seriesTitle') or context.get('verified'):continue
     observer.prefetch(context)
   except Exception as error:
    log('episode source prefetch '+type(error).__name__)
 def current_programme_context(channel_id):
  try:row=programme_snapshot().get(channel_id)
  except (sqlite3.Error,OSError,RuntimeError,ValueError):return None
- context=episode_audio.programme_context(row,channel_id)
+ view=playback_activity.views().get(channel_id) if isinstance(row,dict) and row.get("contentSource")=="local-audio-programme-identity" else None
+ context=episode_audio.programme_context(row,channel_id,session_hash=view.session_hash if view else None)
  if context is not None:return context
  if channel_id not in channels:return None
  return {'channelID':channel_id,'seriesTitle':'','channelName':channels[channel_id].get('Name','')}
@@ -2563,7 +2574,7 @@ def episode_active_view(channel_id):
  except (sqlite3.Error,OSError,RuntimeError,ValueError):row={}
  return {'channel_id':channel_id,'session_hash':view.session_hash,
          'active_seconds':view.active_seconds,'confirmed_seconds':view.confirmed_seconds,
-         'hasEpisodeIdentity':episode_audio.programme_has_resolved_identity(row)}
+         'hasEpisodeIdentity':episode_audio.programme_has_resolved_identity(row,view.session_hash)}
 def note_episode_probe(reason=None,detail=None):
  # Short, bounded diagnostics for every early return. No audio, transcript,
  # media URL or credential is retained.
@@ -2917,7 +2928,13 @@ def _overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
   result=bridge.clear(scope=scope)
   programme_overlay_fault='' if result=='fallback' else result
   return 'no_programme'
- identity=programme_overlay.programme_identity(row)
+ typed=row.get('contentSource')=='local-audio-programme-identity'
+ if typed:
+  item=programme_item(cid,row)
+  # Use the exact verified public display name without inventing episode fields.
+  identity=programme_overlay.ProgrammeIdentity(series_title=item['Name'],source='local-audio-identity') if item else None
+  if identity is not None and not identity.checked():identity=None
+ else:identity=programme_overlay.programme_identity(row)
  if identity is None:
   result=bridge.clear(scope=scope)
   programme_overlay_fault='' if result=='fallback' else result
@@ -2935,7 +2952,7 @@ def _overlay_combined_publish(cid,name=None,probe=None,evidence=None,now=None):
   # Expired evidence is not stronger than the installed live-metadata
   # fallback, and must never switch the native node on.
   language=None
- has_episode=bool(identity.episode_title or identity.season_number is not None)
+ has_episode=bool(typed or identity.episode_title or identity.season_number is not None)
  if not has_episode and language is None:
   # The installed 22 px fallback already shows live programme metadata. Do
   # not switch to the native combined node until there is something stronger
@@ -3722,7 +3739,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
    programmes=programme_snapshot()
    for item in out:
     row=programmes.get(item['Id'])
-    if row:item['CurrentProgram']=programme_item(item['Id'],row)
+    if row:
+     current=programme_item(item['Id'],row)
+     if current is not None:item['CurrentProgram']=current
    result={'Items':out,'TotalRecordCount':len(out),'JealousfinPolicyRevision':'sqlite-policy-v1'}
    if include:result['JealousfinPolicy']=policy_payload(snapshot)
    return self.reply(200,result)
@@ -3744,6 +3763,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    # time range, do not invent times; the client can use CurrentProgram.
    selected=set(','.join(q.get('ChannelIds',[])).split(','))-{''}
    out=[programme_item(cid,row) for cid,row in programme_snapshot().items() if language_visible(cid) and (not selected or cid in selected)]
+   out=[item for item in out if item is not None]
    return self.reply(200,{'Items':out,'TotalRecordCount':len(out),'JealousfinCurrentOnly':True})
   if path=='/LiveTv/Recordings':return self.reply(200,{'Items':[],'TotalRecordCount':0})
   m=re.fullmatch(r'/Items/([a-f0-9]{32})/PlaybackInfo',path)

@@ -1340,12 +1340,60 @@ def programme_has_episode_identity(row):
     return type(season) is int and 1 <= season <= 99 and type(number) is int and 1 <= number <= 9999
 
 
-def programme_has_resolved_identity(row):
-    if programme_has_episode_identity(row):
-        return True
-    return bool(isinstance(row, dict) and row.get("contentKind") in TYPED_CONTENT_KINDS and
-                row.get("contentSource") == "local-audio-programme-identity" and
-                type(row.get("contentCorroboratingSources")) is int and row["contentCorroboratingSources"] >= 2)
+def typed_programme_resolved(row, session_hash, now=None):
+    """Only complete, fresh typed evidence bound to an independently supplied
+    current playback session can suppress further research.
+    """
+    if not isinstance(row, dict) or not isinstance(session_hash, str) or not session_hash:
+        return False
+    kind = row.get("contentKind")
+    title = row.get("contentTitle")
+    if (not isinstance(kind, str) or kind not in TYPED_CONTENT_KINDS or
+            not isinstance(title, str) or not 1 <= len(title) <= 200 or
+            title != " ".join(title.split()) or
+            row.get("contentSource") != "local-audio-programme-identity" or
+            row.get("contentVerification") != "official-and-independent-programme" or
+            row.get("audioPlaybackSessionHash") != session_hash or
+            type(row.get("contentCorroboratingSources")) is not int or
+            not 2 <= row["contentCorroboratingSources"] <= MAX_REPORTS or
+            type(row.get("contentMatchCount")) is not int or
+            row["contentMatchCount"] < (3 if kind == "sports-event" else MIN_DISTINCTIVE_CLUES) or
+            not isinstance(row.get("contentVisitDigest"), str) or
+            not DIGEST_RE.fullmatch(row["contentVisitDigest"])):
+        return False
+    for key in ("title", "seriesTitle", "audioSeriesTitle"):
+        if key in row and row[key] != title:
+            return False
+    if any(row.get(key) is not None and row.get(key) != "" for key in
+           ("seasonNumber", "episodeNumber", "episodeTitle", "originalAirDate")):
+        return False
+    now = time.time() if now is None else now
+    observed, expires, confidence = (row.get(key) for key in
+                                    ("contentObservedAt", "contentExpiresAt", "contentConfidence"))
+    try:
+        finite = all(type(v) in (int, float) and math.isfinite(v)
+                     for v in (now, observed, expires, confidence))
+    except OverflowError:
+        return False
+    if not finite:
+        return False
+    if not observed <= now + 0.001 or not now < expires or not 0 < expires - observed <= PUBLICATION_TTL + 0.001 or not 0 < confidence <= 1:
+        return False
+    import datetime as dt
+    try:
+        today = dt.datetime.fromtimestamp(now, dt.timezone.utc).date().isoformat()
+    except (ValueError, OverflowError, OSError):
+        return False
+    year, event = row.get("contentReleaseYear"), row.get("contentEventDate")
+    if kind == "sports-event":
+        return year is None and isinstance(event, str) and bool(event) and _date(event) == event and event <= today
+    return event in (None, "") and type(year) is int and _year(year) is not None and year <= int(today[:4])
+
+
+def programme_has_resolved_identity(row, session_hash=None, now=None):
+    if isinstance(row, dict) and row.get("contentSource") == "local-audio-programme-identity":
+        return typed_programme_resolved(row, session_hash, now)
+    return programme_has_episode_identity(row)
 
 
 def _bounded_int(value, low, high):
@@ -1354,7 +1402,7 @@ def _bounded_int(value, low, high):
     return None
 
 
-def programme_context(row, channel_id=""):
+def programme_context(row, channel_id="", session_hash=None, now=None):
     """Reduce an existing programme metadata row to bounded public context.
 
     Only public programme metadata is retained: series/episode titles, numbers
@@ -1362,6 +1410,9 @@ def programme_context(row, channel_id=""):
     Returns ``None`` when there is no usable series title.
     """
     if not isinstance(row, dict):
+        return None
+    typed = row.get("contentSource") == "local-audio-programme-identity"
+    if typed and not typed_programme_resolved(row, session_hash, now):
         return None
     title = row.get("seriesTitle") or row.get("title") or row.get("name")
     if not isinstance(title, str):
@@ -1382,9 +1433,10 @@ def programme_context(row, channel_id=""):
                "seasonNumber": season, "episodeNumber": number,
                "episodeTitle": episode_title, "originalAirDate": air_date,
                "verified": season is not None and number is not None}
-    if programme_has_resolved_identity(row) and row.get("contentKind") in TYPED_CONTENT_KINDS:
-        context.update(contentKind=row["contentKind"], contentSource=row["contentSource"],
-                       contentCorroboratingSources=row["contentCorroboratingSources"], verified=True)
+    if typed:
+        context.update({k: v for k, v in row.items() if k.startswith("content")})
+        context["audioPlaybackSessionHash"] = session_hash
+        context["verified"] = True
     return context
 
 
@@ -1529,10 +1581,13 @@ class PublicationStore:
                    "contentCorroboratingSources": int(episode.corroborating_sources),
                    "contentVisitDigest": episode.binding.digest()}
             row.update(identity.evidence())
+            if not typed_programme_resolved(row, session, now):
+                return False
             with self._lock:
                 self._prune(now)
                 self.entries[episode.channel_id] = Publication(episode.channel_id, now + self.ttl, row)
                 self.entries.move_to_end(episode.channel_id)
+                self._prune(now)
                 self.published += 1
             return True
         title = " ".join(str(identity.episode_title or "").split())[:300]
@@ -3280,7 +3335,16 @@ class EpisodeObserver:
             row = self.programme(channel_id)
         except Exception:
             return None
+        if isinstance(row, dict) and row.get("contentSource") == "local-audio-programme-identity":
+            if not self._has_resolved_identity(row, channel_id):
+                return {"channelID": channel_id, "seriesTitle": ""}
         return row if isinstance(row, dict) else None
+
+    def _has_resolved_identity(self, row, channel_id):
+        if isinstance(row, dict) and row.get("contentSource") == "local-audio-programme-identity":
+            view = self._usable_activity(channel_id)
+            return typed_programme_resolved(row, (view or {}).get("session_hash"))
+        return programme_has_episode_identity(row)
 
     def _view(self, binding, job):
         view = {"channel_id": binding.channel_id, "session_hash": binding.digest(),
@@ -3531,7 +3595,7 @@ class EpisodeObserver:
             elif (fresh_context is not None and fresh_context.get("channelID")
                   and fresh_context.get("channelID") != binding.channel_id):
                 promotion = Promotion(False, "programme-changed")
-            elif fresh_context is not None and programme_has_resolved_identity(fresh_context):
+            elif fresh_context is not None and self._has_resolved_identity(fresh_context, binding.channel_id):
                 promotion = Promotion(False, "identity-present")
             else:
                 try:
@@ -3603,7 +3667,7 @@ class EpisodeObserver:
                 if context.get("channelID") and context.get("channelID") != binding.channel_id:
                     self._diagnose("programme-changed", "stale")
                     return None
-                if programme_has_resolved_identity(context):
+                if self._has_resolved_identity(context, binding.channel_id):
                     self._diagnose("identity-present", "identity-present")
                     return None
             request = build_request(text, job, decision, binding, now)
@@ -3710,7 +3774,7 @@ class EpisodeObserver:
             if context.get("channelID") and context.get("channelID") != binding.channel_id:
                 self._diagnose("programme-changed", "stale")
                 return None
-            if programme_has_resolved_identity(context):
+            if self._has_resolved_identity(context, binding.channel_id):
                 self._diagnose("identity-present", "identity-present")
                 return None
         request = build_request_from_clues(item.clues, item.job, item.decision, binding, now)
