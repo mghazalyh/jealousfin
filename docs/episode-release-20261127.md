@@ -88,6 +88,7 @@ docs/incident-identity-overlay-20261127.md
 docs/incident-overlay-post-pressure-20261127.md
 docs/incident-probe-concurrency-20261127.md
 docs/schedule-episode-discovery-20261127.md
+Server/iptv/test_episode_autodiscovery.py
 Server/iptv/test_typed_programme.py
 Server/iptv/typed_visibility.py
 Server/iptv/typed-evidence-requirements.txt
