@@ -1795,7 +1795,11 @@ def provider_resolution_unavailable(error):
  # provider outages. An actual missing stream remains a channel failure.
  if isinstance(error,urllib.error.HTTPError):
   return error.code in (408,429,500,502,503,504)
- return isinstance(error,(urllib.error.URLError,TimeoutError,ConnectionError,http.client.RemoteDisconnected,http.client.IncompleteRead))
+ # URLError also wraps permanent certificate, DNS and malformed-URL
+ # failures; only explicit transport errors qualify for transient recovery.
+ if isinstance(error,urllib.error.URLError):error=error.reason
+ if isinstance(error,socket.gaierror):return error.errno==socket.EAI_AGAIN
+ return isinstance(error,(TimeoutError,ConnectionError,http.client.RemoteDisconnected,http.client.IncompleteRead))
 
 def resolve(cid):
  source_id=sources[cid]

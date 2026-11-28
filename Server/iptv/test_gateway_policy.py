@@ -564,6 +564,13 @@ class GatewayAcceptance(unittest.TestCase):
                 self.assertEqual((status,body),(503,{"JealousfinPolicyError":"unavailable"}))
         with patch.object(g,"resolve",side_effect=TimeoutError):
             self.assertEqual(self.req(path,{}),(503,{"JealousfinPolicyError":"unavailable"}))
+        import socket,ssl
+        for reason in (TimeoutError(),ConnectionResetError(),socket.gaierror(socket.EAI_AGAIN,"temporary DNS")):
+            with self.subTest(reason=type(reason).__name__),patch.object(g,"resolve",side_effect=urllib.error.URLError(reason)):
+                self.assertEqual(self.req(path,{}),(503,{"JealousfinPolicyError":"unavailable"}))
+        for reason in (ssl.SSLCertVerificationError("bad certificate"),socket.gaierror(socket.EAI_NONAME,"unknown host"),"unknown URL type"):
+            with self.subTest(reason=type(reason).__name__),patch.object(g,"resolve",side_effect=urllib.error.URLError(reason)):
+                self.assertEqual(self.req(path,{}),(502,{}))
         with patch.object(g,"resolve",side_effect=ValueError("No usable stream source")):
             self.assertEqual(self.req(path,{}),(502,{}))
         with sqlite3.connect(self.db) as db:
