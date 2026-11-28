@@ -291,7 +291,9 @@ class RetryCacheTests(unittest.TestCase):
         self.assertTrue(first[1])
         self.assertEqual(research(payload),first)
         self.assertEqual(len(calls),1)
-        second=research(dict(payload,researchRetry=True))
+        self.assertEqual(research(dict(payload,researchRetry=True)),first)
+        self.assertEqual(len(calls),1)
+        second=research.retry_unknown(payload)
         self.assertEqual(len(calls),2)
         self.assertTrue(second[0])
         self.assertTrue(second[1])
@@ -299,23 +301,49 @@ class RetryCacheTests(unittest.TestCase):
         self.assertEqual(research(payload),second)
         self.assertEqual(len(calls),2)
 
-    def test_observer_marks_only_independent_unknown_retry(self):
+    def test_adapter_retry_bound_is_per_session_not_per_clue(self):
+        calls=[]
+        adapter=audio.PublicEvidenceResearch(lambda url:None,provider=lambda payload:calls.append(payload) or ([],[]))
+        ctx={"channelID":fixtures.CHANNEL,"seriesTitle":"","researchSession":"a"*64}
+        payload={"programme":ctx,"clues":list(fixtures.nxt_request().clues)}
+        adapter(payload)
+        for _ in range(audio.MAX_EPISODE_RETRIES+2):
+            adapter.retry_unknown(payload)
+        self.assertEqual(len(calls),1+audio.MAX_EPISODE_RETRIES)
+        # New clues do not reset the extra refresh permit. A normal initial
+        # search for distinct clues remains governed by the observer budget.
+        changed=dict(payload,clues=["different person","different plot"])
+        adapter(changed)
+        count=len(calls)
+        adapter.retry_unknown(changed)
+        self.assertEqual(len(calls),count)
+        other=dict(payload,programme=dict(ctx,researchSession="b"*64))
+        adapter(other);adapter.retry_unknown(other)
+        self.assertEqual(len(calls),count+2)
+
+    def test_observer_routes_budget_admitted_retry_to_internal_adapter(self):
         wall=time.time()
         payloads=[]
-        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),
-            lambda payload:payloads.append(payload) or ([],[]),enabled=True,
+        class Adapter(audio.PublicEvidenceResearch):
+            def __call__(self,payload):
+                payloads.append(("initial",payload))
+                return [],[]
+            def retry_unknown(self,payload):
+                payloads.append(("retry",payload))
+                return [],[]
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),Adapter(lambda url:None),enabled=True,
+            budget=audio.EpisodeBudget(clock=lambda:wall),
             programme=lambda cid:{"channelID":cid,"seriesTitle":""},
-            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":"retry-session"})
+            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"confirmed_seconds":150,"session_hash":"retry-session"})
         job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
              "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
              "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
-        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":32.0}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":24.0,"sampleSeconds":55.0}
         observer(job,decision,fixtures.NXT_TEXT)
         observer(dict(job,episodeOnly=True),decision,fixtures.NXT_TEXT)
-        self.assertEqual(len(payloads),2)
-        self.assertNotIn("researchRetry",payloads[0])
-        self.assertIs(payloads[1]["researchRetry"],True)
-        self.assertEqual(payloads[0]["programme"]["researchSession"],payloads[1]["programme"]["researchSession"])
+        self.assertEqual([kind for kind,_ in payloads],["initial","retry"])
+        self.assertEqual(payloads[0][1]["programme"]["researchSession"],payloads[1][1]["programme"]["researchSession"])
+        self.assertNotIn("researchRetry",payloads[1][1])
 
     def test_episode_retry_refetches_same_negative_urls(self):
         calls=[];reads=[]
@@ -332,7 +360,7 @@ class RetryCacheTests(unittest.TestCase):
         self.assertEqual(research(payload),([],[]))
         self.assertEqual(research(payload),([],[]))
         self.assertEqual(len(calls),1)
-        official,reports=research(dict(payload,researchRetry=True))
+        official,reports=research.retry_unknown(payload)
         self.assertEqual(len(calls),2)
         self.assertTrue(official)
         self.assertTrue(reports)

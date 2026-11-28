@@ -3154,6 +3154,7 @@ class PublicEvidenceResearch:
         self._evidence_ttl = max(1.0, float(cache_ttl))
         self._read_diag_lock = threading.Lock()
         self._unknown_read_diag = {}
+        self._retry_admissions = OrderedDict()
 
     def diagnostics(self):
         with self._read_diag_lock:
@@ -3380,7 +3381,36 @@ class PublicEvidenceResearch:
         if not isinstance(context, dict):
             return [], []
         clues = payload.get("clues") if isinstance(payload, dict) else ()
-        return self._read(context, clues, retry=payload.get("researchRetry") is True)
+        return self._read(context, clues)
+
+    def retry_unknown(self, payload):
+        """Internal observer retry; bounded independently of its caller.
+
+        The ordinary callable deliberately ignores retry-like payload fields.
+        The caller must use this entry point after its playback/episode budget
+        has admitted a new attempt. Scope the independent bound to the actual
+        session and channel, rather than to mutable clue text.
+        """
+        context = _source_context(payload.get("programme")) if isinstance(payload, dict) else {}
+        clues = payload.get("clues", ()) if isinstance(payload, dict) else ()
+        session = context.get("researchSession")
+        channel = context.get("channelID")
+        if context.get("seriesTitle") or not session or not channel or len(normalize_clues(clues)) < MIN_DISTINCTIVE_CLUES:
+            return self._read(context, clues)
+        now = time.monotonic()
+        key = (channel, session)
+        with self._read_diag_lock:
+            for old, (count, at) in list(self._retry_admissions.items()):
+                if now-at >= self._evidence_ttl:
+                    del self._retry_admissions[old]
+            count, at = self._retry_admissions.get(key, (0, now))
+            admitted = count < MAX_EPISODE_RETRIES
+            if admitted and (key in self._retry_admissions or len(self._retry_admissions) < MAX_SOURCE_CACHE):
+                self._retry_admissions[key] = (count+1, at)
+                self._retry_admissions.move_to_end(key)
+            else:
+                admitted = False
+        return self._read(context, clues, retry=admitted)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3753,12 +3783,13 @@ class EpisodeObserver:
             if unknown_title:
                 programme["researchSession"] = hashlib.sha256((binding.digest() + "|" + str(session_hash or "")).encode()).hexdigest()
             payload = dict(payload, channelID=binding.channel_id, programme=programme)
-            if unknown_title and retry:
-                payload["researchRetry"] = True
         official, reports = [], []
         if callable(self.research):
             try:
-                official, reports = self.research(payload)
+                if unknown_title and retry and self.budget is not None and isinstance(self.research, PublicEvidenceResearch):
+                    official, reports = self.research.retry_unknown(payload)
+                else:
+                    official, reports = self.research(payload)
             except Exception as error:
                 self._diagnose("research-error", "research", type(error).__name__)
                 official, reports = [], []
