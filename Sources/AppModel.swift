@@ -1232,12 +1232,14 @@ import CryptoKit
         if !disk.save(rotationState,"surf-rotation.json"){log("ERROR","surf","ROTATION_PERSIST_FAILED")}
     }
     func open(_ c:Channel){
-        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
         if c.isSurf {
             // App-owned Surf rotation identifies the actual channel for validation and Favorites.
             let category=String(c.name.dropFirst("Surf:".count)).trimmingCharacters(in:.whitespacesAndNewlines)
-            startSurf(category:category)
-        } else {stopSurf();begin(c,keepSurf:false)}
+            startSurfFromUI(category:category)
+            return
+        }
+        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady else{log("WARN","player","NOT_CONNECTED");return}
+        stopSurf();begin(c,keepSurf:false)
     }
     func openServerSurf(_ c:Channel){
         guard c.isSurf,jelly.sharedSurfAvailable,!loginBusy,!apiChanging,policyReady,jelly.connected,catalogueReady else{return}
