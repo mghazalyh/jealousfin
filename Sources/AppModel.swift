@@ -892,16 +892,17 @@ import CryptoKit
             programs=items;log("INFO","epg","REFRESHED",["count":String(programs.count)])
         }catch{log("WARN","epg","UNAVAILABLE")}
     }
-    @discardableResult func refresh() async throws -> [Channel] {
+    @discardableResult func refresh() async throws -> (items:[Channel],publishedAt:Date) {
         guard !apiChanging,!catalogueBusy,!loginBusy,jelly.connected else{throw AppError.message("Catalogue unavailable or busy")}
         catalogueBusy=true;defer{catalogueBusy=false}
         programmeRequestID=UUID()
         lastCatalogueRefreshAttempt=Date()
         let items=try await jelly.channels()
         publishCatalogue(items)
+        let publishedAt=lastRefresh
         await refreshProgramme()
         recalculateInsights()
-        return items
+        return (items,publishedAt)
     }
     func refreshFromUI(){Task{
         if !catalogueReady || !jelly.connected {await connect();return}
@@ -3300,12 +3301,14 @@ extension AppModel {
             "channelID":channel.id,"channelName":channel.name,"nonce":UUID().uuidString.lowercased()]
         let encoded=String(decoding:try JSONSerialization.data(withJSONObject:value,options:[.sortedKeys]),as:UTF8.self)
         try setDynamicUIValue("spanishRequest",value:encoded)
-        let refreshed:[Channel]
+        let refreshed:(items:[Channel],publishedAt:Date)
         do{refreshed=try await refresh()}catch{return "Language correction queued; catalogue refresh unavailable. Playback unchanged."}
+        // Use this refresh's rows, and refuse to act if another catalogue was
+        // published during the optional EPG request.
         if marker=="add",generation==capturedGeneration,current?.id==channel.id,activeSurfSource == .american,
            !sourceTransitionBusy,!apiChanging,!loginBusy,surfing,!usingSharedSurf,!currentSharedTransport,catalogueReady,
-           !refreshed.isEmpty,!refreshed.contains(where:{$0.id==channel.id}),
-           !channels.contains(where:{$0.id==channel.id}){
+           lastRefresh==refreshed.publishedAt,!refreshed.items.isEmpty,
+           !refreshed.items.contains(where:{$0.id==channel.id}){
             next(reason:"confirmed-language-exclusion")
             return "Spanish exclusion confirmed; advancing."
         }
