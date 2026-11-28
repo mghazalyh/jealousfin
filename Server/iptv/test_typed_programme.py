@@ -228,6 +228,17 @@ class TypedParserTests(unittest.TestCase):
             ('','<p style="font-size:0e3vw">'+self.plot+'</p>'),
             ('','<p style="opacity:0%">'+self.plot+'</p>'),
             ('','<p style="opacity:+.0">'+self.plot+'</p>'),
+            ('','<p style="clip-path:inset(100%)">'+self.plot+'</p>'),
+            ('','<p style="transform:scale(0)">'+self.plot+'</p>'),
+            ('','<p style="-webkit-mask-image:linear-gradient(transparent,transparent)">'+self.plot+'</p>'),
+            ('','<p style="filter:opacity(0)">'+self.plot+'</p>'),
+            ('','<p style="font-size:calc(0px)">'+self.plot+'</p>'),
+            ('','<p style="display:none ! important">'+self.plot+'</p>'),
+            ('','<p style="max-height:0;overflow:hidden">'+self.plot+'</p>'),
+            ('','<p style="color:transparent">'+self.plot+'</p>'),
+            ('','<p aria-hidden=" true ">'+self.plot+'</p>'),
+            ('<style>.concealed {transform:scale(0)}</style>','<div class="concealed"><p>'+self.plot+'</p></div>'),
+
             ('<style>.concealed{font-size:00.000pt}</style>','<p class="concealed">'+self.plot+'</p>'),
 
             ('','<p style="visib/**/ility: hidden">'+self.plot+'</p>'),

@@ -2389,7 +2389,20 @@ _CSS_ZERO = r"[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?"
 _CSS_HIDDEN_DECLARATION = re.compile(
     r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|"
     r"content-visibility\s*:\s*hidden|opacity\s*:\s*" + _CSS_ZERO + r"%?|"
-    r"font-size\s*:\s*" + _CSS_ZERO + r"(?:[a-z]+|%)?)\s*(?:!important\s*)?(?:;|$)", re.I)
+    r"(?:font-size|line-height|height|width|max-height|max-width|inline-size|block-size|max-inline-size|max-block-size)\s*:\s*" + _CSS_ZERO + r"(?:[a-z]+|%)?|"
+    r"(?:color|-webkit-text-fill-color)\s*:\s*transparent)\s*(?:!\s*important\s*)?(?:;|$)", re.I)
+# A semantic extractor cannot evaluate arbitrary paint/geometry functions.
+# Treat non-default clipping, transforms, masks and filters as uncertain and
+# exclude the affected subtree. Never use uncertain visibility as proof.
+_CSS_UNCERTAIN_PAINT = re.compile(
+    r"(?:^|;)\s*(?:-(?:webkit|moz|ms|o)-)?(?:clip|clip-path|mask(?:-[\w-]+)?|"
+    r"transform|scale|translate|rotate|filter|perspective)\s*:\s*([^;]+)", re.I)
+# Dynamic layout dimensions and theme colours are common in ordinary article
+# text. They are not an explicit hiding instruction. Only fail closed for
+# computed visibility controls or a literal zero-valued dimension.
+_CSS_COMPUTED_VISIBILITY = re.compile(
+    r"(?:^|;)\s*(?:display|visibility|content-visibility|opacity)\s*:\s*(?:var|calc|min|max|clamp|env)\s*\(|"
+    r"(?:^|;)\s*(?:font-size|line-height|height|width|max-height|max-width|inline-size|block-size)\s*:\s*calc\(\s*" + _CSS_ZERO + r"(?:[a-z]+|%)?\s*\)", re.I)
 _HIDDEN_CLASS = re.compile(r"^(?:hidden|is-hidden|u-hidden|d-none|sr-only|visually-hidden|"
                            r"screen-reader(?:-text|-only)?|hide|hidden-content|"
                            r"hide-on-[\w-]+|hidden-[\w-]+|d-[\w-]+-none)$", re.I)
@@ -2407,7 +2420,13 @@ def _css_hides(value):
             return chr(code) if 0 < code <= 0x10ffff else "\ufffd"
         return match[2] or ""
     value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))", decode, value)
-    return bool(_CSS_HIDDEN_DECLARATION.search(value))
+    if _CSS_HIDDEN_DECLARATION.search(value) or _CSS_COMPUTED_VISIBILITY.search(value):
+        return True
+    for declaration in _CSS_UNCERTAIN_PAINT.finditer(value):
+        paint = re.sub(r"\s*!\s*important\s*$", "", declaration[1], flags=re.I).strip().casefold()
+        if paint not in ("none", "auto", "initial", "unset", "revert", "revert-layer"):
+            return True
+    return False
 
 
 def _typed_scope(page, selector):
@@ -2427,7 +2446,7 @@ def _typed_scope(page, selector):
         for node in soup.find_all(True):
             classes = node.get("class", [])
             if (node.name in _TYPED_EXCLUDED or node.has_attr("hidden") or
-                    str(node.get("aria-hidden", "")).casefold() == "true" or
+                    str(node.get("aria-hidden", "")).strip().casefold() == "true" or
                     _css_hides(node.get("style", "")) or
                     any(_HIDDEN_CLASS.fullmatch(str(c)) for c in classes)):
                 hidden.add(id(node))
