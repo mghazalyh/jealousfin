@@ -168,7 +168,9 @@ import CryptoKit
     private var rotationSelectionPending=false
     private var pending=Set<String>()
     private var started=false
-    private var loginBusy=false
+    @Published private(set) var loginBusy=false
+    @Published private(set) var surfStartPending=false
+    private var surfStartIntent=UUID()
     private var intentionallyPaused=false
     private var lastTick=Date()
     private var healthDirty=false
@@ -802,44 +804,77 @@ import CryptoKit
             log("WARN","settings","PRIVATE_DEFAULTS_UNAVAILABLE",["errorType":String(describing:type(of:error))])
         }
     }
+    var surfReady:Bool{apiReady && policyReady && !apiChanging && !loginBusy && jelly.connected && catalogueReady && !channels.isEmpty}
+    var connectionReadiness:String{
+        if loginBusy{return "Connecting / loading catalogue…"}
+        if jelly.connected && catalogueReady && !channels.isEmpty{return "Connected"}
+        if status=="Connection failed" || status.hasPrefix("Surf unavailable:"){return "Catalogue or connection unavailable"}
+        return "Offline / catalogue not ready"
+    }
     func connect() async {
-        guard apiReady,!apiChanging,!loginBusy else{return};loginBusy=true;defer{loginBusy=false}
-        // Drain the old stream's operations before replacing server credentials.
+        guard apiReady,policyReady,!apiChanging,!loginBusy,!catalogueBusy,!gatewayHealthBusy else{return}
+        loginBusy=true;defer{loginBusy=false}
+        let savedSettings=settings
+        let intent=surfStartIntent
         selectionTask?.cancel();selectionID=UUID();rotationSelectionPending=false
         let resumeLoop=settings.resumeSurf || surfing
         let category=settings.surfCategory
         let resumeChannel=current?.id
         saveSurfCheckpoint(force:true)
         let oldWork=work
-        if current != nil || session != nil { clearPlayback() }
-        await oldWork?.value
-        await cleanupTask?.value
+        if current != nil || session != nil {clearPlayback()}
         catalogueReady=false
         lastLogin=Date();saveSettings();status="Connecting…"
+        await oldWork?.value
+        await cleanupTask?.value
         do {
-            try await jelly.connect(settings)
+            let items=try await jelly.connectCatalogue(savedSettings,stillCurrent:{
+                self.settings.server==savedSettings.server && self.settings.username==savedSettings.username &&
+                self.settings.password==savedSettings.password && !self.apiChanging
+            })
+            publishCatalogue(items)
             status="Connected"
-            try await refresh()
             log("INFO","jellyfin","CONNECTED",["channels":String(channels.count)])
             failureRun=0
+            // EPG is optional and must not block initial catalogue readiness.
             loginBusy=false
-            if !engineeringOwnsPlayback && resumeLoop && current==nil {restoreSurf(category:category)}
-            else if !engineeringOwnsPlayback,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
-        } catch {status="Connection failed";log("ERROR","jellyfin","CONNECT_FAILED",["error":error.localizedDescription])}
+            if intent==surfStartIntent && !surfStartPending && settings.surfCategory==category && !engineeringOwnsPlayback && resumeLoop && current==nil {restoreSurf(category:category)}
+            else if intent==surfStartIntent && !surfStartPending && !engineeringOwnsPlayback,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
+            Task{await refreshProgramme()}
+        } catch {
+            jelly.invalidateConnection();catalogueReady=false;updateEffectiveHealth()
+            status="Connection failed";lastLogin=Date()
+            log("ERROR","jellyfin","CONNECT_FAILED",["error":error.localizedDescription,"catalogueReady":"false"])
+        }
         recalculateInsights();requestSync()
     }
-    func refresh() async throws {
-        guard !apiChanging,!catalogueBusy else{return};catalogueBusy=true;defer{catalogueBusy=false}
-        lastCatalogueRefreshAttempt=Date()
-        let items=try await jelly.channels()
+    private func publishCatalogue(_ items:[Channel]){
         channels=items;catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
         updateEffectiveHealth()
         log("INFO","catalogue","REFRESHED",["count":String(items.count),"favorites":String(items.filter(\.favorite).count)])
-        do {programs=try await jelly.programs();log("INFO","epg","REFRESHED",["count":String(programs.count)])}
-        catch {log("WARN","epg","UNAVAILABLE")}
+    }
+    private func refreshProgramme() async {
+        let origin=jelly.base,account=jelly.userID,token=jelly.token,epoch=jelly.connectionEpoch
+        guard jelly.connected,catalogueReady else{return}
+        do {
+            let items=try await jelly.programs()
+            guard jelly.connectionEpoch==epoch,jelly.base==origin,jelly.userID==account,jelly.token==token,catalogueReady else{return}
+            programs=items;log("INFO","epg","REFRESHED",["count":String(programs.count)])
+        }catch{log("WARN","epg","UNAVAILABLE")}
+    }
+    func refresh() async throws {
+        guard !apiChanging,!catalogueBusy,!loginBusy,jelly.connected else{throw AppError.message("Catalogue unavailable or busy")}
+        catalogueBusy=true;defer{catalogueBusy=false}
+        lastCatalogueRefreshAttempt=Date()
+        let items=try await jelly.channels()
+        publishCatalogue(items)
+        await refreshProgramme()
         recalculateInsights()
     }
-    func refreshFromUI(){Task{do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}}}
+    func refreshFromUI(){Task{
+        if !catalogueReady || !jelly.connected {await connect();return}
+        do{try await refresh()}catch{log("ERROR","catalogue","REFRESH_FAILED",["error":error.localizedDescription])}
+    }}
     // Prefer the refreshed catalogue over the playback-start copy. An absent
     // programme in a refreshed row must not resurrect the old programme.
     private var currentProgramme:Program?{
@@ -883,13 +918,35 @@ import CryptoKit
     func favoriteFromUI(_ channel:Channel){Task{do{try await favorite(channel)}catch{log("ERROR","favorites","FAILED",["error":error.localizedDescription])}}}
     func loadRecordings(){Task{do{recordings=try await jelly.recordings();log("INFO","dvr","RECORDINGS_LOADED",["count":String(recordings.count)])}catch{log("WARN","dvr","UNAVAILABLE")}}}
     func schedule(_ program:Program){Task{do{try await jelly.record(program);log("INFO","dvr","TIMER_CREATED",["programID":program.id])}catch{log("ERROR","dvr","TIMER_FAILED",["error":error.localizedDescription])}}}
+    func requestStartSurf(category:String="All Channels") async throws {
+        guard !surfStartPending,!sourceTransitionBusy else{throw AppError.message("Surf start already pending or source transition busy")}
+        surfStartPending=true;defer{surfStartPending=false}
+        let intent=surfStartIntent
+        let deadline=ProcessInfo.processInfo.systemUptime+90
+        while (!apiReady || !policyReady || loginBusy || catalogueBusy || (!surfReady && gatewayHealthBusy) || apiChanging),
+              ProcessInfo.processInfo.systemUptime<deadline {
+            try Task.checkCancellation()
+            guard intent==surfStartIntent else{throw CancellationError()}
+            try await Task.sleep(nanoseconds:200_000_000)
+        }
+        guard intent==surfStartIntent,!apiChanging,apiReady,policyReady,!loginBusy,!catalogueBusy,(surfReady || !gatewayHealthBusy) else{throw AppError.message("Connection engine busy")}
+        if !surfReady{await connect()}
+        try Task.checkCancellation()
+        guard intent==surfStartIntent,surfReady else{throw AppError.message("Catalogue not ready; Surf not started")}
+        startSurf(category:category)
+        guard surfing else{throw AppError.message("Surf not started")}
+    }
+    func startSurfFromUI(category:String="All Channels"){
+        Task{do{try await requestStartSurf(category:category)}
+        catch{if !(error is CancellationError){if !surfing && !playing{status="Surf unavailable: "+sanitized(error.localizedDescription)};log("WARN","surf","START_NOT_READY",["error":error.localizedDescription])}}}
+    }
     func startSurf(category:String="All Channels"){
-        guard !apiChanging,!loginBusy,jelly.connected,catalogueReady else{log("WARN","surf","NOT_CONNECTED");return}
+        guard surfReady else{log("WARN","surf","NOT_CONNECTED");return}
         surfing=true;surfPaused=false;settings.resumeSurf=true;settings.surfCategory=category;disk.save(settings,"settings.json")
         log("INFO","surf","START",["category":category,"minutes":String(settings.rotationMinutes)])
         next()
     }
-    func stopSurf(){selectionTask?.cancel();selectionID=UUID();rotationSelectionPending=false;surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
+    func stopSurf(){surfStartIntent=UUID();selectionTask?.cancel();selectionID=UUID();rotationSelectionPending=false;surfing=false;surfPaused=false;nextRotation=nil;pausedRotationSeconds=nil;emptyPoolRetry=nil;remaining=0;settings.resumeSurf=false;disk.save(settings,"settings.json");log("INFO","surf","STOP")}
     private func currentSourceCheckpoint()->SurfSourceCheckpoint{
         let seconds=nextRotation.map{SurfClock.remaining(deadline:$0,now:Date())} ?? (pausedRotationSeconds ?? resumeRotationSeconds ?? remaining)
         return SurfSourceCheckpoint(source:activeSurfSource,category:settings.surfCategory,surfing:surfing,paused:surfPaused,channelID:current?.id,remainingSeconds:max(0,min(86400,seconds)),pausedRotationSeconds:pausedRotationSeconds,resumeSurf:settings.resumeSurf,at:Date().timeIntervalSince1970)
@@ -1775,11 +1832,11 @@ import CryptoKit
         }
         if let retry=emptyPoolRetry,surfing,!surfPaused,!intentionallyPaused,!apiChanging,retry<=now {emptyPoolRetry=nil;next(reason:"failure-recovery")}
         let catalogueInterval=Double(operational.catalogueRefreshSeconds ?? (jelly.gatewayHealth != nil ? 60:180))
-        if jelly.connected && catalogueReady && !catalogueBusy && !apiChanging && now.timeIntervalSince(max(lastRefresh,lastCatalogueRefreshAttempt))>catalogueInterval {
+        if jelly.connected && catalogueReady && !catalogueBusy && !loginBusy && !apiChanging && now.timeIntervalSince(max(lastRefresh,lastCatalogueRefreshAttempt))>catalogueInterval {
             lastCatalogueRefreshAttempt=now
             Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if apiReady && !apiChanging && policyReady && (!jelly.connected || status=="Connection failed") && settings.autoLogin && settings.unattended && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect()}}
+        if apiReady && !apiChanging && policyReady && !loginBusy && !catalogueBusy && !surfStartPending && (!jelly.connected || !catalogueReady || status=="Connection failed") && settings.autoLogin && (!surfing || settings.unattended) && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect()}}
         resumeCampaignIfNeeded()
         runPlatformIfDue()
         runModuleIfDue()
@@ -1960,6 +2017,10 @@ import CryptoKit
         snapshot["hiatusBaseDays"]=healthPenalty.baseDays
         snapshot["hiatusBanAfter"]=healthPenalty.banAfter
         snapshot["gatewayPolicyRevision"]=jelly.gatewayHealth?.revision ?? ""
+        snapshot["jellyfinConnected"]=jelly.connected
+        snapshot["surfReady"]=surfReady
+        snapshot["connectionReadiness"]=connectionReadiness
+        snapshot["catalogueInitializing"]=loginBusy
         snapshot["gatewayPolicyChannels"]=jelly.gatewayHealth?.channels.count ?? 0
         snapshot["gatewayPolicyLastPoll"]=lastGatewayHealthPoll == .distantPast ? "" : ISO8601DateFormatter().string(from:lastGatewayHealthPoll)
         let candidates=pool()
@@ -2419,8 +2480,8 @@ import CryptoKit
             return "Previous channel requested; rotation state preserved; verify decoded playback"
         case "start_surf":
             let category=args["category"] ?? "All Channels"
-            guard ["All Channels","Favorites","Sports","Movies & Series"].contains(category),jelly.connected,catalogueReady,policyReady,!loginBusy,!apiChanging else{throw AppError.message("Invalid category or Jellyfin unavailable")}
-            startSurf(category:category)
+            guard ["All Channels","Favorites","Sports","Movies & Series"].contains(category) else{throw AppError.message("Invalid category")}
+            try await requestStartSurf(category:category)
         case "stop_surf":
             stopSurf()
             return "Surf mode stopped; use stop to stop the local player"
@@ -2464,7 +2525,7 @@ import CryptoKit
             return String(decoding:try JSONSerialization.data(withJSONObject:["active":telemetryActive,"launchID":launchID,"lastSample":telemetryLastSample.map{ISO8601DateFormatter().string(from:$0)} ?? "","system":systemMetrics,"playback":metrics],options:[.sortedKeys]),as:UTF8.self)
         case "get_insights":return try json(insights)
         case "sync_now":requestSync()
-        case "reconnect":await connect();guard jelly.connected,status != "Connection failed" else{throw AppError.message("Reconnect failed")}
+        case "reconnect":await connect();guard surfReady else{throw AppError.message("Reconnect failed")}
         case "list_patch_versions":
             let offset=max(0,min(patchVersions.count,args["offset"].flatMap(Int.init) ?? 0))
             let limit=max(1,min(100,args["limit"].flatMap(Int.init) ?? 50))

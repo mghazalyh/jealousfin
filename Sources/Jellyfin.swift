@@ -19,6 +19,8 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     var userID = ""
     private(set) var sharedSurfAvailable=false
     private(set) var gatewayHealth:GatewayHealthSnapshot?
+    private var requiresGatewayPolicy=false
+    private(set) var connectionEpoch=UUID()
     var adapter:JellyfinAPIAdapter?
     var gatewayConfiguration=GatewayConfiguration()
     private(set) var inFlight=0
@@ -29,9 +31,45 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     private let transport:URLSession
     init(deviceID: String,transport:URLSession = .shared) { self.deviceID = deviceID;self.transport=transport }
     var connected: Bool { !token.isEmpty && !userID.isEmpty }
+    func invalidateConnection(){
+        connectionEpoch=UUID()
+        base=nil;token="";userID="";sharedSurfAvailable=false;gatewayHealth=nil;requiresGatewayPolicy=false
+    }
+    // Authentication alone is not a ready connection. Stage credentials and
+    // the validated catalogue together; retry catalogue failures without
+    // exposing a half-initialized session to playback or policy callers.
+    func connectCatalogue(_ settings:Settings, stillCurrent:()->Bool = {true},
+                          retryDelays:[UInt64]=[1_000_000_000,3_000_000_000,8_000_000_000]) async throws -> [Channel] {
+        let previousPolicyOrigin=gatewayHealth != nil ? base:nil
+        invalidateConnection()
+        let epoch=connectionEpoch
+        let staged=Jellyfin(deviceID:deviceID,transport:transport)
+        staged.adapter=adapter;staged.gatewayConfiguration=gatewayConfiguration;staged.log=log
+        try await staged.connect(settings)
+        if previousPolicyOrigin==staged.base{staged.requiresGatewayPolicy=true}
+        for attempt in 0...retryDelays.count {
+            try Task.checkCancellation()
+            guard stillCurrent(),connectionEpoch==epoch else{throw CancellationError()}
+            do{
+                let catalogue=try await staged.channels()
+                try Task.checkCancellation()
+                guard stillCurrent(),connectionEpoch==epoch else{throw CancellationError()}
+                adoptConnection(from:staged)
+                return catalogue
+            }catch{
+                if error is CancellationError{throw error}
+                if let fault=error as? JellyfinConnectionFault,case .authentication=fault{throw error}
+                guard attempt<retryDelays.count else{throw error}
+                log?("WARN","CATALOGUE_STARTUP_RETRY",["attempt":String(attempt+1),"errorType":String(describing:type(of:error))])
+                try await Task.sleep(nanoseconds:retryDelays[attempt])
+            }
+        }
+        throw AppError.message("Channel catalogue unavailable")
+    }
     func adoptConnection(from staged:Jellyfin){
+        connectionEpoch=UUID()
         base=staged.base;token=staged.token;userID=staged.userID
-        sharedSurfAvailable=staged.sharedSurfAvailable;gatewayHealth=staged.gatewayHealth
+        sharedSurfAvailable=staged.sharedSurfAvailable;gatewayHealth=staged.gatewayHealth;requiresGatewayPolicy=staged.requiresGatewayPolicy
     }
     private var auth: String {
         "MediaBrowser Client=\"Jealousfin\", Device=\"iOS\", DeviceId=\"\(deviceID)\", Version=\"0.1\"" + (token.isEmpty ? "" : ", Token=\"\(token)\"")
@@ -93,8 +131,12 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     func connect(_ settings: Settings) async throws {
         let s = settings.server.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let u = URL(string: s), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil else { throw AppError.message("Enter an HTTP or HTTPS server URL") }
+        connectionEpoch=UUID()
+        let epoch=connectionEpoch
         base = u; token = ""; userID = ""; sharedSurfAvailable=false;gatewayHealth=nil
+        requiresGatewayPolicy=[18796,18797].contains(u.port ?? 0)
         let a = try await request("Users/AuthenticateByName", method: "POST", body: ["Username": settings.username, "Pw": settings.password])
+        guard connectionEpoch==epoch else{throw CancellationError()}
         let spec=adapterSpec
         guard let t=JellyfinAdapterRules.string(at:spec.tokenPath,in:a),let id=JellyfinAdapterRules.string(at:spec.userIDPath,in:a),!t.isEmpty,!id.isEmpty else{throw AppError.message("Jellyfin authentication failed")}
         token = t; userID = id
@@ -139,15 +181,19 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     }
     static func program(_ x: [String: Any]) -> Program? {JellyfinProgrammeParser.program(x)}
     func channels() async throws -> [Channel] {
+        guard connected else{throw AppError.message("Jellyfin authentication required")}
+        let origin=base,account=userID,credential=token,epoch=connectionEpoch
         let a = try await request("LiveTv/Channels", query: ["UserId":userID,"EnableImages":"true","EnableUserData":"true","Fields":"Genres,Tags","JealousfinIncludePolicy":"true"])
+        guard connectionEpoch==epoch,base==origin,userID==account,token==credential else{throw CancellationError()}
+        var policy:GatewayHealthSnapshot?
         if let raw=a["JealousfinPolicy"] {
             let snapshot=try decodeGatewayHealth(raw)
             guard let items=a["Items"] as? [[String:Any]],Set(items.compactMap{$0["Id"] as? String})==Set(snapshot.channels.keys)
             else{throw AppError.message("Gateway policy/catalogue mismatch")}
-            gatewayHealth=snapshot
-        }else if gatewayHealth != nil{throw GatewayPolicyError.unavailable}
+            policy=snapshot
+        }else if requiresGatewayPolicy || gatewayHealth != nil{throw GatewayPolicyError.unavailable}
         guard let items = a["Items"] as? [[String: Any]] else { throw AppError.message("Channel catalogue missing") }
-        return items.compactMap { x in
+        let catalogue:[Channel] = items.compactMap { x in
             guard let id = x["Id"] as? String, let n = x["Name"] as? String else { return nil }
             let p = (x["CurrentProgram"] as? [String: Any]).flatMap(Self.program)
             let genres=x["Genres"] as? [String] ?? []
@@ -157,6 +203,12 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             let favorite=(x["UserData"] as? [String:Any])?["IsFavorite"] as? Bool ?? false
             return Channel(id:id,name:n,number:x["ChannelNumber"] as? String,logo:hasLogo,favorite:favorite,program:p,genres:genres+tags+genreItems)
         }
+        guard !catalogue.isEmpty,catalogue.count==items.count,Set(catalogue.map(\.id)).count==catalogue.count,
+              catalogue.allSatisfy({!$0.id.isEmpty && !$0.name.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty})
+        else{throw AppError.message("Empty or invalid channel catalogue")}
+        gatewayHealth=policy
+        if policy != nil{requiresGatewayPolicy=true}
+        return catalogue
     }
     private func decodeGatewayHealth(_ raw:Any)throws->GatewayHealthSnapshot{
         let data=try JSONSerialization.data(withJSONObject:raw)
@@ -165,18 +217,18 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     }
     func refreshGatewayHealth()async throws{
         guard gatewayHealth != nil else{return}
-        let origin=base,account=userID
+        let origin=base,account=userID,credential=token,epoch=connectionEpoch
         let raw=try await request("Jealousfin/Policy")
         let snapshot=try decodeGatewayHealth(raw)
-        guard base==origin,userID==account else{throw CancellationError()}
+        guard connectionEpoch==epoch,base==origin,userID==account,token==credential else{throw CancellationError()}
         gatewayHealth=snapshot
     }
     func submitGatewayHealth(channelID:String,trace:String,action:String,reason:String)async throws{
         guard gatewayHealth != nil else{return}
-        let origin=base,account=userID
+        let origin=base,account=userID,credential=token,epoch=connectionEpoch
         let raw=try await request("Jealousfin/Policy/Event",method:"POST",body:["channelID":channelID,"trace":trace,"action":action,"reason":reason,"approval":action=="approve" ? "explicit":""])
         let snapshot=try decodeGatewayHealth(raw)
-        guard base==origin,userID==account else{throw CancellationError()}
+        guard connectionEpoch==epoch,base==origin,userID==account,token==credential else{throw CancellationError()}
         gatewayHealth=snapshot
     }
     func programs() async throws -> [Program] {

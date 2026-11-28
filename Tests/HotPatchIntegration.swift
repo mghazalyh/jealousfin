@@ -52,6 +52,43 @@ final class JellyfinFixture:URLProtocol {
     override func stopLoading(){}
 }
 
+final class CatalogueStartupFixture:URLProtocol {
+    private static let lock=NSLock()
+    private static var attempts:[String:Int]=[:]
+    static func count(_ key:String)->Int{lock.lock();defer{lock.unlock()};return attempts[key,default:0]}
+    override class func canInit(with request:URLRequest)->Bool{true}
+    override class func canonicalRequest(for request:URLRequest)->URLRequest{request}
+    override func startLoading(){
+        guard let url=request.url else{return}
+        let host=url.host ?? ""
+        let key=host+url.path
+        Self.lock.lock();Self.attempts[key,default:0]+=1;let attempt=Self.attempts[key]!;Self.lock.unlock()
+        var code=200
+        var object:[String:Any]=[:]
+        if url.path=="/Users/AuthenticateByName" {
+            object=["AccessToken":"fixture-token","User":["Id":"fixture-user"]]
+            if host=="bad-auth.invalid"{code=401}
+        }else if url.path=="/LiveTv/Channels" {
+            let row:[String:Any]=["lastAttempt":0,"hiatusUntil":0,"banned":false,"failures":0,"lastFailure":0,"reason":"","successes":0]
+            object=["Items":[["Id":"channel-a","Name":"Ready channel"]],
+                    "JealousfinPolicy":["revision":"sqlite-policy-v2","channels":["channel-a":row]]]
+            if host=="recover.invalid" && attempt==1{code=503;object=["JealousfinPolicyError":"unavailable"]}
+            if host=="recover.invalid" && attempt==2{object=["Items":[]]}
+            if host=="empty.invalid"{object=["Items": []]}
+            if host=="missing-policy.invalid"{object=["Items":[["Id":"channel-a","Name":"Ready channel"]]]}
+            if host=="mismatch.invalid"{object["Items"]=[["Id":"other","Name":"Other"]]}
+            if host=="malformed.invalid"{object["Items"]=[["Id":"channel-a"]]}
+            if host=="duplicate.invalid"{object["Items"]=[["Id":"channel-a","Name":"One"],["Id":"channel-a","Name":"Two"]]}
+            if host=="expired.invalid"{code=401}
+        }else{code=404}
+        let data=(try? JSONSerialization.data(withJSONObject:object)) ?? Data()
+        let response=HTTPURLResponse(url:url,statusCode:code,httpVersion:"HTTP/1.1",headerFields:["Content-Type":"application/json"])!
+        client?.urlProtocol(self,didReceive:response,cacheStoragePolicy:.notAllowed)
+        client?.urlProtocol(self,didLoad:data);client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading(){}
+}
+
 // Deterministic concurrent-commit fixture: no production repository writes.
 final class TorrioConflictFixture:URLProtocol {
     private static let lock=NSLock()
@@ -202,6 +239,38 @@ final class TorrioConflictFixture:URLProtocol {
         try require(stream.url.path=="/patched.m3u8" && stream.method=="Transcode" && URLComponents(url:stream.url,resolvingAgainstBaseURL:false)?.queryItems?.first(where:{$0.name=="api_key"})?.value=="fixture-token","patched playback URL and native credential injection")
         await client.close(stream,position:0)
         try require(client.inFlight==0,"session cleanup drains transport")
+        let startupConfig=URLSessionConfiguration.ephemeral
+        startupConfig.protocolClasses=[CatalogueStartupFixture.self]
+        let startup=Jellyfin(deviceID:"startup",transport:URLSession(configuration:startupConfig))
+        var startupSettings=fixtureSettings;startupSettings.server="http://recover.invalid:8096"
+        var exposedPartial=false
+        startup.log={_,code,_ in if code=="CATALOGUE_STARTUP_RETRY" && startup.connected{exposedPartial=true}}
+        let recoveredCatalogue=try await startup.connectCatalogue(startupSettings,retryDelays:[0,0])
+        try require(recoveredCatalogue.count==1 && startup.connected && startup.gatewayHealth?.channels.count==1 && !exposedPartial,"atomic startup retries transient policy and empty catalogue without exposing authentication")
+        try require(CatalogueStartupFixture.count("recover.invalid/Users/AuthenticateByName")==1 && CatalogueStartupFixture.count("recover.invalid/LiveTv/Channels")==3,"catalogue retry reuses authentication and is bounded")
+        startup.log=nil
+        for host in ["empty.invalid","mismatch.invalid","malformed.invalid","duplicate.invalid","expired.invalid","bad-auth.invalid","missing-policy.invalid"] {
+            startupSettings.server="http://"+host+(host=="missing-policy.invalid" ? ":18796":":8096")
+            var failed=false
+            do{_ = try await startup.connectCatalogue(startupSettings,retryDelays:[0,0])}catch{failed=true}
+            try require(failed && !startup.connected && startup.gatewayHealth==nil,"failed startup cannot expose stale credentials or policy: "+host)
+            let reads=CatalogueStartupFixture.count(host+"/LiveTv/Channels")
+            try require(reads==(host=="bad-auth.invalid" ? 0:host=="expired.invalid" ? 1:3),"bounded startup failure: "+host)
+        }
+        startupSettings.server="http://recover.invalid:8096"
+        var cancelled=false
+        do{_ = try await startup.connectCatalogue(startupSettings,stillCurrent:{false},retryDelays:[0])}catch is CancellationError{cancelled=true}
+        try require(cancelled && !startup.connected && startup.gatewayHealth==nil,"settings change cancels staged catalogue")
+        var changedEpoch=false
+        do{
+            _ = try await startup.connectCatalogue(startupSettings,stillCurrent:{
+                if !changedEpoch{changedEpoch=true;startup.invalidateConnection()}
+                return true
+            },retryDelays:[0])
+            throw AppError.message("stale connection adopted")
+        }catch is CancellationError{}
+        try require(changedEpoch && !startup.connected && startup.gatewayHealth==nil,"same-account connection epoch change rejects staged response")
+
         let nativePolicyClient=Jellyfin(deviceID:"policy-fixture",transport:URLSession(configuration:config))
         var policySettings=fixtureSettings;policySettings.server="http://fixture.invalid:18796"
         try await nativePolicyClient.connect(policySettings)

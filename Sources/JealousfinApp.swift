@@ -78,14 +78,14 @@ struct GuideView:View{
                 VStack(alignment:.leading,spacing:4){Text("LIVE TV").font(.caption.bold()).foregroundColor(accent);Text("Jealousfin").font(.largeTitle.bold())}
                 Spacer()
                 Circle().fill(model.jelly.connected ? Color.green:Color.orange).frame(width:8,height:8)
-                Text(model.jelly.connected ? "Connected":"Offline").font(.caption).foregroundColor(subdued)
+                Text(model.connectionReadiness).font(.caption).foregroundColor(subdued)
             }
             Panel{
                 VStack(alignment:.leading,spacing:10){
                     HStack{Label("Surf: All Channels",systemImage:"shuffle").font(.headline);Spacer();Text(model.jelly.sharedSurfAvailable ? "Shared live" : "\(model.settings.rotationMinutes) min").font(.caption).foregroundColor(accent)}
                     Text(model.jelly.sharedSurfAvailable ? "Watch the shared live Surf stream with server-managed source rotation." : "Discover something new. Automatically rotate through eligible channels.").font(.subheadline).foregroundColor(subdued)
-                    Button{model.startSurf()}label:{Label("Start Surf",systemImage:"play.fill").frame(maxWidth:.infinity)}
-                        .buttonStyle(.borderedProminent)
+                    Button{model.startSurfFromUI()}label:{Label(model.surfStartPending ? "Preparing Surf…":"Start Surf",systemImage:"play.fill").frame(maxWidth:.infinity)}
+                        .buttonStyle(.borderedProminent).disabled(model.surfStartPending)
                 }
             }
             HStack{
@@ -180,7 +180,7 @@ struct PlaybackView:View{
                     Toggle("Random order",isOn:$model.settings.random).onChange(of:model.settings.random){_ in model.saveSettings()}
                     Toggle("Validate while watching",isOn:$model.settings.validation).onChange(of:model.settings.validation){_ in model.saveSettings()}
                     HStack{
-                        Button(model.surfing ? "Stop Surf":"Start Surf"){if model.surfing{model.stopSurf()}else{model.startSurf(category:category)}}.buttonStyle(.borderedProminent)
+                        Button(model.surfing ? "Stop Surf":model.surfStartPending ? "Preparing Surf…":"Start Surf"){if model.surfing{model.stopSurf()}else{model.startSurfFromUI(category:category)}}.buttonStyle(.borderedProminent).disabled(model.surfStartPending && !model.surfing)
                         if model.surfing && !model.usingSharedSurf{Button(model.surfPaused ? "Resume rotation":"Pause rotation"){model.toggleSurfPause()}.buttonStyle(.bordered)}
                     }
                 }
