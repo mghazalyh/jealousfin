@@ -352,7 +352,7 @@ import CryptoKit
             await self.bootRuntime()
             self.capturePatchArchive(reason:"launch-reconciliation")
             if self.settings.provisionFromPrivateDB==true && [self.settings.server,self.settings.username,self.settings.password].contains(where:{$0.isEmpty}){await self.provisionConnection()}
-            if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect()}
+            if self.settings.autoLogin && !self.settings.server.isEmpty {await self.connect(resumePlayback:self.settings.unattended)}
             self.resumeCampaignIfNeeded()
         }
         supervisor=Task { [weak self] in
@@ -864,7 +864,7 @@ import CryptoKit
     }
     private func publishCatalogue(_ items:[Channel]){
         programmeRequestID=UUID()
-        channels=items;catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
+        channels=items;programs=[];catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
         updateEffectiveHealth()
         log("INFO","catalogue","REFRESHED",["count":String(items.count),"favorites":String(items.filter(\.favorite).count)])
     }
@@ -956,7 +956,8 @@ import CryptoKit
         guard intent==surfStartIntent,!sourceTransitionBusy,!apiChanging,apiReady,policyReady,!loginBusy,!catalogueBusy,(surfReady || !gatewayHealthBusy) else{throw AppError.message("Connection engine busy")}
         if !surfReady{await connect()}
         try Task.checkCancellation()
-        guard intent==surfStartIntent,surfReady else{throw AppError.message("Catalogue not ready; Surf not started")}
+        guard intent==surfStartIntent else{throw CancellationError()}
+        guard surfReady else{throw AppError.message("Catalogue not ready; Surf not started")}
         startSurf(category:category)
         guard surfing else{throw AppError.message("Surf not started")}
     }

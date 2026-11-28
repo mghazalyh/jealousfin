@@ -133,10 +133,10 @@ struct FullscreenSurfPlayer:View {
                     }
                     PatchableRegion("player.fullscreen.surfToggle"){
                     Button{
-                        if model.surfing{model.stopSurf()}else{model.startSurfFromUI(category:model.settings.surfCategory)}
-                    }label:{Text(model.surfing ? "Stop Surf":(model.surfStartPending ? "Preparing Surf…":"Start Surf")).font(.subheadline).frame(minHeight:44).padding(.horizontal,10)}
+                        if model.surfing || model.surfStartPending{model.stopSurf()}else{model.startSurfFromUI(category:model.settings.surfCategory)}
+                    }label:{Text(model.surfing ? "Stop Surf":(model.surfStartPending ? "Cancel Surf start":"Start Surf")).font(.subheadline).frame(minHeight:44).padding(.horizontal,10)}
                         .buttonStyle(FullscreenControlButtonStyle(palette:palette))
-                        .disabled(model.sourceTransitionBusy || (!model.surfing && model.surfStartPending))
+                        .disabled(model.sourceTransitionBusy)
                         .accessibilityIdentifier("player.fullscreen.surfToggle")
                     }
                 }
