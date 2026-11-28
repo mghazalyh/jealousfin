@@ -1790,16 +1790,25 @@ def resolve_bases(source_id,config):
  elif source_id in uk_cohort(config) and uk_base(config):
   bases=[uk_base(config)] if config['ukTrialEnabled'] else [uk_base(config),None]
  return bases
+def provider_resolution_unavailable(error):
+ # HTTP errors inherit URLError; only explicitly transient statuses are
+ # provider outages. An actual missing stream remains a channel failure.
+ if isinstance(error,urllib.error.HTTPError):
+  return error.code in (408,429,500,502,503,504)
+ return isinstance(error,(urllib.error.URLError,TimeoutError,ConnectionError,http.client.RemoteDisconnected,http.client.IncompleteRead))
+
 def resolve(cid):
  source_id=sources[cid]
- candidates=[];local_rejections=0;other_rejections=0
+ candidates=[];local_rejections=0;other_rejections=0;transient_error=None
  config=gateway_config
  path='/stream/tv/'+urllib.parse.quote(source_id,safe=':')+'.json'
  bases=resolve_bases(source_id,config)
  for base in bases:
   try:response=provider_json(path) if base is None else provider_json(path,base)
-  except Exception:
+  except Exception as error:
    if len(bases)==1:raise
+   if provider_resolution_unavailable(error) and transient_error is None:transient_error=error
+   if isinstance(error,urllib.error.HTTPError):error.close()
    other_rejections+=1
    continue
   streams=response.get('streams',[])
@@ -1814,6 +1823,7 @@ def resolve(cid):
    except Exception:other_rejections+=1;continue
    candidates.append(url)
  if not candidates:
+  if transient_error is not None:raise transient_error
   if local_rejections and not other_rejections:raise MediaCompatibilityError('Only unconfigured public media endpoints')
   raise ValueError('No usable stream source')
  config=gateway_config
@@ -3805,7 +3815,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     record_source_error(cid,None,'compatibility','Unconfigured public media endpoint',correlation)
     return self.reply(409,{'JealousfinPolicyError':'excluded'})
    except Exception as e:
-    record_source_error(cid,None,'resolve','HTTP '+str(e.code) if isinstance(e,urllib.error.HTTPError) else ('No usable stream source' if isinstance(e,ValueError) and str(e)=='No usable stream source' else type(e).__name__),correlation);return self.reply(502,{})
+    record_source_error(cid,None,'resolve','HTTP '+str(e.code) if isinstance(e,urllib.error.HTTPError) else ('No usable stream source' if isinstance(e,ValueError) and str(e)=='No usable stream source' else type(e).__name__),correlation)
+    if isinstance(e,urllib.error.HTTPError):e.close()
+    if provider_resolution_unavailable(e):return self.reply(503,{'JealousfinPolicyError':'unavailable'})
+    return self.reply(502,{})
    try:snapshot=policy_rows()
    except (sqlite3.Error,OSError,RuntimeError,ValueError) as error:
     record_infrastructure_error(None,'policy',error,correlation);return self.reply(503,{'JealousfinPolicyError':'unavailable'})

@@ -555,6 +555,29 @@ class GatewayAcceptance(unittest.TestCase):
         self.assertEqual(self.req("/media/fixture-token/"+("f"*32)+".m3u8")[0],404)
         self.assertEqual(len(continuity.stale_hits(root,self.c,now-10,now+10)),1)
 
+    def test_transient_provider_resolution_is_not_channel_failure(self):
+        g=self.g
+        path="/Items/"+self.c+"/PlaybackInfo"
+        for code in (408,429,500,502,503,504):
+            with self.subTest(code=code),patch.object(g,"resolve",side_effect=urllib.error.HTTPError("https://provider.example",code,"fixture",{},None)):
+                status,body=self.req(path,{})
+                self.assertEqual((status,body),(503,{"JealousfinPolicyError":"unavailable"}))
+        with patch.object(g,"resolve",side_effect=TimeoutError):
+            self.assertEqual(self.req(path,{}),(503,{"JealousfinPolicyError":"unavailable"}))
+        with patch.object(g,"resolve",side_effect=ValueError("No usable stream source")):
+            self.assertEqual(self.req(path,{}),(502,{}))
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("select failures from channel where id=?",(self.c,)).fetchone()[0],0)
+
+    def test_multibase_resolution_preserves_transient_failure_if_no_source(self):
+        g=self.g
+        failure=lambda:urllib.error.HTTPError("https://provider.example",503,"fixture",{},None)
+        with patch.object(g,"resolve_bases",return_value=["https://one.example",None]),patch.object(g,"provider_json",side_effect=[failure(),{"streams":[]}]):
+            with self.assertRaises(urllib.error.HTTPError) as error:g.resolve(self.c)
+            self.assertEqual(error.exception.code,503)
+        with patch.object(g,"resolve_bases",return_value=["https://one.example",None]),patch.object(g,"provider_json",side_effect=[failure(),{"streams":[{"url":"https://stream.example/live.m3u8"}]}]),patch.object(g,"validate",side_effect=lambda url,**kwargs:url):
+            self.assertEqual(g.resolve(self.c),"https://stream.example/live.m3u8")
+
     def test_policy_unavailable_fails_closed(self):
         with self.g.policy_connect(self.db) as db:db.execute("DELETE FROM meta WHERE key='seeded'")
         self.assertEqual(self.req("/LiveTv/Channels")[0],503)
