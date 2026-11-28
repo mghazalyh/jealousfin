@@ -3058,7 +3058,7 @@ class EpisodeSourceDiscovery:
         return (official[:self.max_candidates], reports[:self.max_candidates],
                 "automatic+provider" if self.provider is not None else "automatic")
 
-    def resolve(self, context, clues=(), now=None):
+    def resolve(self, context, clues=(), now=None, *, refresh=False):
         """Return ``(official_urls, report_urls, source)`` for a programme context.
 
         A private registry entry always wins. Automatic discovery is otherwise
@@ -3073,12 +3073,12 @@ class EpisodeSourceDiscovery:
         now = self.clock() if now is None else float(now)
         key = self._cache_key(context, clues)
         cacheable = bool(context.get("seriesTitle") or context.get("researchSession"))
-        cached = self._cache_get(key, now) if cacheable else None
+        cached = self._cache_get(key, now) if cacheable and not refresh else None
         if cached is not None:
             return list(cached[0]), list(cached[1]), cached[2]
         # A complete date-scoped warm cache can be reused and rechecked against
         # actual clues. Incomplete/negative prefetch never suppresses audio search.
-        if clues and context.get("seriesTitle") and _date(context.get("originalAirDate")):
+        if not refresh and clues and context.get("seriesTitle") and _date(context.get("originalAirDate")):
             warm = self._cache_get(self._cache_key(context, ()), now)
             if warm is not None and warm[0] and warm[1]:
                 return list(warm[0]), list(warm[1]), warm[2]
@@ -3305,7 +3305,7 @@ class PublicEvidenceResearch:
         self._record_unknown_read(counts)
         return official[:MAX_OFFICIAL_EPISODES], reports[:MAX_REPORTS]
 
-    def _read(self, context, clues=(), now=None):
+    def _read(self, context, clues=(), now=None, *, retry=False):
         context = _source_context(context)
         if not context or (not context.get("seriesTitle") and (not context.get("channelID") or len(normalize_clues(clues)) < MIN_DISTINCTIVE_CLUES)):
             return [], []
@@ -3314,12 +3314,15 @@ class PublicEvidenceResearch:
         # The known-title lane retains its previous fetch budget.
         unknown_title = not context.get("seriesTitle")
         started = time.monotonic()
-        official_urls, report_urls, _source = self.discovery.resolve(context, clues, now)
+        # Episode-only retries are already bounded by the observer. A retry
+        # must discover new leads and reread pages, not return a failed cached result.
+        refresh = retry is True and unknown_title
+        official_urls, report_urls, _source = self.discovery.resolve(context, clues, now, refresh=True) if refresh else self.discovery.resolve(context, clues, now)
         official_urls = official_urls[:self.max_pages]
         report_urls = report_urls[:self.max_pages]
         key = self._evidence_key(context, official_urls, report_urls, clues)
         cacheable = not unknown_title or bool(context.get("researchSession"))
-        cached = self._cached(key, now) if cacheable else None
+        cached = self._cached(key, now) if cacheable and not refresh else None
         if cached is not None:
             return cached
         deadline = (started + self.unknown_deadline_seconds if unknown_title else time.monotonic() + self.deadline_seconds)
@@ -3377,7 +3380,7 @@ class PublicEvidenceResearch:
         if not isinstance(context, dict):
             return [], []
         clues = payload.get("clues") if isinstance(payload, dict) else ()
-        return self._read(context, clues)
+        return self._read(context, clues, retry=payload.get("researchRetry") is True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3750,6 +3753,8 @@ class EpisodeObserver:
             if unknown_title:
                 programme["researchSession"] = hashlib.sha256((binding.digest() + "|" + str(session_hash or "")).encode()).hexdigest()
             payload = dict(payload, channelID=binding.channel_id, programme=programme)
+            if unknown_title and retry:
+                payload["researchRetry"] = True
         official, reports = [], []
         if callable(self.research):
             try:

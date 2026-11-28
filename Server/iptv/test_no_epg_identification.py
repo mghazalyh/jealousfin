@@ -271,6 +271,73 @@ class ReviewHardeningTests(unittest.TestCase):
         read(dict(ctx,researchSession=""));read(dict(ctx,researchSession=""))
         self.assertEqual(len(calls),4)
 
+class RetryCacheTests(unittest.TestCase):
+    def test_episode_retry_rediscovers_and_refetches_same_clues(self):
+        calls=[]; reads=[]
+        def provider(payload):
+            self.assertNotIn("researchSession",payload)
+            self.assertNotIn("researchRetry",payload)
+            calls.append(payload)
+            if len(calls)==1:return [],[fixtures.REPORT_URL]
+            return [fixtures.OFFICIAL_URL],[fixtures.REPORT_URL]
+        def fetch(url):
+            reads.append(url)
+            return fixtures.OFFICIAL_PAGE if url==fixtures.OFFICIAL_URL else fixture_scoped_report()
+        research=audio.PublicEvidenceResearch(fetch,provider=provider)
+        payload={"programme":{"channelID":fixtures.CHANNEL,"seriesTitle":"","researchSession":"a"*64},
+                 "clues":list(fixtures.nxt_request().clues)}
+        first=research(payload)
+        self.assertFalse(first[0])
+        self.assertTrue(first[1])
+        self.assertEqual(research(payload),first)
+        self.assertEqual(len(calls),1)
+        second=research(dict(payload,researchRetry=True))
+        self.assertEqual(len(calls),2)
+        self.assertTrue(second[0])
+        self.assertTrue(second[1])
+        self.assertEqual(reads.count(fixtures.REPORT_URL),2)
+        self.assertEqual(research(payload),second)
+        self.assertEqual(len(calls),2)
+
+    def test_observer_marks_only_independent_unknown_retry(self):
+        wall=time.time()
+        payloads=[]
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),
+            lambda payload:payloads.append(payload) or ([],[]),enabled=True,
+            programme=lambda cid:{"channelID":cid,"seriesTitle":""},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":150,"session_hash":"retry-session"})
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1",
+             "visitID":"visit-1","observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":32.0}
+        observer(job,decision,fixtures.NXT_TEXT)
+        observer(dict(job,episodeOnly=True),decision,fixtures.NXT_TEXT)
+        self.assertEqual(len(payloads),2)
+        self.assertNotIn("researchRetry",payloads[0])
+        self.assertIs(payloads[1]["researchRetry"],True)
+        self.assertEqual(payloads[0]["programme"]["researchSession"],payloads[1]["programme"]["researchSession"])
+
+    def test_episode_retry_refetches_same_negative_urls(self):
+        calls=[];reads=[]
+        def provider(payload):
+            calls.append(payload)
+            return [fixtures.OFFICIAL_URL],[fixtures.REPORT_URL]
+        def fetch(url):
+            reads.append(url)
+            if len(calls)==1:return None
+            return fixtures.OFFICIAL_PAGE if url==fixtures.OFFICIAL_URL else fixture_scoped_report()
+        research=audio.PublicEvidenceResearch(fetch,provider=provider)
+        payload={"programme":{"channelID":fixtures.CHANNEL,"seriesTitle":"","researchSession":"b"*64},
+                 "clues":list(fixtures.nxt_request().clues)}
+        self.assertEqual(research(payload),([],[]))
+        self.assertEqual(research(payload),([],[]))
+        self.assertEqual(len(calls),1)
+        official,reports=research(dict(payload,researchRetry=True))
+        self.assertEqual(len(calls),2)
+        self.assertTrue(official)
+        self.assertTrue(reports)
+        self.assertEqual(len(reads),4)
+
 class ReviewTimestampTests(fixtures.GatewayAudioIntegrationTests):
     def test_invalid_timestamps_do_not_break_programme(self):
         for start,end in [(float("nan"),1),(0,float("inf")),(-1e100,1e100),(2,1),(False,10),(0,0)]:
