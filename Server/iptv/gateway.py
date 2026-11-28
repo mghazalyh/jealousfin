@@ -598,6 +598,7 @@ paged_due={}
 paged_failures={}
 paged_last_success=0.0
 paged_origin_block_until=0.0
+paged_host_health={}
 # Explicit distributor IDs confirmed in the November 25–26 guide audits.
 # Exact provider identity, exact name, and two corroborating schedules are required.
 # Do not match similarly named channels across regional feeds.
@@ -1613,6 +1614,16 @@ def page_plan(config):
   [('uk',uk_base(config),0)] if uk_base(config) else [])+(
   [('canada',canada_base(config),p) for p in range(config.get('canadaCataloguePageCount',1))] if canada_base(config) else [])
 
+def programme_page_host(base):
+ # All catalogue paths on a host share metadata availability. No credential
+ # or manifest path is retained in this scheduler state.
+ return urllib.parse.urlsplit(PROVIDER if base is None else base).hostname if (PROVIDER if base is None else base) else None
+
+def programme_page_ready_at(origin,base,page):
+ with lock:
+  host=programme_page_host(base)
+  return max(paged_origin_block_until,paged_due.get((origin,page),0),paged_host_health.get(host,(0,0))[1])
+
 def refresh_programme_page(origin,base,page,now=None):
  global paged_last_success,paged_origin_block_until
  supplied_now=now
@@ -1632,6 +1643,7 @@ def refresh_programme_page(origin,base,page,now=None):
    if sources.get(cid)==sid:parsed[cid]=parse_programme(row)
   observed=time.time() if supplied_now is None else supplied_now
   with lock:
+   paged_host_health.pop(programme_page_host(base),None)
    old=paged_programmes.get(key,(0,{}))[1]
    paged_seen.update(old);paged_seen.update(parsed)
    paged_programmes[key]=(observed,parsed)
@@ -1640,6 +1652,7 @@ def refresh_programme_page(origin,base,page,now=None):
    paged_due[key]=observed+PROGRAMME_REFRESH
   return True
  except Exception as error:
+  now=time.time() if supplied_now is None else supplied_now
   failures=paged_failures.get(key,0)+1
   reason,delay=programme_retry_delay(error,failures,now)
   if isinstance(error,urllib.error.HTTPError):
@@ -1648,6 +1661,17 @@ def refresh_programme_page(origin,base,page,now=None):
     with lock:paged_origin_block_until=max(paged_origin_block_until,now+delay)
    if getattr(error,"fp",None) is not None:error.close()
   with lock:
+   host=programme_page_host(base)
+   if host and isinstance(error,urllib.error.HTTPError) and error.code==503:
+    count,_=paged_host_health.get(host,(0,0))
+    count=min(count+1,4)
+    # A single page can fail independently. Two successive 503s on the
+    # same host open a short metadata-only circuit; one success resets it.
+    # Existing page-specific backoff and Retry-After remain authoritative.
+    block=now+min(60,15*2**(count-2)) if count>=2 else 0
+    paged_host_health[host]=(count,block)
+   elif host:
+    paged_host_health.pop(host,None)
    paged_faults[key]=reason;paged_failures[key]=failures;paged_due[key]=now+delay
   log('Programme page '+origin+'/'+str(page*100)+' failed '+reason+'; retry in '+str(round(delay))+'s')
   return False
@@ -1668,7 +1692,7 @@ def paged_refresh_status(now=None):
   primary_faults=[v for k,v in paged_faults.items() if k[0]=='primary']
   programme_fault=primary_faults[0] if primary_faults else None
   programme_refresh_failures=sum(paged_failures.values())
-  programme_next_attempt=max(paged_origin_block_until,min(paged_due.values(),default=now+5))
+  programme_next_attempt=min((max(paged_origin_block_until,paged_due.get((origin,page),now),paged_host_health.get(programme_page_host(base),(0,0))[1]) for origin,base,page in page_plan(gateway_config)),default=now+5)
 
 def paged_programme_worker(stop):
  global programme_last_attempt
@@ -1676,11 +1700,14 @@ def paged_programme_worker(stop):
   config=gateway_config;now=time.time()
   paged_refresh_status(now)
   if now<paged_origin_block_until:continue
-  for origin,base,page in page_plan(config):
+  # Oldest eligible pages first, rather than letting the primary group
+  # repeatedly consume the first recovery opportunities after an outage.
+  plan=sorted(page_plan(config),key=lambda item:(programme_page_ready_at(*item),paged_due.get((item[0],item[2]),0)))
+  for origin,base,page in plan:
    if stop.is_set():return
    now=time.time()
    if now<paged_origin_block_until:break
-   if now<paged_due.get((origin,page),0):continue
+   if now<programme_page_ready_at(origin,base,page):continue
    with lock:programme_last_attempt=now
    refresh_programme_page(origin,base,page)
    paged_refresh_status()

@@ -174,6 +174,56 @@ class GatewayAcceptance(unittest.TestCase):
         with patch.object(g,'provider_json',side_effect=urllib.error.HTTPError('https://fixture.invalid',429,'fixture',{'Retry-After':'180'},None)):
             self.assertFalse(g.refresh_programme_page('primary',None,0,1200))
             self.assertEqual(g.paged_origin_block_until,1380)
+    def test_shared_metadata_503_backoff_isolated_from_other_hosts(self):
+        g=self.g
+        g.PROVIDER="https://shared.example/primary"
+        expanded="https://shared.example/expanded"
+        different="https://other.example/catalogue"
+        error=lambda:urllib.error.HTTPError("https://shared.example",503,"fixture",{},None)
+        good={"metas":[{"id":"unmapped","name":"fixture"}]}
+        with patch.object(g,"provider_json",side_effect=[error(),error(),good,good]) as provider:
+            self.assertFalse(g.refresh_programme_page("primary",None,0,1000))
+            self.assertFalse(g.refresh_programme_page("expanded",expanded,0,1001))
+            # Both paths share the upstream service. Do not send the next
+            # page immediately after two consecutive unavailable responses.
+            self.assertGreaterEqual(g.programme_page_ready_at("expanded",expanded,1),1016)
+            self.assertEqual(g.programme_page_ready_at("uk",different,0),0)
+            self.assertTrue(g.refresh_programme_page("uk",different,0,1002))
+            self.assertGreaterEqual(g.programme_page_ready_at("expanded",expanded,1),1016)
+            self.assertTrue(g.refresh_programme_page("expanded",expanded,1,1016))
+            self.assertEqual(g.programme_page_ready_at("expanded",expanded,2),0)
+            self.assertEqual(provider.call_count,4)
+            self.assertEqual(g.paged_due[("primary",0)],1015)
+
+    def test_metadata_worker_rechecks_shared_backoff_between_pages(self):
+        g=self.g
+        g.PROVIDER="https://shared.example/primary"
+        expanded="https://shared.example/expanded"
+        other="https://other.example/catalogue"
+        plan=[("primary",None,0),("expanded",expanded,0),("expanded",expanded,1),("uk",other,0)]
+        error=lambda:urllib.error.HTTPError("https://shared.example",503,"fixture",{},None)
+        good={"metas":[{"id":"unmapped","name":"fixture"}]}
+        class Stop:
+            cycles=0
+            def wait(self,seconds):
+                if seconds==5:self.cycles+=1
+                return self.cycles>1
+            def is_set(self):return False
+        with patch.object(g,"page_plan",return_value=plan),patch.object(g,"provider_json",side_effect=[error(),error(),good]) as provider,patch.object(g.time,"time",return_value=1000):
+            g.paged_programme_worker(Stop())
+        self.assertEqual(provider.call_count,3)
+        self.assertEqual(provider.call_args_list[-1].args[1],other)
+        self.assertNotIn(("expanded",1),g.paged_due)
+        self.assertGreaterEqual(g.programme_next_attempt,1015)
+
+    def test_metadata_recovery_backoff_uses_request_completion_time(self):
+        g=self.g
+        g.PROVIDER="https://shared.example/primary"
+        err=urllib.error.HTTPError("https://shared.example",503,"fixture",{},None)
+        with patch.object(g,"provider_json",side_effect=err),patch.object(g.time,"time",side_effect=[1000,1012,1012,1012]):
+            self.assertFalse(g.refresh_programme_page("primary",None,0))
+        self.assertGreaterEqual(g.paged_due[("primary",0)],1027)
+
     def test_expanded_trial_catalogue_and_origin(self):
         g=self.g
         sid='nltv:us:Extra.us'
