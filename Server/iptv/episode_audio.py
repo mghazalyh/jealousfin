@@ -2422,6 +2422,21 @@ def _css_hides(value):
     value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))", decode, value)
     if _CSS_HIDDEN_DECLARATION.search(value) or _CSS_COMPUTED_VISIBILITY.search(value):
         return True
+    # Explicit zero alpha in hexadecimal and functional CSS colors. Do not
+    # mistake ordinary theme variables for hiding declarations.
+    for color in re.finditer(r"(?:^|;)\s*(?:color|-webkit-text-fill-color)\s*:\s*([^;]+)", value, re.I):
+        paint = re.sub(r"\s*!\s*important\s*$", "", color[1], flags=re.I).strip().casefold()
+        if re.fullmatch(r"#[0-9a-f]{3}0|#[0-9a-f]{6}00", paint):
+            return True
+        if re.match(r"(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(", paint):
+            # Modern slash alpha and legacy comma alpha. For unknown computed
+            # alpha, exclude the subtree rather than assume it is visible.
+            alpha = paint.rsplit("/", 1)[-1].strip().rstrip(")").strip() if "/" in paint else None
+            if alpha is None and re.match(r"(?:rgba?|hsla?)\(", paint) and paint.count(",") == 3:
+                alpha = paint.rsplit(",", 1)[-1].strip().rstrip(")").strip()
+            if alpha is not None:
+                if alpha.startswith("-") or re.fullmatch(_CSS_ZERO + r"%?", alpha) or not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?%?", alpha):
+                    return True
     for declaration in _CSS_UNCERTAIN_PAINT.finditer(value):
         paint = re.sub(r"\s*!\s*important\s*$", "", declaration[1], flags=re.I).strip().casefold()
         if paint not in ("none", "auto", "initial", "unset", "revert", "revert-layer"):

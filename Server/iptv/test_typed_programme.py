@@ -236,6 +236,17 @@ class TypedParserTests(unittest.TestCase):
             ('','<p style="display:none ! important">'+self.plot+'</p>'),
             ('','<p style="max-height:0;overflow:hidden">'+self.plot+'</p>'),
             ('','<p style="color:transparent">'+self.plot+'</p>'),
+            ('','<p style="color:rgba(0,0,0,0)">'+self.plot+'</p>'),
+            ('','<p style="color:rgba(0,0,0,-1)">'+self.plot+'</p>'),
+            ('','<p style="color:rgb(0 0 0 / 0%)">'+self.plot+'</p>'),
+            ('','<p style="color:#0000">'+self.plot+'</p>'),
+            ('','<p style="color:#12345600">'+self.plot+'</p>'),
+            ('','<p style="-webkit-text-fill-color:hsla(30,50%,50%,0.0)">'+self.plot+'</p>'),
+            ('','<p style="color:hwb(30 0% 0% / .0)">'+self.plot+'</p>'),
+            ('','<p style="color:oklch(.5 .1 30 / 0)">'+self.plot+'</p>'),
+            ('','<p style="color:color(display-p3 0 0 0 / 0)">'+self.plot+'</p>'),
+            ('','<p style="color:rgb(0 0 0 / var(--alpha))">'+self.plot+'</p>'),
+
             ('','<p aria-hidden=" true ">'+self.plot+'</p>'),
             ('<style>.concealed {transform:scale(0)}</style>','<div class="concealed"><p>'+self.plot+'</p></div>'),
 
