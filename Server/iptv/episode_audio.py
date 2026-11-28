@@ -42,6 +42,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 from collections import OrderedDict
@@ -188,7 +189,7 @@ INDEPENDENT_REPORT_HOSTS = frozenset({
 # source profiles. Never interpret a movie/event as an episode.
 TYPED_CONTENT_KINDS = frozenset({"series", "movie", "sports-event", "other-programme"})
 TYPED_OFFICIAL_HOSTS = OFFICIAL_ARCHIVE_HOSTS | frozenset({"amblin.com", "www.amblin.com", "indycar.com", "www.indycar.com"})
-TYPED_REPORT_HOSTS = INDEPENDENT_REPORT_HOSTS | frozenset({"screamhorrormag.com", "www.screamhorrormag.com", "theapex.racing", "www.theapex.racing", "racingnews.co", "www.racingnews.co"})
+TYPED_REPORT_HOSTS = INDEPENDENT_REPORT_HOSTS | frozenset({"screamhorrormag.com", "www.screamhorrormag.com", "theapex.racing", "www.theapex.racing", "racingnews.co", "www.racingnews.co", "thenewdispatch.com", "www.thenewdispatch.com"})
 
 
 # Reviewed, non-date-specific official archive roots. A known series can be
@@ -2468,7 +2469,7 @@ def _css_hides(value):
     return False
 
 
-def _typed_scope(page, selector):
+def _typed_scope(page, selector, kinds=("p","h1","h2","h3","h4","li","th","td"), within=None):
     """Read a single reviewed semantic scope, never page-wide text.
 
     Ignore hidden HTML, embedded CSS-hidden elements (including conditional
@@ -2527,14 +2528,20 @@ def _typed_scope(page, selector):
                 hidden.add(id(node))
         def is_hidden(node):
             return id(node) in hidden or any(id(parent) in hidden for parent in node.parents)
-        scopes = [node for node in soup.find_all(True) if not is_hidden(node) and
-                  selector(node.name,{k:" ".join(v) if isinstance(v,list) else v for k,v in node.attrs.items()})]
+        def attrs(node):
+            return {k:" ".join(v) if isinstance(v,list) else v for k,v in node.attrs.items()}
+        root=soup
+        if within is not None:
+            roots=[node for node in soup.find_all(True) if not is_hidden(node) and within(node.name,attrs(node))]
+            if len(roots)!=1:
+                return []
+            root=roots[0]
+        scopes = [node for node in root.find_all(True) if not is_hidden(node) and selector(node.name,attrs(node))]
         if len(scopes) != 1:
             return []
         rows=[]
         size=0
         scope=scopes[0]
-        kinds=("p","h1","h2","h3","h4","li","th","td")
         nodes=([scope] if scope.name in kinds else [])+scope.find_all(kinds)
         for node in nodes:
             if is_hidden(node) or any(parent is not scope and parent.name in kinds
@@ -2554,6 +2561,14 @@ def _typed_scope(page, selector):
     except Exception:
         # Malformed HTML/unsupported CSS must never contribute evidence.
         return []
+
+
+def _typed_requested_public_terms(clues,*sections):
+    # Accent-equivalent Latin spellings (Álex/Alex) are the same full
+    # phrase, not fuzzy surname matching. Do not transliterate other scripts.
+    def latin(value):
+        return re.sub(r"(?<=[A-Za-z])[\u0300-\u036f]+","",unicodedata.normalize("NFD",value))
+    return _requested_public_terms(clues,*(latin(html_module.unescape(value)) for value in sections))
 
 
 def _typed_movie_year(title, paragraphs):
@@ -2661,11 +2676,40 @@ def _typed_indy500(page, url, clues, official, meta, headline):
             return []
         sections=[title]+finishers
         published=_page_date(meta.get("article:published_time"))
+    elif not official and host=="thenewdispatch.com":
+        # Reviewed long-form sports recap. Require a dated, completed event
+        # statement in the lead, not the article publication date or URL.
+        if not re.fullmatch(r"/[a-z0-9-]+/?",path):
+            return []
+        article=lambda t,a:t=="article" and {"type-post","category-sports"} <= set((a.get("class") or "").split())
+        header=_typed_scope(page,lambda t,a:t=="header" and "td-post-title" in (a.get("class") or "").split(),kinds=("h1","time"),within=article)
+        heads=[v for k,v in header if k=="h1"]
+        stamps=[v for k,v in header if k=="time"]
+        if len(heads)!=1 or len(stamps)!=1:
+            return []
+        m=re.fullmatch(r".{1,100} Makes History at the (\d{4}) Indianapolis 500",heads[0],re.I)
+        if not m:
+            return []
+        title=m[1]+" Indianapolis 500"
+        published=_date_from_text(stamps[0])
+        rows=_typed_scope(page,lambda t,a:t=="div" and {"td-post-content","tagdiv-type"} <= set((a.get("class") or "").split()),within=article)
+        paragraphs=[v for k,v in rows if k=="p"]
+        if not paragraphs:
+            return []
+        lead=re.match(r"On ([A-Za-z]+ \d{1,2}, \d{4}), the \d+(?:st|nd|rd|th) Indianapolis 500\b",paragraphs[0],re.I)
+        if not lead or not re.search(r"\b(?:won|win|victory)\b",paragraphs[0],re.I):
+            return []
+        event_date=_date_from_text(lead[1])
+        if not published or published<event_date:
+            return []
+        # Use only the first completed-race recap paragraphs. Do not treat
+        # subsequent broadcast commentary or other events as result evidence.
+        sections=[title]+paragraphs[:3]
     else:
         return []
     if not event_date or event_date[:4]!=title[:4]:
         return []
-    terms=_requested_public_terms(clues,*sections[:128])
+    terms=_typed_requested_public_terms(clues,*sections[:128])
     row=TypedProgrammeEvidence("sports-event",title,url,terms,event_date=event_date,published_at=published)
     return [row] if len(terms)>=3 and row.checked(official) else []
 
@@ -2687,7 +2731,7 @@ def parse_typed_programme_page(page, url, clues, official=False):
     path = urllib.parse.urlsplit(url).path
     meta = _meta_map(page)
     headline = _report_headline(meta.get("og:title", ""), meta.get("og:site_name", ""))
-    if host in ("indycar.com", "theapex.racing", "racingnews.co"):
+    if host in ("indycar.com", "theapex.racing", "racingnews.co", "thenewdispatch.com"):
         return _typed_indy500(page, url, clues, official, meta, headline)
     title = ""
     year = None
@@ -2728,7 +2772,7 @@ def parse_typed_programme_page(page, url, clues, official=False):
         published = _page_date(meta.get("article:published_time"))
     else:
         return []
-    terms = _requested_public_terms(clues, *paragraphs[:128])
+    terms = _typed_requested_public_terms(clues, *paragraphs[:128])
     if not year or not terms:
         return []
     row = TypedProgrammeEvidence("movie", " ".join(title.split()), url, terms, release_year=year, published_at=published)

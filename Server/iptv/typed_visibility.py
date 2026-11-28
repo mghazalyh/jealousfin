@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -9,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import urllib.parse
 import urllib.request
 import uuid
@@ -18,6 +20,7 @@ MAX_HTML = 2 * 1024 * 1024
 MAX_CSS = 2 * 1024 * 1024
 MAX_CSS_TOTAL = 4 * 1024 * 1024
 MAX_STYLESHEETS = 24
+CSS_FETCH_WORKERS = 4
 MAX_NODES = 20000
 MAX_PAGE_SECONDS = 12.0
 # Only CSS for these reviewed article profiles; no arbitrary third-party hosts.
@@ -28,6 +31,7 @@ CSS_HOSTS = {
     "indycar.com": {"indycar.com", "use.typekit.net", "p.typekit.net"},
     "theapex.racing": {"theapex.racing", "fonts.googleapis.com", "theissue.fuelthemes.net"},
     "racingnews.co": {"racingnews.co", "a.pub.network"},
+    "thenewdispatch.com": {"thenewdispatch.com", "fonts.googleapis.com"},
 }
 
 def _host(url):
@@ -103,79 +107,103 @@ def _render(page,url,seconds):
     else:
         soup.insert(0,base)
     failed=[]
-    cache={}
+    futures={}
     total=0
+    totals_lock=threading.Lock()
     def remaining():
         return max(0.0,deadline-time.monotonic())
-    def route_request(route):
+    def fetch_one(target):
         nonlocal total
-        req=route.request
-        if req.resource_type!="stylesheet":
-            route.abort()
-            return
-        try:
-            if remaining()<=0 or _host(req.url) not in allowed:
+        if remaining()<=0:
+            raise ValueError("stylesheet deadline")
+        body=_fetch_css(target,allowed,min(2.0,remaining()))
+        with totals_lock:
+            if total+len(body)>MAX_CSS_TOTAL:
+                # Never retain a partial result from an over-budget sheet.
+                raise ValueError("stylesheet total")
+            total+=len(body)
+        return body
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CSS_FETCH_WORKERS) as executor:
+        def submit(target):
+            if remaining()<=0 or _host(target) not in allowed:
                 raise ValueError("unapproved stylesheet")
-            if req.url not in cache:
-                if len(cache)>=MAX_STYLESHEETS:
+            if target not in futures:
+                if len(futures)>=MAX_STYLESHEETS:
                     raise ValueError("stylesheet count")
-                body=_fetch_css(req.url,allowed,min(2.0,remaining()))
-                total+=len(body)
-                if total>MAX_CSS_TOTAL:
-                    raise ValueError("stylesheet total")
-                cache[req.url]=body
-            route.fulfill(status=200,content_type="text/css; charset=utf-8",body=cache[req.url])
-        except Exception:
-            failed.append(True)
-            route.abort()
-    with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True,chromium_sandbox=True,timeout=max(1,int(remaining()*1000)),args=["--disable-background-networking","--dns-prefetch-disable","--disable-preconnect"])
-        try:
-            ctx=browser.new_context(java_script_enabled=False,service_workers="block",viewport={"width":1280,"height":900})
-            ctx.route("**/*",route_request)
-            tab=ctx.new_page()
-            tab.set_content(str(soup),wait_until="load",timeout=max(1,int(remaining()*1000)))
-            if failed or remaining()<=0:
-                return None
-            if not tab.evaluate("() => Array.from(document.querySelectorAll('link[rel~=stylesheet]')).every(n => !!n.sheet)"):
-                return None
-            # Browser evaluation is trusted local code; page JavaScript stays disabled.
-            hidden=tab.evaluate(r"""marker => Array.from(document.querySelectorAll('['+marker+']')).filter(n=>{
-                const s=getComputedStyle(n), r=n.getBoundingClientRect();
-                if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)<=0||s.contentVisibility==='hidden'||parseFloat(s.fontSize)===0) return true;
-                if(s.color==='transparent'||s.webkitTextFillColor==='transparent'||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.color)||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.webkitTextFillColor)) return true;
-                // A normal article may continue below the fold. Explicitly
-                // positioned/transformed boxes outside the viewport are not
-                // reliable source evidence, unlike ordinary document flow.
-                if(Math.abs(parseFloat(s.textIndent))>=1000) return true;
-                const positioned=s.position!=='static', outOfFlow=s.position==='absolute'||s.position==='fixed', transformed=s.transform!=='none'||s.translate!=='none'||s.scale!=='none'||s.rotate!=='none';
-                if(positioned&&[s.left,s.right,s.top,s.bottom].some(v=>Math.abs(parseFloat(v))>=1000)) return true;
-                if((positioned||transformed)&&(r.right<=0||r.left>=innerWidth||r.bottom<=0)) return true;
-                if((outOfFlow||transformed)&&r.top>=innerHeight) return true;
-                if(transformed){
-                    if(r.width<=0||r.height<=0) return true;
-                    if(s.transform!=='none'){
-                        const m=new DOMMatrixReadOnly(s.transform);
-                        if(Math.abs(m.m41)>=1000||Math.abs(m.m42)>=1000||Math.abs(m.m43)>=1000) return true;
+                futures[target]=executor.submit(fetch_one,target)
+            return futures[target]
+        # The browser still determines which sheets/imports it needs and applies
+        # CSS in document order. Start the reviewed direct links concurrently;
+        # imports are submitted only when requested. No page scripts execute.
+        for link in _links(soup):
+            target=urllib.parse.urljoin(url,str(link.get("href") or ""))
+            try:
+                submit(target)
+            except (ValueError,TypeError):
+                # An unused or disabled stylesheet need not be fetched. If
+                # Chromium requests it, the same admission check rejects it.
+                pass
+        def route_request(route):
+            req=route.request
+            if req.resource_type!="stylesheet":
+                route.abort()
+                return
+            try:
+                body=submit(req.url).result(timeout=remaining())
+                if remaining()<=0:
+                    raise ValueError("stylesheet deadline")
+                route.fulfill(status=200,content_type="text/css; charset=utf-8",body=body)
+            except Exception:
+                failed.append(True)
+                route.abort()
+        with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,chromium_sandbox=True,timeout=max(1,int(remaining()*1000)),args=["--disable-background-networking","--dns-prefetch-disable","--disable-preconnect"])
+            try:
+                ctx=browser.new_context(java_script_enabled=False,service_workers="block",viewport={"width":1280,"height":900})
+                ctx.route("**/*",route_request)
+                tab=ctx.new_page()
+                tab.set_content(str(soup),wait_until="load",timeout=max(1,int(remaining()*1000)))
+                if failed or remaining()<=0:
+                    return None
+                if not tab.evaluate("() => Array.from(document.querySelectorAll('link[rel~=stylesheet]')).every(n => !!n.sheet)"):
+                    return None
+                # Browser evaluation is trusted local code; page JavaScript stays disabled.
+                hidden=tab.evaluate(r"""marker => Array.from(document.querySelectorAll('['+marker+']')).filter(n=>{
+                    const s=getComputedStyle(n), r=n.getBoundingClientRect();
+                    if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)<=0||s.contentVisibility==='hidden'||parseFloat(s.fontSize)===0) return true;
+                    if(s.color==='transparent'||s.webkitTextFillColor==='transparent'||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.color)||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.webkitTextFillColor)) return true;
+                    // A normal article may continue below the fold. Explicitly
+                    // positioned/transformed boxes outside the viewport are not
+                    // reliable source evidence, unlike ordinary document flow.
+                    if(Math.abs(parseFloat(s.textIndent))>=1000) return true;
+                    const positioned=s.position!=='static', outOfFlow=s.position==='absolute'||s.position==='fixed', transformed=s.transform!=='none'||s.translate!=='none'||s.scale!=='none'||s.rotate!=='none';
+                    if(positioned&&[s.left,s.right,s.top,s.bottom].some(v=>Math.abs(parseFloat(v))>=1000)) return true;
+                    if((positioned||transformed)&&(r.right<=0||r.left>=innerWidth||r.bottom<=0)) return true;
+                    if((outOfFlow||transformed)&&r.top>=innerHeight) return true;
+                    if(transformed){
+                        if(r.width<=0||r.height<=0) return true;
+                        if(s.transform!=='none'){
+                            const m=new DOMMatrixReadOnly(s.transform);
+                            if(Math.abs(m.m41)>=1000||Math.abs(m.m42)>=1000||Math.abs(m.m43)>=1000) return true;
+                        }
+                        if(s.translate!=='none'&&s.translate.split(/\s+/).some(v=>Math.abs(parseFloat(v))>=1000)) return true;
                     }
-                    if(s.translate!=='none'&&s.translate.split(/\s+/).some(v=>Math.abs(parseFloat(v))>=1000)) return true;
-                }
-                // Exclude actual text boxes entirely outside the horizontal
-                // viewing area even if the parent retains a visible box.
-                if(n.childNodes.length&&Array.from(n.childNodes).some(t=>t.nodeType===3&&t.textContent.trim())){
-                    const ranges=Array.from(n.childNodes).filter(t=>t.nodeType===3&&t.textContent.trim()).flatMap(t=>{const q=document.createRange();q.selectNode(t);return Array.from(q.getClientRects());});
-                    if(ranges.length&&ranges.every(q=>q.right<=0||q.left>=innerWidth||q.bottom<=0||q.width<=0||q.height<=0)) return true;
-                }
-                if(s.display!=='contents'&&(r.width<=0||r.height<=0)&&/hidden|clip/.test(s.overflow)) return true;
-                if(s.clipPath!=='none'||(s.clip!=='auto'&&s.clip!=='rect(auto, auto, auto, auto)')) return true;
-                if(s.maskImage&&s.maskImage!=='none') return true;
-                if(s.filter&&/opacity\(0(?:%|\.0+)?\)/.test(s.filter)) return true;
-                return false;
-            }).map(n=>Number(n.getAttribute(marker)))""",marker)
-            if failed or remaining()<=0 or not isinstance(hidden,list):
-                return None
-        finally:
-            browser.close()
+                    // Exclude actual text boxes entirely outside the horizontal
+                    // viewing area even if the parent retains a visible box.
+                    if(n.childNodes.length&&Array.from(n.childNodes).some(t=>t.nodeType===3&&t.textContent.trim())){
+                        const ranges=Array.from(n.childNodes).filter(t=>t.nodeType===3&&t.textContent.trim()).flatMap(t=>{const q=document.createRange();q.selectNode(t);return Array.from(q.getClientRects());});
+                        if(ranges.length&&ranges.every(q=>q.right<=0||q.left>=innerWidth||q.bottom<=0||q.width<=0||q.height<=0)) return true;
+                    }
+                    if(s.display!=='contents'&&(r.width<=0||r.height<=0)&&/hidden|clip/.test(s.overflow)) return true;
+                    if(s.clipPath!=='none'||(s.clip!=='auto'&&s.clip!=='rect(auto, auto, auto, auto)')) return true;
+                    if(s.maskImage&&s.maskImage!=='none') return true;
+                    if(s.filter&&/opacity\(0(?:%|\.0+)?\)/.test(s.filter)) return true;
+                    return false;
+                }).map(n=>Number(n.getAttribute(marker)))""",marker)
+                if failed or remaining()<=0 or not isinstance(hidden,list):
+                    return None
+            finally:
+                browser.close()
     for i in hidden:
         if type(i) is not int or not 0<=i<len(nodes):
             return None

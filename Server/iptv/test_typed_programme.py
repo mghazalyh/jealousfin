@@ -216,6 +216,27 @@ class TypedParserTests(unittest.TestCase):
         self.assertEqual(audio.parse_typed_programme_page(apex.replace("Race Top Five","Starting Grid"),apex_url,clues),[])
         self.assertEqual(audio.parse_typed_programme_page(racing.replace("Indy 500 Race Results May 25","Indy 500 Race Results May 24"),racing_url,clues),[])
 
+    def test_explicit_dated_sports_recap(self):
+        clues=("indianapolis","alex palou","david malukas")
+        url="https://www.thenewdispatch.com/alex-palou-makes-history-at-the-2025-indianapolis-500/"
+        header='<header class="td-post-title"><h1>Alex Palou Makes History at the 2025 Indianapolis 500</h1><time>May 28, 2025</time></header>'
+        lead='<p>On May 25, 2025, the 109th Indianapolis 500 ended with Álex Palou victory.</p>'
+        body='<p>David Malukas finished the race.</p>'
+        page='<article class="type-post category-sports">'+header+'<div class="td-post-content tagdiv-type">'+lead+body+'</div></article>'
+        rows=audio.parse_typed_programme_page(page,url,clues)
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0].event_date,rows[0].published_at),("2025-05-25","2025-05-28"))
+        self.assertIn("alex palou",rows[0].terms)
+        for invalid in (page.replace("On May 25, 2025,","Yesterday,"),
+                        page.replace("victory","entry").replace("ended","started"),
+                        page.replace(body,'<div hidden>'+body+'</div>'),
+                        page.replace('<time>','<time hidden>'),
+                        page.replace("May 28, 2025","May 24, 2025"),
+                        page.replace(header,"")+header,
+                        page.replace("Álex Palou","Palou").replace("Alex Palou","Palou")):
+            result=audio.parse_typed_programme_page(invalid,url,clues)
+            self.assertTrue(not result or "alex palou" not in result[0].terms)
+
     def test_unresolved_external_styles_never_count_as_evidence(self):
         for markup in ('<link rel="stylesheet" href="https://amblin.com/hide.css">',
                        '<style>@import url("https://amblin.com/hide.css");</style>'):
@@ -315,6 +336,24 @@ class TypedParserTests(unittest.TestCase):
         self.assertFalse(v.needs_resolution(result))
         with patch.object(v,"_fetch_css",side_effect=ValueError("failed")):
             self.assertIsNone(v._render(html,"https://amblin.com/movie/test/",8))
+
+    def test_browser_prefetches_independent_styles_concurrently(self):
+        import threading
+        import typed_visibility as v
+        from unittest.mock import patch
+        from bs4 import BeautifulSoup
+        barrier=threading.Barrier(2, timeout=3)
+        html='<html><head><link rel="stylesheet" href="/a.css"><link rel="stylesheet" href="/b.css"></head><body><p id="x">hidden</p><p id="y">visible</p></body></html>'
+        def css(url, hosts, timeout):
+            barrier.wait()
+            return b'#x {display:none}' if url.endswith('/a.css') else b'#y {display:block}'
+        with patch.object(v,"_fetch_css",side_effect=css) as f:
+            result=v._render(html,"https://amblin.com/movie/test/",8)
+        self.assertIsNotNone(result)
+        self.assertEqual(f.call_count,2)
+        soup=BeautifulSoup(result,"html.parser")
+        self.assertTrue(soup.select_one("#x").has_attr("hidden"))
+        self.assertFalse(soup.select_one("#y").has_attr("hidden"))
 
     def test_browser_excludes_positioned_and_transformed_text(self):
         import typed_visibility as v
