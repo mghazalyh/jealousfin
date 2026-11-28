@@ -148,9 +148,10 @@ def _render(page,url,seconds):
                 // positioned/transformed boxes outside the viewport are not
                 // reliable source evidence, unlike ordinary document flow.
                 if(Math.abs(parseFloat(s.textIndent))>=1000) return true;
-                const positioned=s.position!=='static', transformed=s.transform!=='none'||s.translate!=='none'||s.scale!=='none'||s.rotate!=='none';
+                const positioned=s.position!=='static', outOfFlow=s.position==='absolute'||s.position==='fixed', transformed=s.transform!=='none'||s.translate!=='none'||s.scale!=='none'||s.rotate!=='none';
                 if(positioned&&[s.left,s.right,s.top,s.bottom].some(v=>Math.abs(parseFloat(v))>=1000)) return true;
-                if((positioned||transformed)&&(r.right<=0||r.left>=innerWidth||r.bottom<=0||r.top>=innerHeight)) return true;
+                if((positioned||transformed)&&(r.right<=0||r.left>=innerWidth||r.bottom<=0)) return true;
+                if((outOfFlow||transformed)&&r.top>=innerHeight) return true;
                 if(transformed){
                     if(r.width<=0||r.height<=0) return true;
                     if(s.transform!=='none'){

@@ -322,13 +322,14 @@ class TypedParserTests(unittest.TestCase):
         from bs4 import BeautifulSoup
         css=b"""#right{position:absolute;left:9999px}#below{position:absolute;top:9999px}
         #indent{text-indent:9999px}#translate{transform:translateX(9999px)}
-        #zero{transform:scale(0)}#vertical{transform:translateY(9999px)}"""
-        html='<html><head><link rel="stylesheet" href="/a.css"></head><body>'+''.join('<p id="'+x+'">clue text</p>' for x in ('right','below','indent','translate','zero','vertical','visible'))+'<div style="height:2000px"></div><p id="flow">ordinary below-fold content</p></body></html>'
+         #zero{transform:scale(0)}#vertical{transform:translateY(9999px)}
+         #relative{position:relative;top:9999px}#normal{position:relative}#sticky{position:sticky;top:0}"""
+        html='<html><head><link rel="stylesheet" href="/a.css"></head><body>'+''.join('<p id="'+x+'">clue text</p>' for x in ('right','below','indent','translate','zero','vertical','relative','visible'))+'<div style="height:2000px"></div><p id="flow">ordinary below-fold content</p><div id="normal"><p id="nested">ordinary relative article content</p></div><div id="sticky">ordinary sticky content</div></body></html>'
         with patch.object(v,"_fetch_css",return_value=css):
             out=v._render(html,"https://amblin.com/movie/test/",8)
         self.assertIsNotNone(out)
         soup=BeautifulSoup(out,"html.parser")
-        for x in ('right','below','indent','translate','zero','vertical'):
+        for x in ('right','below','indent','translate','zero','vertical','relative'):
             self.assertTrue(soup.select_one("#"+x).has_attr("hidden"),x)
-        for x in ('visible','flow'):
+        for x in ('visible','flow','normal','nested','sticky'):
             self.assertFalse(soup.select_one("#"+x).has_attr("hidden"),x)
