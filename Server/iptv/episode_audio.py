@@ -2422,7 +2422,7 @@ def _css_hides(value):
     value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))", decode, value)
     if _CSS_HIDDEN_DECLARATION.search(value) or _CSS_COMPUTED_VISIBILITY.search(value):
         return True
-    # Explicit large negative offsets and text indents are conventional
+    # Explicit large offsets and text indents are conventional
     # off-screen hiding. Evaluate independently of position so that split
     # stylesheet rules cannot bypass this static semantic filter. Normal
     # layout offsets and modest negative margins are not hiding evidence.
@@ -2440,7 +2440,7 @@ def _css_hides(value):
         value, re.I
     ):
         for offset in re.finditer(
-            r"(?<![\w.])-(\d+(?:\.\d*)?|\.\d+)(?:([eE][+-]?\d+))?([a-z]+|%)(?![\w-])",
+            r"(?<![\w.])[+-]?(\d+(?:\.\d*)?|\.\d+)(?:([eE][+-]?\d+))?([a-z]+|%)(?![\w-])",
             declaration[1], re.I
         ):
             unit = offset[3].casefold()

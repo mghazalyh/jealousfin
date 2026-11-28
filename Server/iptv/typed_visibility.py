@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 MAX_HTML = 2 * 1024 * 1024
-MAX_CSS = 512 * 1024
+MAX_CSS = 2 * 1024 * 1024
 MAX_CSS_TOTAL = 4 * 1024 * 1024
 MAX_STYLESHEETS = 24
 MAX_NODES = 20000
@@ -25,7 +25,7 @@ CSS_HOSTS = {
     "amblin.com": {"amblin.com", "use.fontawesome.com", "cdn.fonts.net", "fonts.googleapis.com"},
     "theguardian.com": {"theguardian.com", "assets.guim.co.uk"},
     "screamhorrormag.com": {"screamhorrormag.com"},
-    "indycar.com": {"indycar.com", "use.typekit.net"},
+    "indycar.com": {"indycar.com", "use.typekit.net", "p.typekit.net"},
     "theapex.racing": {"theapex.racing", "fonts.googleapis.com", "theissue.fuelthemes.net"},
     "racingnews.co": {"racingnews.co", "a.pub.network"},
 }
@@ -144,8 +144,27 @@ def _render(page,url,seconds):
                 const s=getComputedStyle(n), r=n.getBoundingClientRect();
                 if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)<=0||s.contentVisibility==='hidden'||parseFloat(s.fontSize)===0) return true;
                 if(s.color==='transparent'||s.webkitTextFillColor==='transparent'||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.color)||/rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(s.webkitTextFillColor)) return true;
-                if(parseFloat(s.textIndent)<=-1000) return true;
-                if(s.position!=='static'&&(r.right<=0||r.bottom<=0)&&r.width>0&&r.height>0) return true;
+                // A normal article may continue below the fold. Explicitly
+                // positioned/transformed boxes outside the viewport are not
+                // reliable source evidence, unlike ordinary document flow.
+                if(Math.abs(parseFloat(s.textIndent))>=1000) return true;
+                const positioned=s.position!=='static', transformed=s.transform!=='none'||s.translate!=='none'||s.scale!=='none'||s.rotate!=='none';
+                if(positioned&&[s.left,s.right,s.top,s.bottom].some(v=>Math.abs(parseFloat(v))>=1000)) return true;
+                if((positioned||transformed)&&(r.right<=0||r.left>=innerWidth||r.bottom<=0||r.top>=innerHeight)) return true;
+                if(transformed){
+                    if(r.width<=0||r.height<=0) return true;
+                    if(s.transform!=='none'){
+                        const m=new DOMMatrixReadOnly(s.transform);
+                        if(Math.abs(m.m41)>=1000||Math.abs(m.m42)>=1000||Math.abs(m.m43)>=1000) return true;
+                    }
+                    if(s.translate!=='none'&&s.translate.split(/\s+/).some(v=>Math.abs(parseFloat(v))>=1000)) return true;
+                }
+                // Exclude actual text boxes entirely outside the horizontal
+                // viewing area even if the parent retains a visible box.
+                if(n.childNodes.length&&Array.from(n.childNodes).some(t=>t.nodeType===3&&t.textContent.trim())){
+                    const ranges=Array.from(n.childNodes).filter(t=>t.nodeType===3&&t.textContent.trim()).flatMap(t=>{const q=document.createRange();q.selectNode(t);return Array.from(q.getClientRects());});
+                    if(ranges.length&&ranges.every(q=>q.right<=0||q.left>=innerWidth||q.bottom<=0||q.width<=0||q.height<=0)) return true;
+                }
                 if(s.display!=='contents'&&(r.width<=0||r.height<=0)&&/hidden|clip/.test(s.overflow)) return true;
                 if(s.clipPath!=='none'||(s.clip!=='auto'&&s.clip!=='rect(auto, auto, auto, auto)')) return true;
                 if(s.maskImage&&s.maskImage!=='none') return true;

@@ -315,3 +315,20 @@ class TypedParserTests(unittest.TestCase):
         self.assertFalse(v.needs_resolution(result))
         with patch.object(v,"_fetch_css",side_effect=ValueError("failed")):
             self.assertIsNone(v._render(html,"https://amblin.com/movie/test/",8))
+
+    def test_browser_excludes_positioned_and_transformed_text(self):
+        import typed_visibility as v
+        from unittest.mock import patch
+        from bs4 import BeautifulSoup
+        css=b"""#right{position:absolute;left:9999px}#below{position:absolute;top:9999px}
+        #indent{text-indent:9999px}#translate{transform:translateX(9999px)}
+        #zero{transform:scale(0)}#vertical{transform:translateY(9999px)}"""
+        html='<html><head><link rel="stylesheet" href="/a.css"></head><body>'+''.join('<p id="'+x+'">clue text</p>' for x in ('right','below','indent','translate','zero','vertical','visible'))+'<div style="height:2000px"></div><p id="flow">ordinary below-fold content</p></body></html>'
+        with patch.object(v,"_fetch_css",return_value=css):
+            out=v._render(html,"https://amblin.com/movie/test/",8)
+        self.assertIsNotNone(out)
+        soup=BeautifulSoup(out,"html.parser")
+        for x in ('right','below','indent','translate','zero','vertical'):
+            self.assertTrue(soup.select_one("#"+x).has_attr("hidden"),x)
+        for x in ('visible','flow'):
+            self.assertFalse(soup.select_one("#"+x).has_attr("hidden"),x)
