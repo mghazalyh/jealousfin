@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -61,16 +62,18 @@ def _checked(url, hosts):
     return p, addresses
 
 
-def _fetch_css(url, hosts, timeout):
+def fetch_https(url, hosts, timeout, *, accept, content_types, max_bytes, validate_url=None):
     # Connect to the exact vetted sockaddr, never re-resolve the hostname.
     # HTTPSConnection still supplies the original hostname for TLS SNI and
     # certificate validation. Each redirect receives a fresh vetted address.
     origin = _host(url)
     deadline = time.monotonic() + timeout
     for _ in range(5):
-        p, addresses = _checked(url, hosts)
+        if validate_url is not None and not validate_url(url):
+            raise ValueError("unapproved evidence URL")
         if _host(url) != origin:
-            raise ValueError("cross-host stylesheet redirect")
+            raise ValueError("cross-host evidence redirect")
+        p, addresses = _checked(url, hosts)
         def connect_address(_address, timeout=None, source_address=None):
             for family, kind, proto, _, sockaddr in addresses:
                 remaining=deadline-time.monotonic()
@@ -96,7 +99,7 @@ def _fetch_css(url, hosts, timeout):
         conn._create_connection=connect_address
         try:
             path=urllib.parse.urlunsplit(("","",p.path or "/",p.query,""))
-            conn.request("GET",path,headers={"User-Agent":"Jealousfin-Episode-Evidence/1.0","Accept":"text/css","Accept-Encoding":"identity"})
+            conn.request("GET",path,headers={"User-Agent":"Jealousfin-Episode-Evidence/1.0","Accept":accept,"Accept-Encoding":"identity"})
             response=conn.getresponse()
             if response.status in (301,302,303,307,308):
                 target=response.getheader("Location")
@@ -104,15 +107,21 @@ def _fetch_css(url, hosts, timeout):
                     raise ValueError("missing stylesheet redirect")
                 url=urllib.parse.urljoin(url,target)
                 continue
-            if response.status!=200 or response.headers.get_content_type()!="text/css":
-                raise ValueError("not CSS")
-            data=response.read(MAX_CSS+1)
-            if len(data)>MAX_CSS:
-                raise ValueError("stylesheet too large")
+            if response.status!=200:
+                raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,None)
+            if response.headers.get_content_type() not in content_types:
+                raise ValueError("unexpected evidence content type")
+            data=response.read(max_bytes+1)
+            if len(data)>max_bytes:
+                raise ValueError("evidence too large")
             return data
         finally:
             conn.close()
-    raise ValueError("too many stylesheet redirects")
+    raise ValueError("too many evidence redirects")
+
+
+def _fetch_css(url, hosts, timeout):
+    return fetch_https(url,hosts,timeout,accept="text/css",content_types={"text/css"},max_bytes=MAX_CSS)
 
 
 def _render(page,url,seconds):

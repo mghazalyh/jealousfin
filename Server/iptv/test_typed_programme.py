@@ -150,7 +150,7 @@ class TypedParserTests(unittest.TestCase):
         self.guardian="https://www.theguardian.com/film/example"
         self.scream="https://www.screamhorrormag.com/example-film-review/"
         self.plot="Martin Brody and Matt Hooper investigate Amity with Quint."
-        self.year="1975, when Example opened wide."
+        self.year="It was 1975, when Example opened wide."
         self.movie_html=(
             '<meta property="og:type" content="video.movie">'
             '<meta property="og:title" content="Example (1975) - About the Movie | Amblin">'
@@ -242,12 +242,20 @@ class TypedParserTests(unittest.TestCase):
             result=audio.parse_typed_programme_page(invalid,url,clues)
             self.assertTrue(not result or "alex palou" not in result[0].terms)
 
+    def test_accent_equivalent_title_keys(self):
+        row=audio.TypedProgrammeEvidence("movie","Amélie",self.official,("amity","quint"),release_year=2001)
+        self.assertEqual(row.key(),dataclasses.replace(row,title="Amelie").key())
+
     def test_nonenglish_typed_scope_rejected(self):
         for page in ('<html lang="es">'+self.movie_html+'</html>',
                      self.movie_html.replace("<p>","<p lang='fr'>"),
                      '<meta property="og:locale" content="es_ES">'+self.movie_html,
                      self.movie_html.replace(self.plot,"Martin Brody y Matt Hooper investigan Amity con Quint.")):
             self.assertEqual(audio.parse_typed_programme_page(page,self.official,self.clues,True),[])
+
+    def test_unmarked_nonenglish_report_plot_rejected(self):
+        page=self.guardian_html.replace(self.plot,"Martin Brody y Matt Hooper investigan Amity con Quint.")
+        self.assertEqual(audio.parse_typed_programme_page(page,self.guardian,self.clues),[])
 
     def test_unresolved_external_styles_never_count_as_evidence(self):
         for markup in ('<link rel="stylesheet" href="https://amblin.com/hide.css">',

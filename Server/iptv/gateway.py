@@ -2450,21 +2450,14 @@ def episode_research_page(url,timeout=8.0):
  # Bounded, HTTPS-only read of one approved public page. Never stores the page.
  target=episode_audio.safe_source_url(url,EPISODE_SOURCE_HOSTS,allow_query=True)
  if not target:raise ValueError('Unapproved episode source')
- original_host=urllib.parse.urlsplit(target).hostname
- class EpisodeRedirect(Redirect):
-  def redirect_request(self,req,fp,code,msg,headers,newurl):
-   redirect=episode_audio.safe_source_url(urllib.parse.urljoin(req.full_url,newurl),EPISODE_SOURCE_HOSTS,allow_query=True)
-   if not redirect or not episode_audio._same_site(urllib.parse.urlsplit(redirect).hostname,original_host):
-    raise ValueError('Unapproved episode source redirect')
-   return super().redirect_request(req,fp,code,msg,headers,redirect)
- req=urllib.request.Request(validate(target),headers={'User-Agent':'Jealousfin-Episode-Evidence/1.0','Accept':'text/html,application/xhtml+xml'})
- agent=urllib.request.build_opener(urllib.request.ProxyHandler({}),EpisodeRedirect())
- with agent.open(req,timeout=max(0.01,min(8.0,float(timeout)))) as f:
-  data=f.read(episode_audio.MAX_PAGE_BYTES+1)
-  final=f.geturl()
- if not episode_audio._same_site(urllib.parse.urlsplit(final).hostname,original_host):raise ValueError('Episode source left approved host')
- if len(data)>episode_audio.MAX_PAGE_BYTES:raise ValueError('Episode evidence page too large')
- return data
+ # Pin every public HTML connection to its validated DNS address, including
+ # same-site redirects. Keep the existing exact host and URL allowlist.
+ import typed_visibility
+ return typed_visibility.fetch_https(target,{h.removeprefix("www.") for h in EPISODE_SOURCE_HOSTS},
+   max(0.01,min(8.0,float(timeout))),accept="text/html,application/xhtml+xml",
+   content_types={"text/html","application/xhtml+xml"},max_bytes=episode_audio.MAX_PAGE_BYTES,
+   validate_url=lambda u:episode_audio.safe_source_url(u,EPISODE_SOURCE_HOSTS,allow_query=True))
+
 def episode_source_provider(payload):
  # Search results are URL leads only; pages still require independent evidence.
  if not gateway_config.get('episodeAudioEnabled'):return [], []

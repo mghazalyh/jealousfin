@@ -930,7 +930,7 @@ class TypedProgrammeEvidence:
         return official or bool(_date(self.published_at))
 
     def key(self):
-        return (self.content_kind, _norm_text(self.title), self.release_year, self.event_date)
+        return (self.content_kind, _norm_text(_typed_latin(self.title)), self.release_year, self.event_date)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2586,6 +2586,14 @@ def _typed_requested_public_terms(clues,*sections):
     return _requested_public_terms(_typed_normalized_clues(clues),*(_typed_latin(value) for value in sections))
 
 
+def _typed_english_prose(value):
+    # Proper names alone do not establish language. Require multiple English
+    # function words and a minimum amount of ordinary sentence text.
+    words=re.findall(r"[a-z]+", _typed_latin(value).lower())
+    common=set(words).intersection({"the","a","an","and","with","of","to","in","is","are","was","were","when","who","his","her","their","on","for","from","as","by","at","has","had","have","it","that","this","which","he","she","they","but","after","before","since"})
+    return len(words)>=5 and len(common)>=2
+
+
 def _typed_movie_year(title, paragraphs):
     """Only explicit release statements tied to the article's named film."""
     years = set()
@@ -2766,7 +2774,7 @@ def parse_typed_programme_page(page, url, clues, official=False):
         # The first plot paragraph is separate from subsequent production history.
         paragraphs = [re.sub(r"\([^()]{1,120}\)", " ", p) for k,p in rows if k == "p"][:1]
         # The English profile must contain English prose, not merely names.
-        if not paragraphs or len(set(re.findall(r"\b(?:the|a|an|and|with|of|to|in|is|are|was|were|when|who|his|her|their|on|for|from|as|by|at)\b", paragraphs[0].lower()))) < 2:
+        if not paragraphs or not _typed_english_prose(paragraphs[0]):
             return []
     elif not official and host == "theguardian.com" and path.startswith("/film/"):
         match = re.fullmatch(r"(.{1,200}),\s+\d+\s+years on:\s+.+", headline, re.I)
@@ -2777,7 +2785,7 @@ def parse_typed_programme_page(page, url, clues, official=False):
         if not article or not _article_matches_headline(article, headline):
             return []
         rows = _typed_scope(page, lambda tag,a: tag == "article")
-        paragraphs = [p for k,p in rows if k == "p"]
+        paragraphs = [p for k,p in rows if k == "p" and _typed_english_prose(p)]
         year = _typed_movie_year(title, paragraphs)
         published = _page_date(meta.get("article:published_time"))
     elif not official and host == "screamhorrormag.com":
@@ -2788,7 +2796,7 @@ def parse_typed_programme_page(page, url, clues, official=False):
         rows = _typed_scope(page, lambda tag,a: tag == "div" and "category-film-reviews" in (a.get("class") or "").split())
         if [_norm_text(v) for k,v in rows if k == "h1"] != [_norm_text(headline)]:
             return []
-        paragraphs = [p for k,p in rows if k == "p"]
+        paragraphs = [p for k,p in rows if k == "p" and _typed_english_prose(p)]
         year = _typed_movie_year(title, paragraphs)
         published = _page_date(meta.get("article:published_time"))
     else:
