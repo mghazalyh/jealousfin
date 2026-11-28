@@ -265,11 +265,16 @@ import CryptoKit
         if !versionRecoveryFailed{decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()}
         if !nativeSafeMode,!versionRecoveryFailed,disk.load(String.self,NativeOverlayDefaults.marker) != patchReleaseEpoch.namespace {
             do {
-                if disk.load(DynamicUIStore.self,"dynamic-ui.json")?.active == nil {
+                let active=disk.load(DynamicUIStore.self,"dynamic-ui.json")?.active
+                if active == nil {
                     let layout=try NativeOverlayDefaults.layout()
                     guard disk.save(DynamicUIStore(active:layout,previous:nil,values:layout.formDefaults()),"dynamic-ui.json") else{throw AppError.message("Cannot persist native overlay defaults")}
                 }
-                guard disk.save(patchReleaseEpoch.namespace,NativeOverlayDefaults.marker) else{throw AppError.message("Cannot persist native overlay marker")}
+                // Preserve an explicitly installed third-party layout. Do not
+                // record native defaults as installed if that layout was kept.
+                if active == nil || active?.revision==NativeOverlayDefaults.revision {
+                    guard disk.save(patchReleaseEpoch.namespace,NativeOverlayDefaults.marker) else{throw AppError.message("Cannot persist native overlay marker")}
+                }
             }catch{patchArchiveFault="Native overlay defaults installation failed"}
         }
         if !nativeSafeMode,!versionRecoveryFailed,var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
@@ -887,7 +892,7 @@ import CryptoKit
             programs=items;log("INFO","epg","REFRESHED",["count":String(programs.count)])
         }catch{log("WARN","epg","UNAVAILABLE")}
     }
-    func refresh() async throws {
+    @discardableResult func refresh() async throws -> [Channel] {
         guard !apiChanging,!catalogueBusy,!loginBusy,jelly.connected else{throw AppError.message("Catalogue unavailable or busy")}
         catalogueBusy=true;defer{catalogueBusy=false}
         programmeRequestID=UUID()
@@ -896,6 +901,7 @@ import CryptoKit
         publishCatalogue(items)
         await refreshProgramme()
         recalculateInsights()
+        return items
     }
     func refreshFromUI(){Task{
         if !catalogueReady || !jelly.connected {await connect();return}
@@ -2693,6 +2699,9 @@ import CryptoKit
             try commitUILayout(DynamicUIStore(active:previous,previous:dynamicUI.active,values:previous.formDefaults()))
             return "UI layout rolled back: "+previous.revision
         case "reset_ui_layout":
+            // A deliberate user reset suppresses default re-seeding for this
+            // release epoch, even if the previous layout was custom.
+            guard disk.save(patchReleaseEpoch.namespace,NativeOverlayDefaults.marker) else{throw AppError.message("Cannot persist native overlay reset preference")}
             try commitUILayout(DynamicUIStore(active:nil,previous:dynamicUI.active))
             return "Native UI restored"
         case "ui_set_value":
@@ -3291,9 +3300,12 @@ extension AppModel {
             "channelID":channel.id,"channelName":channel.name,"nonce":UUID().uuidString.lowercased()]
         let encoded=String(decoding:try JSONSerialization.data(withJSONObject:value,options:[.sortedKeys]),as:UTF8.self)
         try setDynamicUIValue("spanishRequest",value:encoded)
-        do{try await refresh()}catch{return "Language correction queued; catalogue refresh unavailable. Playback unchanged."}
+        let refreshed:[Channel]
+        do{refreshed=try await refresh()}catch{return "Language correction queued; catalogue refresh unavailable. Playback unchanged."}
         if marker=="add",generation==capturedGeneration,current?.id==channel.id,activeSurfSource == .american,
-           surfing,!usingSharedSurf,!currentSharedTransport,catalogueReady,!channels.contains(where:{$0.id==channel.id}){
+           !sourceTransitionBusy,!apiChanging,!loginBusy,surfing,!usingSharedSurf,!currentSharedTransport,catalogueReady,
+           !refreshed.isEmpty,!refreshed.contains(where:{$0.id==channel.id}),
+           !channels.contains(where:{$0.id==channel.id}){
             next(reason:"confirmed-language-exclusion")
             return "Spanish exclusion confirmed; advancing."
         }
