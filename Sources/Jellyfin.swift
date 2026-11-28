@@ -83,6 +83,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
     }
     func request(_ path: String, method: String = "GET", query: [String: String] = [:], body: [String: Any]? = nil) async throws -> [String: Any] {
         let operation=JellyfinAdapterRules.operation(path)
+        let epoch=connectionEpoch
         let active=adapter
         let revision=active?.revision.id ?? "native-baseline"
         let spec=active?.spec ?? JellyfinAdapterSpec()
@@ -94,6 +95,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             let plan:(path:String,method:String,query:[String:String],body:[String:Any]?)
             if let active=active{plan=try await active.request(operation:operation,path:path,method:method,query:query,body:body)}
             else{plan=(path,method,query,body)}
+            guard connectionEpoch==epoch else{throw CancellationError()}
             phase="transport"
             var r=URLRequest(url:try url(plan.path,plan.query));r.httpMethod=plan.method;r.timeoutInterval=Double(spec.timeoutSeconds)
             if spec.authorizationHeader != "X-Emby-Authorization"{r.setValue(auth,forHTTPHeaderField:"Authorization")}
@@ -102,6 +104,7 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
             r.setValue(requestID,forHTTPHeaderField:"X-Jealousfin-Request-ID")
             if let payload=plan.body{r.httpBody=try JSONSerialization.data(withJSONObject:payload);r.setValue("application/json",forHTTPHeaderField:"Content-Type")}
             let (data, httpResponse) = try await transport.data(for: r)
+            guard connectionEpoch==epoch else{throw CancellationError()}
             guard let http = httpResponse as? HTTPURLResponse else { throw AppError.message("Invalid HTTP response") }
             log?(http.statusCode < 400 ? "INFO" : "ERROR","HTTP_RESULT",["operation":operation,"endpoint":plan.path,"method":plan.method,"adapter":revision,"requestID":requestID,"status":String(http.statusCode),"bytes":String(data.count),"ms":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
             if [409,503].contains(http.statusCode),let body=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
@@ -121,10 +124,11 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
                 else{throw AppError.message("Unexpected Jellyfin JSON shape")}
             }
             phase="response_hook"
-            if let active=active{return try await active.response(operation:operation,response:response)}
+            if let active=active{let result=try await active.response(operation:operation,response:response);guard connectionEpoch==epoch else{throw CancellationError()};return result}
             return response
         } catch {
             log?("ERROR","HTTP_FAILURE",["operation":operation,"adapter":revision,"requestID":requestID,"phase":phase,"errorType":String(describing:type(of:error))])
+            if error is CancellationError{throw error}
             if phase=="request_hook" || phase=="response_hook"{throw AppError.message("Jellyfin API adapter failed during "+operation+" "+phase)}
             if phase=="transport",let fault=JellyfinConnectionFault.networkError(error){throw fault}
             throw error

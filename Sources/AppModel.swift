@@ -830,6 +830,12 @@ import CryptoKit
         await oldWork?.value
         await cleanupTask?.value
         do {
+            let drainDeadline=ProcessInfo.processInfo.systemUptime+30
+            while jelly.inFlight>0 && ProcessInfo.processInfo.systemUptime<drainDeadline {
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds:200_000_000)
+            }
+            guard jelly.inFlight==0 else{throw AppError.message("Old Jellyfin operations have not drained")}
             let items=try await jelly.connectCatalogue(savedSettings,stillCurrent:{
                 self.settings.server==savedSettings.server && self.settings.username==savedSettings.username &&
                 self.settings.password==savedSettings.password && self.settings.surfCategory==savedSettings.surfCategory &&
@@ -913,8 +919,10 @@ import CryptoKit
         defer{favoriteInFlight.remove(channel.id)}
         let value = !(channels.first(where:{$0.id==channel.id})?.favorite ?? channel.favorite)
         favoriteFailureChannelID=nil
+        let epoch=jelly.connectionEpoch
         do{try await jelly.favorite(channel.id,value:value)}
-        catch{favoriteFailureChannelID=channel.id;throw error}
+        catch{if jelly.connectionEpoch==epoch{favoriteFailureChannelID=channel.id};throw error}
+        guard jelly.connectionEpoch==epoch else{throw CancellationError()}
         if let i=channels.firstIndex(where:{$0.id==channel.id}){channels[i].favorite=value}
         if current?.id==channel.id {current?.favorite=value}
         if let i=previous.firstIndex(where:{$0.id==channel.id}){previous[i].favorite=value}
@@ -923,8 +931,13 @@ import CryptoKit
         requestSync()
     }
     func favoriteFromUI(_ channel:Channel){Task{do{try await favorite(channel)}catch{log("ERROR","favorites","FAILED",["error":error.localizedDescription])}}}
-    func loadRecordings(){Task{do{recordings=try await jelly.recordings();log("INFO","dvr","RECORDINGS_LOADED",["count":String(recordings.count)])}catch{log("WARN","dvr","UNAVAILABLE")}}}
-    func schedule(_ program:Program){Task{do{try await jelly.record(program);log("INFO","dvr","TIMER_CREATED",["programID":program.id])}catch{log("ERROR","dvr","TIMER_FAILED",["error":error.localizedDescription])}}}
+    func loadRecordings(){Task{
+        guard !loginBusy,!apiChanging,jelly.connected else{return}
+        let epoch=jelly.connectionEpoch
+        do{let items=try await jelly.recordings();guard jelly.connectionEpoch==epoch else{return};recordings=items;log("INFO","dvr","RECORDINGS_LOADED",["count":String(recordings.count)])}
+        catch{log("WARN","dvr","UNAVAILABLE")}
+    }}
+    func schedule(_ program:Program){Task{guard !loginBusy,!apiChanging,jelly.connected else{return};do{try await jelly.record(program);log("INFO","dvr","TIMER_CREATED",["programID":program.id])}catch{log("ERROR","dvr","TIMER_FAILED",["error":error.localizedDescription])}}}
     func requestStartSurf(category:String="All Channels") async throws {
         guard !surfStartPending,!sourceTransitionBusy else{throw AppError.message("Surf start already pending or source transition busy")}
         surfStartPending=true;defer{surfStartPending=false}
@@ -1578,9 +1591,9 @@ import CryptoKit
         log("INFO","health","POLICY_CHANGED",["channelID":channel.id,"action":action,"failures":String(health[channel.id]?.failures ?? 0)])
         if ["failure","success"].contains(action),jelly.gatewayHealth != nil {
             let sessionTrace=(current?.id==channel.id ? trace:nil) ?? UUID().uuidString
-            let origin=jelly.base,account=jelly.userID
+            let origin=jelly.base,account=jelly.userID,epoch=jelly.connectionEpoch
             Task{[weak self] in
-                guard let self=self,self.jelly.base==origin,self.jelly.userID==account else{return}
+                guard let self=self,self.jelly.base==origin,self.jelly.userID==account,self.jelly.connectionEpoch==epoch,!self.loginBusy else{return}
                 do{try await self.jelly.submitGatewayHealth(channelID:channel.id,trace:sessionTrace,action:action,reason:clean);self.updateEffectiveHealth()}
                 catch{self.log("WARN","health","GATEWAY_POLICY_WRITE_FAILED",["channelID":channel.id,"errorType":String(describing:type(of:error))])}
             }
@@ -1588,10 +1601,13 @@ import CryptoKit
         recalculateInsights();requestSync()
     }
     func approve(_ channel:Channel)async throws{
+        guard !loginBusy,!apiChanging else{throw AppError.message("Connection engine busy")}
+        let epoch=jelly.connectionEpoch
         guard health[channel.id]?.banned==true else{return}
         if jelly.gatewayHealth != nil {
             try await jelly.submitGatewayHealth(channelID:channel.id,trace:UUID().uuidString,action:"approve",reason:"Explicit administrator approval")
         }
+        guard jelly.connectionEpoch==epoch else{throw CancellationError()}
         appendHealth(channel,"approve","Explicit administrator approval")
     }
     func approveFromUI(_ channel:Channel){
@@ -2926,7 +2942,7 @@ extension AppModel {
             return Observation(status:telemetryActive && telemetryLastSample != nil ? "passed":"failed",evidence:evidence)
         case "network":
             sampleSystemTelemetry(force:true)
-            guard jelly.connected else{return Observation(status:"blocked",evidence:["reason":"Jellyfin not configured or connected"])}
+            guard jelly.connected,!loginBusy else{return Observation(status:"blocked",evidence:["reason":"Jellyfin not configured or connected"])}
             let ok=await jelly.healthy()
             return Observation(status:ok ? "passed":"failed",evidence:["networkState":networkState,"interfaces":networkInterfaces,"jellyfinReachable":String(ok),"requestMs":String(Int((ProcessInfo.processInfo.systemUptime-start)*1000))])
         case "reconnect":
@@ -2944,7 +2960,7 @@ extension AppModel {
                 return Observation(status:result.trimmingCharacters(in:.whitespacesAndNewlines)=="true" ? "passed":"failed",evidence:["result":sanitized(result)])
             }catch{return Observation(status:"failed",evidence:["reason":error.localizedDescription])}
         case "catalogue":
-            guard jelly.connected else{return Observation(status:"blocked",evidence:["reason":"Jellyfin is not connected"])}
+            guard jelly.connected,!loginBusy else{return Observation(status:"blocked",evidence:["reason":"Jellyfin is not connected"])}
             do{
                 // Query actual server instead of treating cached channels as live evidence.
                 let fresh=try await jelly.channels()
@@ -3518,7 +3534,7 @@ extension AppModel {
         }
     }
     private func probeJellyfinAPI(_ operation:String)async throws->[String:String]{
-        guard apiReady,!apiChanging,jelly.connected else{throw AppError.message("Jellyfin API unavailable")}
+        guard apiReady,!apiChanging,!loginBusy,jelly.connected else{throw AppError.message("Jellyfin API unavailable")}
         let start=ProcessInfo.processInfo.systemUptime
         var result=["revision":jellyfinAPIRevision,"operation":operation]
         switch operation{

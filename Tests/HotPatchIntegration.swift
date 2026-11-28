@@ -80,6 +80,7 @@ final class CatalogueStartupFixture:URLProtocol {
             if host=="malformed.invalid"{object["Items"]=[["Id":"channel-a"]]}
             if host=="duplicate.invalid"{object["Items"]=[["Id":"channel-a","Name":"One"],["Id":"channel-a","Name":"Two"]]}
             if host=="expired.invalid"{code=401}
+            if host=="slow.invalid" && attempt>1{Thread.sleep(forTimeInterval:0.25)}
         }else{code=404}
         let data=(try? JSONSerialization.data(withJSONObject:object)) ?? Data()
         let response=HTTPURLResponse(url:url,statusCode:code,httpVersion:"HTTP/1.1",headerFields:["Content-Type":"application/json"])!
@@ -281,6 +282,16 @@ final class TorrioConflictFixture:URLProtocol {
             },retryDelays:[0])
         }catch is CancellationError{configurationCancelled=true}
         try require(configurationCancelled && configurationChecks==2 && !startup.connected && startup.gatewayHealth==nil,"gateway configuration change rejects completed staged catalogue")
+
+        startupSettings.server="http://slow.invalid:8096"
+        _ = try await startup.connectCatalogue(startupSettings,retryDelays:[0])
+        let delayed=Task{@MainActor in try await startup.request("LiveTv/Channels")}
+        for _ in 0..<100 where startup.inFlight==0{try await Task.sleep(nanoseconds:1_000_000)}
+        try require(startup.inFlight>0,"old catalogue request is in flight")
+        startup.invalidateConnection()
+        var staleResponseRejected=false
+        do{_ = try await delayed.value}catch is CancellationError{staleResponseRejected=true}
+        try require(staleResponseRejected && startup.inFlight==0 && !startup.connected,"late old-epoch transport response cannot escape reconnect boundary")
 
         let nativePolicyClient=Jellyfin(deviceID:"policy-fixture",transport:URLSession(configuration:config))
         var policySettings=fixtureSettings;policySettings.server="http://fixture.invalid:18796"
