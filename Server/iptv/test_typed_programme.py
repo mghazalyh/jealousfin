@@ -216,6 +216,11 @@ class TypedParserTests(unittest.TestCase):
         self.assertEqual(audio.parse_typed_programme_page(apex.replace("Race Top Five","Starting Grid"),apex_url,clues),[])
         self.assertEqual(audio.parse_typed_programme_page(racing.replace("Indy 500 Race Results May 25","Indy 500 Race Results May 24"),racing_url,clues),[])
 
+    def test_unresolved_external_styles_never_count_as_evidence(self):
+        for markup in ('<link rel="stylesheet" href="https://amblin.com/hide.css">',
+                       '<style>@import url("https://amblin.com/hide.css");</style>'):
+            self.assertEqual(audio.parse_typed_programme_page(markup+self.movie_html,self.official,self.clues,True),[])
+
     def test_explicit_offscreen_plot_is_not_evidence(self):
         visible = '<p>'+self.plot+'</p>'
         for style in ("position:absolute;left:-9999px", "text-indent:-9999px",
@@ -292,3 +297,21 @@ class TypedParserTests(unittest.TestCase):
                 self.assertEqual(audio.parse_typed_programme_page(self.movie_html.replace(visible,wrapper),self.official,self.clues,True),[])
         for tag in ('details','dialog'):
             self.assertEqual(len(audio.parse_typed_programme_page(self.movie_html.replace(visible,'<'+tag+' open>'+visible+'</'+tag+'>'),self.official,self.clues,True)),1)
+
+    def test_browser_resolves_external_hidden_and_import(self):
+        import typed_visibility as v
+        from unittest.mock import patch
+        from bs4 import BeautifulSoup
+        html='<html><head><link rel="stylesheet" href="/a.css"></head><body><div id="x">hidden</div><div id="y">visible</div></body></html>'
+        def css(url, hosts, timeout):
+            return b'@import "/b.css";' if url.endswith("/a.css") else b'#x {display:none}'
+        with patch.object(v,"_fetch_css",side_effect=css) as f:
+            result=v._render(html,"https://amblin.com/movie/test/",8)
+        self.assertIsNotNone(result)
+        self.assertEqual(f.call_count,2)
+        soup=BeautifulSoup(result,"html.parser")
+        self.assertTrue(soup.select_one("#x").has_attr("hidden"))
+        self.assertFalse(soup.select_one("#y").has_attr("hidden"))
+        self.assertFalse(v.needs_resolution(result))
+        with patch.object(v,"_fetch_css",side_effect=ValueError("failed")):
+            self.assertIsNone(v._render(html,"https://amblin.com/movie/test/",8))

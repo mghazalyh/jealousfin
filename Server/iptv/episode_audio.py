@@ -2672,6 +2672,15 @@ def _typed_indy500(page, url, clues, official, meta, headline):
 
 def parse_typed_programme_page(page, url, clues, official=False):
     """Reviewed movie profiles; unsupported content never becomes identity."""
+    # Unresolved external CSS is not evidence. The live research adapter
+    # resolves it in an isolated, script-disabled browser before parsing.
+    try:
+        import typed_visibility
+        if typed_visibility.needs_resolution(page):
+            return []
+    except Exception:
+        return []
+
     host = _host(url).removeprefix("www.")
     if not safe_source_url(url, TYPED_OFFICIAL_HOSTS if official else TYPED_REPORT_HOSTS):
         return []
@@ -3140,6 +3149,19 @@ class PublicEvidenceResearch:
     def _fetch(self, url, allowed_hosts):
         return self._fetch_result(url, allowed_hosts)[0]
 
+    def _typed_page(self, page, url, clues, deadline, official=False):
+        try:
+            import typed_visibility
+            if _host(url).removeprefix("www.") not in typed_visibility.CSS_HOSTS:
+                return []
+            if typed_visibility.needs_resolution(page):
+                page=typed_visibility.resolve(page,url,deadline)
+            if page is None or time.monotonic()>=deadline:
+                return []
+            return parse_typed_programme_page(page,url,clues,official=official)
+        except Exception:
+            return []
+
     def _read_unknown(self, official_urls, report_urls, context, clues, deadline):
         """Use the shared deadline fairly across both required source families.
 
@@ -3173,7 +3195,7 @@ class PublicEvidenceResearch:
                     blocked.add(independent_publisher(url))
                 elif page is not None:
                     reports.extend(parse_report_page(page, url, context, clues=clues))
-                    reports.extend(parse_typed_programme_page(page, url, clues))
+                    reports.extend(self._typed_page(page, url, clues, deadline))
             elif official_urls:
                 # A report's explicit air date can prioritize existing archive
                 # leads, but cannot generate a new URL or establish identity.
@@ -3194,7 +3216,7 @@ class PublicEvidenceResearch:
                     blocked.add(_host(url).removeprefix("www."))
                 elif page is not None:
                     official.extend(parse_official_page(page, url))
-                    official.extend(parse_typed_programme_page(page, url, clues, official=True))
+                    official.extend(self._typed_page(page, url, clues, deadline, official=True))
             if len(official) >= MAX_OFFICIAL_EPISODES:
                 official_urls.clear()
             if len(reports) >= MAX_REPORTS:

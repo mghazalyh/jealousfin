@@ -89,6 +89,8 @@ docs/incident-overlay-post-pressure-20261127.md
 docs/incident-probe-concurrency-20261127.md
 docs/schedule-episode-discovery-20261127.md
 Server/iptv/test_typed_programme.py
+Server/iptv/typed_visibility.py
+Server/iptv/typed-evidence-requirements.txt
 ```
 
 No generated artifact, credential, registry, transcript, page body, audio
@@ -243,12 +245,14 @@ Reviewed, narrow public-source profiles:
   have evidence architecture and fixtures only; no reviewed real-source
   parser yet.
 
-Scope parsing uses the installed BeautifulSoup/SoupSieve packages, with fail-closed
-behavior if missing or if hiding selectors are unsupported. It excludes inline
-hidden elements, hidden classes and embedded stylesheet hiding rules. This is
-static semantic source evidence; externally loaded CSS and dynamic visual
-rendering are not fetched or asserted. No secondary stylesheet or script
-requests, raw page storage or browser execution are introduced.
+Scope parsing requires the versions in Server/iptv/typed-evidence-requirements.txt.
+Install Chromium with the exact gateway interpreter: python3 -m playwright install chromium.
+Inline and embedded styles are filtered conservatively. Linked stylesheets and
+imports are resolved only for the reviewed source profiles in a time-bounded
+script-disabled isolated Chromium child. Unapproved CSS, missing dependencies,
+failed CSS loads, and deadline expiry fail closed. Browser visibility is checked
+at a fixed desktop viewport; no claim about dynamic page scripts or every viewport.
+No external script, image, frame, or raw page persistence is permitted.
 
 Historical public source proof (fixture clues, not live device acceptance):
 Jaws (1975), Amblin/Guardian/Scream; 2025 Indianapolis 500 (2025-05-25),
