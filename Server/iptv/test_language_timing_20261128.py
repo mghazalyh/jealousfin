@@ -50,6 +50,34 @@ class TranscriptDecisionTests(unittest.TestCase):
             {"outcome": "excluded", "reason": "language_es_dominant"}))
 
 
+class AdaptiveCollectionTests(unittest.TestCase):
+    def test_early_collection_needs_verified_scope_and_all_four_windows(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import language_audio
+        m=object.__new__(language_audio.Manager);m.on_speech=lambda *a:None
+        sample=SimpleNamespace(cid="a"*32,probe={"channelID":"a"*32,"launchID":"l","streamGeneration":"g"},
+            visit={"channelID":"a"*32,"launchID":"l","streamGeneration":"g","visitID":"v","verified":True})
+        best=SimpleNamespace(seconds=45,pcm=b"fixture")
+        quality={"duration":45,"speechSeconds":20,"coverage":.44,"windows":[{"usable":True} for _ in range(4)]}
+        with patch.object(m,"_verified_visit",return_value="v"), patch.object(m,"_best_base",return_value=best), patch.object(spanish_audio,"analyze_speech",return_value=quality):
+            self.assertTrue(m._sample_target_reached(sample,best))
+            quality["windows"][3]["usable"]=False
+            self.assertFalse(m._sample_target_reached(sample,best))
+            quality["windows"][3]["usable"]=True
+            sample.visit["streamGeneration"]="old"
+            self.assertFalse(m._sample_target_reached(sample,best))
+            sample.visit["streamGeneration"]="g"
+            best.seconds=44
+            self.assertFalse(m._sample_target_reached(sample,best))
+            best.seconds=45
+            m.on_speech=None
+            self.assertFalse(m._sample_target_reached(sample,best))
+            best.seconds=55
+            self.assertTrue(m._sample_target_reached(sample,best))
+        legacy=object.__new__(spanish_audio.Manager)
+        self.assertFalse(legacy._sample_target_reached(sample,SimpleNamespace(seconds=45)))
+
 class SpanishInferTimingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

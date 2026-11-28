@@ -996,8 +996,8 @@ class Manager:
             base.segments += 1
             with self._lock:
                 self.telemetry["counters"]["segmentsDecoded"] += 1
-        if base.seconds >= TARGET_SECONDS:
-            self._finalize(event["cid"], "target_reached")
+        if self._sample_target_reached(sample,base):
+            self._finalize(event["cid"], "target_reached" if base.seconds>=TARGET_SECONDS else "speech_ready_early")
         self._update_current()
 
     def _write_diagnostic(self, event, map_data):
@@ -1057,8 +1057,8 @@ class Manager:
                 if now - sample.last_tap >= IDLE_SECONDS:
                     self._finalize(cid, "idle")
                 continue
-            if best.seconds >= TARGET_SECONDS:
-                self._finalize(cid, "target_reached")
+            if self._sample_target_reached(sample,best):
+                self._finalize(cid, "target_reached" if best.seconds>=TARGET_SECONDS else "speech_ready_early")
             elif verified and verified != cid and best.seconds >= MIN_SAMPLE_SECONDS:
                 self._finalize(cid, "channel_changed")
             elif verified and verified == cid:
@@ -1067,6 +1067,9 @@ class Manager:
             elif now - sample.last_tap >= IDLE_SECONDS:
                 self._finalize(cid, "idle")
         self._update_current()
+
+    def _sample_target_reached(self,sample,best):
+        return best is not None and best.seconds>=TARGET_SECONDS
 
     def _best_base(self, sample):
         candidates = list(sample.bases.values())

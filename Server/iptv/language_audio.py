@@ -29,6 +29,8 @@ STRICT_NO_LEXICAL_PROBABILITY = 0.92
 SAME_VISIT_RETRY_SECONDS = base.SAME_VISIT_RETRY_SECONDS
 MAX_SAME_VISIT_ATTEMPTS = base.MAX_SAME_VISIT_ATTEMPTS
 STATE_PUBLISH_SECONDS = 10.0
+# Early completion is a collection optimization only, not a new evidence floor.
+EARLY_COMPLETE_SECONDS = 45.0
 # An episode lookup rejected for a commercial/no-match reason may request a
 # fresh, episode-only sample in the same physical visit. It reuses already
 # fetched media bytes, never records another language evidence event and is
@@ -198,6 +200,34 @@ class Manager(base.Manager):
         if started:
             self.log("language auto ready model=" + pathlib.Path(self.model_path).name)
         return started
+
+    def _sample_target_reached(self,sample,best):
+        if super()._sample_target_reached(sample,best):
+            return True
+        # Only the English gateway installs the speech observer. Keep the
+        # original target for other managers, unverified visits and weak audio.
+        if not callable(getattr(self,"on_speech",None)) or best is None or best.seconds<EARLY_COMPLETE_SECONDS:
+            return False
+        visit=sample.visit if isinstance(sample.visit,dict) else {}
+        probe=sample.probe if isinstance(sample.probe,dict) else {}
+        if (not self._verified_visit(visit) or probe.get("channelID")!=sample.cid
+                or visit.get("channelID")!=sample.cid
+                or not probe.get("launchID") or not probe.get("streamGeneration")
+                or visit.get("launchID")!=probe.get("launchID")
+                or visit.get("streamGeneration")!=probe.get("streamGeneration")):
+            return False
+        # The chosen base must be the exact one _finalize will hand to inference.
+        if self._best_base(sample) is not best:
+            return False
+        analysis=base.analyze_speech(best.pcm)
+        # Require all four windows, not merely the minimum three. The actual
+        # inference still analyzes every window and applies unchanged language
+        # probabilities, coverage, transcript agreement and visit checks.
+        return (analysis["duration"]>=EARLY_COMPLETE_SECONDS
+                and analysis["speechSeconds"]>=base.MIN_SPEECH_SECONDS
+                and analysis["coverage"]>=base.MIN_COVERAGE
+                and len(analysis["windows"])==base.MAX_WINDOWS
+                and all(window["usable"] for window in analysis["windows"]))
 
     def _infer(self, job):
         if not self._enabled():
