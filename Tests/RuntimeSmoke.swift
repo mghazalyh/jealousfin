@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 @main struct RuntimeSmoke {
     @MainActor static func main() async throws {
@@ -361,6 +362,28 @@ t.close()
         let authenticatedCommand=try await authRequest("/command",method:"POST",token:"fixture-token",body:Data("{}".utf8))
         precondition(healthStatus==200 && unauthenticatedStatus==401 && authenticatedStatus==200 && wrongTokenCommand==401 && authenticatedCommand==200)
         print("PASS: LAN authentication and /health bypass preserved after connection cleanup")
+        // A second listener initially cannot bind a held port. It must recover
+        // without a UI tick, and an explicit stop must cancel its retries.
+        let retryFixture=LANServer(port:NWEndpoint.Port(rawValue:authPort)!,advertise:false)
+        defer{retryFixture.stop()}
+        do{try retryFixture.start()}catch{}
+        try await Task.sleep(nanoseconds:300_000_000)
+        authFixture.stop()
+        var retryReady=false
+        for _ in 0..<100 {
+            if let retryPort=retryFixture.port,
+               let retryURL=URL(string:"http://127.0.0.1:\(retryPort)/health"){
+                var req=URLRequest(url:retryURL);req.timeoutInterval=0.5
+                if let (_,reply)=try? await localTransport.data(for:req),(reply as? HTTPURLResponse)?.statusCode==200{retryReady=true;break}
+            }
+            try await Task.sleep(nanoseconds:200_000_000)
+        }
+        precondition(retryReady,"listener did not recover after port became available")
+        retryFixture.stop()
+        try await Task.sleep(nanoseconds:1_200_000_000)
+        precondition(retryFixture.port==nil,"explicit stop must cancel retry")
+        print("PASS: LAN listener bind recovery and explicit stop")
+
         print("PASS: runtime bridge, interrupt recovery, Jellyfin hooks and embedded release baseline")
     }
 }

@@ -818,3 +818,9 @@ check(!epProgramme.isCurrent(at:programmeNow.addingTimeInterval(61)),"episode ex
 let decodedEpisodeProgramme=try JSONCodec.decoder().decode(Program.self,from:JSONCodec.encoder().encode(epProgramme))
 check(decodedEpisodeProgramme==epProgramme,"episode metadata round trip")
 print("PASS: \(checks) assertions including native episode formatting")
+
+let overlayDefaults=try NativeOverlayDefaults.layout()
+check(overlayDefaults.slots.map(\.location)==["more.bottom","player.fullscreen.top"],"native overlay slots restored without WebKit replacements")
+check(overlayDefaults.formNode("languageOverlay") != nil && overlayDefaults.formNode("spanishRequest") != nil && overlayDefaults.formNode("programmeOverlay") != nil,"gateway overlay bindings restored")
+check(overlayDefaults.formDefaults()["languageOverlay"]=="Detector status unavailable","native overlay starts with honest detector fallback")
+print("PASS: native overlay defaults")

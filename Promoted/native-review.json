@@ -48,6 +48,10 @@
       "prototype-source-switcher-live-20261126": {
         "disposition": "native",
         "evidence": "Native SurfSourceIdentity maps American All Channels and Malay Movies & Series to the installed same-origin gateway aliases. Fullscreen accessible two-button selector, single-flight pause_surf -> stop -> set_preferences -> refresh_catalogue -> start_surf sequence, outgoing category/Surf/pause checkpoint, catalogue readiness check and rollback. Category-scoped rotations, favorites and gateway policy are unchanged. Physical iPad acceptance is outstanding."
+      },
+      "native-overlay-controls-20261128": {
+        "disposition": "native",
+        "evidence": "Built-in checked native language controls and form bindings; native SwiftUI programme title, unavailable fallback and paused rotation tint; candidate physical acceptance required."
       }
     },
     "jellyfinAPIRevision": {

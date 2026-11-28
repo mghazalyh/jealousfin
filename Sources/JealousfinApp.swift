@@ -134,7 +134,7 @@ struct PlaybackView:View{
     var body:some View{
         Screen{
             DynamicUISlotView(location:"player.top")
-            HStack{Text("Now playing").font(.largeTitle.bold());Spacer();if model.playing{Label("LIVE",systemImage:"circle.fill").font(.caption.bold()).foregroundColor(.red)}}
+            HStack{Text(model.current?.name ?? "Choose a channel").font(.largeTitle.bold()).lineLimit(2);Spacer();if model.playing{Label("LIVE",systemImage:"circle.fill").font(.caption.bold()).foregroundColor(.red)}}
             ZStack(alignment:.bottomTrailing){
                 if model.fullscreenPresented {
                     Color.black.aspectRatio(16/9,contentMode:.fit)
@@ -157,8 +157,9 @@ struct PlaybackView:View{
             PatchableRegion("player.transport"){
             Panel{
                 VStack(alignment:.leading,spacing:8){
-                    Text(model.current?.name ?? "Choose a channel").font(.title2.bold())
-                    Text(model.current?.program?.title ?? model.status).font(.subheadline).foregroundColor(subdued)
+                    Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Programme unavailable")
+                        .font(.title2.bold()).frame(maxWidth:.infinity,alignment:.leading)
+                        .accessibilityIdentifier("player.programmeTitle")
                     if let p=model.current?.program?.progress {ProgressView(value:p).tint(accent)}
                     HStack{
                         Button{if model.playing{model.pause()}else{model.resume()}}label:{Image(systemName:model.playing ? "pause.fill":"play.fill").frame(maxWidth:.infinity)}

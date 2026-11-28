@@ -102,8 +102,9 @@ struct FullscreenSurfPlayer:View {
                 PatchableRegion("player.fullscreen.heading"){
                     HStack(spacing:8){
                         PatchableRegion("player.fullscreen.programmeTitle"){
-                            Text(model.currentProgrammeTitle ?? model.current?.name ?? "Choose a channel")
-                                .font(.headline).lineLimit(1).truncationMode(.tail)
+                            Text(model.currentProgrammeTitle.flatMap{ $0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Programme unavailable")
+                                .font(.system(size:22,weight:.semibold)).lineLimit(3)
+                                .frame(maxWidth:.infinity,alignment:.leading)
                                 .accessibilityIdentifier("player.fullscreen.programmeTitle")
                         }
                         Spacer(minLength:4)
@@ -165,7 +166,7 @@ struct FullscreenSurfPlayer:View {
     @ViewBuilder private func transportControl(_ id:String)->some View{
         switch id{
         case "rotationToggle":
-            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:.rotation){model.toggleSurfPause()}}
+            if model.surfing && !model.usingSharedSurf{control(model.surfPaused ? "Resume rotation":"Pause rotation",model.surfPaused ? "play.circle":"pause.circle",id,role:model.surfPaused ? .favorite : .rotation){model.toggleSurfPause()}}
         case "previous":
             control("Previous channel","backward.end.fill",id){model.previousFromUI()}
                 .disabled(!model.canGoPrevious)

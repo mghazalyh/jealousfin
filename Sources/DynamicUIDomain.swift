@@ -316,3 +316,164 @@ enum DynamicUIBinding {
         return ["true","1","yes","on"].contains(value)
     }
 }
+
+// Built-in, reviewed language controls. Native nodes only; programme title
+// and rotation use SwiftUI rather than persistent WebKit replacements.
+enum NativeOverlayDefaults {
+    static let marker = "native-overlay-defaults.json"
+    static func layout() throws -> DynamicUILayout {
+        let data=Data(#"""
+{
+  "pages": [],
+  "revision": "native-overlay-controls-20261128",
+  "schemaVersion": 1,
+  "slots": [
+    {
+      "location": "more.bottom",
+      "nodes": [
+        {
+          "children": [
+            {
+              "defaultValue": "",
+              "id": "spanish-request-value",
+              "kind": "input",
+              "title": "Pending request",
+              "valueKey": "form.spanishRequest"
+            },
+            {
+              "action": {
+                "arguments": {
+                  "source": "(function(){var f=(api.state&&api.state.form)||{};return String(f.spanishRequest||\"\");})()"
+                },
+                "command": "script"
+              },
+              "id": "spanish-read",
+              "kind": "button",
+              "style": "muted",
+              "title": "Read Spanish request"
+            }
+          ],
+          "detail": "Automatic gateway read path",
+          "id": "spanish-advanced",
+          "kind": "disclosure",
+          "title": "Spanish classification"
+        },
+        {
+          "defaultValue": "Detector status unavailable",
+          "id": "language-overlay-value",
+          "kind": "input",
+          "title": "Language overlay value",
+          "valueKey": "form.languageOverlay",
+          "visibleWhen": "form.languageOverlayVisible"
+        },
+        {
+          "defaultValue": "",
+          "id": "hidden-programmeOverlay",
+          "kind": "input",
+          "title": "programmeOverlay",
+          "valueKey": "form.programmeOverlay",
+          "visibleWhen": "form.programmeOverlayHidden"
+        },
+        {
+          "defaultValue": "false",
+          "id": "hidden-programmeOverlayReady",
+          "kind": "input",
+          "title": "programmeOverlayReady",
+          "valueKey": "form.programmeOverlayReady",
+          "visibleWhen": "form.programmeOverlayHidden"
+        },
+        {
+          "defaultValue": "true",
+          "id": "hidden-programmeOverlayFallback",
+          "kind": "input",
+          "title": "programmeOverlayFallback",
+          "valueKey": "form.programmeOverlayFallback",
+          "visibleWhen": "form.programmeOverlayHidden"
+        }
+      ]
+    },
+    {
+      "location": "player.fullscreen.top",
+      "nodes": [
+        {
+          "defaultValue": "Detector status unavailable",
+          "id": "language-evidence",
+          "kind": "text",
+          "style": "caption",
+          "valueKey": "form.languageOverlay"
+        },
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nif(s.surfing!==true){return \"Spanish: Surf is not active\";}\nif(s.currentSharedTransport===true||s.surfRotationControllable===false){return \"Spanish: device-owned rotation required\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"add\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.command(\"next_channel\",{});\napi.log(\"Spanish mark requested: \"+id);\nreturn \"Spanish: marked \"+name+\"; excluding and advancing\";\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Mark this English channel Spanish, exclude it and advance",
+                          "id": "spanish-mark",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "globe",
+                          "title": "Spanish"
+                        },
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{},p=s.preferences||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nvar cat=String(p.surfCategory||\"\"),source=String(s.surfSource||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Spanish: no current channel\";}\nif(source===\"malay\"||cat===\"Movies & Series\"){return \"Spanish: English source only\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:1,action:\"remove\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"Spanish unmark requested: \"+id);\nreturn \"Spanish: unmarked \"+name+\"; English membership will refresh\";\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Explicitly remove this English channel from Spanish exclusion",
+                          "id": "spanish-unmark",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "globe.badge.chevron.backward",
+                          "title": "Not Spanish"
+                        },
+                        {
+                          "action": {
+                            "arguments": {
+                              "source": "(function(){\nvar s=api.state||{};\nvar id=String(s.currentChannelID||\"\"),name=String(s.currentChannel||\"\");\nif(!/^[a-f0-9]{32}$/.test(id)){return \"Correction: no current channel\";}\nvar nonce=Date.now().toString(36)+\"-\"+Math.random().toString(36).slice(2,10);\nvar payload={schemaVersion:2,action:\"mistaken_english\",channelID:id,channelName:name,nonce:nonce};\napi.command(\"ui_set_value\",{key:\"spanishRequest\",value:JSON.stringify(payload)});\napi.command(\"refresh_catalogue\",{});\napi.log(\"English correction requested: \"+id);\nreturn \"Correction: English retraction queued for \"+name;\n})()"
+                            },
+                            "command": "script"
+                          },
+                          "detail": "Retract the latest automatic language evidence for this channel; playback is unchanged",
+                          "id": "language-mistaken",
+                          "kind": "button",
+                          "style": "muted",
+                          "symbol": "checkmark.circle",
+                          "title": "Mistaken — English"
+                        }
+                      ],
+                      "id": "spanish-actions",
+                      "kind": "hstack"
+                    }
+                  ],
+                  "id": "compact-language-v2-content",
+                  "kind": "vstack"
+                }
+              ],
+              "id": "compact-language-v2",
+              "kind": "disclosure",
+              "title": "Language"
+            }
+          ],
+          "id": "compact-side-columns-v2",
+          "kind": "hstack"
+        }
+      ]
+    }
+  ]
+}
+"""#.utf8)
+        return try JSONCodec.decoder().decode(DynamicUILayout.self,from:data).checked()
+    }
+}

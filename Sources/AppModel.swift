@@ -263,6 +263,15 @@ import CryptoKit
             cp.state="paused";campaign=cp;_ = disk.save(cp,"device-campaign.json")
         }
         if !versionRecoveryFailed{decisions=disk.load(DecisionJournal.self,"decision-journal.json") ?? DecisionJournal()}
+        if !nativeSafeMode,!versionRecoveryFailed,disk.load(String.self,NativeOverlayDefaults.marker) != patchReleaseEpoch.namespace {
+            do {
+                if disk.load(DynamicUIStore.self,"dynamic-ui.json")?.active == nil {
+                    let layout=try NativeOverlayDefaults.layout()
+                    guard disk.save(DynamicUIStore(active:layout,previous:nil,values:layout.formDefaults()),"dynamic-ui.json") else{throw AppError.message("Cannot persist native overlay defaults")}
+                }
+                guard disk.save(patchReleaseEpoch.namespace,NativeOverlayDefaults.marker) else{throw AppError.message("Cannot persist native overlay marker")}
+            }catch{patchArchiveFault="Native overlay defaults installation failed"}
+        }
         if !nativeSafeMode,!versionRecoveryFailed,var stored=disk.load(DynamicUIStore.self,"dynamic-ui.json"){
             if let layout=stored.active,(try? layout.checked())==nil {
                 stored.active=nil;stored.values=[:]
@@ -489,7 +498,7 @@ import CryptoKit
                         self.suspendAutomation(reason:"iOS memory warning")
                     }
                     if name==UIApplication.willEnterForegroundNotification || name==UIApplication.didEnterBackgroundNotification {
-                        if name==UIApplication.willEnterForegroundNotification{self.lastVideoFrameAt=Date();self.lastAdvance=Date()}
+                        if name==UIApplication.willEnterForegroundNotification{self.lastVideoFrameAt=Date();self.lastAdvance=Date();self.configureLAN()}
                         self.sampleSystemTelemetry(force:true)
                         self.publishHeartbeat(now:Date())
                         self.requestSync()
@@ -1734,7 +1743,6 @@ import CryptoKit
     private func tick() async {
         let now=Date()
         saveSurfCheckpoint()
-        if (lanStatus.hasPrefix("failed") || lanStatus=="Failed to listen") && Int(now.timeIntervalSince1970)%15==0{configureLAN()}
         sampleSystemTelemetry()
         if let trial=applicationTrial,trial.pending,now>=trial.expiresAt,now.timeIntervalSince(lastApplicationRollback)>5,!versionBusy,!patchBusy,!apiChanging,!loginBusy,!catalogueBusy {
             lastApplicationRollback=now

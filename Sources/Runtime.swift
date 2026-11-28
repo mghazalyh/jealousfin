@@ -46,6 +46,10 @@ final class LANServer {
         init(_ connection:NWConnection){self.connection=connection;id=ObjectIdentifier(connection)}
     }
     private var listener:NWListener?
+    private var desiredRunning=false
+    private var retry:DispatchWorkItem?
+    private var retryGeneration=UUID()
+    private var retryDelay:TimeInterval=1
     private let queue=DispatchQueue(label:"jealousfin.lan")
     private let listenPort:NWEndpoint.Port
     private let advertise:Bool
@@ -73,7 +77,12 @@ final class LANServer {
     var port:UInt16? {queue.sync{guard let value=listener?.port?.rawValue,value != 0 else{return nil};return value}}
     func start() throws {
         try queue.sync {
-            guard listener==nil else{return}
+            desiredRunning=true
+            guard listener==nil,retry==nil else{return}
+            do{try startLocked()}catch{scheduleRetry(replaceWaiting:false);throw error}
+        }
+    }
+    private func startLocked() throws {
             let parameters=NWParameters.tcp
             parameters.prohibitedInterfaceTypes=[.cellular]
             let l=try NWListener(using:parameters,on:listenPort)
@@ -81,10 +90,21 @@ final class LANServer {
             l.stateUpdateHandler={ [weak self,weak l] status in
                 guard let self=self,let l=l,self.listener===l else{return}
                 self.state?(String(describing:status))
-                if case .failed = status {self.listener=nil;l.cancel()}
+                switch status {
+                case .ready:
+                    self.cancelRetry()
+                    self.retryDelay=1
+                case .waiting:
+                    self.scheduleRetry(replaceWaiting:true)
+                case .failed,.cancelled:
+                    self.cancelRetry()
+                    self.invalidateListener()
+                    self.scheduleRetry(replaceWaiting:false)
+                default:break
+                }
             }
-            l.newConnectionHandler={ [weak self] c in
-                guard let self=self,self.connections.count<self.maxConnections else{c.cancel();return}
+            l.newConnectionHandler={ [weak self,weak l] c in
+                guard let self=self,let l=l,self.listener===l,self.desiredRunning,self.connections.count<self.maxConnections else{c.cancel();return}
                 let p=Pending(c)
                 self.connections[p.id]=p
                 c.stateUpdateHandler={ [weak self,weak p] status in
@@ -100,14 +120,41 @@ final class LANServer {
                 self.receive(p)
             }
             listener=l;l.start(queue:queue)
+    }
+    private func cancelRetry(){
+        retryGeneration=UUID()
+        retry?.cancel();retry=nil
+    }
+    private func invalidateListener(){
+        let old=listener;listener=nil;old?.cancel()
+        let pending=Array(connections.values)
+        connections.removeAll()
+        for p in pending{close(p)}
+    }
+    private func scheduleRetry(replaceWaiting:Bool){
+        guard desiredRunning,retry==nil else{return}
+        let generation=UUID();retryGeneration=generation
+        let delay=replaceWaiting ? 15 : retryDelay
+        if !replaceWaiting{retryDelay=min(15,retryDelay*2)}
+        let item=DispatchWorkItem{[weak self] in
+            guard let self=self,self.desiredRunning,self.retryGeneration==generation else{return}
+            self.retry=nil
+            if replaceWaiting{self.invalidateListener()}
+            guard self.listener==nil else{return}
+            do{try self.startLocked()}catch{
+                self.state?("failed: listener restart")
+                self.scheduleRetry(replaceWaiting:false)
+            }
         }
+        retry=item
+        queue.asyncAfter(deadline:.now()+delay,execute:item)
     }
     func stop(){
         queue.sync{
-            listener?.cancel();listener=nil
-            let pending=Array(connections.values)
-            connections.removeAll()
-            for p in pending{close(p)}
+            desiredRunning=false
+            cancelRetry()
+            invalidateListener()
+            retryDelay=1
         }
     }
     private func isCurrent(_ p:Pending)->Bool{connections[p.id] === p}
