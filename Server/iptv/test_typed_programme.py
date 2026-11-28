@@ -117,6 +117,10 @@ class TypedGatewayTests(fixtures.GatewayAudioIntegrationTests):
             self.assertNotIn("EndDate",item)
             self.assertNotIn("episodeTitle",item["JealousfinProgramme"])
             self.assertNotIn("audioPlaybackSessionHash",item["JealousfinProgramme"])
+            self.assertNotIn("contentVisitDigest",item["JealousfinProgramme"])
+            self.assertIn("contentVisitDigest",result)
+            self.assertIn("contentVisitDigest",self.g.episode_publisher.get(fixtures.CHANNEL,now))
+
             for key in ("contentTitle","contentReleaseYear","contentVerification","contentVisitDigest","contentObservedAt","contentExpiresAt"):
                 corrupt=dict(result);corrupt.pop(key)
                 self.assertFalse(audio.programme_has_resolved_identity(corrupt,"s1"))
@@ -211,6 +215,23 @@ class TypedParserTests(unittest.TestCase):
         self.assertEqual(audio.parse_typed_programme_page(official.replace("Date: Sunday, May 25","Schedule: Sunday, May 25"),official_url,clues,True),[])
         self.assertEqual(audio.parse_typed_programme_page(apex.replace("Race Top Five","Starting Grid"),apex_url,clues),[])
         self.assertEqual(audio.parse_typed_programme_page(racing.replace("Indy 500 Race Results May 25","Indy 500 Race Results May 24"),racing_url,clues),[])
+
+    def test_explicit_offscreen_plot_is_not_evidence(self):
+        visible = '<p>'+self.plot+'</p>'
+        for style in ("position:absolute;left:-9999px", "text-indent:-9999px",
+                      "inset-inline-start:-100vw", "inset:0 0 0 -9999px",
+                      "top:-1e4px", "text-indent:-100em", "right:-200%",
+                      "bottom:-1000px"):
+            with self.subTest(style=style):
+                inline = self.movie_html.replace(visible, '<p style="'+style+'">'+self.plot+'</p>')
+                embedded = '<style>.offscreen{'+style+'}</style>'+self.movie_html.replace(visible,'<div class="offscreen">'+visible+'</div>')
+                for page in (inline, embedded):
+                    self.assertEqual(audio.parse_typed_programme_page(page,self.official,self.clues,True),[])
+        for style in ("position:relative;left:-12px", "margin-left:-9999px",
+                      "text-indent:-1em", "color:var(--theme-text)", "inset:0"):
+            with self.subTest(visible_style=style):
+                page = self.movie_html.replace(visible,'<p style="'+style+'">'+self.plot+'</p>')
+                self.assertEqual(len(audio.parse_typed_programme_page(page,self.official,self.clues,True)),1)
 
     def test_css_hidden_plot_is_not_evidence(self):
         visible='<p>'+self.plot+'</p>'

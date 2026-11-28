@@ -2422,6 +2422,30 @@ def _css_hides(value):
     value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))", decode, value)
     if _CSS_HIDDEN_DECLARATION.search(value) or _CSS_COMPUTED_VISIBILITY.search(value):
         return True
+    # Explicit large negative offsets and text indents are conventional
+    # off-screen hiding. Evaluate independently of position so that split
+    # stylesheet rules cannot bypass this static semantic filter. Normal
+    # layout offsets and modest negative margins are not hiding evidence.
+    # This is a conservative heuristic, not computed browser geometry.
+    offscreen = {
+        "px": 1000, "pt": 750, "pc": 62.5, "in": 10,
+        "cm": 25, "mm": 250, "q": 1000,
+        "em": 50, "rem": 50, "ch": 100, "ex": 100,
+        "%": 100, "vw": 100, "vh": 100, "vmin": 100, "vmax": 100,
+        "vi": 100, "vb": 100, "svw": 100, "svh": 100,
+        "lvw": 100, "lvh": 100, "dvw": 100, "dvh": 100,
+    }
+    for declaration in re.finditer(
+        r"(?:^|;)\s*(?:left|right|top|bottom|inset(?:-(?:inline|block)(?:-(?:start|end))?)?|text-indent)\s*:\s*([^;]+)",
+        value, re.I
+    ):
+        for offset in re.finditer(
+            r"(?<![\w.])-(\d+(?:\.\d*)?|\.\d+)(?:([eE][+-]?\d+))?([a-z]+|%)(?![\w-])",
+            declaration[1], re.I
+        ):
+            unit = offset[3].casefold()
+            if unit in offscreen and float(offset[1] + (offset[2] or "")) >= offscreen[unit]:
+                return True
     # Explicit zero alpha in hexadecimal and functional CSS colors. Do not
     # mistake ordinary theme variables for hiding declarations.
     for color in re.finditer(r"(?:^|;)\s*(?:color|-webkit-text-fill-color)\s*:\s*([^;]+)", value, re.I):
