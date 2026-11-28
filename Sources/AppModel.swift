@@ -1006,6 +1006,7 @@ import CryptoKit
         if surfing && !surfPaused && !usingSharedSurf{toggleSurfPause()}
         saveSurfCheckpoint(force:true)
         stop()
+        let transitionIntent=surfStartIntent
         do{
             var candidate=settings
             candidate=try PatchablePreferences.applying(["surfCategory":plan.targetCategory],to:candidate)
@@ -1016,6 +1017,9 @@ import CryptoKit
             let previousRefresh=lastRefresh
             try await refresh()
             guard catalogueReady,!channels.isEmpty,lastRefresh>previousRefresh else{throw AppError.message("Source catalogue is not ready")}
+            guard surfStartIntent==transitionIntent,!Task.isCancelled else{
+                log("INFO","source","SWITCH_PLAYBACK_CANCELLED",["source":target.rawValue]);requestSync();return
+            }
             beginSurf(category:plan.targetCategory)
             guard surfing,settings.surfCategory==plan.targetCategory,catalogueReady else{throw AppError.message("Source Surf did not start")}
             log("INFO","source","SWITCHED",["source":target.rawValue,"category":plan.targetCategory,"channels":String(channels.count)])
@@ -1024,12 +1028,13 @@ import CryptoKit
             let message=sanitized(error.localizedDescription)
             sourceTransitionError=message
             log("ERROR","source","SWITCH_FAILED",["source":target.rawValue,"category":plan.targetCategory,"error":message])
-            await rollbackSurfSource(plan:plan)
+            await rollbackSurfSource(plan:plan,resumePlayback:surfStartIntent==transitionIntent && !Task.isCancelled)
             requestSync()
         }
     }
-    private func rollbackSurfSource(plan:SurfSourceTransitionPlan) async {
+    private func rollbackSurfSource(plan:SurfSourceTransitionPlan,resumePlayback:Bool) async {
         stop()
+        let rollbackIntent=surfStartIntent
         do{
             var candidate=settings
             candidate=try PatchablePreferences.applying(["surfCategory":plan.checkpoint.category],to:candidate)
@@ -1049,7 +1054,7 @@ import CryptoKit
                 log("ERROR","source","ROLLBACK_CATALOGUE_FAILED",["error":sanitized(error.localizedDescription)])
             }
         }
-        if catalogueRestored{
+        if catalogueRestored && resumePlayback && surfStartIntent==rollbackIntent && !Task.isCancelled{
             if plan.checkpoint.surfing{
                 restoreSurf(category:plan.checkpoint.category)
                 if plan.checkpoint.paused,!surfPaused{
@@ -1063,11 +1068,12 @@ import CryptoKit
                 settings.resumeSurf=plan.checkpoint.resumeSurf
                 if let id=plan.checkpoint.channelID,let channel=channels.first(where:{$0.id==id}),
                    health[id]?.eligible(at:Date()) ?? true,policyReady{
-                    open(channel)
+                    if channel.isSurf{beginSurf(category:plan.checkpoint.category)}
+                    else{begin(channel,keepSurf:false)}
                 }
                 _=disk.save(settings,"settings.json")
             }
-        }else{
+        }else if !catalogueRestored{
             settings.resumeSurf=false
             _=disk.save(settings,"settings.json")
             sourceTransitionError=(sourceTransitionError ?? "Source switch failed")+"; previous catalogue could not be reloaded"
@@ -1232,6 +1238,7 @@ import CryptoKit
         if !disk.save(rotationState,"surf-rotation.json"){log("ERROR","surf","ROTATION_PERSIST_FAILED")}
     }
     func open(_ c:Channel){
+        guard !sourceTransitionBusy else{log("WARN","player","SOURCE_TRANSITION_BUSY");return}
         if c.isSurf {
             // App-owned Surf rotation identifies the actual channel for validation and Favorites.
             let category=String(c.name.dropFirst("Surf:".count)).trimmingCharacters(in:.whitespacesAndNewlines)
