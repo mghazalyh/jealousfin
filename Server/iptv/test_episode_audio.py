@@ -1010,6 +1010,12 @@ class GatewayAudioIntegrationTests(unittest.TestCase):
         # The exact episode/original-air year is used, never the series
         # premiere year carried by the programme title.
         self.assertEqual(merged[CHANNEL]["episodeYear"], 2026)
+        self.assertIn("episodeVisitDigest", merged[CHANNEL])
+        item = self.g.programme_item(CHANNEL, merged[CHANNEL])
+        self.assertNotIn("episodeVisitDigest", item["JealousfinProgramme"])
+        self.assertNotIn("audioPlaybackSessionHash", item["JealousfinProgramme"])
+        self.assertIn("episodeVisitDigest", self.g.episode_publisher.get(CHANNEL, wall))
+
         strong = {CHANNEL: {"title": "WWE NXT", "source": "provider-catalogue",
                             "episodeTitle": "Guide Title", "seasonNumber": 20,
                             "episodeNumber": 24}}
