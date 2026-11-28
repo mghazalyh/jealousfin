@@ -516,6 +516,42 @@ class ConfirmedProgressTests(unittest.TestCase):
         self.assertEqual(len(calls),1)
         self.assertEqual(observer.diagnostics()["reasons"].get("progress-ready-reused-sample"),1)
 
+    def test_known_title_retains_full_sample_until_existing_progress_floor(self):
+        wall=time.time();progress=[26.0];calls=[];store=audio.PublicationStore()
+        def research(payload):
+            calls.append(payload)
+            return [fixtures.nxt_official()],fixtures.nxt_reports()
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),research,enabled=True,
+            budget=audio.EpisodeBudget(),programme=lambda cid:{"channelID":cid,"seriesTitle":"WWE NXT"},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":progress[0],"confirmed_seconds":progress[0],"session_hash":"s1"},
+            publisher=store)
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1","visitID":"visit-1",
+             "observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":50.0}
+        def tick(_):
+            self.assertEqual(calls,[])
+            progress[0]=50.0
+        with patch.object(audio.time,"sleep",side_effect=tick):
+            observer(job,decision,fixtures.NXT_TEXT)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(observer.diagnostics()["reasons"].get("progress-ready-reused-sample"),1)
+
+    def test_known_title_wait_rejects_changed_session_without_spending_budget(self):
+        wall=time.time();session=["s1"];calls=[]
+        observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),lambda payload:calls.append(payload) or ([],[]),
+            enabled=True,budget=audio.EpisodeBudget(),programme=lambda cid:{"channelID":cid,"seriesTitle":"WWE NXT"},
+            activity=lambda cid:{"channel_id":cid,"active_seconds":26.0,"confirmed_seconds":26.0,"session_hash":session[0]})
+        job={"cid":fixtures.CHANNEL,"name":"CW Presents WWE NXT","deviceVerified":True,
+             "changed":False,"launchID":"launch-1","streamGeneration":"generation-1","visitID":"visit-1",
+             "observedAt":wall-5,"expiresAt":wall+50,"sampleDigest":"b"*32}
+        decision={"outcome":"allowed","language":"en","confidence":0.97,"speechSeconds":21.0,"sampleSeconds":50.0}
+        with patch.object(audio.time,"sleep",side_effect=lambda _:session.__setitem__(0,"s2")):
+            self.assertIsNone(observer(job,decision,fixtures.NXT_TEXT))
+        self.assertEqual(calls,[])
+        self.assertEqual(observer.budget.diagnostics()["callsLast24Hours"],0)
+        self.assertEqual(observer.diagnostics()["reasons"].get("session-changed"),1)
+
     def test_reused_sample_cannot_cross_playback_sessions(self):
         wall=time.time();session=["s1"];calls=[]
         observer=audio.EpisodeObserver(lambda:fixtures.current(now=wall),

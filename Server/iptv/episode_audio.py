@@ -115,6 +115,10 @@ AUDIO_MIN_ACTIVE_SECONDS = 40.0
 UNKNOWN_LEAD_PROGRESS_SECONDS = 12.0
 UNKNOWN_PUBLISH_PROGRESS_SECONDS = 40.0
 UNKNOWN_CONFIRM_WAIT_SECONDS = 12.0
+# Known-title samples can be buffered ahead of the confirmed visit clock.
+# Retain the same bounded clues while activity catches up; do not start
+# research or lower its existing floor before the real progress is observed.
+KNOWN_CONFIRM_WAIT_SECONDS = 30.0
 
 # Bounded publication into the existing programme metadata path.
 PUBLICATION_TTL = 1800.0
@@ -3703,8 +3707,9 @@ class EpisodeObserver:
                 required = self.budget.required_progress(request.sample_seconds, early_lead)
                 progress = self._confirmed_progress(activity) if early_lead else float((activity or {}).get("active_seconds",0))
                 gap = required-progress
-                if active_session and 0 < gap <= UNKNOWN_CONFIRM_WAIT_SECONDS:
-                    deadline = time.monotonic()+UNKNOWN_CONFIRM_WAIT_SECONDS
+                wait_seconds = UNKNOWN_CONFIRM_WAIT_SECONDS if early_lead else KNOWN_CONFIRM_WAIT_SECONDS
+                if active_session and 0 < gap <= wait_seconds:
+                    deadline = time.monotonic()+wait_seconds
                     while binding.checked(time.time()) and time.monotonic()<deadline:
                         time.sleep(min(0.5,max(0.0,deadline-time.monotonic())))
                         activity = self._usable_activity(binding.channel_id)
