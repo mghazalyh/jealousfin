@@ -577,7 +577,7 @@ import CryptoKit
         dynamicUI=snapshot.patches.ui;dynamicPage=nil;dynamicUIResults=[:];dynamicUISeen.removeAll()
         try applyHotConfiguration(snapshot.configuration)
         applyRuntime(snapshot.patches.runtime.active==nil ? nil:policy)
-        jelly.token="";jelly.userID="";catalogueReady=false
+        jelly.token="";jelly.userID="";catalogueReady=false;programs=[]
         apiReady=true;policyReady=true;versionRecoveryFailed=false
         status="Connection failed"
     }
@@ -825,7 +825,7 @@ import CryptoKit
         saveSurfCheckpoint(force:true)
         let oldWork=work
         if current != nil || session != nil {clearPlayback()}
-        catalogueReady=false
+        catalogueReady=false;programs=[]
         lastLogin=Date();saveSettings();status="Connecting…"
         await oldWork?.value
         await cleanupTask?.value
@@ -855,7 +855,7 @@ import CryptoKit
             }
             Task{await refreshProgramme()}
         } catch {
-            jelly.invalidateConnection();catalogueReady=false;updateEffectiveHealth()
+            jelly.invalidateConnection();catalogueReady=false;programs=[];updateEffectiveHealth()
             status="Connection failed";lastLogin=Date()
             log("ERROR","jellyfin","CONNECT_FAILED",["error":error.localizedDescription,"catalogueReady":"false"])
         }
@@ -1298,7 +1298,7 @@ import CryptoKit
     private func holdForConnectionRecovery(channel:Channel,reason:String){
         saveSurfCheckpoint(force:true)
         nextRotation=nil;emptyPoolRetry=nil
-        catalogueReady=false;playing=false;validated=false
+        catalogueReady=false;programs=[];playing=false;validated=false
         status="Connection failed";lastLogin=Date()
         lastPlayerError=reason
         log("WARN","jellyfin","PLAYBACK_CONNECTION_HELD",["channelID":channel.id,"reason":reason,"terminal":"false"])
@@ -3522,7 +3522,7 @@ extension AppModel {
                 try persistJellyfinAPI(JellyfinAdapterStore(active:candidate,previous:previous.active,pending:false))
                 jelly.adapter=validatedCandidate;jelly.token="";jelly.userID=""
                 jellyfinAPIRevision=jelly.adapterID
-                catalogueReady=false;status="Connection failed"
+                catalogueReady=false;programs=[];status="Connection failed"
                 jellyfinAPIFault="Recovery adapter restored locally; live probe unavailable"
                 settings.resumeSurf=resumeLoop;settings.surfCategory=category
                 disk.save(settings,"settings.json")
@@ -3703,7 +3703,7 @@ extension AppModel {
         if apiChanged{
             jellyfinAPIStore=after.api;jelly.adapter=adapter
             jellyfinAPIRevision=jelly.adapterID;jellyfinAPIFault=nil
-            jelly.token="";jelly.userID="";catalogueReady=false;status="Connection failed"
+            jelly.token="";jelly.userID="";catalogueReady=false;programs=[];status="Connection failed"
             settings.resumeSurf=resumeLoop;settings.surfCategory=category
             disk.save(settings,"settings.json")
         }
@@ -4031,7 +4031,7 @@ extension AppModel {
         try persistJellyfinAPI(JellyfinAdapterStore(active:candidate,previous:jellyfinAPIStore.active,pending:false))
         jelly.adapter=loaded;jelly.adoptConnection(from:staged)
         jellyfinAPIRevision=jelly.adapterID;jellyfinAPIFault=nil
-        channels=catalogue;if let epg=epg{programs=epg};catalogueReady=true;lastRefresh=Date()
+        channels=catalogue;programs=epg ?? [];catalogueReady=true;lastRefresh=Date()
         disk.save(catalogue,"channels.json");updateEffectiveHealth()
         capturePatchArchive(reason:"catalogue-adapter-activated-live")
         log("INFO","jellyfin-api","ACTIVATED_LIVE",["revision":jellyfinAPIRevision,"channels":String(catalogue.count)])
