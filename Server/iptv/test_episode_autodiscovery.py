@@ -127,6 +127,21 @@ class SourceDiscoveryTests(unittest.TestCase):
             discovery.resolve(context(originalAirDate="2025-12-%02d" % (day % 28 + 1)))
         self.assertLessEqual(discovery.diagnostics()["cacheEntries"], audio.MAX_SOURCE_CACHE)
 
+    def test_incomplete_prefetch_does_not_suppress_clue_search(self):
+        calls = []
+        def provider(payload):
+            calls.append(payload)
+            return {"official":[OFFICIAL_DATE],"reports":[REPORT_ONE,REPORT_TWO]} if payload.get("clues") else {}
+        discovery = audio.EpisodeSourceDiscovery(lambda url: None,provider=provider,official_hints={},report_hints={})
+        ctx=context(originalAirDate="2025-11-04")
+        self.assertFalse(discovery.prefetch(ctx))
+        official,reports,_=discovery.resolve(ctx,("zaria","sol ruca"))
+        self.assertEqual(official,[OFFICIAL_DATE])
+        self.assertEqual(reports,[REPORT_ONE,REPORT_TWO])
+        self.assertEqual(len(calls),2)
+        discovery.resolve(ctx,("zaria","sol ruca"))
+        self.assertEqual(len(calls),2)
+
     def test_prefetch_warm_cache_avoids_refetch_and_never_uses_transcript(self):
         clock = FakeClock(time.time())
         fetches = []

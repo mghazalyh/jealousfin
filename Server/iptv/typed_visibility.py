@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import ipaddress
+import http.client
+import ssl
 import json
 import os
 import re
@@ -56,25 +58,62 @@ def _checked(url, hosts):
     addresses = socket.getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
         raise ValueError("non-public stylesheet host")
-    return url
+    return p, addresses
+
 
 def _fetch_css(url, hosts, timeout):
+    # Connect to the exact vetted sockaddr, never re-resolve the hostname.
+    # HTTPSConnection still supplies the original hostname for TLS SNI and
+    # certificate validation. Each redirect receives a fresh vetted address.
     origin = _host(url)
-    class Redirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self,req,fp,code,msg,headers,newurl):
-            target = urllib.parse.urljoin(req.full_url,newurl)
-            if _host(target)!=origin:
-                raise ValueError("cross-host stylesheet redirect")
-            return super().redirect_request(req,fp,code,msg,headers,_checked(target,hosts))
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),Redirect())
-    request = urllib.request.Request(_checked(url,hosts),headers={"User-Agent":"Jealousfin-Episode-Evidence/1.0","Accept":"text/css"})
-    with opener.open(request,timeout=timeout) as response:
-        if response.headers.get_content_type() != "text/css":
-            raise ValueError("not CSS")
-        data=response.read(MAX_CSS+1)
-        if len(data)>MAX_CSS:
-            raise ValueError("stylesheet too large")
-        return data
+    deadline = time.monotonic() + timeout
+    for _ in range(5):
+        p, addresses = _checked(url, hosts)
+        if _host(url) != origin:
+            raise ValueError("cross-host stylesheet redirect")
+        def connect_address(_address, timeout=None, source_address=None):
+            for family, kind, proto, _, sockaddr in addresses:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    raise TimeoutError("stylesheet deadline")
+                sock=socket.socket(family,kind,proto)
+                try:
+                    sock.settimeout(remaining)
+                    sock.connect(sockaddr)
+                    if not ipaddress.ip_address(sock.getpeername()[0]).is_global:
+                        raise ValueError("non-public stylesheet peer")
+                    return sock
+                except OSError:
+                    sock.close()
+                except BaseException:
+                    sock.close()
+                    raise
+            raise OSError("no vetted stylesheet address reachable")
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            raise TimeoutError("stylesheet deadline")
+        conn=http.client.HTTPSConnection(p.hostname,443,timeout=remaining,context=ssl.create_default_context())
+        conn._create_connection=connect_address
+        try:
+            path=urllib.parse.urlunsplit(("","",p.path or "/",p.query,""))
+            conn.request("GET",path,headers={"User-Agent":"Jealousfin-Episode-Evidence/1.0","Accept":"text/css","Accept-Encoding":"identity"})
+            response=conn.getresponse()
+            if response.status in (301,302,303,307,308):
+                target=response.getheader("Location")
+                if not target:
+                    raise ValueError("missing stylesheet redirect")
+                url=urllib.parse.urljoin(url,target)
+                continue
+            if response.status!=200 or response.headers.get_content_type()!="text/css":
+                raise ValueError("not CSS")
+            data=response.read(MAX_CSS+1)
+            if len(data)>MAX_CSS:
+                raise ValueError("stylesheet too large")
+            return data
+        finally:
+            conn.close()
+    raise ValueError("too many stylesheet redirects")
+
 
 def _render(page,url,seconds):
     from bs4 import BeautifulSoup

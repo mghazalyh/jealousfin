@@ -1554,7 +1554,7 @@ def programme_item(cid,row):
  if typed and row.get('contentKind')=='sports-event':
   date=episode_audio._pretty_date(row.get('contentEventDate'))
   if date:display=title+' — '+date
- evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber','audioPlaybackSessionHash','contentVisitDigest','episodeVisitDigest')}
+ evidence={k:v for k,v in row.items() if k not in ('guideSynopsis','guideEpisode','guideSeasonNumber','guideEpisodeNumber','audioPlaybackSessionHash','contentVisitDigest','contentBindingDigest','episodeVisitDigest')}
  episode=None if typed else programme_text(row.get('episodeTitle'))
  if episode:
   prefix='' if guide_norm(channels.get(cid,{}).get('Name',''))==guide_norm(title_year(title)[0]) else title_year(title)[0]+' — '

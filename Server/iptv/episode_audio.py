@@ -375,6 +375,7 @@ def _clue_candidates(value):
     """
     if not isinstance(value, str) or not value:
         return []
+    value = _typed_latin(value)
     # Preserve sentence boundaries and retain capitalized multi-token names
     # before lowercasing. Whisper punctuation is a hint, never evidence.
     kept, names, name_run = [], [], []
@@ -977,8 +978,8 @@ class Verification:
 
 def _typed_distinct_matches(clues, terms):
     # Typed parsers provide only exact, scoped matches, not article prose.
-    wanted = set(normalize_clues(clues))
-    exact = wanted.intersection(terms)
+    wanted = set(_typed_normalized_clues(clues))
+    exact = wanted.intersection(_typed_latin(t) for t in terms if isinstance(t, str))
     groups, used = [], set()
     for value in sorted(exact, key=lambda t: (-len(t.split()), -len(t), t)):
         words = set(value.split())
@@ -1360,7 +1361,8 @@ def typed_programme_resolved(row, session_hash, now=None):
             type(row.get("contentMatchCount")) is not int or
             row["contentMatchCount"] < (3 if kind == "sports-event" else MIN_DISTINCTIVE_CLUES) or
             not isinstance(row.get("contentVisitDigest"), str) or
-            not DIGEST_RE.fullmatch(row["contentVisitDigest"])):
+            not DIGEST_RE.fullmatch(row["contentVisitDigest"]) or
+            row.get("contentBindingDigest") != _digest("typed-visit|" + session_hash + "|" + row["contentVisitDigest"])):
         return False
     for key in ("title", "seriesTitle", "audioSeriesTitle"):
         if key in row and row[key] != title:
@@ -1581,6 +1583,7 @@ class PublicationStore:
                    "contentMatchCount": int(episode.matched_clue_count),
                    "contentCorroboratingSources": int(episode.corroborating_sources),
                    "contentVisitDigest": episode.binding.digest()}
+            row["contentBindingDigest"] = _digest("typed-visit|" + session + "|" + row["contentVisitDigest"])
             row.update(identity.evidence())
             if not typed_programme_resolved(row, session, now):
                 return False
@@ -2485,6 +2488,9 @@ def _typed_scope(page, selector, kinds=("p","h1","h2","h3","h4","li","th","td"),
         hidden = set()
         for node in soup.find_all(True):
             classes = node.get("class", [])
+            lang = str(node.get("lang") or node.get("xml:lang") or "").strip().lower()
+            if (lang and not re.fullmatch(r"en(?:[-_][a-z0-9]+)*", lang)):
+                hidden.add(id(node))
             if (node.name in _TYPED_EXCLUDED or node.has_attr("hidden") or
                     str(node.get("aria-hidden", "")).strip().casefold() == "true" or
                     _css_hides(node.get("style", "")) or
@@ -2563,12 +2569,21 @@ def _typed_scope(page, selector, kinds=("p","h1","h2","h3","h4","li","th","td"),
         return []
 
 
+def _typed_latin(value):
+    return re.sub(r"(?<=[A-Za-z])[\u0300-\u036f]+","",unicodedata.normalize("NFD",html_module.unescape(value)))
+
+
+def _typed_normalized_clues(clues):
+    if isinstance(clues, str):
+        clues = [clues]
+    if not isinstance(clues, (list, tuple, set)):
+        return ()
+    return normalize_clues([_typed_latin(c) for c in list(clues)[:MAX_TERMS] if isinstance(c, str)])
+
+
 def _typed_requested_public_terms(clues,*sections):
-    # Accent-equivalent Latin spellings (Álex/Alex) are the same full
-    # phrase, not fuzzy surname matching. Do not transliterate other scripts.
-    def latin(value):
-        return re.sub(r"(?<=[A-Za-z])[\u0300-\u036f]+","",unicodedata.normalize("NFD",value))
-    return _requested_public_terms(clues,*(latin(html_module.unescape(value)) for value in sections))
+    # Accent-equivalent Latin spellings are exact phrases, not fuzzy names.
+    return _requested_public_terms(_typed_normalized_clues(clues),*(_typed_latin(value) for value in sections))
 
 
 def _typed_movie_year(title, paragraphs):
@@ -2730,6 +2745,9 @@ def parse_typed_programme_page(page, url, clues, official=False):
         return []
     path = urllib.parse.urlsplit(url).path
     meta = _meta_map(page)
+    locale = str(meta.get("og:locale", "")).strip().lower()
+    if locale and not re.fullmatch(r"en(?:[-_][a-z0-9]+)*", locale):
+        return []
     headline = _report_headline(meta.get("og:title", ""), meta.get("og:site_name", ""))
     if host in ("indycar.com", "theapex.racing", "racingnews.co", "thenewdispatch.com"):
         return _typed_indy500(page, url, clues, official, meta, headline)
@@ -2747,6 +2765,9 @@ def parse_typed_programme_page(page, url, clues, official=False):
         rows = _typed_scope(page, lambda tag, a: tag == "div" and "description" in (a.get("class") or "").split() and "data-description" in a)
         # The first plot paragraph is separate from subsequent production history.
         paragraphs = [re.sub(r"\([^()]{1,120}\)", " ", p) for k,p in rows if k == "p"][:1]
+        # The English profile must contain English prose, not merely names.
+        if not paragraphs or len(set(re.findall(r"\b(?:the|a|an|and|with|of|to|in|is|are|was|were|when|who|his|her|their|on|for|from|as|by|at)\b", paragraphs[0].lower()))) < 2:
+            return []
     elif not official and host == "theguardian.com" and path.startswith("/film/"):
         match = re.fullmatch(r"(.{1,200}),\s+\d+\s+years on:\s+.+", headline, re.I)
         if not match:
@@ -2857,9 +2878,10 @@ class EpisodeSourceDiscovery:
     def _cache_key(context, clues):
         series = _norm_text(context.get("seriesTitle"))
         air = _date(context.get("originalAirDate"))
-        if air and series:
-            return series + "|" + air
         normalized = normalize_clues(clues)
+        if air and series:
+            base = series + "|" + air
+            return base + "|" + _digest("|".join(normalized)) if normalized else base
         episode = _norm_text(context.get("episodeTitle"))
         seed = "|".join((episode, "|".join(normalized)))
         scope = series or ("unknown:" + str(context.get("channelID") or context.get("channelName") or ""))
@@ -3048,6 +3070,12 @@ class EpisodeSourceDiscovery:
         cached = self._cache_get(key, now) if cacheable else None
         if cached is not None:
             return list(cached[0]), list(cached[1]), cached[2]
+        # A complete date-scoped warm cache can be reused and rechecked against
+        # actual clues. Incomplete/negative prefetch never suppresses audio search.
+        if clues and context.get("seriesTitle") and _date(context.get("originalAirDate")):
+            warm = self._cache_get(self._cache_key(context, ()), now)
+            if warm is not None and warm[0] and warm[1]:
+                return list(warm[0]), list(warm[1]), warm[2]
         entry = self._registry_entry(context.get("seriesTitle"))
         if entry is not None:
             official = self._clean_candidates(entry.get("official", []), OFFICIAL_ARCHIVE_HOSTS)

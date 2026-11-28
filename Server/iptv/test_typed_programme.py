@@ -118,16 +118,17 @@ class TypedGatewayTests(fixtures.GatewayAudioIntegrationTests):
             self.assertNotIn("episodeTitle",item["JealousfinProgramme"])
             self.assertNotIn("audioPlaybackSessionHash",item["JealousfinProgramme"])
             self.assertNotIn("contentVisitDigest",item["JealousfinProgramme"])
+            self.assertNotIn("contentBindingDigest",item["JealousfinProgramme"])
             self.assertIn("contentVisitDigest",result)
             self.assertIn("contentVisitDigest",self.g.episode_publisher.get(fixtures.CHANNEL,now))
 
-            for key in ("contentTitle","contentReleaseYear","contentVerification","contentVisitDigest","contentObservedAt","contentExpiresAt"):
+            for key in ("contentTitle","contentReleaseYear","contentVerification","contentVisitDigest","contentBindingDigest","contentObservedAt","contentExpiresAt"):
                 corrupt=dict(result);corrupt.pop(key)
                 self.assertFalse(audio.programme_has_resolved_identity(corrupt,"s1"))
                 self.assertIsNone(audio.programme_context(corrupt,session_hash="s1"))
                 self.assertIsNone(self.g.programme_item(fixtures.CHANNEL,corrupt))
             for overrides in ({"contentConfidence":float("nan")},{"contentObservedAt":10**1000},
-                              {"contentExpiresAt":now+999999},{"contentTitle":"Wrong title"},
+                              {"contentExpiresAt":now+999999},{"contentTitle":"Wrong title"},{"contentVisitDigest":"a"*32},
                               {"contentReleaseYear":True},{"contentReleaseYear":2100},
                               {"seasonNumber":1,"episodeNumber":2}):
                 self.assertFalse(audio.programme_has_resolved_identity(dict(result,**overrides),"s1"))
@@ -227,6 +228,10 @@ class TypedParserTests(unittest.TestCase):
         self.assertEqual(len(rows),1)
         self.assertEqual((rows[0].event_date,rows[0].published_at),("2025-05-25","2025-05-28"))
         self.assertIn("alex palou",rows[0].terms)
+        accent_clues=("indianapolis","Álex Palou","david malukas")
+        plain=page.replace("Álex Palou","Alex Palou")
+        self.assertIn("alex palou",audio.parse_typed_programme_page(plain,url,accent_clues)[0].terms)
+        self.assertEqual(audio._typed_distinct_matches(accent_clues,rows[0].terms),audio._typed_distinct_matches(clues,rows[0].terms))
         for invalid in (page.replace("On May 25, 2025,","Yesterday,"),
                         page.replace("victory","entry").replace("ended","started"),
                         page.replace(body,'<div hidden>'+body+'</div>'),
@@ -236,6 +241,13 @@ class TypedParserTests(unittest.TestCase):
                         page.replace("Álex Palou","Palou").replace("Alex Palou","Palou")):
             result=audio.parse_typed_programme_page(invalid,url,clues)
             self.assertTrue(not result or "alex palou" not in result[0].terms)
+
+    def test_nonenglish_typed_scope_rejected(self):
+        for page in ('<html lang="es">'+self.movie_html+'</html>',
+                     self.movie_html.replace("<p>","<p lang='fr'>"),
+                     '<meta property="og:locale" content="es_ES">'+self.movie_html,
+                     self.movie_html.replace(self.plot,"Martin Brody y Matt Hooper investigan Amity con Quint.")):
+            self.assertEqual(audio.parse_typed_programme_page(page,self.official,self.clues,True),[])
 
     def test_unresolved_external_styles_never_count_as_evidence(self):
         for markup in ('<link rel="stylesheet" href="https://amblin.com/hide.css">',
@@ -318,6 +330,31 @@ class TypedParserTests(unittest.TestCase):
                 self.assertEqual(audio.parse_typed_programme_page(self.movie_html.replace(visible,wrapper),self.official,self.clues,True),[])
         for tag in ('details','dialog'):
             self.assertEqual(len(audio.parse_typed_programme_page(self.movie_html.replace(visible,'<'+tag+' open>'+visible+'</'+tag+'>'),self.official,self.clues,True)),1)
+
+    def test_stylesheet_dns_pinning(self):
+        import typed_visibility as tv
+        import socket
+        from unittest.mock import MagicMock
+        addr=(socket.AF_INET,socket.SOCK_STREAM,6,"",("8.8.8.8",443))
+        sock=MagicMock()
+        sock.getpeername.return_value=("8.8.8.8",443)
+        conn=MagicMock()
+        response=conn.getresponse.return_value
+        response.status=200
+        response.headers.get_content_type.return_value="text/css"
+        response.read.return_value=b"p{}"
+        def request(*a,**kw):
+            conn._create_connection(("amblin.com",443))
+        conn.request.side_effect=request
+        with patch.object(tv.socket,"getaddrinfo",return_value=[addr]) as dns, patch.object(tv.socket,"socket",return_value=sock), patch.object(tv.http.client,"HTTPSConnection",return_value=conn) as https:
+            self.assertEqual(tv._fetch_css("https://amblin.com/a.css",{"amblin.com"},2),b"p{}")
+            dns.assert_called_once()
+            sock.connect.assert_called_once_with(("8.8.8.8",443))
+            self.assertEqual(https.call_args.args[:2],("amblin.com",443))
+        with patch.object(tv.socket,"getaddrinfo",return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,"",("127.0.0.1",443))]), patch.object(tv.http.client,"HTTPSConnection") as https:
+            with self.assertRaises(ValueError):
+                tv._fetch_css("https://amblin.com/a.css",{"amblin.com"},2)
+            https.assert_not_called()
 
     def test_browser_resolves_external_hidden_and_import(self):
         import typed_visibility as v
