@@ -185,6 +185,7 @@ import CryptoKit
     private var emptyPoolRetry:Date?
     private var retryCurrentAfterResume=false
     private var catalogueBusy=false
+    private var programmeRequestID=UUID()
     @Published private var favoriteInFlight=Set<String>()
     @Published private var favoriteFailureChannelID:String?
     private var lastProgressReport:Task<Void,Never>?
@@ -812,7 +813,7 @@ import CryptoKit
         if status=="Connection failed" || status.hasPrefix("Surf unavailable:"){return "Catalogue or connection unavailable"}
         return "Offline / catalogue not ready"
     }
-    func connect() async {
+    func connect(resumePlayback:Bool=true) async {
         guard apiReady,policyReady,!apiChanging,!loginBusy,!catalogueBusy,!gatewayHealthBusy,!sourceTransitionBusy else{return}
         loginBusy=true;defer{loginBusy=false}
         let savedSettings=settings
@@ -848,7 +849,7 @@ import CryptoKit
             failureRun=0
             // EPG is optional and must not block initial catalogue readiness.
             loginBusy=false
-            if intent==surfStartIntent && !surfStartPending && !sourceTransitionBusy && settings.surfCategory==category &&
+            if resumePlayback && intent==surfStartIntent && !surfStartPending && !sourceTransitionBusy && settings.surfCategory==category &&
                 settings.resumeSurf==savedSettings.resumeSurf && !engineeringOwnsPlayback && current==nil {
                 if resumeLoop && (settings.resumeSurf || surfing){restoreSurf(category:category)}
                 else if !resumeLoop,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
@@ -862,6 +863,7 @@ import CryptoKit
         recalculateInsights();requestSync()
     }
     private func publishCatalogue(_ items:[Channel]){
+        programmeRequestID=UUID()
         channels=items;catalogueReady=true;disk.save(items,"channels.json");lastRefresh=Date()
         updateEffectiveHealth()
         log("INFO","catalogue","REFRESHED",["count":String(items.count),"favorites":String(items.filter(\.favorite).count)])
@@ -869,15 +871,17 @@ import CryptoKit
     private func refreshProgramme() async {
         let origin=jelly.base,account=jelly.userID,token=jelly.token,epoch=jelly.connectionEpoch
         guard jelly.connected,catalogueReady else{return}
+        let requestID=UUID();programmeRequestID=requestID
         do {
             let items=try await jelly.programs()
-            guard jelly.connectionEpoch==epoch,jelly.base==origin,jelly.userID==account,jelly.token==token,catalogueReady else{return}
+            guard programmeRequestID==requestID,jelly.connectionEpoch==epoch,jelly.base==origin,jelly.userID==account,jelly.token==token,catalogueReady else{return}
             programs=items;log("INFO","epg","REFRESHED",["count":String(programs.count)])
         }catch{log("WARN","epg","UNAVAILABLE")}
     }
     func refresh() async throws {
         guard !apiChanging,!catalogueBusy,!loginBusy,jelly.connected else{throw AppError.message("Catalogue unavailable or busy")}
         catalogueBusy=true;defer{catalogueBusy=false}
+        programmeRequestID=UUID()
         lastCatalogueRefreshAttempt=Date()
         let items=try await jelly.channels()
         publishCatalogue(items)
@@ -1873,7 +1877,7 @@ import CryptoKit
             lastCatalogueRefreshAttempt=now
             Task{do{try await refresh()}catch{log("WARN","catalogue","REFRESH_FAILED")}}
         }
-        if apiReady && !apiChanging && policyReady && !loginBusy && !catalogueBusy && !surfStartPending && (!jelly.connected || !catalogueReady || status=="Connection failed") && settings.autoLogin && (!surfing || settings.unattended) && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect()}}
+        if apiReady && !apiChanging && policyReady && !loginBusy && !catalogueBusy && !surfStartPending && (!jelly.connected || !catalogueReady || status=="Connection failed") && settings.autoLogin && (settings.unattended || (current==nil && !surfing)) && !settings.server.isEmpty && now.timeIntervalSince(lastLogin)>Double(operational.reconnectSeconds ?? 60) {Task{await connect(resumePlayback:settings.unattended)}}
         resumeCampaignIfNeeded()
         runPlatformIfDue()
         runModuleIfDue()
