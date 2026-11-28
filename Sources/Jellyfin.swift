@@ -43,17 +43,19 @@ private final class SurfNoRedirect: NSObject, URLSessionTaskDelegate {
         let previousPolicyOrigin=gatewayHealth != nil ? base:nil
         invalidateConnection()
         let epoch=connectionEpoch
+        let expectedConfiguration=gatewayConfiguration
+        let expectedAdapter=adapter
         let staged=Jellyfin(deviceID:deviceID,transport:transport)
         staged.adapter=adapter;staged.gatewayConfiguration=gatewayConfiguration;staged.log=log
         try await staged.connect(settings)
         if previousPolicyOrigin==staged.base{staged.requiresGatewayPolicy=true}
         for attempt in 0...retryDelays.count {
             try Task.checkCancellation()
-            guard stillCurrent(),connectionEpoch==epoch else{throw CancellationError()}
+            guard stillCurrent(),connectionEpoch==epoch,gatewayConfiguration==expectedConfiguration,adapter === expectedAdapter else{throw CancellationError()}
             do{
                 let catalogue=try await staged.channels()
                 try Task.checkCancellation()
-                guard stillCurrent(),connectionEpoch==epoch else{throw CancellationError()}
+                guard stillCurrent(),connectionEpoch==epoch,gatewayConfiguration==expectedConfiguration,adapter === expectedAdapter else{throw CancellationError()}
                 adoptConnection(from:staged)
                 return catalogue
             }catch{

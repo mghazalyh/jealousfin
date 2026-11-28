@@ -804,7 +804,8 @@ import CryptoKit
             log("WARN","settings","PRIVATE_DEFAULTS_UNAVAILABLE",["errorType":String(describing:type(of:error))])
         }
     }
-    var surfReady:Bool{apiReady && policyReady && !apiChanging && !loginBusy && jelly.connected && catalogueReady && !channels.isEmpty}
+    private var catalogueSurfReady:Bool{apiReady && policyReady && !apiChanging && !loginBusy && jelly.connected && catalogueReady && !channels.isEmpty}
+    var surfReady:Bool{catalogueSurfReady && !sourceTransitionBusy}
     var connectionReadiness:String{
         if loginBusy{return "Connecting / loading catalogue…"}
         if jelly.connected && catalogueReady && !channels.isEmpty{return "Connected"}
@@ -812,9 +813,10 @@ import CryptoKit
         return "Offline / catalogue not ready"
     }
     func connect() async {
-        guard apiReady,policyReady,!apiChanging,!loginBusy,!catalogueBusy,!gatewayHealthBusy else{return}
+        guard apiReady,policyReady,!apiChanging,!loginBusy,!catalogueBusy,!gatewayHealthBusy,!sourceTransitionBusy else{return}
         loginBusy=true;defer{loginBusy=false}
         let savedSettings=settings
+        let configurationRevision=hotConfiguration.revision
         let intent=surfStartIntent
         selectionTask?.cancel();selectionID=UUID();rotationSelectionPending=false
         let resumeLoop=settings.resumeSurf || surfing
@@ -830,7 +832,9 @@ import CryptoKit
         do {
             let items=try await jelly.connectCatalogue(savedSettings,stillCurrent:{
                 self.settings.server==savedSettings.server && self.settings.username==savedSettings.username &&
-                self.settings.password==savedSettings.password && !self.apiChanging
+                self.settings.password==savedSettings.password && self.settings.surfCategory==savedSettings.surfCategory &&
+                self.apiReady && self.policyReady && !self.apiChanging && !self.sourceTransitionBusy &&
+                self.hotConfiguration.revision==configurationRevision
             })
             publishCatalogue(items)
             status="Connected"
@@ -838,8 +842,11 @@ import CryptoKit
             failureRun=0
             // EPG is optional and must not block initial catalogue readiness.
             loginBusy=false
-            if intent==surfStartIntent && !surfStartPending && settings.surfCategory==category && !engineeringOwnsPlayback && resumeLoop && current==nil {restoreSurf(category:category)}
-            else if intent==surfStartIntent && !surfStartPending && !engineeringOwnsPlayback,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
+            if intent==surfStartIntent && !surfStartPending && !sourceTransitionBusy && settings.surfCategory==category &&
+                settings.resumeSurf==savedSettings.resumeSurf && !engineeringOwnsPlayback && current==nil {
+                if resumeLoop && (settings.resumeSurf || surfing){restoreSurf(category:category)}
+                else if !resumeLoop,let id=resumeChannel,let c=channels.first(where:{$0.id==id}),health[id]?.eligible(at:Date()) ?? true {open(c)}
+            }
             Task{await refreshProgramme()}
         } catch {
             jelly.invalidateConnection();catalogueReady=false;updateEffectiveHealth()
@@ -926,10 +933,10 @@ import CryptoKit
         while (!apiReady || !policyReady || loginBusy || catalogueBusy || (!surfReady && gatewayHealthBusy) || apiChanging),
               ProcessInfo.processInfo.systemUptime<deadline {
             try Task.checkCancellation()
-            guard intent==surfStartIntent else{throw CancellationError()}
+            guard intent==surfStartIntent,!sourceTransitionBusy else{throw CancellationError()}
             try await Task.sleep(nanoseconds:200_000_000)
         }
-        guard intent==surfStartIntent,!apiChanging,apiReady,policyReady,!loginBusy,!catalogueBusy,(surfReady || !gatewayHealthBusy) else{throw AppError.message("Connection engine busy")}
+        guard intent==surfStartIntent,!sourceTransitionBusy,!apiChanging,apiReady,policyReady,!loginBusy,!catalogueBusy,(surfReady || !gatewayHealthBusy) else{throw AppError.message("Connection engine busy")}
         if !surfReady{await connect()}
         try Task.checkCancellation()
         guard intent==surfStartIntent,surfReady else{throw AppError.message("Catalogue not ready; Surf not started")}
@@ -942,6 +949,11 @@ import CryptoKit
     }
     func startSurf(category:String="All Channels"){
         guard surfReady else{log("WARN","surf","NOT_CONNECTED");return}
+        beginSurf(category:category)
+    }
+    // Only the source-transition owner may start after its own catalogue refresh.
+    private func beginSurf(category:String){
+        guard catalogueSurfReady else{log("WARN","surf","NOT_CONNECTED");return}
         surfing=true;surfPaused=false;settings.resumeSurf=true;settings.surfCategory=category;disk.save(settings,"settings.json")
         log("INFO","surf","START",["category":category,"minutes":String(settings.rotationMinutes)])
         next()
@@ -956,7 +968,7 @@ import CryptoKit
     // Only one transition may run, and success is reported only after the
     // refreshed catalogue is ready and the target category has started Surf.
     func transitionSurfSource(to target:SurfSourceIdentity) async {
-        guard !sourceTransitionBusy else{return}
+        guard !sourceTransitionBusy,!surfStartPending,!loginBusy else{return}
         sourceTransitionBusy=true
         sourceTransitionError=nil
         defer{sourceTransitionBusy=false}
@@ -991,7 +1003,7 @@ import CryptoKit
             let previousRefresh=lastRefresh
             try await refresh()
             guard catalogueReady,!channels.isEmpty,lastRefresh>previousRefresh else{throw AppError.message("Source catalogue is not ready")}
-            startSurf(category:plan.targetCategory)
+            beginSurf(category:plan.targetCategory)
             guard surfing,settings.surfCategory==plan.targetCategory,catalogueReady else{throw AppError.message("Source Surf did not start")}
             log("INFO","source","SWITCHED",["source":target.rawValue,"category":plan.targetCategory,"channels":String(channels.count)])
             requestSync()

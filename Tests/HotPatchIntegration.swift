@@ -271,6 +271,17 @@ final class TorrioConflictFixture:URLProtocol {
         }catch is CancellationError{}
         try require(changedEpoch && !startup.connected && startup.gatewayHealth==nil,"same-account connection epoch change rejects staged response")
 
+        var configurationChecks=0
+        var configurationCancelled=false
+        do{
+            _ = try await startup.connectCatalogue(startupSettings,stillCurrent:{
+                configurationChecks+=1
+                if configurationChecks==2{startup.gatewayConfiguration.timeoutSeconds=29}
+                return true
+            },retryDelays:[0])
+        }catch is CancellationError{configurationCancelled=true}
+        try require(configurationCancelled && configurationChecks==2 && !startup.connected && startup.gatewayHealth==nil,"gateway configuration change rejects completed staged catalogue")
+
         let nativePolicyClient=Jellyfin(deviceID:"policy-fixture",transport:URLSession(configuration:config))
         var policySettings=fixtureSettings;policySettings.server="http://fixture.invalid:18796"
         try await nativePolicyClient.connect(policySettings)
